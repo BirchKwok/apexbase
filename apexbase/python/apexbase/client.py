@@ -1,7 +1,9 @@
 """
-ApexClient - High-performance embedded database client
+ApexClient - High-performance embedded database client.
 
-This module provides the ApexClient class that wraps ApexStorage with on-demand storage engine.
+This module provides :class:`ApexClient`, which wraps ApexStorage with an
+on-demand ``.apex`` storage engine, plus helpers for vector encoding and
+optional auto query scheduling.
 """
 
 from __future__ import annotations
@@ -32,6 +34,15 @@ POLARS_AVAILABLE = importlib.util.find_spec("polars") is not None
 
 
 def _ensure_pyarrow():
+    """
+    Lazily import and cache the ``pyarrow`` module.
+
+    Returns:
+        The imported ``pyarrow`` module.
+
+    Raises:
+        ImportError: If pyarrow is not installed.
+    """
     global pa, ARROW_AVAILABLE
     if pa is None:
         if not ARROW_AVAILABLE:
@@ -42,6 +53,15 @@ def _ensure_pyarrow():
 
 
 def _ensure_pandas():
+    """
+    Lazily import and cache the ``pandas`` module.
+
+    Returns:
+        The imported ``pandas`` module.
+
+    Raises:
+        ImportError: If pandas is not installed.
+    """
     global pd, PANDAS_AVAILABLE
     if pd is None:
         if not PANDAS_AVAILABLE:
@@ -52,6 +72,15 @@ def _ensure_pandas():
 
 
 def _ensure_polars():
+    """
+    Lazily import and cache the ``polars`` module.
+
+    Returns:
+        The imported ``polars`` module.
+
+    Raises:
+        ImportError: If polars is not installed.
+    """
     global pl, POLARS_AVAILABLE
     if pl is None:
         if not POLARS_AVAILABLE:
@@ -74,7 +103,15 @@ _auto_scheduler_enabled = False
 _auto_scheduler_initialized = False
 
 def _init_auto_scheduler():
-    """Initialize the scheduler automatically if enabled"""
+    """
+    Initialize the Rust query scheduler if auto-scheduling is enabled.
+
+    Creates a 4-worker scheduler on first successful call. Failures are
+    ignored so clients can continue without parallel execution.
+
+    Returns:
+        None
+    """
     global _auto_scheduler_initialized
     if not _auto_scheduler_initialized:
         try:
@@ -85,13 +122,23 @@ def _init_auto_scheduler():
             pass
 
 def _enable_auto_scheduler():
-    """Enable automatic scheduler for concurrent query execution"""
+    """
+    Enable automatic concurrent query scheduling and initialize the pool.
+
+    Returns:
+        None
+    """
     global _auto_scheduler_enabled
     _auto_scheduler_enabled = True
     _init_auto_scheduler()
 
 def _disable_auto_scheduler():
-    """Disable automatic scheduler"""
+    """
+    Disable automatic concurrent query scheduling.
+
+    Returns:
+        None
+    """
     global _auto_scheduler_enabled
     _auto_scheduler_enabled = False
 
@@ -101,9 +148,16 @@ def _disable_auto_scheduler():
 # ─────────────────────────────────────────────────────────────────────────────
 
 def encode_vector(vec) -> bytes:
-    """Encode a float vector to raw little-endian float32 bytes for storage.
+    """
+    Encode a float vector to raw little-endian float32 bytes for storage.
 
-    Accepts: list/tuple of numbers, numpy array (any float/int dtype).
+    Accepts a list/tuple of numbers or a numpy array of any float/int dtype.
+
+    Args:
+        vec: Vector values as a sequence or numpy array.
+
+    Returns:
+        Packed little-endian float32 bytes suitable for a Binary column.
 
     Example::
 
@@ -115,7 +169,15 @@ def encode_vector(vec) -> bytes:
 
 
 def decode_vector(b: bytes) -> list:
-    """Decode raw little-endian float32 bytes back to a Python list of floats.
+    """
+    Decode raw little-endian float32 bytes back to a Python list of floats.
+
+    Args:
+        b: Bytes previously produced by :func:`encode_vector` or equivalent
+            Binary column storage.
+
+    Returns:
+        List of ``float`` values.
 
     Example::
 
@@ -126,7 +188,17 @@ def decode_vector(b: bytes) -> list:
 
 
 def _is_vector_column(values) -> bool:
-    """Return True if *values* looks like a column of float vectors."""
+    """
+    Return whether *values* looks like a column of float vectors.
+
+    Args:
+        values: Column values (list/iterable). Empty or all-None columns
+            are treated as non-vector.
+
+    Returns:
+        ``True`` if the first non-None value is a 1-D numeric array or a
+        list/tuple of numbers; otherwise ``False``.
+    """
     if not values:
         return False
     # Find first non-None value
@@ -143,7 +215,15 @@ def _is_vector_column(values) -> bool:
 
 
 def _encode_vector_col(values) -> list:
-    """Encode a column of vectors to a list of bytes objects."""
+    """
+    Encode a column of vectors to a list of bytes objects.
+
+    Args:
+        values: Iterable of vector values (or ``None``).
+
+    Returns:
+        List of encoded bytes (or ``None`` for null entries).
+    """
     return [None if v is None else encode_vector(v) for v in values]
 
 
@@ -210,6 +290,18 @@ _RE_SIMPLE_INSERT_VALUES = re.compile(
 
 
 def _projection_columns_from_text(projection: str) -> Optional[List[str]]:
+    """
+    Parse a simple SELECT projection list into plain column names.
+
+    Only accepts comma-separated identifiers (optionally table-qualified).
+    Expressions, aliases, wildcards, and aggregates return ``None``.
+
+    Args:
+        projection: Text between ``SELECT`` and ``FROM``.
+
+    Returns:
+        Ordered list of column names, or ``None`` if not a simple projection.
+    """
     if not projection or projection == "*":
         return None
 
@@ -232,7 +324,16 @@ def _projection_columns_from_text(projection: str) -> Optional[List[str]]:
 
 
 def _simple_projection_columns(sql: str) -> Optional[List[str]]:
-    """Return plain SELECT columns for simple projected fast paths."""
+    """
+    Return plain SELECT columns for simple projected SQL fast paths.
+
+    Args:
+        sql: SQL statement text.
+
+    Returns:
+        List of column names, or ``None`` when the statement is not a
+        simple projected SELECT.
+    """
     m = _RE_SIMPLE_SELECT_FROM.match(sql)
     if not m:
         return None
@@ -240,11 +341,29 @@ def _simple_projection_columns(sql: str) -> Optional[List[str]]:
 
 
 def _simple_from_table(sql: str) -> Optional[str]:
+    """
+    Extract the first simple ``FROM`` table identifier from SQL.
+
+    Args:
+        sql: SQL statement text.
+
+    Returns:
+        Table name string, or ``None`` if no match.
+    """
     m = _RE_SIMPLE_FROM_TABLE.search(sql)
     return m.group(1) if m else None
 
 
 def _simple_id_list(sql: str) -> Optional[List[int]]:
+    """
+    Parse a simple ``WHERE _id IN (...)`` integer list from SQL.
+
+    Args:
+        sql: SQL statement text.
+
+    Returns:
+        List of integer IDs, or ``None`` if the clause is missing/invalid.
+    """
     m = _RE_SIMPLE_ID_IN.search(sql)
     if not m:
         return None
@@ -258,7 +377,23 @@ def _simple_id_list(sql: str) -> Optional[List[int]]:
 
 
 def _classify_sql_route(sql: str, sql_upper: Optional[str] = None):
-    """Classify one statement for Python-side locking and fast-path routing."""
+    """
+    Classify one statement for Python-side locking and fast-path routing.
+
+    Args:
+        sql: Original SQL text.
+        sql_upper: Optional precomputed upper-cased stripped SQL. Computed
+            from *sql* when omitted.
+
+    Returns:
+        Tuple ``(sig, count_star_match, simple_projection)`` where:
+
+        - ``sig`` is a route signature string (e.g. ``point_lookup``,
+          ``write``, ``complex``).
+        - ``count_star_match`` is a regex match for ``COUNT(*)`` queries,
+          otherwise ``None``.
+        - ``simple_projection`` is a list of projected columns or ``None``.
+    """
     if sql_upper is None:
         sql_upper = sql.strip().upper()
 
@@ -383,7 +518,16 @@ def _classify_sql_route(sql: str, sql_upper: Optional[str] = None):
 
 
 def _sql_route_family(sig: str) -> str:
-    """Collapse Python fast-path detail into the cross-layer routing contract."""
+    """
+    Collapse a detailed Python fast-path signature into a routing family.
+
+    Args:
+        sig: Signature from :func:`_classify_sql_route`.
+
+    Returns:
+        One of ``'write'``, ``'transaction'``, ``'multi'``, ``'session'``,
+        or ``'read'``.
+    """
     if sig == 'write':
         return 'write'
     if sig in ('transaction', 'multi', 'session'):
@@ -392,6 +536,19 @@ def _sql_route_family(sig: str) -> str:
 
 
 def _split_simple_insert_value_groups(values_text: str) -> Optional[List[str]]:
+    """
+    Split an INSERT ``VALUES`` clause into parenthesized value groups.
+
+    Respects nested parentheses and single-quoted string literals
+    (including escaped ``''``).
+
+    Args:
+        values_text: Text after the ``VALUES`` keyword.
+
+    Returns:
+        List of group strings such as ``'(1, \'a\')'``, or ``None`` if
+        the text is malformed.
+    """
     groups = []
     start = None
     depth = 0
@@ -425,6 +582,17 @@ def _split_simple_insert_value_groups(values_text: str) -> Optional[List[str]]:
 
 
 def _parse_simple_insert_values(sql: str):
+    """
+    Parse a simple ``INSERT INTO t (cols) VALUES (...)`` statement.
+
+    Args:
+        sql: SQL statement text.
+
+    Returns:
+        ``(table_name, rows)`` where *rows* is a list of dicts mapping
+        column names to literal values; or ``None`` if the statement is
+        not a supported simple insert (e.g. includes ``_id`` or non-literals).
+    """
     match = _RE_SIMPLE_INSERT_VALUES.match(sql)
     if not match:
         return None
@@ -451,9 +619,22 @@ def _parse_simple_insert_values(sql: str):
 
 class ApexClient:
     """
-    ApexClient - High-performance embedded database client
-    
-    Uses on-demand storage format (.apex) for persistence.
+    High-performance embedded database client for ApexBase.
+
+    Wraps :class:`~apexbase._core.ApexStorage` with on-demand ``.apex`` storage,
+    multi-database/table management, SQL execution, vector helpers, BLOB APIs,
+    and optional full-text search (FTS).
+
+    Typical usage::
+
+        with ApexClient("./data") as client:
+            client.create_table("users", {"name": "string", "age": "int64"})
+            client.store({"name": "Ada", "age": 36})
+            rows = client.execute("SELECT * FROM users WHERE age > 30").to_dict()
+
+    Attributes:
+        current_database: Name of the active database (``'default'`` = root).
+        current_table: Name of the active table, or ``None`` if unset.
     """
     
     def __init__(
@@ -467,6 +648,29 @@ class ApexClient:
         durability: DurabilityLevel = 'fast',
         _auto_manage: bool = True
     ):
+        """
+        Create an ApexClient bound to a directory-backed ``.apex`` database.
+
+        Args:
+            dirpath: Database directory path. Defaults to the current directory.
+            batch_size: Hint for batch-oriented write paths (default ``1000``).
+            drop_if_exists: If ``True``, recreate storage and clear persisted
+                FTS config under this directory.
+            enable_cache: Whether client-side caches are enabled (default ``True``).
+            cache_size: Soft cache size hint (default ``10000``).
+            prefer_arrow_format: Prefer Arrow-friendly result materialization
+                when pyarrow is available (default ``True``).
+            durability: Write durability level: ``'fast'``, ``'safe'``, or
+                ``'max'`` (default ``'fast'``).
+            _auto_manage: Internal flag. When ``True`` (default), register with
+                the process-wide client/storage registry for sharing and cleanup.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If *durability* is not a recognised level.
+        """
         if dirpath is None:
             dirpath = "."
         
@@ -586,6 +790,15 @@ class ApexClient:
         self._store_one_delta_durable = getattr(self._storage, "store_one_delta_durable", None)
 
     def _load_fts_config(self) -> None:
+        """
+        Load persisted FTS table configuration from ``fts_config.json``.
+
+        Skips reload when the file mtime is unchanged. Corrupt or missing
+        files reset in-memory FTS state.
+
+        Returns:
+            None
+        """
         try:
             try:
                 stat = self._fts_config_path.stat()
@@ -615,6 +828,14 @@ class ApexClient:
             self._fts_config_mtime_ns = None
 
     def _save_fts_config(self) -> None:
+        """
+        Persist current FTS table configuration to ``fts_config.json``.
+
+        Writes via a temporary file and atomic replace. Failures are ignored.
+
+        Returns:
+            None
+        """
         try:
             temp_path = self._fts_config_path.with_suffix('.json.tmp')
             with open(temp_path, 'w', encoding='utf-8') as f:
@@ -630,14 +851,42 @@ class ApexClient:
             pass
 
     def _is_fts_enabled(self, table_name: str = None) -> bool:
+        """
+        Return whether full-text search is enabled for a table.
+
+        Args:
+            table_name: Table to check. Defaults to the current table.
+
+        Returns:
+            ``True`` if FTS is marked enabled in the local config.
+        """
         table = table_name or self._current_table
         return table in self._fts_tables and self._fts_tables[table].get('enabled', False)
     
     def _get_fts_config(self, table_name: str = None) -> Optional[Dict]:
+        """
+        Return the FTS configuration dict for a table.
+
+        Args:
+            table_name: Table to look up. Defaults to the current table.
+
+        Returns:
+            Config dict, or ``None`` if the table has no FTS entry.
+        """
         table = table_name or self._current_table
         return self._fts_tables.get(table)
     
     def _ensure_fts_initialized(self, table_name: str = None) -> bool:
+        """
+        Lazily initialize the Rust FTS engine for a table on first use.
+
+        Args:
+            table_name: Table to initialize. Defaults to the current table.
+                Initialization only proceeds when the table is currently selected.
+
+        Returns:
+            ``True`` if FTS is enabled and the engine is ready; otherwise ``False``.
+        """
         table = table_name or self._current_table
         if not self._is_fts_enabled(table):
             return False
@@ -665,6 +914,18 @@ class ApexClient:
 
     @contextlib.contextmanager
     def _fts_table_context(self, table: str):
+        """
+        Temporarily select *table* for FTS operations, then restore the previous table.
+
+        Args:
+            table: Target table name for the duration of the context.
+
+        Yields:
+            None
+
+        Returns:
+            A context manager.
+        """
         original = self._current_table
         if table != original:
             self.use_table(table)
@@ -675,16 +936,43 @@ class ApexClient:
                 self.use_table(original)
 
     def _sync_fts_config_from_disk(self, initialize_current: bool = True) -> None:
-        """Refresh Python-side FTS state after SQL DDL updates fts_config.json."""
+        """
+        Refresh Python-side FTS state after SQL DDL updates ``fts_config.json``.
+
+        Args:
+            initialize_current: If ``True`` (default), also initialize the FTS
+                engine for the currently selected table when enabled.
+
+        Returns:
+            None
+        """
         self._load_fts_config()
         if initialize_current and self._current_table and self._is_fts_enabled(self._current_table):
             self._ensure_fts_initialized(self._current_table)
     
     def _check_connection(self):
+        """
+        Raise if this client has been closed or has no storage handle.
+
+        Returns:
+            None
+
+        Raises:
+            RuntimeError: When the connection is closed.
+        """
         if self._is_closed or self._storage is None:
             raise RuntimeError("ApexClient connection has been closed, cannot perform operations.")
 
     def _invalidate_replace_cache(self) -> None:
+        """
+        Clear exact-replace / numeric-update / missing-delete and numeric-range caches.
+
+        Also bumps the current table's result generation token so cached SQL
+        results cannot be reused across mutations.
+
+        Returns:
+            None
+        """
         self._last_exact_replace_key = None
         self._last_exact_replace_data = None
         self._last_exact_numeric_update = None
@@ -703,6 +991,14 @@ class ApexClient:
             _TABLE_RESULT_GENERATIONS[key] = _TABLE_RESULT_GENERATIONS.get(key, 0) + 1
 
     def _numeric_range_cache_token(self):
+        """
+        Build a cache token for numeric-range query result reuse.
+
+        Returns:
+            Opaque token derived from table generation state, used to validate
+            cached numeric-range rows; or ``None`` when caching is disabled,
+            a transaction is active, or overlay writes are pending.
+        """
         if (not self._enable_cache or not self._current_table
                 or getattr(self, '_in_txn', False)
                 or getattr(self, '_fast_txn_active', False)):
@@ -720,10 +1016,32 @@ class ApexClient:
             return None
 
     def _remember_exact_replace(self, id_: int, data: dict) -> None:
+        """
+        Cache the last successful exact ``replace`` payload for idempotent repeats.
+
+        Args:
+            id_: Row ``_id`` that was replaced.
+            data: Replacement row dict.
+
+        Returns:
+            None
+        """
         self._last_exact_replace_key = (self._current_database, self._current_table, int(id_))
         self._last_exact_replace_data = dict(data)
 
     def _remember_exact_numeric_update(self, row_id: int, column: str, value, updated=True) -> None:
+        """
+        Cache the last exact numeric ``UPDATE ... WHERE _id = ...`` result.
+
+        Args:
+            row_id: Updated row ``_id``.
+            column: Updated column name.
+            value: New numeric value.
+            updated: Whether the update reported success (default ``True``).
+
+        Returns:
+            None
+        """
         self._last_exact_numeric_update = (
             self._current_database,
             self._current_table,
@@ -739,11 +1057,32 @@ class ApexClient:
         columns_dict,
         show_internal_id: bool,
     ) -> 'ResultView':
+        """
+        Build a :class:`ResultView` from a columnar ``columns_dict`` payload.
+
+        Args:
+            sql: Original SQL (reserved for callers / debugging context).
+            columns_dict: Mapping of column name to value lists.
+            show_internal_id: Whether ``_id`` should be visible on the view.
+
+        Returns:
+            A :class:`ResultView` wrapping the columnar data.
+        """
         rv = ResultView(lazy_pydict=columns_dict)
         rv._show_internal_id = show_internal_id
         return rv
     
     def _ensure_table_selected(self):
+        """
+        Ensure a current table is selected before table-scoped operations.
+
+        Returns:
+            None
+
+        Raises:
+            RuntimeError: If no table is currently selected. Call
+                :meth:`create_table` or :meth:`use_table` first.
+        """
         if self._current_table is None:
             raise RuntimeError("No table selected. Call create_table() or use_table() first.")
 
@@ -796,15 +1135,21 @@ class ApexClient:
 
     @property
     def current_database(self) -> str:
-        """Return the currently active database name."""
+        """
+        Return the currently active database name.
+
+        Returns:
+            Active database name (``'default'`` for root-level tables).
+        """
         self._check_connection()
         return self._current_database
 
     def list_databases(self) -> list:
-        """List all available databases.
+        """
+        List all available databases.
 
-        'default' is always included (represents root-level tables).
-        Other entries are named sub-directories inside the root directory.
+        ``'default'`` is always included (root-level tables). Other entries are
+        named sub-directories inside the root directory.
 
         Returns:
             Sorted list of database name strings.
@@ -815,6 +1160,22 @@ class ApexClient:
     # ============ Table Management ============
 
     def use_table(self, table_name: str):
+        """
+        Switch the active table used by subsequent read/write operations.
+
+        Flushes pending memtable/buffered writes when switching away from another
+        table, and refreshes FTS config when needed.
+
+        Args:
+            table_name: Name of the table to select.
+
+        Returns:
+            None
+
+        Raises:
+            RuntimeError: If the client is closed.
+            Exception: Propagated from the storage layer if the table is missing.
+        """
         self._check_connection()
         storage_lock = getattr(self, '_storage_lock', None)
         storage_context = storage_lock if storage_lock is not None else _NULL_CONTEXT
@@ -836,20 +1197,34 @@ class ApexClient:
 
     @property
     def current_table(self) -> str:
+        """
+        Return the currently selected table name.
+
+        Returns:
+            Current table name, or ``None`` if no table is selected.
+        """
         self._check_connection()
         return self._current_table
 
     def create_table(self, table_name: str, schema: dict = None):
-        """Create a new table.
+        """
+        Create a new table and select it as the current table.
 
         Args:
             table_name: Name of the table to create.
             schema: Optional dict mapping column names to type strings.
-                    Pre-defining schema avoids type inference on the first insert,
-                    providing a performance benefit for bulk loading.
-                    Supported types: int8, int16, int32, int64, uint8, uint16,
-                    uint32, uint64, float32, float64, bool, string, binary, blob.
-                    Example: {"name": "string", "age": "int64", "score": "float64"}
+                Pre-defining schema avoids type inference on the first insert.
+                Supported types include: ``int8``/``int16``/``int32``/``int64``,
+                ``uint8``/``uint16``/``uint32``/``uint64``, ``float32``/``float64``,
+                ``bool``, ``string``, ``binary``, ``blob``.
+                Example: ``{"name": "string", "age": "int64"}``.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If table creation fails (storage ``OSError`` wrapped).
+            RuntimeError: If the client is closed.
         """
         self._check_connection()
         storage_lock = getattr(self, '_storage_lock', None)
@@ -866,6 +1241,15 @@ class ApexClient:
         self._current_table = table_name
 
     def drop_table(self, table_name: str):
+        """
+        Drop a table and best-effort remove its FTS index files.
+
+        Args:
+            table_name: Name of the table to drop.
+
+        Returns:
+            None
+        """
         self._check_connection()
 
         # Detach the engine while the table can still be selected.
@@ -909,25 +1293,31 @@ class ApexClient:
             self._current_table = None
 
     def list_tables(self) -> List[str]:
+        """
+        List table names in the currently active database.
+
+        Returns:
+            List of table name strings.
+        """
         self._check_connection()
         with self._lock:
             return self._storage.list_tables()
 
     def register_temp_table(self, name: str, file_path: str):
-        """Register a data file (CSV, JSON, Parquet) as a temporary table.
+        """
+        Register a data file (CSV, JSON, Parquet) as a temporary table.
 
-        The file is parsed once and materialized into a native .apex table
-        stored in a temp directory. Subsequent queries on this table bypass
-        file parsing and use the mmap-backed native format with zone maps and
-        bloom filters, achieving an order-of-magnitude speedup vs repeated
-        ``read_csv()`` / ``read_json()`` / ``read_parquet()`` calls.
-
-        The temp table is automatically cleaned up when the client is closed.
+        The file is parsed once and materialized into a native ``.apex`` table
+        under a temp directory. Subsequent queries use mmap-backed storage.
+        The temp table is cleaned up when the client is closed.
 
         Args:
             name: Name for the temporary table.
-            file_path: Path to the data file. Supports CSV (.csv/.tsv),
-                        JSON (.json/.ndjson/.jsonl), and Parquet (.parquet).
+            file_path: Path to the data file (``.csv``/``.tsv``,
+                ``.json``/``.ndjson``/``.jsonl``, or ``.parquet``).
+
+        Returns:
+            None
         """
         self._check_connection()
         with self._lock:
@@ -936,7 +1326,15 @@ class ApexClient:
             self._storage.register_temp_table(name, file_path)
 
     def drop_temp_table(self, name: str):
-        """Drop a previously registered temporary table."""
+        """
+        Drop a previously registered temporary table.
+
+        Args:
+            name: Temporary table name.
+
+        Returns:
+            None
+        """
         self._check_connection()
         with self._lock:
             self._storage.drop_temp_table(name)
@@ -965,10 +1363,14 @@ class ApexClient:
             return self._storage.set_compression(compression)
 
     def get_compression(self) -> str:
-        """Get the current compression type for the current table.
+        """
+        Get the current compression type for the current table.
 
         Returns:
-            "none", "lz4", or "zstd".
+            ``"none"``, ``"lz4"``, or ``"zstd"``.
+
+        Raises:
+            RuntimeError: If no table is selected or the client is closed.
         """
         self._check_connection()
         self._ensure_table_selected()
@@ -984,6 +1386,21 @@ class ApexClient:
         lazy_load: bool = False,
         cache_size: int = 10000
     ) -> 'ApexClient':
+        """
+        Enable and initialize full-text search for a table.
+
+        Persists configuration to ``fts_config.json`` so FTS auto-enables on reopen.
+
+        Args:
+            table_name: Target table. Defaults to the current table.
+            index_fields: Optional list of text fields to index. ``None`` indexes
+                string fields automatically.
+            lazy_load: If ``True``, defer loading index pages until search time.
+            cache_size: FTS engine cache size hint (default ``10000``).
+
+        Returns:
+            ``self`` for method chaining.
+        """
         self._check_connection()
         
         table = table_name or self._current_table
@@ -1102,7 +1519,15 @@ class ApexClient:
         return count
 
     def disable_fts(self, table_name: str = None) -> 'ApexClient':
-        """Disable FTS for a table (keeps index files)."""
+        """
+        Disable FTS for a table while keeping index files on disk.
+
+        Args:
+            table_name: Target table. Defaults to the current table.
+
+        Returns:
+            ``self`` for method chaining.
+        """
         self._check_connection()
         table = table_name or self._current_table
 
@@ -1118,7 +1543,15 @@ class ApexClient:
         return self
 
     def drop_fts(self, table_name: str = None) -> 'ApexClient':
-        """Drop FTS for a table: disable + delete index files."""
+        """
+        Disable FTS for a table and delete its index files.
+
+        Args:
+            table_name: Target table. Defaults to the current table.
+
+        Returns:
+            ``self`` for method chaining.
+        """
         self._check_connection()
         table = table_name or self._current_table
 
@@ -1161,6 +1594,17 @@ class ApexClient:
         return self
 
     def _should_index_field(self, field_name: str, field_value, table_name: str = None) -> bool:
+        """
+        Decide whether a field value should be included in FTS indexing.
+
+        Args:
+            field_name: Column/field name.
+            field_value: Field value (used when no explicit index field list).
+            table_name: Table context. Defaults to the current table.
+
+        Returns:
+            ``True`` if the field should be indexed for FTS.
+        """
         table = table_name or self._current_table
         
         if not self._is_fts_enabled(table):
@@ -1178,6 +1622,16 @@ class ApexClient:
         return isinstance(field_value, str)
 
     def _extract_indexable_content(self, data: dict, table_name: str = None) -> dict:
+        """
+        Extract FTS-indexable string content from a row dict.
+
+        Args:
+            data: Row mapping of field name to value.
+            table_name: Table context. Defaults to the current table.
+
+        Returns:
+            Dict of field name to string content. Empty when FTS is disabled.
+        """
         table = table_name or self._current_table
         
         if not self._is_fts_enabled(table):
@@ -1192,6 +1646,23 @@ class ApexClient:
     # ============ Store Operations ============
 
     def store(self, data) -> None:
+        """
+        Store one or more rows into the current table.
+
+        Accepts a single row dict, a list of dicts, a columnar ``Dict[str, list]``,
+        or pandas / polars / pyarrow tabular objects. Uses scalar fast paths and
+        optional client-side buffering when applicable.
+
+        Args:
+            data: Row(s) or tabular data to append.
+
+        Returns:
+            None
+
+        Raises:
+            RuntimeError: If no table is selected or the client is closed.
+            ValueError: If *data* is an unsupported type.
+        """
         self._check_connection()
         self._ensure_table_selected()
         # Acquire storage lock for thread-safe concurrent access (shared across all clients)
@@ -1211,10 +1682,17 @@ class ApexClient:
             self._store_impl(data)
 
     def store_durable_one(self, data: dict) -> None:
-        """Persist one schema-stable row immediately when the narrow fast path applies.
+        """
+        Persist one schema-stable row immediately when the durable fast path applies.
 
-        Falls back to `store()` + `flush()` for all unsupported cases so the API
-        remains correct even when the optimized delta path is unavailable.
+        Falls back to :meth:`store` plus :meth:`flush` for unsupported cases so
+        the API remains correct when the optimized delta path is unavailable.
+
+        Args:
+            data: Single row dict of scalar (non-nested) values.
+
+        Returns:
+            None
         """
         self._check_connection()
         self._ensure_table_selected()
@@ -1227,6 +1705,15 @@ class ApexClient:
             self._store_durable_one_impl(data)
 
     def _store_durable_one_impl(self, data: dict) -> None:
+        """
+        Internal implementation of :meth:`store_durable_one` (caller holds storage lock).
+
+        Args:
+            data: Single row dict.
+
+        Returns:
+            None
+        """
         with self._lock:
             durable_one = self._store_one_delta_durable
             if (
@@ -1247,6 +1734,16 @@ class ApexClient:
             self.flush()
 
     def _store_scalar_fast_unlocked(self, data: dict) -> bool:
+        """
+        Attempt a lock-held scalar single-row store via buffering or ``store_one`` paths.
+
+        Args:
+            data: Single row dict of scalar values.
+
+        Returns:
+            ``True`` if the row was stored (or buffered) by a fast path;
+            ``False`` if *data* is empty or not scalar-shaped.
+        """
         if not data:
             return False
         for value in data.values():
@@ -1297,6 +1794,18 @@ class ApexClient:
         return True
     
     def _store_impl(self, data) -> None:
+        """
+        Dispatch store logic for the supported tabular and row input shapes.
+
+        Args:
+            data: Single row, list of rows, columnar dict, or DataFrame/Table.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If *data* is not a supported type.
+        """
         with self._lock:
             # 1. Columnar data Dict[str, list/ndarray]
             if isinstance(data, dict):
@@ -1366,6 +1875,15 @@ class ApexClient:
 
     @staticmethod
     def _is_columnar_dict(data: dict) -> bool:
+        """
+        Return whether *data* is a columnar dict (each value is a sequence/array).
+
+        Args:
+            data: Candidate mapping.
+
+        Returns:
+            ``True`` if every non-empty value looks like a column sequence.
+        """
         if not data:
             return False
 
@@ -1379,10 +1897,27 @@ class ApexClient:
         return True
 
     def _encode_vectors_in_record(self, record: dict) -> dict:
-        """Leave vector-shaped values intact so Rust can honor declared vector schemas."""
+        """
+        Prepare a single record for storage (vector values left intact for Rust schema).
+
+        Args:
+            record: Single row dict.
+
+        Returns:
+            The same *record* (identity transform for declared vector schemas).
+        """
         return record
 
     def _store_batch(self, records: List[dict]) -> None:
+        """
+        Store a list of row dicts via the storage batch API.
+
+        Args:
+            records: List of row dictionaries.
+
+        Returns:
+            None
+        """
         if not records:
             return
         self._storage.store_batch(records)
@@ -1390,13 +1925,17 @@ class ApexClient:
         self._invalidate_replace_cache()
 
     def _store_batch_optimized(self, records: List[dict]) -> None:
-        """Store batch with automatic columnar conversion for 3x performance boost.
-        
-        This method automatically converts a list of dicts to columnar format,
-        which is ~3x faster than row-by-row processing.
-        
+        """
+        Store a batch with automatic columnar conversion for higher throughput.
+
+        Converts a list of dicts into a columnar ``Dict[str, list]`` (missing
+        keys become ``None``) and delegates to :meth:`_store_columnar`.
+
         Args:
-            records: List of dict records to store
+            records: List of dict records to store.
+
+        Returns:
+            None
         """
         if not records:
             return
@@ -1418,6 +1957,18 @@ class ApexClient:
             self._storage.store_batch(records)
 
     def _store_columnar(self, columns: Dict[str, list]) -> None:
+        """
+        Store columnar data via the native ``store_columnar`` path.
+
+        Converts numpy/polars columns to Python lists and encodes mixed-dimension
+        vector columns to bytes when needed.
+
+        Args:
+            columns: Mapping of column name to value sequences.
+
+        Returns:
+            None
+        """
         if not columns:
             return
         
@@ -1447,11 +1998,30 @@ class ApexClient:
     # ============ Query Operations ============
 
     def _empty_sql_result(self, show_internal_id: bool = None) -> 'ResultView':
+        """
+        Create an empty :class:`ResultView` for DDL/transaction no-result statements.
+
+        Args:
+            show_internal_id: Visibility flag forwarded onto the view.
+
+        Returns:
+            Empty :class:`ResultView`.
+        """
         rv = ResultView(data=None)
         rv._show_internal_id = show_internal_id
         return rv
 
     def _start_fast_txn(self, read_only: bool = False, show_internal_id: bool = None) -> 'ResultView':
+        """
+        Begin a Python-side fast transaction for simple BEGIN/COMMIT workloads.
+
+        Args:
+            read_only: Reserved read-only flag for promotion to Rust transactions.
+            show_internal_id: Visibility flag for the returned empty result.
+
+        Returns:
+            Empty :class:`ResultView`.
+        """
         self._in_txn = True
         self._fast_txn_active = True
         self._fast_txn_read_only = read_only
@@ -1459,11 +2029,28 @@ class ApexClient:
         return self._empty_sql_result(show_internal_id)
 
     def _reset_fast_txn(self) -> None:
+        """
+        Clear fast-transaction bookkeeping state without touching storage.
+
+        Returns:
+            None
+        """
         self._fast_txn_active = False
         self._fast_txn_read_only = False
         self._fast_txn_writes = []
 
     def _promote_fast_txn_to_rust_unlocked(self, begin_sql: str = "BEGIN") -> None:
+        """
+        Promote a Python fast transaction into a real Rust transaction.
+
+        Replays buffered fast-txn writes under a Rust ``BEGIN``.
+
+        Args:
+            begin_sql: BEGIN statement to execute (default ``"BEGIN"``).
+
+        Returns:
+            None
+        """
         if not self._fast_txn_active:
             return
         writes = self._fast_txn_writes
@@ -1479,6 +2066,15 @@ class ApexClient:
                     self._storage.execute(insert_sql)
 
     def _append_fast_txn_insert(self, sql: str) -> bool:
+        """
+        Buffer a simple INSERT into the active fast transaction.
+
+        Args:
+            sql: INSERT statement text.
+
+        Returns:
+            ``True`` if the statement was parsed and buffered; ``False`` otherwise.
+        """
         parsed = _parse_simple_insert_values(sql)
         if not parsed:
             return False
@@ -1493,6 +2089,17 @@ class ApexClient:
         return True
 
     def _store_fast_txn_rows(self, rows: List[dict]) -> None:
+        """
+        Persist rows collected during a fast transaction commit.
+
+        Prefers delta/batch storage paths when available and FTS is disabled.
+
+        Args:
+            rows: Row dicts (``_id`` keys are stripped before write).
+
+        Returns:
+            None
+        """
         rows = [{k: v for k, v in row.items() if k != "_id"} for row in rows]
         store_rows_delta = getattr(self._storage, "store_rows_delta", None)
         if store_rows_delta is not None and not self._is_fts_enabled(self._current_table):
@@ -1516,6 +2123,15 @@ class ApexClient:
             self._store_batch_optimized(rows)
 
     def _commit_fast_txn(self, show_internal_id: bool = None) -> 'ResultView':
+        """
+        Commit the active Python fast transaction by flushing buffered writes.
+
+        Args:
+            show_internal_id: Visibility flag for the returned empty result.
+
+        Returns:
+            Empty :class:`ResultView`.
+        """
         writes = self._fast_txn_writes
         self._in_txn = False
         self._reset_fast_txn()
@@ -1558,11 +2174,29 @@ class ApexClient:
         return self._empty_sql_result(show_internal_id)
 
     def _rollback_fast_txn(self, show_internal_id: bool = None) -> 'ResultView':
+        """
+        Roll back the active Python fast transaction and discard buffered writes.
+
+        Args:
+            show_internal_id: Visibility flag for the returned empty result.
+
+        Returns:
+            Empty :class:`ResultView`.
+        """
         self._in_txn = False
         self._reset_fast_txn()
         return self._empty_sql_result(show_internal_id)
 
     def _fast_txn_pending_rows(self, table_name: str = None) -> List[dict]:
+        """
+        Return pending insert rows for a table inside the fast transaction.
+
+        Args:
+            table_name: Table to filter. Defaults to the current table.
+
+        Returns:
+            List of pending row dicts (may include provisional ``_id`` values).
+        """
         table_name = table_name or self._current_table
         rows = []
         for write in self._fast_txn_writes:
@@ -1571,11 +2205,32 @@ class ApexClient:
         return rows
 
     def _project_rows(self, rows: List[dict], columns: Optional[List[str]]) -> List[dict]:
+        """
+        Project row dicts onto a subset of columns.
+
+        Args:
+            rows: Input row dictionaries.
+            columns: Column names to keep, or ``None`` to keep all columns.
+
+        Returns:
+            List of projected row dictionaries.
+        """
         if not columns:
             return [dict(row) for row in rows]
         return [{col: row.get(col) for col in columns} for row in rows]
 
     def _fast_txn_select(self, sql: str, show_internal_id: bool = None):
+        """
+        Answer a simple SELECT against committed data plus fast-txn pending inserts.
+
+        Args:
+            sql: SELECT statement text.
+            show_internal_id: Whether to expose ``_id`` in the result.
+
+        Returns:
+            :class:`ResultView` when handled; ``None`` when the statement is not
+            eligible for the fast-txn select path.
+        """
         table = _simple_from_table(sql) or self._current_table
         pending_rows = self._fast_txn_pending_rows(table)
         old_in_txn = self._in_txn
@@ -1620,6 +2275,22 @@ class ApexClient:
         return None
 
     def execute(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
+        """
+        Execute a SQL statement and return a :class:`ResultView`.
+
+        Supports SELECT/DML/DDL/transaction statements. Uses Python-side caches
+        and fast paths for common point lookups, scans, and simple filters before
+        falling back to the Rust executor.
+
+        Args:
+            sql: SQL statement to execute.
+            show_internal_id: If ``True``, include the internal ``_id`` column
+                in SELECT results when applicable. ``None`` uses default policy.
+
+        Returns:
+            :class:`ResultView` containing query rows or an empty view for
+            statements without a result set.
+        """
         self._check_connection()
 
         if sql == "BEGIN" and not getattr(self, '_in_txn', False):
@@ -1715,7 +2386,12 @@ class ApexClient:
         return self._execute_impl(sql, show_internal_id)
 
     def _flush_pending_memtable_rows_for_read(self) -> None:
-        """Persist storage-level single-row write buffers before broad reads."""
+        """
+        Persist storage-level single-row write buffers before broad reads.
+
+        Returns:
+            None
+        """
         has_pending = getattr(self._storage, "has_pending_memtable_rows", None)
         if has_pending is None:
             return
@@ -1727,7 +2403,12 @@ class ApexClient:
             pass
 
     def _flush_pending_overlay_writes_unlocked(self) -> None:
-        """Persist same-client buffered/overlay writes before SQL write execution."""
+        """
+        Persist same-client buffered/overlay writes before SQL write execution.
+
+        Returns:
+            None
+        """
         self._flush_buffered_writes_unlocked()
         has_pending = getattr(self._storage, "has_pending_overlay_writes", None)
         if has_pending is None:
@@ -1737,7 +2418,19 @@ class ApexClient:
 
     @staticmethod
     def _should_use_columnar_materialization(sql_upper: str, sig: str) -> bool:
-        """Prefer Rust-side columnar Python conversion for to_dict-friendly result sets."""
+        """
+        Decide whether Rust should return columnar Python lists for a result set.
+
+        Prefers columnar conversion for ``to_dict``-friendly analytic / filtered
+        SELECT shapes to avoid Arrow import and ``Table.to_pylist()`` overhead.
+
+        Args:
+            sql_upper: Upper-cased SQL text.
+            sig: Route signature from :func:`_classify_sql_route`.
+
+        Returns:
+            ``True`` when columnar materialization is preferred.
+        """
         if sig not in ('like', 'complex', 'projected_full_scan', 'table_func'):
             return False
         is_cte_query = sql_upper.startswith('WITH ')
@@ -1791,6 +2484,15 @@ class ApexClient:
 
     @staticmethod
     def _extract_point_lookup_id(sql: str) -> Optional[int]:
+        """
+        Extract the integer ``_id`` from a simple ``WHERE _id = N`` clause.
+
+        Args:
+            sql: SQL statement text.
+
+        Returns:
+            Integer ID, or ``None`` if not found / invalid.
+        """
         match = _RE_POINT_LOOKUP_ID.search(sql)
         if not match:
             return None
@@ -1800,6 +2502,18 @@ class ApexClient:
             return None
 
     def _execute_cached_simple_select(self, sql, cached_simple, show_internal_id):
+        """
+        Execute a previously classified simple SELECT via storage hot paths.
+
+        Args:
+            sql: Original SQL text.
+            cached_simple: Cached classification tuple from ``_simple_sql_cache``.
+            show_internal_id: Whether to expose ``_id``.
+
+        Returns:
+            :class:`ResultView` on cache hit/success, or the sentinel
+            ``_HOT_CACHE_MISS`` when the hot path does not apply.
+        """
         if (not cached_simple
                 or getattr(self, '_in_txn', False)
                 or getattr(self, '_fast_txn_active', False)):
@@ -1945,6 +2659,15 @@ class ApexClient:
 
     @staticmethod
     def _simple_identifier_list(text: str) -> Optional[List[str]]:
+        """
+        Parse a comma-separated list of simple SQL identifiers.
+
+        Args:
+            text: Identifier list text (e.g. SELECT projection fragment).
+
+        Returns:
+            List of identifiers, or ``None`` if any token is not a plain identifier.
+        """
         cols = []
         for part in text.split(','):
             col = part.strip().strip('"').strip('`')
@@ -1955,6 +2678,15 @@ class ApexClient:
 
     @staticmethod
     def _view_aggregate_sql(agg: dict) -> Optional[str]:
+        """
+        Build SQL for a recognized view-aggregate rewrite descriptor.
+
+        Args:
+            agg: Aggregate descriptor dict produced by the group-view fast path.
+
+        Returns:
+            SQL string to execute, or ``None`` if *agg* is unsupported.
+        """
         func = str(agg.get("func", "")).upper()
         if func not in {"COUNT", "AVG", "SUM", "MIN", "MAX"}:
             return None
@@ -1971,6 +2703,16 @@ class ApexClient:
         return f"{func}({inner}) AS {alias}"
 
     def _execute_simple_group_view_select(self, sql: str, show_internal_id: bool):
+        """
+        Try a specialized fast path for simple grouped-view SELECT patterns.
+
+        Args:
+            sql: SQL statement text.
+            show_internal_id: Whether to expose ``_id``.
+
+        Returns:
+            :class:`ResultView` on success, or ``_HOT_CACHE_MISS`` when inapplicable.
+        """
         sql_lower = sql.lower()
         if (" where " not in sql_lower
                 or " order by " not in sql_lower
@@ -2082,6 +2824,16 @@ class ApexClient:
             return _HOT_CACHE_MISS
     
     def _execute_impl(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
+        """
+        Core SQL execution implementation with routing, caching, and storage calls.
+
+        Args:
+            sql: SQL statement text.
+            show_internal_id: Whether to expose ``_id`` (``None`` = default policy).
+
+        Returns:
+            :class:`ResultView` for the statement result.
+        """
         sql_upper = sql.strip().upper()
 
         if (not getattr(self, '_in_txn', False)
@@ -3011,7 +3763,21 @@ class ApexClient:
         return np.frombuffer(raw, dtype=np.float64).reshape(n, k, 2)
 
     def _validate_table_in_sql(self, sql: str) -> None:
-        """Validate that table names in SQL exist (skip for multi-statement SQL)"""
+        """
+        Validate that table names referenced in SQL exist (best-effort).
+
+        Skips multi-statement DDL, CTEs, table functions, and qualified
+        ``db.table`` references (resolved by the Rust executor).
+
+        Args:
+            sql: SQL statement text.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If a referenced local table/view cannot be found.
+        """
         # Skip validation for multi-statement SQL (contains CREATE TABLE/VIEW)
         if _RE_CREATE_TABLE.search(sql):
             return
@@ -3056,6 +3822,13 @@ class ApexClient:
         raise ValueError(f"Table '{m.group(1)}' not found")
 
     def _load_view_catalog(self) -> Dict[str, str]:
+        """
+        Load the persisted view catalog from ``.apex_views.json``.
+
+        Returns:
+            Mapping of lower-cased view name to catalog payload. Empty dict on
+            missing/corrupt catalog.
+        """
         try:
             try:
                 stat = self._view_catalog_path.stat()
@@ -3085,9 +3858,27 @@ class ApexClient:
             return {}
 
     def _relation_exists_as_view(self, table_name: str) -> bool:
+        """
+        Return whether *table_name* exists as a persisted view.
+
+        Args:
+            table_name: Relation name to check.
+
+        Returns:
+            ``True`` if present in the view catalog.
+        """
         return table_name.lower() in self._load_view_catalog()
 
     def _references_persisted_view(self, sql: str) -> bool:
+        """
+        Return whether SQL references any persisted view in FROM/JOIN clauses.
+
+        Args:
+            sql: SQL statement text.
+
+        Returns:
+            ``True`` if at least one local view relation is referenced.
+        """
         for match in _RE_FROM_OR_JOIN_TABLE.finditer(sql):
             relation = match.group(1).lower()
             if relation in ('read_csv', 'read_json', 'read_parquet', 'topk_distance'):
@@ -3099,7 +3890,15 @@ class ApexClient:
         return False
     
     def _should_show_internal_id(self, sql: str) -> bool:
-        """Determine if _id should be visible based on SQL (mirrors ApexClient logic)"""
+        """
+        Determine whether ``_id`` should be visible based on the SELECT list.
+
+        Args:
+            sql: SQL statement text.
+
+        Returns:
+            ``True`` if ``_id`` is explicitly projected (and not only via ``*``).
+        """
         # Fast path: if _id not mentioned at all, skip expensive regex
         if '_id' not in sql:
             return False
@@ -3113,6 +3912,18 @@ class ApexClient:
         
         # Check for explicit _id reference (not in aggregate functions)
         def has_explicit_id(item: str) -> bool:
+            """
+            Return whether a single SELECT-list item explicitly references ``_id``.
+
+            Aggregate expressions are ignored so ``COUNT(_id)`` does not force
+            ``_id`` visibility.
+
+            Args:
+                item: One comma-separated SELECT-list fragment.
+
+            Returns:
+                ``True`` if *item* explicitly names ``_id``.
+            """
             s = item.strip()
             if _RE_AGGREGATE_FUNC.search(s):
                 return False
@@ -3144,7 +3955,20 @@ class ApexClient:
         return False
 
     def query(self, sql: str = None, where_clause: str = None, limit: int = None) -> 'ResultView':
-        """Query with SQL or WHERE clause (for ApexClient compatibility)"""
+        """
+        Query with a full SQL statement or a WHERE-style filter expression.
+
+        Compatibility helper around :meth:`execute`.
+
+        Args:
+            sql: Full ``SELECT``/``WITH`` statement, or a bare filter expression
+                used as ``WHERE`` when it does not start with SELECT/WITH.
+            where_clause: Alternative WHERE expression when *sql* is omitted.
+            limit: Optional row limit appended to generated SELECT statements.
+
+        Returns:
+            :class:`ResultView` with matching rows.
+        """
         self._ensure_table_selected()
         if sql is not None:
             # Check if it's a full SQL statement or a filter expression
@@ -3170,18 +3994,45 @@ class ApexClient:
             return self.execute(full_sql)
 
     def retrieve(self, id_: int) -> Optional[dict]:
+        """
+        Retrieve a single row by internal ``_id``.
+
+        Args:
+            id_: Row identifier.
+
+        Returns:
+            Row dict, or ``None`` if the ID does not exist.
+        """
         self._check_connection()
         self._ensure_table_selected()
         return self._storage.retrieve(id_)
 
     def read_blob(self, column: str, id_: int) -> Optional[bytes]:
-        """Read a BLOB payload by column name and `_id`."""
+        """
+        Read a BLOB payload by column name and ``_id``.
+
+        Args:
+            column: BLOB column name.
+            id_: Row identifier.
+
+        Returns:
+            Payload bytes, or ``None`` if missing.
+        """
         self._check_connection()
         self._ensure_table_selected()
         return self._storage.read_blob(column, id_)
 
     def read_blobs(self, column: str, ids: List[int]) -> List[Optional[bytes]]:
-        """Read multiple BLOB payloads by column name and `_id` values."""
+        """
+        Read multiple BLOB payloads by column name and ``_id`` values.
+
+        Args:
+            column: BLOB column name.
+            ids: List of row identifiers.
+
+        Returns:
+            List of payload bytes (or ``None`` per missing ID), aligned with *ids*.
+        """
         self._check_connection()
         self._ensure_table_selected()
         return self._storage.read_blobs(column, ids)
@@ -3193,7 +4044,18 @@ class ApexClient:
         offset: int = 0,
         length: Optional[int] = None,
     ) -> Optional[bytes]:
-        """Read a byte range from a BLOB payload without materializing the whole value."""
+        """
+        Read a byte range from a BLOB payload without materializing the whole value.
+
+        Args:
+            column: BLOB column name.
+            id_: Row identifier.
+            offset: Start offset in bytes (default ``0``).
+            length: Number of bytes to read, or ``None`` for the remainder.
+
+        Returns:
+            Requested byte slice, or ``None`` if missing.
+        """
         self._check_connection()
         self._ensure_table_selected()
         return self._storage.read_blob_range(column, id_, offset, length)
@@ -3205,30 +4067,78 @@ class ApexClient:
         offsets: List[int],
         length: Optional[int] = None,
     ) -> List[Optional[bytes]]:
-        """Read byte ranges from multiple BLOB payloads."""
+        """
+        Read byte ranges from multiple BLOB payloads.
+
+        Args:
+            column: BLOB column name.
+            ids: List of row identifiers.
+            offsets: Per-ID start offsets (same length as *ids*).
+            length: Shared read length, or ``None`` for remainder per blob.
+
+        Returns:
+            List of byte slices (or ``None``), aligned with *ids*.
+        """
         self._check_connection()
         self._ensure_table_selected()
         return self._storage.read_blob_ranges(column, ids, offsets, length)
 
     def read_blob_descriptor(self, column: str, id_: int) -> Optional[bytes]:
-        """Read the raw BLOB descriptor stored in the main `.apex` file."""
+        """
+        Read the raw BLOB descriptor stored in the main ``.apex`` file.
+
+        Args:
+            column: BLOB column name.
+            id_: Row identifier.
+
+        Returns:
+            Descriptor bytes, or ``None`` if missing.
+        """
         self._check_connection()
         self._ensure_table_selected()
         return self._storage.read_blob_descriptor(column, id_)
 
     def read_blob_info(self, column: str, id_: int) -> Optional[dict]:
-        """Read BLOB descriptor metadata without materializing the payload."""
+        """
+        Read BLOB descriptor metadata without materializing the payload.
+
+        Args:
+            column: BLOB column name.
+            id_: Row identifier.
+
+        Returns:
+            Metadata dict, or ``None`` if missing.
+        """
         self._check_connection()
         self._ensure_table_selected()
         return self._storage.read_blob_info(column, id_)
 
     def read_blob_infos(self, column: str, ids: List[int]) -> List[Optional[dict]]:
-        """Read BLOB descriptor metadata for multiple `_id` values."""
+        """
+        Read BLOB descriptor metadata for multiple ``_id`` values.
+
+        Args:
+            column: BLOB column name.
+            ids: List of row identifiers.
+
+        Returns:
+            List of metadata dicts (or ``None``), aligned with *ids*.
+        """
         self._check_connection()
         self._ensure_table_selected()
         return self._storage.read_blob_infos(column, ids)
 
     def retrieve_many(self, ids: List[int]) -> 'ResultView':
+        """
+        Retrieve multiple rows by ``_id`` as a :class:`ResultView`.
+
+        Args:
+            ids: List of row identifiers.
+
+        Returns:
+            :class:`ResultView` containing the found rows (empty when *ids* is empty
+            or nothing matches).
+        """
         self._check_connection()
         self._ensure_table_selected()
         with self._lock:
@@ -3242,11 +4152,23 @@ class ApexClient:
             return _empty_result_view()
 
     def retrieve_all(self) -> 'ResultView':
+        """
+        Retrieve all rows from the current table.
+
+        Returns:
+            :class:`ResultView` for ``SELECT *`` on the current table.
+        """
         self._check_connection()
         self._ensure_table_selected()
         return self.execute(f"SELECT * FROM {self._current_table}")
 
     def list_fields(self) -> List[str]:
+        """
+        List column/field names of the current table.
+
+        Returns:
+            List of field name strings.
+        """
         self._check_connection()
         self._ensure_table_selected()
         with self._lock:
@@ -3325,6 +4247,19 @@ class ApexClient:
                     raise ValueError("id must be an int or a list of ints")
 
     def replace(self, id_: int, data: dict) -> bool:
+        """
+        Replace an existing row's fields by ``_id``.
+
+        Updates the FTS index when enabled. Identical consecutive replaces are
+        short-circuited via an exact-replace cache.
+
+        Args:
+            id_: Row identifier to replace.
+            data: New field values (partial or full row dict, depending on storage).
+
+        Returns:
+            ``True`` if the row existed and was replaced; ``False`` otherwise.
+        """
         self._check_connection()
         self._ensure_table_selected()
         with self._lock:
@@ -3344,6 +4279,15 @@ class ApexClient:
             return result
 
     def batch_replace(self, data_dict: Dict[int, dict]) -> List[int]:
+        """
+        Replace multiple rows by ``_id``.
+
+        Args:
+            data_dict: Mapping of row ``_id`` to replacement field dict.
+
+        Returns:
+            List of IDs that were successfully replaced.
+        """
         self._check_connection()
         success_ids = []
         for id_, data in data_dict.items():
@@ -3354,6 +4298,16 @@ class ApexClient:
     # ============ DataFrame Import ============
 
     def from_pandas(self, df, table_name: str = None) -> 'ApexClient':
+        """
+        Import a pandas DataFrame into the current (or named) table.
+
+        Args:
+            df: ``pandas.DataFrame`` to store.
+            table_name: Optional table to select/create before import.
+
+        Returns:
+            ``self`` for method chaining.
+        """
         if table_name is not None:
             self._select_or_create_table(table_name)
         self._ensure_table_selected()
@@ -3361,6 +4315,16 @@ class ApexClient:
         return self
 
     def from_pyarrow(self, table, table_name: str = None) -> 'ApexClient':
+        """
+        Import a PyArrow Table into the current (or named) table.
+
+        Args:
+            table: ``pyarrow.Table`` to store.
+            table_name: Optional table to select/create before import.
+
+        Returns:
+            ``self`` for method chaining.
+        """
         if table_name is not None:
             self._select_or_create_table(table_name)
         self._ensure_table_selected()
@@ -3377,10 +4341,22 @@ class ApexClient:
         batch_size: Optional[int] = None,
         **dataset_options,
     ) -> 'ApexClient':
-        """Import a Lance dataset into the current or named ApexBase table.
+        """
+        Import a Lance dataset into the current or named ApexBase table.
 
-        Data is read through Lance's Arrow table path, avoiding row-by-row
-        Python glue before ApexBase's existing columnar write path.
+        Data is read through Lance's Arrow path into ApexBase's columnar write path.
+
+        Args:
+            uri: Lance dataset URI/path, or an object exposing ``to_batches``.
+            table_name: Optional table to select/create before import.
+            columns: Optional column subset to read.
+            filter: Optional Lance filter expression.
+            limit: Optional max rows to import.
+            batch_size: Optional Lance scan batch size.
+            **dataset_options: Extra keyword args forwarded to ``lance.dataset``.
+
+        Returns:
+            ``self`` for method chaining.
         """
         lance_mod = _ensure_lance()
         dataset = uri if hasattr(uri, "to_batches") else lance_mod.dataset(uri, **dataset_options)
@@ -3403,6 +4379,16 @@ class ApexClient:
         return self
 
     def from_polars(self, df, table_name: str = None) -> 'ApexClient':
+        """
+        Import a polars DataFrame into the current (or named) table.
+
+        Args:
+            df: ``polars.DataFrame`` to store.
+            table_name: Optional table to select/create before import.
+
+        Returns:
+            ``self`` for method chaining.
+        """
         if table_name is not None:
             self._select_or_create_table(table_name)
         self._ensure_table_selected()
@@ -3417,7 +4403,21 @@ class ApexClient:
         show_internal_id: bool = False,
         **write_options,
     ):
-        """Export the current table or a SQL result to a Lance dataset."""
+        """
+        Export the current table or a SQL result to a Lance dataset.
+
+        Args:
+            uri: Destination Lance dataset URI/path.
+            sql: Optional SQL whose result is exported instead of the full table.
+                When omitted, exports ``SELECT *`` from the current table.
+            mode: Lance write mode (default ``"create"``).
+            show_internal_id: Whether to include ``_id`` when exporting a SQL result
+                (default ``False``).
+            **write_options: Extra keyword args forwarded to the Lance writer.
+
+        Returns:
+            Result of ``ResultView.to_lance`` (typically the written dataset URI/path).
+        """
         if sql is None:
             self._ensure_table_selected()
             result = self.query()
@@ -3426,7 +4426,16 @@ class ApexClient:
         return result.to_lance(uri, mode=mode, **write_options)
 
     def _select_or_create_table(self, table_name: str, schema: dict = None):
-        """Select an existing table or create a new one."""
+        """
+        Select an existing table or create a new one, then make it current.
+
+        Args:
+            table_name: Table name to select/create.
+            schema: Optional schema dict used when creating a new table.
+
+        Returns:
+            None
+        """
         try:
             self.use_table(table_name)
         except (ValueError, RuntimeError):
@@ -3434,6 +4443,15 @@ class ApexClient:
 
     @staticmethod
     def _arrow_schema_to_apex_schema(schema) -> Optional[dict]:
+        """
+        Map a PyArrow schema to an ApexBase column-type schema dict.
+
+        Args:
+            schema: ``pyarrow.Schema`` (or compatible) object.
+
+        Returns:
+            Mapping of column name to ApexBase type string, or ``None`` if empty.
+        """
         if schema is None:
             return None
         pa_mod = _ensure_pyarrow()
@@ -3473,11 +4491,27 @@ class ApexClient:
     # ============ Utility ============
 
     def optimize(self):
+        """
+        Best-effort optimize hook (currently flushes pending writes).
+
+        Returns:
+            None
+        """
         self._check_connection()
         # ApexStorage doesn't have optimize, just flush
         self.flush()
 
     def count_rows(self, table_name: str = None) -> int:
+        """
+        Return the row count of a table.
+
+        Args:
+            table_name: Optional table name. Defaults to the current table.
+                Temporarily switches tables when a different name is provided.
+
+        Returns:
+            Integer row count.
+        """
         self._check_connection()
         with self._lock:
             if table_name and table_name != self._current_table:
@@ -3491,6 +4525,14 @@ class ApexClient:
             return self._storage.row_count()
 
     def flush(self) -> None:
+        """
+        Flush buffered client writes and storage-level pending data to disk.
+
+        No-ops when there are no pending writes/overlays.
+
+        Returns:
+            None
+        """
         self._check_connection()
         with self._lock:
             if (not self._has_writes
@@ -3502,11 +4544,18 @@ class ApexClient:
             self._has_writes = False
 
     def begin_buffered_writes(self, flush_rows: int = 0) -> None:
-        """Enable explicit client-local buffered single-row writes.
+        """
+        Enable explicit client-local buffered single-row writes.
 
-        Rows are visible after :meth:`flush_buffered_writes`, :meth:`flush`, or
-        :meth:`close`. This mode trades immediate visibility/durability for much
-        lower per-row Python overhead in OLTP-style append bursts.
+        Rows become durable/visible after :meth:`flush_buffered_writes`,
+        :meth:`flush`, or :meth:`close`. Trades immediate visibility for lower
+        per-row Python overhead in OLTP-style append bursts.
+
+        Args:
+            flush_rows: Auto-flush after this many buffered rows (``0`` disables).
+
+        Returns:
+            None
         """
         self._check_connection()
         with self._lock:
@@ -3516,7 +4565,15 @@ class ApexClient:
             self._buffered_write_flush_rows = max(0, int(flush_rows or 0))
 
     def end_buffered_writes(self, flush: bool = True) -> None:
-        """Disable buffered writes, optionally flushing pending rows first."""
+        """
+        Disable buffered writes, optionally flushing pending rows first.
+
+        Args:
+            flush: If ``True`` (default), flush pending rows; otherwise discard them.
+
+        Returns:
+            None
+        """
         self._check_connection()
         with self._lock:
             if flush:
@@ -3528,12 +4585,23 @@ class ApexClient:
             self._buffered_write_flush_rows = 0
 
     def flush_buffered_writes(self) -> int:
-        """Flush pending buffered single-row writes and return the row count."""
+        """
+        Flush pending buffered single-row writes.
+
+        Returns:
+            Number of rows flushed.
+        """
         self._check_connection()
         with self._lock:
             return self._flush_buffered_writes_unlocked()
 
     def _flush_buffered_writes_unlocked(self) -> int:
+        """
+        Flush buffered writes while the caller already holds ``self._lock``.
+
+        Returns:
+            Number of rows flushed.
+        """
         if not self._buffered_write_rows:
             return 0
         table = self._buffered_write_table or self._current_table
@@ -3562,38 +4630,59 @@ class ApexClient:
             self._buffered_writes_enabled = old_enabled
 
     def buffered_write_count(self) -> int:
-        """Return the number of pending client-local buffered rows."""
+        """
+        Return the number of pending client-local buffered rows.
+
+        Returns:
+            Pending buffered row count.
+        """
         return len(getattr(self, "_buffered_write_rows", []))
     
     def flush_cache(self):
+        """
+        Alias for :meth:`flush` (legacy name).
+
+        Returns:
+            None
+        """
         self.flush()
     
     def set_auto_flush(self, rows: int = 0, bytes: int = 0) -> None:
-        """Set auto-flush thresholds.
-        
-        When either threshold is exceeded during writes, data is automatically 
-        written to file. Set to 0 to disable the respective threshold.
-        
+        """
+        Set storage auto-flush thresholds.
+
+        When either threshold is exceeded during writes, data is automatically
+        written to file. Set to ``0`` to disable the respective threshold.
+
         Args:
-            rows: Auto-flush when pending rows exceed this count (0 = disabled)
-            bytes: Auto-flush when estimated memory exceeds this size (0 = disabled)
+            rows: Auto-flush when pending rows exceed this count (``0`` = disabled).
+            bytes: Auto-flush when estimated memory exceeds this size (``0`` = disabled).
+
+        Returns:
+            None
         """
         self._check_connection()
         with self._lock:
             self._storage.set_auto_flush(rows=rows, bytes=bytes)
     
     def get_auto_flush(self) -> tuple:
-        """Get current auto-flush configuration.
-        
+        """
+        Get current auto-flush configuration.
+
         Returns:
-            Tuple of (rows_threshold, bytes_threshold)
+            Tuple ``(rows_threshold, bytes_threshold)``.
         """
         self._check_connection()
         with self._lock:
             return self._storage.get_auto_flush()
     
     def estimate_memory_bytes(self) -> int:
-        """Get estimated memory usage in bytes."""
+        """
+        Get estimated in-memory usage of pending storage buffers.
+
+        Returns:
+            Estimated memory usage in bytes.
+        """
         self._check_connection()
         with self._lock:
             return self._storage.estimate_memory_bytes()
@@ -3601,6 +4690,18 @@ class ApexClient:
     # ============ Column Operations ============
 
     def drop_column(self, column_name: str):
+        """
+        Drop a column from the current table.
+
+        Args:
+            column_name: Column to drop. Cannot be ``_id``.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If attempting to drop ``_id``.
+        """
         self._check_connection()
         if column_name == '_id':
             raise ValueError("Cannot drop _id column")
@@ -3608,11 +4709,34 @@ class ApexClient:
         self._storage.drop_column(column_name)
 
     def add_column(self, column_name: str, column_type: str):
+        """
+        Add a column to the current table.
+
+        Args:
+            column_name: New column name.
+            column_type: ApexBase type string (e.g. ``"string"``, ``"int64"``).
+
+        Returns:
+            None
+        """
         self._check_connection()
         self._invalidate_replace_cache()
         self._storage.add_column(column_name, column_type)
 
     def rename_column(self, old_column_name: str, new_column_name: str):
+        """
+        Rename a column on the current table.
+
+        Args:
+            old_column_name: Existing column name. Cannot be ``_id``.
+            new_column_name: New column name.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If attempting to rename ``_id``.
+        """
         self._check_connection()
         if old_column_name == '_id':
             raise ValueError("Cannot rename _id column")
@@ -3620,12 +4744,34 @@ class ApexClient:
         self._storage.rename_column(old_column_name, new_column_name)
 
     def get_column_dtype(self, column_name: str) -> str:
+        """
+        Return the storage type string for a column.
+
+        Args:
+            column_name: Column name.
+
+        Returns:
+            Type string such as ``"int64"`` or ``"string"``.
+        """
         self._check_connection()
         return self._storage.get_column_dtype(column_name)
 
     # ============ FTS Search ==========
 
     def search_text(self, query: str, table_name: str = None) -> Optional[np.ndarray]:
+        """
+        Full-text search returning matching document IDs.
+
+        Args:
+            query: Search query text.
+            table_name: Table to search. Defaults to the current table.
+
+        Returns:
+            ``numpy.ndarray`` of ``int64`` document IDs (possibly empty).
+
+        Raises:
+            ValueError: If FTS is not enabled for the table.
+        """
         self._check_connection()
         table = table_name or self._current_table
         
@@ -3645,7 +4791,20 @@ class ApexClient:
 
     def search_text_with_scores(self, query: str, table_name: str = None,
                                 limit: int = 1000) -> List[Tuple[int, float]]:
-        """Return BM25-ranked ``(document_id, score)`` pairs."""
+        """
+        Full-text search returning BM25-ranked ``(document_id, score)`` pairs.
+
+        Args:
+            query: Search query text.
+            table_name: Table to search. Defaults to the current table.
+            limit: Maximum number of hits (default ``1000``).
+
+        Returns:
+            List of ``(doc_id, score)`` tuples sorted by relevance.
+
+        Raises:
+            ValueError: If FTS is not enabled for the table.
+        """
         self._check_connection()
         table = table_name or self._current_table
         if not self._is_fts_enabled(table):
@@ -3658,6 +4817,20 @@ class ApexClient:
         return [(int(doc_id), float(score)) for doc_id, score in (results or [])]
 
     def fuzzy_search_text(self, query: str, min_results: int = 1, table_name: str = None) -> Optional[np.ndarray]:
+        """
+        Fuzzy full-text search returning matching document IDs.
+
+        Args:
+            query: Search query text.
+            min_results: Soft minimum results before relaxing matching (default ``1``).
+            table_name: Table to search. Defaults to the current table.
+
+        Returns:
+            ``numpy.ndarray`` of ``int64`` document IDs (possibly empty).
+
+        Raises:
+            ValueError: If FTS is not enabled for the table.
+        """
         self._check_connection()
         table = table_name or self._current_table
         
@@ -3675,6 +4848,21 @@ class ApexClient:
 
     def search_and_retrieve(self, query: str, table_name: str = None,
                            limit: Optional[int] = None, offset: int = 0) -> 'ResultView':
+        """
+        Full-text search and retrieve matching rows as a :class:`ResultView`.
+
+        Args:
+            query: Search query text.
+            table_name: Table to search. Defaults to the current table.
+            limit: Optional maximum number of rows.
+            offset: Number of hits to skip (default ``0``).
+
+        Returns:
+            :class:`ResultView` of matching rows (empty if none).
+
+        Raises:
+            ValueError: If FTS is not enabled for the table.
+        """
         self._check_connection()
         target_table = table_name or self._current_table
 
@@ -3692,11 +4880,37 @@ class ApexClient:
             return _empty_result_view()
 
     def search_and_retrieve_top(self, query: str, n: int = 100, table_name: str = None) -> 'ResultView':
+        """
+        Retrieve the top-*n* FTS hits for a query.
+
+        Args:
+            query: Search query text.
+            n: Maximum number of rows (default ``100``).
+            table_name: Table to search. Defaults to the current table.
+
+        Returns:
+            :class:`ResultView` of top matching rows.
+        """
         self._check_connection()
         return self.search_and_retrieve(query, table_name=table_name, limit=n, offset=0)
 
     def set_fts_fuzzy_config(self, threshold: float = 0.7, max_distance: int = 2, 
                              max_candidates: int = 20, table_name: str = None):
+        """
+        Configure fuzzy matching parameters for the table's FTS engine.
+
+        Args:
+            threshold: Similarity threshold in ``[0, 1]`` (default ``0.7``).
+            max_distance: Maximum edit distance (default ``2``).
+            max_candidates: Maximum fuzzy candidate terms (default ``20``).
+            table_name: Target table. Defaults to the current table.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If FTS is not enabled/initialized for the table.
+        """
         self._check_connection()
         table = table_name or self._current_table
         with self._fts_table_context(table):
@@ -3705,6 +4919,16 @@ class ApexClient:
             self._storage._fts_set_fuzzy_config(threshold, max_distance, max_candidates)
 
     def get_fts_stats(self, table_name: str = None) -> Dict:
+        """
+        Return FTS status and basic index statistics for a table.
+
+        Args:
+            table_name: Target table. Defaults to the current table.
+
+        Returns:
+            Dict including at least ``fts_enabled``. When initialized, also
+            includes ``engine_initialized``, ``doc_count``, and ``term_count``.
+        """
         self._check_connection()
         table = table_name or self._current_table
         
@@ -3725,6 +4949,18 @@ class ApexClient:
         return {'fts_enabled': True, 'engine_initialized': False, 'table': table}
 
     def compact_fts_index(self, table_name: str = None):
+        """
+        Compact the FTS index for a table.
+
+        Args:
+            table_name: Target table. Defaults to the current table.
+
+        Returns:
+            None
+
+        Raises:
+            ValueError: If FTS is not enabled/initialized for the table.
+        """
         self._check_connection()
         table = table_name or self._current_table
         with self._fts_table_context(table):
@@ -3733,6 +4969,16 @@ class ApexClient:
             self._storage._fts_compact()
 
     def warmup_fts_terms(self, terms: List[str], table_name: str = None) -> int:
+        """
+        Warm FTS caches for the given terms.
+
+        Args:
+            terms: List of terms to preload.
+            table_name: Target table. Defaults to the current table.
+
+        Returns:
+            Number of terms warmed, or ``0`` if FTS is not initialized.
+        """
         self._check_connection()
         table = table_name or self._current_table
         with self._fts_table_context(table):
@@ -3743,6 +4989,12 @@ class ApexClient:
     # ============ Lifecycle ============
 
     def _force_close(self):
+        """
+        Best-effort close used by finalizers; swallows close failures.
+
+        Returns:
+            None
+        """
         try:
             self.close()
         except Exception:
@@ -3754,6 +5006,15 @@ class ApexClient:
             self._is_closed = True
 
     def close(self):
+        """
+        Close the client, flush pending work, and release shared storage if last user.
+
+        Safe to call multiple times. After close, further operations raise
+        ``RuntimeError``.
+
+        Returns:
+            None
+        """
         if self._is_closed:
             return
 
@@ -3797,19 +5058,58 @@ class ApexClient:
 
     @classmethod
     def create_clean(cls, dirpath=None, **kwargs):
+        """
+        Construct a client that recreates storage under *dirpath* (``drop_if_exists=True``).
+
+        Args:
+            dirpath: Database directory path.
+            **kwargs: Additional :class:`ApexClient` constructor arguments.
+
+        Returns:
+            A new :class:`ApexClient` instance.
+        """
         kwargs['drop_if_exists'] = True
         return cls(dirpath=dirpath, **kwargs)
 
     def __enter__(self):
+        """
+        Enter the context manager.
+
+        Returns:
+            ``self``.
+        """
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        """
+        Exit the context manager and close the client.
+
+        Args:
+            exc_type: Exception type, if any.
+            exc_val: Exception instance, if any.
+            exc_tb: Traceback, if any.
+
+        Returns:
+            ``False`` so exceptions are not suppressed.
+        """
         self.close()
         return False
 
     def __del__(self):
+        """
+        Finalizer that force-closes the client if still open.
+
+        Returns:
+            None
+        """
         if hasattr(self, '_is_closed') and not self._is_closed:
             self._force_close()
 
     def __repr__(self):
+        """
+        Return a concise debug representation of the client.
+
+        Returns:
+            String such as ``ApexClient(path='...', table='...')``.
+        """
         return f"ApexClient(path='{self._dirpath}', table='{self._current_table}')"
