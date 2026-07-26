@@ -3,13 +3,21 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
-## Unreleased
+## [v1.25.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.25.0)
+*2026-07-26*
 
-- Fix `REPLACE(...)` parsing in general expressions while preserving `SELECT * REPLACE (...)`.
-- Add SQL scientific-notation literals and move single-query vector TopK to binary FFI parameters.
-- Execute expression equality JOIN keys with hash join instead of Cartesian materialization.
-- Add `error`, `skip`, and `warn` malformed-row policies to CSV table functions, COPY, and temporary-table registration.
-- Align `metric="cosine"` with documented cosine-distance semantics; older releases could return the least similar rows for this alias.
+[Compare with v1.24.0](https://github.com/BirchKwok/ApexBase/compare/v1.24.0...v1.25.0)
+
+- Fix `REPLACE(...)` parsing in general expressions while preserving `SELECT * REPLACE (...)` projection syntax
+- Add SQL scientific-notation numeric literals and move single-query vector TopK parameters to binary FFI instead of text interpolation
+- Execute expression equality JOIN keys with hash join instead of Cartesian materialization, avoiding Arrow offset overflow on large joins
+- Add `error`, `skip`, and `warn` malformed-row policies to CSV table functions, COPY, and temporary-table registration
+- Align `metric="cosine"` with documented cosine-distance semantics; older releases could return the least similar rows for this alias
+- Fix DELETE performance after UPDATE and append-only `.delta` growth by reusing file-derived delta caches across table epoch changes and avoiding full `.delta` rescans on the DELETE path
+- Introduce a `Database` / `Session` façade so Python, Embedded, Server, and Flight query orchestration share one architecture boundary
+- Unify table epoch cache invalidation so each logical write bumps the epoch once at the outermost scope, with merged delta reads that do not compact on the read path
+- Split aggregation, DML, mmap scan, and Python bindings into domain modules while keeping parent files as thin assembly layers under architecture contract tests
+- Move performance acceptance to local same-machine base/current guards, including canary and full runners, pytest runtime checks, and architecture contract coverage
 
 ---
 
