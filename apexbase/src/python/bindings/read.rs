@@ -5,6 +5,11 @@ use arrow::array::StringArray;
 
 #[pymethods]
 impl ApexStorageImpl {
+    fn _table_epoch(&self) -> PyResult<u64> {
+        let table_path = self.get_current_table_path()?;
+        Ok(crate::storage::epoch::current(&table_path))
+    }
+
     fn row_count(&self, py: Python<'_>) -> PyResult<u64> {
         let table_path = self.get_current_table_path()?;
         // If file doesn't exist (e.g., after drop_if_exists), return 0
@@ -19,10 +24,8 @@ impl ApexStorageImpl {
         }
 
         // No file lock needed — active_count is atomic and always consistent
-        let engine = crate::storage::engine::engine();
         let count = py.allow_threads(|| {
-            engine
-                .active_row_count(&table_path)
+            crate::Database::active_row_count(&table_path)
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         })?;
 
@@ -45,7 +48,7 @@ impl ApexStorageImpl {
             Self::insert_backend_cache_key(&table_path, &table_name),
         ] {
             if let Some(entry) = self.cached_backends.get(&cache_key) {
-                let backend = Arc::clone(entry.value());
+                let backend = entry;
                 if !backends.iter().any(|cached| Arc::ptr_eq(cached, &backend)) {
                     backends.push(backend);
                 }
@@ -71,7 +74,7 @@ impl ApexStorageImpl {
             Self::insert_backend_cache_key(&table_path, &table_name),
         ] {
             if let Some(entry) = self.cached_backends.get(&cache_key) {
-                let backend = Arc::clone(entry.value());
+                let backend = entry;
                 if !backends.iter().any(|cached| Arc::ptr_eq(cached, &backend)) {
                     backends.push(backend);
                 }
@@ -98,7 +101,7 @@ impl ApexStorageImpl {
         }
         let base_dir = self.current_base_dir();
         // Check temp dir first (temp tables shadow persistent)
-        if let Some(temp_dir) = crate::query::executor::get_temp_dir() {
+        if let Some(temp_dir) = crate::Database::temp_dir() {
             let temp_path = temp_dir.join(format!("{}.apex", clean));
             if temp_path.exists() {
                 let mut paths = self.table_paths.write();
@@ -127,18 +130,15 @@ impl ApexStorageImpl {
         }
 
         // Global cache fallback
-        if let Ok(backend) = py.allow_threads(|| crate::query::get_cached_backend_pub(&table_path))
-        {
+        if let Ok(backend) = py.allow_threads(|| crate::Database::cached_backend(&table_path)) {
             self.cached_backends
                 .insert(cache_key.clone(), Arc::clone(&backend));
             return Ok(backend.active_row_count());
         }
 
         // Engine fallback
-        let engine = crate::storage::engine::engine();
         let count = py.allow_threads(|| {
-            engine
-                .active_row_count(&table_path)
+            crate::Database::active_row_count(&table_path)
                 .map_err(|e| PyIOError::new_err(e.to_string()))
         })?;
         Ok(count)
@@ -208,7 +208,7 @@ impl ApexStorageImpl {
         let maybe_cached = { self.cached_backends.get(&cache_key).map(|v| Arc::clone(&v)) };
         let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
             Some(b)
-        } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
+        } else if let Ok(b) = crate::Database::cached_backend(&table_path) {
             // Populate per-instance cache so next call is zero-syscall
             self.cached_backends.insert(cache_key, Arc::clone(&b));
             Some(b)
@@ -217,7 +217,7 @@ impl ApexStorageImpl {
         };
         if let Some(backend) = backend_opt {
             let id_u64 = id as u64;
-            if id_u64 >= backend.next_id_value() {
+            if id_u64 >= backend.next_id_value() && !backend.has_delta() {
                 return Ok(None);
             }
             if backend.has_pending_deltas() {
@@ -284,10 +284,11 @@ impl ApexStorageImpl {
             let lock_file = Self::acquire_read_lock(&table_path)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
-            crate::query::executor::set_query_root_dir(&root_dir);
             let result: PyResult<Option<HashMap<String, Value>>> = (|| {
                 let sql = format!("SELECT * FROM \"{}\" WHERE _id = {}", table_name, id);
-                let result = crate::Database::execute(&sql, &base_dir, &table_path)
+                let result = crate::Session::new(&base_dir, &table_path)
+                    .with_root_dir(&root_dir)
+                    .execute(&sql)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
                 let batch = result
@@ -305,7 +306,6 @@ impl ApexStorageImpl {
                 }
                 Ok(Some(row_data))
             })();
-            crate::query::executor::clear_query_root_dir();
             Self::release_lock(lock_file);
             result
         });
@@ -356,15 +356,13 @@ impl ApexStorageImpl {
                             .insert(table_name.clone(), Arc::clone(&backend));
                         Some(backend)
                     } else {
-                        crate::query::get_cached_backend_pub(&table_path)
-                            .ok()
-                            .map(|b| {
-                                self.cached_backends
-                                    .insert(cache_key.clone(), Arc::clone(&b));
-                                self.cached_backends
-                                    .insert(table_name.clone(), Arc::clone(&b));
-                                b
-                            })
+                        crate::Database::cached_backend(&table_path).ok().map(|b| {
+                            self.cached_backends
+                                .insert(cache_key.clone(), Arc::clone(&b));
+                            self.cached_backends
+                                .insert(table_name.clone(), Arc::clone(&b));
+                            b
+                        })
                     }
                 } else {
                     None
@@ -421,13 +419,11 @@ impl ApexStorageImpl {
             .get(&cache_key)
             .map(|v| Arc::clone(&v))
             .or_else(|| {
-                crate::query::get_cached_backend_pub(&table_path)
-                    .ok()
-                    .map(|b| {
-                        self.cached_backends
-                            .insert(cache_key.clone(), Arc::clone(&b));
-                        b
-                    })
+                crate::Database::cached_backend(&table_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(cache_key.clone(), Arc::clone(&b));
+                    b
+                })
             });
 
         let Some(backend) = backend_opt else {
@@ -479,13 +475,11 @@ impl ApexStorageImpl {
             .get(&cache_key)
             .map(|v| Arc::clone(&v))
             .or_else(|| {
-                crate::query::get_cached_backend_pub(&table_path)
-                    .ok()
-                    .map(|b| {
-                        self.cached_backends
-                            .insert(cache_key.clone(), Arc::clone(&b));
-                        b
-                    })
+                crate::Database::cached_backend(&table_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(cache_key.clone(), Arc::clone(&b));
+                    b
+                })
             });
 
         let Some(backend) = backend_opt else {
@@ -544,13 +538,11 @@ impl ApexStorageImpl {
             .get(&cache_key)
             .map(|v| Arc::clone(&v))
             .or_else(|| {
-                crate::query::get_cached_backend_pub(&table_path)
-                    .ok()
-                    .map(|b| {
-                        self.cached_backends
-                            .insert(cache_key.clone(), Arc::clone(&b));
-                        b
-                    })
+                crate::Database::cached_backend(&table_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(cache_key.clone(), Arc::clone(&b));
+                    b
+                })
             });
 
         let Some(backend) = backend_opt else {
@@ -679,13 +671,11 @@ impl ApexStorageImpl {
             .get(&cache_key)
             .map(|v| Arc::clone(&v))
             .or_else(|| {
-                crate::query::get_cached_backend_pub(&table_path)
-                    .ok()
-                    .map(|b| {
-                        self.cached_backends
-                            .insert(cache_key.clone(), Arc::clone(&b));
-                        b
-                    })
+                crate::Database::cached_backend(&table_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(cache_key.clone(), Arc::clone(&b));
+                    b
+                })
             });
 
         let Some(backend) = backend_opt else {
@@ -781,13 +771,11 @@ impl ApexStorageImpl {
             .get(&cache_key)
             .map(|v| Arc::clone(&v))
             .or_else(|| {
-                crate::query::get_cached_backend_pub(&target_path)
-                    .ok()
-                    .map(|b| {
-                        self.cached_backends
-                            .insert(cache_key.clone(), Arc::clone(&b));
-                        b
-                    })
+                crate::Database::cached_backend(&target_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(cache_key.clone(), Arc::clone(&b));
+                    b
+                })
             });
 
         let Some(backend) = backend_opt else {
@@ -946,13 +934,11 @@ impl ApexStorageImpl {
             .get(&cache_key)
             .map(|v| Arc::clone(&v))
             .or_else(|| {
-                crate::query::get_cached_backend_pub(&table_path)
-                    .ok()
-                    .map(|b| {
-                        self.cached_backends
-                            .insert(cache_key.clone(), Arc::clone(&b));
-                        b
-                    })
+                crate::Database::cached_backend(&table_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(cache_key.clone(), Arc::clone(&b));
+                    b
+                })
             });
 
         let Some(backend) = backend_opt else {
@@ -1000,13 +986,11 @@ impl ApexStorageImpl {
             .get(&table_name)
             .map(|v| Arc::clone(&v))
             .or_else(|| {
-                crate::query::get_cached_backend_pub(&table_path)
-                    .ok()
-                    .map(|b| {
-                        self.cached_backends
-                            .insert(table_name.clone(), Arc::clone(&b));
-                        b
-                    })
+                crate::Database::cached_backend(&table_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(table_name.clone(), Arc::clone(&b));
+                    b
+                })
             });
 
         let Some(backend) = backend_opt else {
@@ -1113,7 +1097,7 @@ impl ApexStorageImpl {
             .map(|v| Arc::clone(&v));
         let backend_opt: Option<Arc<TableStorageBackend>> = if let Some(b) = maybe_cached {
             Some(b)
-        } else if let Ok(b) = crate::query::get_cached_backend_pub(&table_path) {
+        } else if let Ok(b) = crate::Database::cached_backend(&table_path) {
             self.cached_backends
                 .insert(table_name.clone(), Arc::clone(&b));
             Some(b)
@@ -1216,7 +1200,8 @@ impl ApexStorageImpl {
         let rows = py.allow_threads(|| -> PyResult<Vec<HashMap<String, Value>>> {
             let sql = format!("SELECT * FROM {}", table_name);
             let sql = sql.as_str();
-            let result = crate::Database::execute(sql, &table_path, &table_path)
+            let result = crate::Session::new(&table_path, &table_path)
+                .execute(sql)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             let batch = result
@@ -1257,9 +1242,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             // Use StorageEngine for unified list_columns
-            let engine = crate::storage::engine::engine();
-            let result = engine
-                .list_columns(&table_path)
+            let result = crate::Database::columns(&table_path)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
             Self::release_lock(lock_file);
@@ -1277,9 +1260,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             // Use StorageEngine for unified get_column_type
-            let engine = crate::storage::engine::engine();
-            let result = engine
-                .get_column_type(&table_path, &column_name)
+            let result = crate::Database::column_type(&table_path, &column_name)
                 .map(|dtype| dtype.map(|dt| format!("{:?}", dt)))
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
@@ -1316,7 +1297,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during search for better concurrency
             let results = py.allow_threads(|| {
-                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+                crate::Database::wait_fts_backfill(&base_dir, &table_name);
                 engine
                     .search_ranked(query, limit.unwrap_or(100))
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -1349,7 +1330,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during fuzzy search for better concurrency
             let ids: Vec<u64> = py.allow_threads(|| -> PyResult<Vec<u64>> {
-                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+                crate::Database::wait_fts_backfill(&base_dir, &table_name);
                 if let Some(max_distance) = max_distance {
                     engine.set_fuzzy_config(0.7, max_distance, 20);
                 }

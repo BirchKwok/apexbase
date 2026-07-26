@@ -38,7 +38,6 @@ use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
 use super::pg_catalog;
 use super::types::{schema_to_field_info, schema_to_field_info_binary};
-use crate::query::{ApexExecutor, ApexResult};
 
 /// Client metadata key for tracking current database per connection
 const METADATA_KEY_DB: &str = "apex_current_db";
@@ -49,7 +48,7 @@ pub struct ApexBaseHandler {
     base_dir: PathBuf,
     /// Schema cache: SQL template → Arc<Vec<FieldInfo>>.
     /// Avoids re-executing queries in do_describe_statement just to get column schema.
-    schema_cache: RwLock<HashMap<String, Arc<Vec<FieldInfo>>>>,
+    schema_cache: RwLock<HashMap<String, (Arc<Vec<FieldInfo>>, u64)>>,
 }
 
 impl ApexBaseHandler {
@@ -62,7 +61,13 @@ impl ApexBaseHandler {
 
     /// Look up cached schema for a SQL string.
     fn cached_schema(&self, sql: &str) -> Option<Arc<Vec<FieldInfo>>> {
-        self.schema_cache.read().get(sql).cloned()
+        let epoch = crate::storage::epoch::global_current();
+        self.schema_cache
+            .read()
+            .get(sql)
+            .and_then(|(fields, observed_epoch)| {
+                (*observed_epoch == epoch).then(|| Arc::clone(fields))
+            })
     }
 
     /// Store schema in cache after successful execution.
@@ -71,7 +76,10 @@ impl ApexBaseHandler {
         if cache.len() > 512 {
             cache.clear();
         }
-        cache.insert(sql.to_string(), fields);
+        cache.insert(
+            sql.to_string(),
+            (fields, crate::storage::epoch::global_current()),
+        );
     }
 
     /// Compute effective base_dir for a given database name.
@@ -90,9 +98,9 @@ impl ApexBaseHandler {
         }
         let base_dir = self.effective_base_dir(current_db);
         let default_table_path = base_dir.join("apexbase.apex");
-        crate::query::executor::set_query_root_dir(&self.base_dir);
-        let exec_result = crate::Database::execute(sql, &base_dir, &default_table_path);
-        crate::query::executor::clear_query_root_dir();
+        let exec_result = crate::Session::new(&base_dir, &default_table_path)
+            .with_root_dir(&self.base_dir)
+            .execute(sql);
         exec_result
             .map_err(|e| e.to_string())?
             .to_record_batch()

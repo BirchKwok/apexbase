@@ -19,21 +19,18 @@ impl ApexStorageImpl {
         let table_path = self
             .get_current_table_path()
             .unwrap_or_else(|_| base_dir.clone());
-        crate::query::executor::set_query_root_dir(&self.root_dir);
-        crate::query::executor::set_temp_dir(&self.temp_dir);
-
         // Execute query in Rust thread pool
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-            let result = crate::Database::execute_classified(&sql, &sig, &base_dir, &table_path)
+            let result = crate::Session::new(&base_dir, &table_path)
+                .with_root_dir(&self.root_dir)
+                .with_temp_dir(&self.temp_dir)
+                .execute_classified(&sql, &sig)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             result
                 .to_record_batch()
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
-        crate::query::executor::clear_temp_dir();
-        crate::query::executor::clear_query_root_dir();
-
         if is_write && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
         }
@@ -92,7 +89,7 @@ impl ApexStorageImpl {
         );
 
         let batch = py.allow_threads(|| -> Option<arrow::record_batch::RecordBatch> {
-            let backend = crate::query::get_cached_backend_pub(&table_path).ok()?;
+            let backend = crate::Database::cached_backend(&table_path).ok()?;
             if backend.pending_v4_in_memory_rows() > 0 {
                 return None;
             }
@@ -154,9 +151,6 @@ impl ApexStorageImpl {
                 .unwrap_or_else(|| self.current_base_dir().join(format!("{}.apex", table_name)))
         };
         let base_dir = self.current_base_dir();
-        crate::query::executor::set_query_root_dir(&self.root_dir);
-        crate::query::executor::set_temp_dir(&self.temp_dir);
-
         // FAST PATH: SELECT * LIMIT N — build Arrow batch directly from V4
         if let QuerySignature::SimpleScanLimit {
             limit,
@@ -166,7 +160,7 @@ impl ApexStorageImpl {
         {
             let (_, target_path) =
                 self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
-            if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+            if let Ok(backend) = crate::Database::cached_backend(&target_path) {
                 if backend.pending_v4_in_memory_rows() == 0 {
                     let batch_result = if *offset > 0 {
                         if backend.has_pending_deltas()
@@ -222,13 +216,11 @@ impl ApexStorageImpl {
             py.allow_threads(|| -> PyResult<(RecordBatch, Option<u64>)> {
                 let stmts = crate::query::sql_parser::SqlParser::parse_multi(&sql)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let (result, final_txn) = crate::Database::execute_multi_with_txn(
-                    stmts,
-                    &base_dir,
-                    &table_path,
-                    current_txn,
-                )
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let (result, final_txn) = crate::Session::new(&base_dir, &table_path)
+                    .with_root_dir(&self.root_dir)
+                    .with_temp_dir(&self.temp_dir)
+                    .execute_multi_with_txn(stmts, current_txn)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let batch = result
                     .to_record_batch()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -236,9 +228,11 @@ impl ApexStorageImpl {
             })?
         } else {
             let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-                let result =
-                    crate::Database::execute_classified(&sql, &sig, &base_dir, &table_path)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let result = crate::Session::new(&base_dir, &table_path)
+                    .with_root_dir(&self.root_dir)
+                    .with_temp_dir(&self.temp_dir)
+                    .execute_classified(&sql, &sig)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 result
                     .to_record_batch()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -291,8 +285,6 @@ impl ApexStorageImpl {
             *self.current_table.write() = name.clone();
         }
 
-        crate::query::executor::clear_temp_dir();
-        crate::query::executor::clear_query_root_dir();
         Ok(PyBytes::new_bound(py, &buf).into())
     }
 
@@ -319,7 +311,6 @@ impl ApexStorageImpl {
             .cloned()
             .unwrap_or_else(|| self.current_base_dir().join(format!("{}.apex", table_name)));
         let base_dir = self.current_base_dir();
-        crate::query::executor::set_query_root_dir(&self.root_dir);
         let where_clause = where_clause.to_string();
 
         // Build SQL from where clause using current table name
@@ -342,7 +333,9 @@ impl ApexStorageImpl {
 
         // Execute query
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-            let result = crate::Database::execute(&sql, &base_dir, &table_path)
+            let result = crate::Session::new(&base_dir, &table_path)
+                .with_root_dir(&self.root_dir)
+                .execute(&sql)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             result
@@ -377,7 +370,7 @@ impl ApexStorageImpl {
         k: usize,
         metric: &str,
     ) -> PyResult<(usize, usize)> {
-        use crate::query::vector_ops::bytes_to_query_vec_f32;
+        use crate::compute::vector_ops::bytes_to_query_vec_f32;
         use arrow::array::{Array, StructArray};
         use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
@@ -397,8 +390,7 @@ impl ApexStorageImpl {
         let names = vec!["_id".to_string(), "dist".to_string()];
 
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-            use crate::query::executor::get_cached_backend_pub;
-            use crate::query::vector_ops::{
+            use crate::compute::vector_ops::{
                 topk_heap_direct_parallel, DistanceComputer, DistanceMetric,
             };
             use arrow::array::{ArrayRef, BinaryArray, Float64Array, Int64Array};
@@ -411,7 +403,7 @@ impl ApexStorageImpl {
                 ))
             })?;
 
-            let backend = get_cached_backend_pub(&table_path)
+            let backend = crate::Database::cached_backend(&table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             let id_field = Field::new(&names[0], ArrowDataType::Int64, false);
@@ -492,7 +484,7 @@ impl ApexStorageImpl {
                 .as_any()
                 .downcast_ref::<arrow::array::FixedSizeListArray>()
             {
-                use crate::query::vector_ops::topk_heap_direct_parallel_fixed;
+                use crate::compute::vector_ops::topk_heap_direct_parallel_fixed;
                 topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
             } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
                 topk_heap_direct_parallel(bin_arr, &computer, k)
@@ -551,8 +543,7 @@ impl ApexStorageImpl {
         k: usize,
         metric: &str,
     ) -> PyResult<PyObject> {
-        use crate::query::executor::get_cached_backend_pub;
-        use crate::query::vector_ops::DistanceMetric;
+        use crate::compute::vector_ops::DistanceMetric;
         use arrow::array::Int64Array;
         use pyo3::types::PyBytes;
 
@@ -596,7 +587,7 @@ impl ApexStorageImpl {
                     ))
                 })?;
 
-                let backend = get_cached_backend_pub(&table_path)
+                let backend = crate::Database::cached_backend(&table_path)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
                 // FAST PATH: mmap direct scan (FixedList → Binary fallback)
@@ -615,7 +606,7 @@ impl ApexStorageImpl {
                     r
                 } else {
                     // FALLBACK: load Arrow batch, run batch topk on FixedSizeListArray / BinaryArray
-                    use crate::query::vector_ops::{
+                    use crate::compute::vector_ops::{
                         topk_heap_direct_parallel, topk_heap_direct_parallel_fixed,
                         DistanceComputer,
                     };

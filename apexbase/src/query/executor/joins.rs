@@ -251,6 +251,16 @@ impl ApexExecutor {
                     extra_filter,
                 )) = Self::extract_join_keys_with_filter(&join_clause.on)
                 else {
+                    if let Some(joined) = Self::try_hash_join_on_expression(
+                        &result_batch,
+                        &right_batch,
+                        &join_clause.on,
+                        &join_clause.join_type,
+                        right_alias.as_deref(),
+                    )? {
+                        result_batch = joined;
+                        continue;
+                    }
                     result_batch = Self::nested_loop_join_on(
                         &result_batch,
                         &right_batch,
@@ -1443,6 +1453,100 @@ impl ApexExecutor {
             .map_err(|e| err_data(e.to_string()))
     }
 
+    /// Hash an equality JOIN whose keys are expressions rather than bare columns.
+    ///
+    /// This avoids materializing a Cartesian product for common normalization
+    /// joins such as `CAST(a.id AS TEXT) = REPLACE(b.file, '.jpg', '')`.
+    fn try_hash_join_on_expression(
+        left: &RecordBatch,
+        right: &RecordBatch,
+        on: &SqlExpr,
+        join_type: &JoinType,
+        right_alias: Option<&str>,
+    ) -> io::Result<Option<RecordBatch>> {
+        if !matches!(join_type, JoinType::Inner) {
+            return Ok(None);
+        }
+        let SqlExpr::BinaryOp {
+            left: left_expr,
+            op: BinaryOperator::Eq,
+            right: right_expr,
+        } = on
+        else {
+            return Ok(None);
+        };
+
+        let evaluated = Self::evaluate_expr_to_array(left, left_expr)
+            .and_then(|left_key| {
+                Self::evaluate_expr_to_array(right, right_expr)
+                    .map(|right_key| (left_key, right_key))
+            })
+            .or_else(|_| {
+                Self::evaluate_expr_to_array(left, right_expr).and_then(|left_key| {
+                    Self::evaluate_expr_to_array(right, left_expr)
+                        .map(|right_key| (left_key, right_key))
+                })
+            });
+        let Ok((left_key, right_key)) = evaluated else {
+            return Ok(None);
+        };
+        if left_key.len() != left.num_rows()
+            || right_key.len() != right.num_rows()
+            || left_key.data_type() != right_key.data_type()
+        {
+            return Ok(None);
+        }
+
+        const LEFT_KEY: &str = "__apex_join_expr_left";
+        const RIGHT_KEY: &str = "__apex_join_expr_right";
+        let append_key =
+            |batch: &RecordBatch, key: ArrayRef, name: &str| -> io::Result<RecordBatch> {
+                let mut fields: Vec<Field> = batch
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|field| field.as_ref().clone())
+                    .collect();
+                fields.push(Field::new(name, key.data_type().clone(), true));
+                let mut columns = batch.columns().to_vec();
+                columns.push(key);
+                RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+                    .map_err(|error| err_data(error.to_string()))
+            };
+
+        let keyed_left = append_key(left, left_key, LEFT_KEY)?;
+        let keyed_right = append_key(right, right_key, RIGHT_KEY)?;
+        let joined = Self::hash_join_aliased(
+            &keyed_left,
+            &keyed_right,
+            LEFT_KEY,
+            RIGHT_KEY,
+            join_type,
+            right_alias,
+            None,
+            None,
+        )?;
+
+        let fields = joined
+            .schema()
+            .fields()
+            .iter()
+            .filter(|field| !matches!(field.name().as_str(), LEFT_KEY | RIGHT_KEY))
+            .map(|field| field.as_ref().clone())
+            .collect::<Vec<_>>();
+        let columns = joined
+            .schema()
+            .fields()
+            .iter()
+            .zip(joined.columns())
+            .filter(|(field, _)| !matches!(field.name().as_str(), LEFT_KEY | RIGHT_KEY))
+            .map(|(_, column)| Arc::clone(column))
+            .collect::<Vec<_>>();
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map(Some)
+            .map_err(|error| err_data(error.to_string()))
+    }
+
     /// Append a qualified copy of the join key without renaming any existing columns.
     ///
     /// RIGHT JOIN needs this for the original left key because the swap-to-LEFT path
@@ -2128,7 +2232,9 @@ impl ApexExecutor {
     fn cross_join(left: &RecordBatch, right: &RecordBatch) -> io::Result<RecordBatch> {
         let left_rows = left.num_rows();
         let right_rows = right.num_rows();
-        let total = left_rows * right_rows;
+        let total = left_rows.checked_mul(right_rows).ok_or_else(|| {
+            err_data("JOIN result cardinality exceeds the platform addressable range")
+        })?;
 
         if total == 0 {
             // Build empty schema
@@ -2153,6 +2259,50 @@ impl ApexExecutor {
                 .map(|f| arrow::array::new_null_array(f.data_type(), 0) as ArrayRef)
                 .collect();
             return RecordBatch::try_new(schema, empty_cols).map_err(|e| err_data(e.to_string()));
+        }
+
+        let utf8_limit = i32::MAX as usize;
+        for column in left.columns() {
+            let value_bytes = if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+                array.value_data().len()
+            } else if let Some(array) = column
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+            {
+                array.value_data().len()
+            } else {
+                0
+            };
+            if value_bytes
+                .checked_mul(right_rows)
+                .map_or(true, |bytes| bytes > utf8_limit)
+            {
+                return Err(err_data(
+                    "JOIN intermediate exceeds Arrow Utf8/Binary 32-bit offset capacity; \
+                     use an equality join key or materialize normalized keys before joining",
+                ));
+            }
+        }
+        for column in right.columns() {
+            let value_bytes = if let Some(array) = column.as_any().downcast_ref::<StringArray>() {
+                array.value_data().len()
+            } else if let Some(array) = column
+                .as_any()
+                .downcast_ref::<arrow::array::BinaryArray>()
+            {
+                array.value_data().len()
+            } else {
+                0
+            };
+            if value_bytes
+                .checked_mul(left_rows)
+                .map_or(true, |bytes| bytes > utf8_limit)
+            {
+                return Err(err_data(
+                    "JOIN intermediate exceeds Arrow Utf8/Binary 32-bit offset capacity; \
+                     use an equality join key or materialize normalized keys before joining",
+                ));
+            }
         }
 
         // Build index arrays: left[0,0,...,1,1,...] right[0,1,2,...,0,1,2,...]

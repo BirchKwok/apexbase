@@ -64,6 +64,24 @@ def test_copy_to_csv_and_json_roundtrip():
         client.close()
 
 
+def test_copy_from_csv_bad_line_policy():
+    with tempfile.TemporaryDirectory() as temp_dir:
+        csv_path = os.path.join(temp_dir, "dirty.csv")
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("name,age\nAlice,30\nbroken,40,extra\nBob,25\n")
+
+        client = ApexClient(dirpath=temp_dir)
+        with pytest.raises(Exception):
+            client.execute(f"COPY strict_rows FROM '{csv_path}'")
+        assert client.execute(
+            f"COPY clean_rows FROM '{csv_path}' (on_bad_lines 'skip')"
+        ).scalar() == 2
+        assert client.execute(
+            "SELECT name FROM clean_rows ORDER BY name"
+        ).to_dict() == [{"name": "Alice"}, {"name": "Bob"}]
+        client.close()
+
+
 def test_json_mutation_functions():
     with tempfile.TemporaryDirectory() as temp_dir:
         client = ApexClient(dirpath=temp_dir)

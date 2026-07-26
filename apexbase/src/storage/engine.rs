@@ -66,6 +66,8 @@ struct CacheEntry {
     last_access: Instant,
     /// Whether there's a pending delta file
     has_delta: bool,
+    /// Table epoch observed when this backend was cached.
+    epoch: u64,
 }
 
 /// Lightweight schema cache entry (for fast should_use_delta checks)
@@ -78,6 +80,13 @@ struct SchemaCache {
     modified_time: SystemTime,
     /// Whether this is a V4 format file (cached to avoid repeated header reads)
     is_v4: bool,
+    /// Table epoch observed when this schema was cached.
+    epoch: u64,
+}
+
+struct InsertCacheEntry {
+    backend: Arc<TableStorageBackend>,
+    epoch: u64,
 }
 
 // ============================================================================
@@ -104,7 +113,7 @@ pub struct StorageEngine {
     /// Lightweight schema cache for fast should_use_delta checks
     schema_cache: RwLock<AHashMap<PathBuf, SchemaCache>>,
     /// Cache for insert-mode backends (for delta writes) - avoids repeated file I/O
-    insert_cache: RwLock<AHashMap<PathBuf, Arc<TableStorageBackend>>>,
+    insert_cache: RwLock<AHashMap<PathBuf, InsertCacheEntry>>,
 }
 
 impl StorageEngine {
@@ -170,8 +179,6 @@ impl StorageEngine {
         self.cache.write().remove(table_path);
         self.insert_cache.write().remove(table_path);
         self.schema_cache.write().remove(table_path);
-
-        crate::storage::epoch::bump(table_path);
     }
 
     /// Invalidate read/query caches after an append while keeping the insert backend warm.
@@ -183,7 +190,6 @@ impl StorageEngine {
     fn invalidate_after_append(&self, table_path: &Path) {
         self.cache.write().remove(table_path);
         self.schema_cache.write().remove(table_path);
-        crate::storage::epoch::bump(table_path);
     }
 
     /// Invalidate all caches under a directory
@@ -196,8 +202,6 @@ impl StorageEngine {
         self.insert_cache
             .write()
             .retain(|path, _| !path.starts_with(dir));
-
-        crate::storage::epoch::remove_dir(dir);
     }
 
     // ========================================================================
@@ -218,6 +222,7 @@ impl StorageEngine {
     ) -> io::Result<Arc<TableStorageBackend>> {
         // Use path directly - avoid expensive canonicalize
         let cache_key = table_path.to_path_buf();
+        let epoch = crate::storage::epoch::current(table_path);
         let has_delta = Self::has_delta_file(table_path);
         let modified = Self::get_modified_time(table_path);
 
@@ -225,7 +230,7 @@ impl StorageEngine {
         if !has_delta {
             let mut cache = self.cache.write();
             if let Some(entry) = cache.get_mut(&cache_key) {
-                if entry.modified_time >= modified && !entry.has_delta {
+                if entry.epoch == epoch && entry.modified_time >= modified && !entry.has_delta {
                     entry.last_access = Instant::now();
                     return Ok(entry.backend.clone());
                 }
@@ -262,6 +267,7 @@ impl StorageEngine {
                     modified_time: new_modified,
                     last_access: Instant::now(),
                     has_delta: false,
+                    epoch,
                 },
             );
         }
@@ -282,6 +288,7 @@ impl StorageEngine {
                     row_count,
                     modified_time: new_modified,
                     is_v4: false,
+                    epoch,
                 },
             );
         }
@@ -293,22 +300,14 @@ impl StorageEngine {
     pub fn get_read_backend(&self, table_path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         // Use path directly - avoid expensive canonicalize
         let cache_key = table_path.to_path_buf();
-        let has_delta = Self::has_delta_file(table_path);
+        let epoch = crate::storage::epoch::current(table_path);
         let modified = Self::get_modified_time(table_path);
-
-        // If delta exists, compact first for consistent reads (metadata-only open)
-        if has_delta {
-            let storage = TableStorageBackend::open_for_compact(table_path)?;
-            storage.compact()?;
-            self.cache.write().remove(&cache_key);
-            self.schema_cache.write().remove(&cache_key);
-        }
 
         // Check cache
         {
             let mut cache = self.cache.write();
             if let Some(entry) = cache.get_mut(&cache_key) {
-                if entry.modified_time >= modified {
+                if entry.epoch == epoch && entry.modified_time >= modified {
                     entry.last_access = Instant::now();
                     return Ok(entry.backend.clone());
                 }
@@ -330,6 +329,7 @@ impl StorageEngine {
                     modified_time: new_modified,
                     last_access: Instant::now(),
                     has_delta: false,
+                    epoch,
                 },
             );
         }
@@ -350,6 +350,7 @@ impl StorageEngine {
                     row_count,
                     modified_time: new_modified,
                     is_v4: false,
+                    epoch,
                 },
             );
         }
@@ -365,12 +366,15 @@ impl StorageEngine {
         durability: DurabilityLevel,
     ) -> io::Result<Arc<TableStorageBackend>> {
         let cache_key = table_path.to_path_buf();
+        let epoch = crate::storage::epoch::current(table_path);
 
         // Check insert cache first
         {
             let cache = self.insert_cache.read();
-            if let Some(backend) = cache.get(&cache_key) {
-                return Ok(backend.clone());
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.epoch == epoch {
+                    return Ok(Arc::clone(&entry.backend));
+                }
             }
         }
 
@@ -388,7 +392,13 @@ impl StorageEngine {
                     cache.remove(&key);
                 }
             }
-            cache.insert(cache_key, backend.clone());
+            cache.insert(
+                cache_key,
+                InsertCacheEntry {
+                    backend: Arc::clone(&backend),
+                    epoch,
+                },
+            );
         }
 
         Ok(backend)
@@ -412,6 +422,7 @@ impl StorageEngine {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
 
         // Determine write strategy and V4 status in one pass (avoids double is_v4_file)
         let (use_delta, is_v4) = self.classify_write(table_path, rows);
@@ -447,6 +458,11 @@ impl StorageEngine {
             ids
         };
 
+        epoch_write.commit();
+        drop(epoch_write);
+        if let Some(entry) = self.insert_cache.write().get_mut(table_path) {
+            entry.epoch = crate::storage::epoch::current(table_path);
+        }
         Ok(ids)
     }
 
@@ -488,12 +504,13 @@ impl StorageEngine {
 
         let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
         let cache_key = table_path.to_path_buf();
+        let epoch = crate::storage::epoch::current(table_path);
 
         // Try schema cache first (FAST PATH — avoids file I/O entirely)
         {
             let schema_cache = self.schema_cache.read();
             if let Some(cached) = schema_cache.get(&cache_key) {
-                if cached.modified_time >= modified {
+                if cached.epoch == epoch && cached.modified_time >= modified {
                     // V4 files always use full write (append_row_group)
                     if cached.is_v4 {
                         return (false, true);
@@ -518,15 +535,16 @@ impl StorageEngine {
         if is_v4 {
             // Lightweight cache update (just V4 flag, no full schema load)
             let mut schema_cache = self.schema_cache.write();
-            schema_cache
-                .entry(cache_key)
-                .or_insert_with(|| SchemaCache {
+            schema_cache.insert(
+                cache_key,
+                SchemaCache {
                     columns: std::collections::HashSet::new(),
                     row_count: 0,
                     modified_time: modified,
                     is_v4: true,
-                })
-                .is_v4 = true;
+                    epoch,
+                },
+            );
             return (false, true);
         }
 
@@ -557,6 +575,7 @@ impl StorageEngine {
                     row_count,
                     modified_time: modified,
                     is_v4: false,
+                    epoch,
                 },
             );
         }
@@ -608,6 +627,7 @@ impl StorageEngine {
         if ids.is_empty() {
             return Ok(0);
         }
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
 
         // Invalidate before delete
         self.invalidate(table_path);
@@ -621,11 +641,16 @@ impl StorageEngine {
             }
         }
 
-        backend.save()?;
+        if deleted > 0 {
+            backend.save()?;
+        }
 
         // Invalidate after delete
         self.invalidate(table_path);
 
+        if deleted > 0 {
+            epoch_write.commit();
+        }
         Ok(deleted)
     }
 
@@ -645,7 +670,9 @@ impl StorageEngine {
     /// Create a new table, optionally with a pre-defined schema.
     /// Pre-defining schema avoids schema inference on the first insert.
     pub fn create_table(&self, table_path: &Path, durability: DurabilityLevel) -> io::Result<()> {
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
         let _backend = TableStorageBackend::create_with_durability(table_path, durability)?;
+        epoch_write.commit();
         Ok(())
     }
 
@@ -658,11 +685,13 @@ impl StorageEngine {
         durability: DurabilityLevel,
         schema_cols: &[(String, ColumnType)],
     ) -> io::Result<()> {
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
         let _backend = TableStorageBackend::create_with_schema_and_durability(
             table_path,
             durability,
             schema_cols,
         )?;
+        epoch_write.commit();
         Ok(())
     }
 
@@ -673,11 +702,17 @@ impl StorageEngine {
         id: u64,
         durability: DurabilityLevel,
     ) -> io::Result<bool> {
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
         let backend = self.get_write_backend(table_path, durability)?;
         let result = backend.delete(id);
-        backend.save()?;
+        if result {
+            backend.save()?;
+        }
         self.invalidate(table_path);
+        if result {
+            epoch_write.commit();
+        }
         Ok(result)
     }
 
@@ -689,11 +724,17 @@ impl StorageEngine {
         fields: &HashMap<String, Value>,
         durability: DurabilityLevel,
     ) -> io::Result<bool> {
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
         let backend = self.get_write_backend(table_path, durability)?;
         let result = backend.replace(id, fields)?;
-        backend.save()?;
+        if result {
+            backend.save()?;
+        }
         self.invalidate(table_path);
+        if result {
+            epoch_write.commit();
+        }
         Ok(result)
     }
 
@@ -722,11 +763,13 @@ impl StorageEngine {
         dtype: crate::data::DataType,
         durability: DurabilityLevel,
     ) -> io::Result<()> {
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
         let backend = self.get_write_backend(table_path, durability)?;
         backend.add_column(column_name, dtype)?;
         backend.save()?;
         self.invalidate(table_path);
+        epoch_write.commit();
         Ok(())
     }
 
@@ -737,11 +780,13 @@ impl StorageEngine {
         column_name: &str,
         durability: DurabilityLevel,
     ) -> io::Result<()> {
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
         let backend = self.get_write_backend(table_path, durability)?;
         backend.drop_column(column_name)?;
         backend.save()?;
         self.invalidate(table_path);
+        epoch_write.commit();
         Ok(())
     }
 
@@ -753,6 +798,7 @@ impl StorageEngine {
         new_name: &str,
         durability: DurabilityLevel,
     ) -> io::Result<()> {
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
         if Self::is_v4_file(table_path) {
             // V4: modify schema in-memory then update footer only (no data reload)
@@ -760,12 +806,14 @@ impl StorageEngine {
             backend.rename_column(old_name, new_name)?;
             backend.storage.update_v4_footer_schema()?;
             self.invalidate(table_path);
+            epoch_write.commit();
             return Ok(());
         }
         let backend = self.get_write_backend(table_path, durability)?;
         backend.rename_column(old_name, new_name)?;
         backend.save()?;
         self.invalidate(table_path);
+        epoch_write.commit();
         Ok(())
     }
 
@@ -801,6 +849,7 @@ impl StorageEngine {
         durability: DurabilityLevel,
     ) -> io::Result<Vec<u64>> {
         use crate::storage::on_demand::{ColumnData, ColumnType};
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
 
         // Determine row count from first non-empty column
         let row_count = int_columns
@@ -813,6 +862,9 @@ impl StorageEngine {
             .or_else(|| binary_columns.values().next().map(|v| v.len()))
             .or_else(|| fixedlist_columns.values().next().map(|v| v.len()))
             .unwrap_or(0);
+        if row_count == 0 {
+            return Ok(Vec::new());
+        }
 
         // FAST PATH: V4 append for existing tables with matching schema
         // Check if file exists, is V4, and schema matches
@@ -1050,6 +1102,14 @@ impl StorageEngine {
                                 match storage.append_row_group(&ids, &new_columns, &new_nulls) {
                                     Ok(()) => {
                                         self.invalidate_after_append(table_path);
+                                        epoch_write.commit();
+                                        drop(epoch_write);
+                                        if let Some(entry) =
+                                            self.insert_cache.write().get_mut(table_path)
+                                        {
+                                            entry.epoch =
+                                                crate::storage::epoch::current(table_path);
+                                        }
                                         return Ok(ids);
                                     }
                                     Err(_) => {
@@ -1108,6 +1168,11 @@ impl StorageEngine {
         )?;
         backend.save()?;
         self.invalidate(table_path);
+        epoch_write.commit();
+        drop(epoch_write);
+        if let Some(entry) = self.insert_cache.write().get_mut(table_path) {
+            entry.epoch = crate::storage::epoch::current(table_path);
+        }
         Ok(ids)
     }
 }

@@ -49,7 +49,7 @@ use arrow::record_batch::RecordBatch;
 use parking_lot::RwLock;
 
 use crate::data::{DataType, Value};
-use crate::query::{ApexExecutor, ApexResult};
+use crate::query::ApexResult;
 use crate::storage::on_demand::ColumnType;
 use crate::storage::DurabilityLevel;
 use crate::{ApexError, Result};
@@ -77,7 +77,7 @@ struct DbInner {
 impl Drop for DbInner {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.temp_dir);
-        crate::query::executor::clear_temp_dir();
+        crate::Database::clear_temp_dir();
     }
 }
 
@@ -132,7 +132,7 @@ impl DbInner {
             let _ = std::fs::remove_file(&path);
             let _ = std::fs::remove_file(path.with_extension("apex.wal"));
             let _ = std::fs::remove_file(path.with_extension("apex.lock"));
-            crate::storage::engine::engine().invalidate(&path);
+            crate::Database::invalidate(&path);
         }
         Ok(())
     }
@@ -246,8 +246,7 @@ impl ApexDB {
         if path.exists() {
             return Err(ApexError::TableExists(name.to_string()));
         }
-        let engine = crate::storage::engine::engine();
-        engine.create_table(&path, self.inner.durability)?;
+        crate::Database::create_table(&path, self.inner.durability)?;
         self.inner.register_table(name, path.clone());
         Ok(Table {
             inner: self.inner.clone(),
@@ -281,8 +280,7 @@ impl ApexDB {
         if path.exists() {
             return Err(ApexError::TableExists(name.to_string()));
         }
-        let engine = crate::storage::engine::engine();
-        engine.create_table_with_schema(&path, self.inner.durability, schema)?;
+        crate::Database::create_table_with_schema(&path, self.inner.durability, schema)?;
         self.inner.register_table(name, path.clone());
         Ok(Table {
             inner: self.inner.clone(),
@@ -309,7 +307,7 @@ impl ApexDB {
         {
             let paths = self.inner.table_paths.read();
             if let Some(p) = paths.get(name) {
-                crate::storage::engine::engine().invalidate(p);
+                crate::Database::invalidate(p);
             }
         }
         let path = {
@@ -376,18 +374,10 @@ impl ApexDB {
             }
         };
 
-        crate::query::executor::set_temp_dir(&self.inner.temp_dir);
         let base_dir = self.inner.current_base_dir();
-        let result = crate::Database::copy_import(
-            &temp_path,
-            name,
-            file_path,
-            fmt,
-            &[],
-            &base_dir,
-            &base_dir,
-        );
-        crate::query::executor::clear_temp_dir();
+        let result = crate::Session::new(&base_dir, &base_dir)
+            .with_temp_dir(&self.inner.temp_dir)
+            .copy_import(&temp_path, name, file_path, fmt, &[]);
 
         match result {
             Ok(_) => {
@@ -419,11 +409,10 @@ impl ApexDB {
         let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl { .. });
 
         let base_dir = self.inner.current_base_dir();
-        crate::query::executor::set_query_root_dir(&self.inner.root_dir);
-        crate::query::executor::set_temp_dir(&self.inner.temp_dir);
-        let result = crate::Database::execute_classified(sql, &sig, &base_dir, &base_dir);
-        crate::query::executor::clear_temp_dir();
-        crate::query::executor::clear_query_root_dir();
+        let result = crate::Session::new(&base_dir, &base_dir)
+            .with_root_dir(&self.inner.root_dir)
+            .with_temp_dir(&self.inner.temp_dir)
+            .execute_classified(sql, &sig);
         let result = result?;
 
         // Sync table registry after DDL / DML
@@ -433,9 +422,9 @@ impl ApexDB {
             } = sig
             {
                 self.inner.unregister_table(name);
-                crate::storage::engine::engine().invalidate(&self.inner.table_path_for(name));
+                crate::Database::invalidate(&self.inner.table_path_for(name));
             } else {
-                crate::storage::engine::engine().invalidate_dir(&base_dir);
+                crate::Database::invalidate_dir(&base_dir);
             }
         }
 
@@ -462,7 +451,7 @@ impl ApexDB {
 
     /// Invalidate all engine caches. Useful after external writes to the same directory.
     pub fn invalidate_cache(&self) {
-        crate::storage::engine::engine().invalidate_dir(&self.inner.current_base_dir());
+        crate::Database::invalidate_dir(&self.inner.current_base_dir());
     }
 
     /// Return the current base directory path.
@@ -514,8 +503,7 @@ impl Table {
     /// ].into_iter().collect()).unwrap();
     /// ```
     pub fn insert(&self, record: Row) -> Result<u64> {
-        let engine = crate::storage::engine::engine();
-        let ids = engine.write(&self.path, &[record], self.inner.durability)?;
+        let ids = crate::Database::write(&self.path, &[record], self.inner.durability)?;
         Ok(ids.into_iter().next().unwrap_or(0))
     }
 
@@ -524,8 +512,11 @@ impl Table {
         if records.is_empty() {
             return Ok(Vec::new());
         }
-        let engine = crate::storage::engine::engine();
-        Ok(engine.write(&self.path, records, self.inner.durability)?)
+        Ok(crate::Database::write(
+            &self.path,
+            records,
+            self.inner.durability,
+        )?)
     }
 
     /// Insert an Arrow [`RecordBatch`]. Returns the assigned `_id` values.
@@ -536,8 +527,7 @@ impl Table {
             return Ok(Vec::new());
         }
         if let Some(columns) = crate::data::arrow_convert::record_batch_to_typed_columns(batch) {
-            let engine = crate::storage::engine::engine();
-            return Ok(engine.write_typed(
+            return Ok(crate::Database::write_typed(
                 &self.path,
                 columns.ints,
                 columns.floats,
@@ -557,14 +547,21 @@ impl Table {
 
     /// Replace (overwrite) a record by `_id`. Returns `true` if the record existed.
     pub fn replace(&self, id: u64, record: Row) -> Result<bool> {
-        let engine = crate::storage::engine::engine();
-        Ok(engine.replace(&self.path, id, &record, self.inner.durability)?)
+        Ok(crate::Database::replace(
+            &self.path,
+            id,
+            &record,
+            self.inner.durability,
+        )?)
     }
 
     /// Delete a record by `_id`. Returns `true` if the record existed.
     pub fn delete(&self, id: u64) -> Result<bool> {
-        let engine = crate::storage::engine::engine();
-        Ok(engine.delete_one(&self.path, id, self.inner.durability)?)
+        Ok(crate::Database::delete_one(
+            &self.path,
+            id,
+            self.inner.durability,
+        )?)
     }
 
     /// Delete multiple records by `_id`. Returns the number of records deleted.
@@ -572,16 +569,18 @@ impl Table {
         if ids.is_empty() {
             return Ok(0);
         }
-        let engine = crate::storage::engine::engine();
-        Ok(engine.delete(&self.path, ids, self.inner.durability)?)
+        Ok(crate::Database::delete(
+            &self.path,
+            ids,
+            self.inner.durability,
+        )?)
     }
 
     // ── Read Operations ───────────────────────────────────────────────────────
 
     /// Retrieve a single record by `_id`. Returns `None` if not found.
     pub fn retrieve(&self, id: u64) -> Result<Option<Row>> {
-        let engine = crate::storage::engine::engine();
-        let backend = engine.get_read_backend(&self.path)?;
+        let backend = crate::Database::read_backend(&self.path)?;
         match backend.storage.retrieve_rcix(id)? {
             None => Ok(None),
             Some(cols) => Ok(Some(cols.into_iter().collect())),
@@ -596,11 +595,14 @@ impl Table {
         if ids.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(Schema::empty())));
         }
-        let engine = crate::storage::engine::engine();
-        let backend = engine.get_read_backend(&self.path)?;
+        let backend = crate::Database::read_backend(&self.path)?;
 
         // Fast path: V4 mmap batch read
-        if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
+        if backend.storage.is_v4_format()
+            && !backend.storage.has_v4_in_memory_data()
+            && !backend.has_delta()
+            && !backend.has_pending_deltas()
+        {
             if let Ok(Some(batch)) = backend.storage.retrieve_many_mmap(ids) {
                 return Ok(batch);
             }
@@ -618,14 +620,12 @@ impl Table {
 
     /// Return the active (non-deleted) row count. O(1) for V4 format files.
     pub fn count(&self) -> Result<u64> {
-        let engine = crate::storage::engine::engine();
-        Ok(engine.active_row_count(&self.path)?)
+        Ok(crate::Database::active_row_count(&self.path)?)
     }
 
     /// Return `true` if a record with the given `_id` exists.
     pub fn exists(&self, id: u64) -> Result<bool> {
-        let engine = crate::storage::engine::engine();
-        Ok(engine.exists(&self.path, id)?)
+        Ok(crate::Database::exists(&self.path, id)?)
     }
 
     // ── SQL Execution ─────────────────────────────────────────────────────────
@@ -647,17 +647,16 @@ impl Table {
             sig,
             crate::query::query_signature::QuerySignature::CountStar { .. }
         ) {
-            let engine = crate::storage::engine::engine();
-            let backend = engine.get_read_backend(&self.path)?;
+            let backend = crate::Database::read_backend(&self.path)?;
             if backend.pending_v4_in_memory_rows() > 0 {
                 backend.save()?;
             }
         }
 
         let base_dir = self.inner.current_base_dir();
-        crate::query::executor::set_query_root_dir(&self.inner.root_dir);
-        let result = crate::Database::execute_classified(sql, &sig, &base_dir, &self.path);
-        crate::query::executor::clear_query_root_dir();
+        let result = crate::Session::new(&base_dir, &self.path)
+            .with_root_dir(&self.inner.root_dir)
+            .execute_classified(sql, &sig);
         Ok(ResultSet { inner: result? })
     }
 
@@ -665,22 +664,22 @@ impl Table {
 
     /// Return the table schema as `(column_name, DataType)` pairs.
     pub fn schema(&self) -> Result<Vec<(String, DataType)>> {
-        Ok(crate::storage::engine::engine().get_schema(&self.path)?)
+        Ok(crate::Database::schema(&self.path)?)
     }
 
     /// Return column names (in schema order).
     pub fn columns(&self) -> Result<Vec<String>> {
-        Ok(crate::storage::engine::engine().list_columns(&self.path)?)
+        Ok(crate::Database::columns(&self.path)?)
     }
 
     /// Get the [`DataType`] of a specific column.
     pub fn column_type(&self, name: &str) -> Result<Option<DataType>> {
-        Ok(crate::storage::engine::engine().get_column_type(&self.path, name)?)
+        Ok(crate::Database::column_type(&self.path, name)?)
     }
 
     /// Add a new column (all existing rows are set to `NULL`).
     pub fn add_column(&self, name: &str, dtype: DataType) -> Result<()> {
-        Ok(crate::storage::engine::engine().add_column(
+        Ok(crate::Database::add_column(
             &self.path,
             name,
             dtype,
@@ -690,18 +689,16 @@ impl Table {
 
     /// Drop a column.
     pub fn drop_column(&self, name: &str) -> Result<()> {
-        Ok(
-            crate::storage::engine::engine().drop_column(
-                &self.path,
-                name,
-                self.inner.durability,
-            )?,
-        )
+        Ok(crate::Database::drop_column(
+            &self.path,
+            name,
+            self.inner.durability,
+        )?)
     }
 
     /// Rename a column.
     pub fn rename_column(&self, old_name: &str, new_name: &str) -> Result<()> {
-        Ok(crate::storage::engine::engine().rename_column(
+        Ok(crate::Database::rename_column(
             &self.path,
             old_name,
             new_name,
@@ -713,8 +710,7 @@ impl Table {
 
     /// Flush pending in-memory data to disk.
     pub fn flush(&self) -> Result<()> {
-        let engine = crate::storage::engine::engine();
-        let backend = engine.get_write_backend(&self.path, self.inner.durability)?;
+        let backend = crate::Database::write_backend(&self.path, self.inner.durability)?;
         backend.save()?;
         Ok(())
     }
@@ -1245,6 +1241,54 @@ mod tests {
         }
         table.execute("DELETE FROM delw_t WHERE age < 20").unwrap();
         // Deleted 15 and 18 → 3 remain
+        assert_eq!(table.count().unwrap(), 3);
+    }
+
+    #[test]
+    fn test_sql_delete_general_predicate_and_all_include_append_delta() {
+        let (_dir, db) = temp_db();
+        let table = db.create_table("del_delta_t").unwrap();
+        for age in &[15i64, 25, 35, 18, 40] {
+            let mut row = Row::new();
+            row.insert("age".to_string(), Value::Int64(*age));
+            table.insert(row).unwrap();
+        }
+
+        let deleted = table
+            .execute("DELETE FROM del_delta_t WHERE age < 20 OR age > 35")
+            .unwrap();
+        assert_eq!(deleted.scalar(), Some(3));
+        assert_eq!(table.count().unwrap(), 2);
+
+        let deleted = table.execute("DELETE FROM del_delta_t").unwrap();
+        assert_eq!(deleted.scalar(), Some(2));
+        assert_eq!(table.count().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_sql_delete_fast_path_includes_pending_memtable_row() {
+        let (_dir, db) = temp_db();
+        let table = db.create_table("del_pending_t").unwrap();
+        for age in [20i64, 30, 40] {
+            let mut row = Row::new();
+            row.insert("age".to_string(), Value::Int64(age));
+            row.insert("score".to_string(), Value::Float64(age as f64));
+            table.insert(row).unwrap();
+        }
+        table.flush().unwrap();
+        table
+            .execute("UPDATE del_pending_t SET score = 77.0 WHERE _id = 1")
+            .unwrap();
+
+        let mut pending = Row::new();
+        pending.insert("age".to_string(), Value::Int64(99));
+        pending.insert("score".to_string(), Value::Float64(99.0));
+        table.insert(pending).unwrap();
+
+        let deleted = table
+            .execute("DELETE FROM del_pending_t WHERE age = 99")
+            .unwrap();
+        assert_eq!(deleted.scalar(), Some(1));
         assert_eq!(table.count().unwrap(), 3);
     }
 

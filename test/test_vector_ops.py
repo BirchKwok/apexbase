@@ -75,6 +75,52 @@ def test_auto_encode_numpy_vectors(client):
     assert result[0]["COUNT(*)"] == 2
 
 
+def test_topk_ffi_preserves_tiny_query_components(client):
+    client.store([
+        {"name": "tiny", "vec": [1.0e-12, 1.0]},
+        {"name": "other", "vec": [1.0, 0.0]},
+    ])
+    rows = client.topk_distance(
+        "vec", np.array([1.0e-12, 1.0], dtype=np.float64), k=1,
+        metric="l2", id_col="row_id", dist_col="distance",
+    ).to_dict()
+    assert list(rows[0]) == ["row_id", "distance"]
+    assert rows[0]["distance"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_topk_sql_array_accepts_scientific_notation(client):
+    client.store([
+        {"name": "tiny", "vec": [1.0e-12, 1.0]},
+        {"name": "other", "vec": [1.0, 0.0]},
+    ])
+    rows = client.execute(
+        "SELECT explode_rename("
+        "topk_distance(vec, [1e-12, 1E0], 1, 'l2'), '_id', 'dist'"
+        ") FROM vecs"
+    ).to_dict()
+    assert rows[0]["dist"] == pytest.approx(0.0, abs=1e-6)
+
+
+def test_cosine_alias_matches_distance_and_similarity_orders_nearest(client):
+    client.store([
+        {"name": "same", "vec": [1.0, 0.0]},
+        {"name": "orthogonal", "vec": [0.0, 1.0]},
+        {"name": "opposite", "vec": [-1.0, 0.0]},
+    ])
+    query = np.array([1.0, 0.0], dtype=np.float32)
+    cosine = client.topk_distance("vec", query, k=3, metric="cosine").to_dict()
+    distance = client.topk_distance(
+        "vec", query, k=3, metric="cosine_distance"
+    ).to_dict()
+    similarity = client.topk_distance(
+        "vec", query, k=3, metric="cosine_similarity"
+    ).to_dict()
+
+    assert [row["_id"] for row in cosine] == [row["_id"] for row in distance]
+    assert cosine[0]["dist"] == pytest.approx(0.0, abs=1e-5)
+    assert similarity[0]["_id"] == cosine[0]["_id"]
+
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────

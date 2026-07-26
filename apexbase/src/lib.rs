@@ -8,6 +8,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
+pub mod compute;
 pub mod data;
 pub mod database;
 pub mod embedded;
@@ -26,7 +27,7 @@ pub mod txn;
 
 // Re-export main types
 pub use data::{DataType, Row, Value};
-pub use database::Database;
+pub use database::{Database, Session};
 pub use query::{ApexExecutor, ApexResult};
 pub use storage::{ColumnType, ColumnValue, ColumnarStorage, FileSchema};
 pub use table::TableCatalog;

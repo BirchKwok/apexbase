@@ -50,6 +50,28 @@ def test_direct_write_invalidates_python_result_cache_across_clients(tmp_path):
         writer.close()
 
 
+def test_batch_write_advances_table_epoch_once(tmp_path):
+    writer, reader = _open_clients(tmp_path)
+
+    try:
+        before = writer._storage._table_epoch()
+        writer.store(
+            [
+                {"name": "gamma", "score": 30, "category": "x"},
+                {"name": "delta", "score": 40, "category": "z"},
+            ]
+        )
+        after = writer._storage._table_epoch()
+
+        assert after == before + 1
+        assert reader.execute(
+            "SELECT name FROM cache_contract WHERE score >= 30 ORDER BY score"
+        ).to_dict() == [{"name": "gamma"}, {"name": "delta"}]
+    finally:
+        reader.close()
+        writer.close()
+
+
 def test_transaction_commit_invalidates_all_warmed_read_caches(tmp_path):
     writer, reader = _open_clients(tmp_path)
     group_sql = (

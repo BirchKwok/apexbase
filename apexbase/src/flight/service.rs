@@ -18,8 +18,6 @@ use futures::stream::BoxStream;
 use futures::{StreamExt, TryStreamExt};
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::query::ApexExecutor;
-
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 fn apex_err(e: impl std::fmt::Display) -> Status {
@@ -30,12 +28,12 @@ fn invalid(msg: impl Into<String>) -> Status {
     Status::invalid_argument(msg.into())
 }
 
-/// Execute SQL via ApexExecutor, return RecordBatch. Runs synchronously (for spawn_blocking).
+/// Execute SQL through the shared session façade. Runs synchronously (for spawn_blocking).
 fn execute_sql(sql: &str, base_dir: &PathBuf) -> Result<arrow::record_batch::RecordBatch, Status> {
     let default_table_path = base_dir.join("apexbase.apex");
-    crate::query::executor::set_query_root_dir(base_dir);
-    let result = crate::Database::execute(sql, base_dir, &default_table_path);
-    crate::query::executor::clear_query_root_dir();
+    let result = crate::Session::new(base_dir, &default_table_path)
+        .with_root_dir(base_dir)
+        .execute(sql);
     result
         .map_err(apex_err)?
         .to_record_batch()

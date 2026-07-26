@@ -11,6 +11,7 @@
 //! - Aggregate functions (COUNT, SUM, AVG, MIN, MAX)
 //! - GROUP BY / HAVING
 
+use crate::data::AggregateFunc;
 use crate::data::DataType;
 use crate::data::Value;
 use crate::ApexError;
@@ -393,28 +394,6 @@ pub enum SelectColumn {
         order_by: Vec<OrderByClause>,
         alias: Option<String>,
     },
-}
-
-/// Aggregate functions
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub enum AggregateFunc {
-    Count,
-    Sum,
-    Avg,
-    Min,
-    Max,
-}
-
-impl std::fmt::Display for AggregateFunc {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AggregateFunc::Count => write!(f, "COUNT"),
-            AggregateFunc::Sum => write!(f, "SUM"),
-            AggregateFunc::Avg => write!(f, "AVG"),
-            AggregateFunc::Min => write!(f, "MIN"),
-            AggregateFunc::Max => write!(f, "MAX"),
-        }
-    }
 }
 
 /// ORDER BY clause
@@ -1487,6 +1466,7 @@ impl SqlParser {
             if c.is_ascii_digit() || (c == b'.' && i + 1 < len && bytes[i + 1].is_ascii_digit()) {
                 let start = i;
                 let mut has_dot = c == b'.';
+                let mut has_exponent = false;
                 i += 1;
                 while i < len && (bytes[i].is_ascii_digit() || (!has_dot && bytes[i] == b'.')) {
                     if bytes[i] == b'.' {
@@ -1494,8 +1474,25 @@ impl SqlParser {
                     }
                     i += 1;
                 }
+                if i < len && matches!(bytes[i], b'e' | b'E') {
+                    let exponent_marker = i;
+                    let mut exponent_end = i + 1;
+                    if exponent_end < len && matches!(bytes[exponent_end], b'+' | b'-') {
+                        exponent_end += 1;
+                    }
+                    let exponent_digits = exponent_end;
+                    while exponent_end < len && bytes[exponent_end].is_ascii_digit() {
+                        exponent_end += 1;
+                    }
+                    if exponent_end > exponent_digits {
+                        has_exponent = true;
+                        i = exponent_end;
+                    } else {
+                        i = exponent_marker;
+                    }
+                }
                 let num_str = &sql[start..i];
-                if has_dot {
+                if has_dot || has_exponent {
                     let f: f64 = num_str.parse().map_err(|_| {
                         ApexError::QueryParseError(format!(
                             "Syntax error at byte {}: Invalid number: {}",
@@ -5494,6 +5491,10 @@ impl SqlParser {
             Token::If => {
                 self.advance();
                 self.parse_function_call_from_name("if".to_string())
+            }
+            Token::Replace => {
+                self.advance();
+                self.parse_function_call_from_name("replace".to_string())
             }
             _ => Err(ApexError::QueryParseError(format!(
                 "Unexpected token in expression: {:?}",

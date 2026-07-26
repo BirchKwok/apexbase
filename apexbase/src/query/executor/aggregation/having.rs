@@ -1,7 +1,7 @@
 use super::*;
 
 impl ApexExecutor {
-    pub(super) fn collect_having_extra_aggs(
+    pub(in crate::query::executor) fn collect_having_extra_aggs(
         expr: &crate::query::SqlExpr,
         select_cols: &[crate::query::SelectColumn],
     ) -> Vec<(crate::query::AggregateFunc, Option<String>)> {
@@ -39,7 +39,7 @@ impl ApexExecutor {
         found
     }
 
-    pub(super) fn walk_having_expr(
+    pub(in crate::query::executor) fn walk_having_expr(
         expr: &crate::query::SqlExpr,
         existing: &[String],
         out: &mut Vec<(crate::query::AggregateFunc, Option<String>)>,

@@ -7,12 +7,12 @@ impl OnDemandStorage {
         filter_val: &str,
         group_col: &str,
         agg_col: Option<&str>,
-        agg_func: crate::query::AggregateFunc,
+        agg_func: crate::data::AggregateFunc,
         descending: bool,
         limit: usize,
         offset: usize,
     ) -> io::Result<Option<RecordBatch>> {
-        use crate::query::AggregateFunc;
+        use crate::data::AggregateFunc;
         use std::collections::HashMap;
 
         let footer = match self.get_or_load_footer()? {

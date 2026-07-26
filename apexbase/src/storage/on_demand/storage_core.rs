@@ -11,13 +11,30 @@ const SYNC_PENDING_DELTASTORE: u8 = 0b100;
 struct DeltaStringIndexCache {
     len: u64,
     modified: std::time::SystemTime,
+    epoch: u64,
     index: HashMap<String, HashMap<String, Vec<u64>>>,
+}
+
+#[derive(Clone, Hash, PartialEq, Eq)]
+struct DeltaNumericRangeKey {
+    column: String,
+    low_bits: u64,
+    high_bits: u64,
+}
+
+struct DeltaNumericRangeEntry {
+    len: u64,
+    modified: std::time::SystemTime,
+    ids: Vec<u64>,
 }
 
 static DELTA_STRING_INDEX_CACHE: once_cell::sync::Lazy<RwLock<HashMap<PathBuf, DeltaStringIndexCache>>> =
     once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+static DELTA_NUMERIC_RANGE_CACHE: once_cell::sync::Lazy<
+    RwLock<HashMap<PathBuf, HashMap<DeltaNumericRangeKey, DeltaNumericRangeEntry>>>,
+> = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 static DELTA_ROW_COUNT_CACHE: once_cell::sync::Lazy<
-    RwLock<HashMap<PathBuf, (u64, std::time::SystemTime, usize)>>,
+    RwLock<HashMap<PathBuf, (u64, std::time::SystemTime, usize, u64)>>,
 > = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// High-performance on-demand columnar storage
@@ -930,11 +947,13 @@ impl OnDemandStorage {
         self.delta_store
             .write()
             .update_cell(row_id, column_name, new_value);
+        crate::storage::epoch::bump(&self.path);
     }
 
     /// Record a full row update in the delta store.
     pub fn delta_update_row(&self, row_id: u64, values: &HashMap<String, crate::data::Value>) {
         self.delta_store.write().update_row(row_id, values);
+        crate::storage::epoch::bump(&self.path);
     }
 
     fn row_active_for_delta_overlay(&self, row_id: u64) -> io::Result<bool> {
@@ -964,7 +983,269 @@ impl OnDemandStorage {
             return Ok(false);
         }
         self.delta_store.write().delete_row(row_id);
+        crate::storage::epoch::bump(&self.path);
         Ok(true)
+    }
+
+    /// Record already-resolved logical row IDs as deleted in one batch.
+    pub fn delta_delete_rows(&self, row_ids: &[u64]) -> usize {
+        let deleted = self.delta_store.write().delete_rows(row_ids);
+        if deleted > 0 {
+            crate::storage::epoch::bump(&self.path);
+        }
+        deleted
+    }
+
+    /// Match rows that still live in the append-only row delta.
+    pub fn delta_numeric_range_ids(
+        &self,
+        column_name: &str,
+        low: f64,
+        high: f64,
+    ) -> io::Result<Vec<u64>> {
+        let delta_path = Self::delta_path(&self.path);
+        let Ok(metadata) = std::fs::metadata(&delta_path) else {
+            DELTA_NUMERIC_RANGE_CACHE.write().remove(&delta_path);
+            return Ok(Vec::new());
+        };
+        let file_len = metadata.len();
+        let modified = metadata
+            .modified()
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let key = DeltaNumericRangeKey {
+            column: column_name.to_string(),
+            low_bits: low.to_bits(),
+            high_bits: high.to_bits(),
+        };
+
+        let (start, mut ids) = {
+            let cache = DELTA_NUMERIC_RANGE_CACHE.read();
+            match cache.get(&delta_path).and_then(|queries| queries.get(&key)) {
+                Some(entry) if entry.len == file_len && entry.modified >= modified => {
+                    let deleted = self.delta_store.read();
+                    return Ok(entry
+                        .ids
+                        .iter()
+                        .copied()
+                        .filter(|id| !deleted.is_deleted(*id))
+                        .collect());
+                }
+                Some(entry) if entry.len < file_len && entry.modified <= modified => {
+                    (entry.len, entry.ids.clone())
+                }
+                _ => (0, Vec::new()),
+            }
+        };
+
+        let mut file = File::open(&delta_path)?;
+        file.seek(SeekFrom::Start(start))?;
+        let mut bytes = Vec::with_capacity((file_len - start) as usize);
+        file.read_to_end(&mut bytes)?;
+        Self::scan_delta_numeric_range_bytes(&bytes, column_name, low, high, &mut ids)?;
+
+        {
+            let mut cache = DELTA_NUMERIC_RANGE_CACHE.write();
+            if cache.len() > 128 {
+                cache.clear();
+            }
+            let queries = cache.entry(delta_path).or_default();
+            if queries.len() > 32 && !queries.contains_key(&key) {
+                queries.clear();
+            }
+            queries.insert(
+                key,
+                DeltaNumericRangeEntry {
+                    len: file_len,
+                    modified,
+                    ids: ids.clone(),
+                },
+            );
+        }
+
+        let deleted = self.delta_store.read();
+        ids.retain(|id| !deleted.is_deleted(*id));
+        Ok(ids)
+    }
+
+    pub fn delta_string_equality_ids(
+        &self,
+        column_name: &str,
+        expected: &str,
+    ) -> io::Result<Vec<u64>> {
+        let mut ids = self.delta_string_match_ids(column_name, expected)?;
+        let deleted = self.delta_store.read();
+        ids.retain(|id| !deleted.is_deleted(*id));
+        Ok(ids)
+    }
+
+    pub fn pending_numeric_range_ids(
+        &self,
+        column_name: &str,
+        low: f64,
+        high: f64,
+    ) -> Vec<u64> {
+        let pending = self.pending_v4_in_memory_rows();
+        if pending == 0 {
+            return Vec::new();
+        }
+        let Some(column_index) = self.schema.read().get_index(column_name) else {
+            return Vec::new();
+        };
+        let ids = self.ids.read();
+        let columns = self.columns.read();
+        let Some(column) = columns.get(column_index) else {
+            return Vec::new();
+        };
+        let rows = pending.min(ids.len()).min(column.len());
+        let id_start = ids.len() - rows;
+        let value_start = column.len() - rows;
+        match column {
+            ColumnData::Int64(values) => (0..rows)
+                .filter_map(|offset| {
+                    let value = values[value_start + offset] as f64;
+                    (value >= low && value <= high).then_some(ids[id_start + offset])
+                })
+                .collect(),
+            ColumnData::Float64(values) => (0..rows)
+                .filter_map(|offset| {
+                    let value = values[value_start + offset];
+                    (value >= low && value <= high).then_some(ids[id_start + offset])
+                })
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    pub fn pending_string_equality_ids(&self, column_name: &str, expected: &str) -> Vec<u64> {
+        let pending = self.pending_v4_in_memory_rows();
+        if pending == 0 {
+            return Vec::new();
+        }
+        let Some(column_index) = self.schema.read().get_index(column_name) else {
+            return Vec::new();
+        };
+        let ids = self.ids.read();
+        let columns = self.columns.read();
+        let Some(column) = columns.get(column_index) else {
+            return Vec::new();
+        };
+        let rows = pending.min(ids.len()).min(column.len());
+        let id_start = ids.len() - rows;
+        let value_start = column.len() - rows;
+        (0..rows)
+            .filter_map(|offset| {
+                (Self::column_string_at(column, value_start + offset) == Some(expected))
+                    .then_some(ids[id_start + offset])
+            })
+            .collect()
+    }
+
+    #[inline]
+    pub fn persisted_row_count(&self) -> u64 {
+        self.persisted_row_count.load(Ordering::Relaxed)
+    }
+
+    fn scan_delta_numeric_range_bytes(
+        bytes: &[u8],
+        column_name: &str,
+        low: f64,
+        high: f64,
+        matched: &mut Vec<u64>,
+    ) -> io::Result<()> {
+        #[inline]
+        fn take<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> io::Result<&'a [u8]> {
+            let end = pos
+                .checked_add(len)
+                .ok_or_else(|| err_data("delta numeric scan offset overflow"))?;
+            if end > bytes.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "delta numeric scan truncated",
+                ));
+            }
+            let value = &bytes[*pos..end];
+            *pos = end;
+            Ok(value)
+        }
+
+        #[inline]
+        fn read_u16(bytes: &[u8], pos: &mut usize) -> io::Result<u16> {
+            Ok(u16::from_le_bytes(take(bytes, pos, 2)?.try_into().unwrap()))
+        }
+
+        #[inline]
+        fn read_u32(bytes: &[u8], pos: &mut usize) -> io::Result<u32> {
+            Ok(u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap()))
+        }
+
+        #[inline]
+        fn read_u64(bytes: &[u8], pos: &mut usize) -> io::Result<u64> {
+            Ok(u64::from_le_bytes(take(bytes, pos, 8)?.try_into().unwrap()))
+        }
+
+        let target = column_name.as_bytes();
+        let mut pos = 0usize;
+        while pos < bytes.len() {
+            let rows = read_u64(bytes, &mut pos)? as usize;
+            let ids = take(bytes, &mut pos, rows.saturating_mul(8))?;
+
+            let int_columns = read_u32(bytes, &mut pos)? as usize;
+            for _ in 0..int_columns {
+                let name_len = read_u16(bytes, &mut pos)? as usize;
+                let name = take(bytes, &mut pos, name_len)?;
+                let values = take(bytes, &mut pos, rows.saturating_mul(8))?;
+                if name == target {
+                    for row in 0..rows {
+                        let offset = row * 8;
+                        let value =
+                            i64::from_le_bytes(values[offset..offset + 8].try_into().unwrap())
+                                as f64;
+                        if value >= low && value <= high {
+                            matched.push(u64::from_le_bytes(
+                                ids[offset..offset + 8].try_into().unwrap(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let float_columns = read_u32(bytes, &mut pos)? as usize;
+            for _ in 0..float_columns {
+                let name_len = read_u16(bytes, &mut pos)? as usize;
+                let name = take(bytes, &mut pos, name_len)?;
+                let values = take(bytes, &mut pos, rows.saturating_mul(8))?;
+                if name == target {
+                    for row in 0..rows {
+                        let offset = row * 8;
+                        let value =
+                            f64::from_le_bytes(values[offset..offset + 8].try_into().unwrap());
+                        if value >= low && value <= high {
+                            matched.push(u64::from_le_bytes(
+                                ids[offset..offset + 8].try_into().unwrap(),
+                            ));
+                        }
+                    }
+                }
+            }
+
+            let string_columns = read_u32(bytes, &mut pos)? as usize;
+            for _ in 0..string_columns {
+                let name_len = read_u16(bytes, &mut pos)? as usize;
+                take(bytes, &mut pos, name_len)?;
+                for _ in 0..rows {
+                    let value_len = read_u32(bytes, &mut pos)? as usize;
+                    take(bytes, &mut pos, value_len)?;
+                }
+            }
+
+            let bool_columns = read_u32(bytes, &mut pos)? as usize;
+            for _ in 0..bool_columns {
+                let name_len = read_u16(bytes, &mut pos)? as usize;
+                take(bytes, &mut pos, name_len)?;
+                take(bytes, &mut pos, rows)?;
+            }
+        }
+        Ok(())
     }
 
     /// Record a full-row replacement in the delta store for an existing row.
@@ -977,6 +1258,7 @@ impl OnDemandStorage {
             return Ok(false);
         }
         self.delta_store.write().update_row(row_id, values);
+        crate::storage::epoch::bump(&self.path);
         Ok(true)
     }
 
@@ -985,6 +1267,7 @@ impl OnDemandStorage {
     pub fn delta_batch_update_rows(&self, batch: &[(u64, &str, crate::data::Value)]) {
         if !batch.is_empty() {
             self.delta_store.write().batch_update_rows(batch);
+            crate::storage::epoch::bump(&self.path);
         }
     }
 
@@ -1830,11 +2113,19 @@ impl OnDemandStorage {
             &string_columns,
             &bool_columns,
         )?;
-        Self::refresh_delta_insert_caches(&delta_path, delta_before, &ids, &string_columns);
+        Self::refresh_delta_insert_caches(
+            &self.path,
+            &delta_path,
+            delta_before,
+            &ids,
+            &string_columns,
+        );
+        crate::storage::epoch::bump(&self.path);
         Ok(ids)
     }
 
     fn refresh_delta_insert_caches(
+        table_path: &Path,
         delta_path: &Path,
         before: Option<(u64, std::time::SystemTime)>,
         ids: &[u64],
@@ -1842,6 +2133,9 @@ impl OnDemandStorage {
     ) {
         if ids.is_empty() {
             return;
+        }
+        if before.is_none() {
+            DELTA_NUMERIC_RANGE_CACHE.write().remove(delta_path);
         }
 
         let Ok(metadata) = std::fs::metadata(delta_path) else {
@@ -1851,6 +2145,7 @@ impl OnDemandStorage {
         let modified = metadata
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let epoch = crate::storage::epoch::current(table_path);
 
         {
             let mut cache = DELTA_ROW_COUNT_CACHE.write();
@@ -1859,7 +2154,10 @@ impl OnDemandStorage {
             }
             match before {
                 None => {
-                    cache.insert(delta_path.to_path_buf(), (file_len, modified, ids.len()));
+                    cache.insert(
+                        delta_path.to_path_buf(),
+                        (file_len, modified, ids.len(), epoch),
+                    );
                 }
                 Some((before_len, before_modified)) => {
                     if let Some(entry) = cache.get_mut(delta_path) {
@@ -1867,6 +2165,7 @@ impl OnDemandStorage {
                             entry.0 = file_len;
                             entry.1 = modified;
                             entry.2 += ids.len();
+                            entry.3 = epoch;
                         }
                     }
                 }
@@ -1898,6 +2197,7 @@ impl OnDemandStorage {
                     DeltaStringIndexCache {
                         len: file_len,
                         modified,
+                        epoch,
                         index,
                     },
                 );
@@ -1908,6 +2208,7 @@ impl OnDemandStorage {
                         append_strings(&mut entry.index);
                         entry.len = file_len;
                         entry.modified = modified;
+                        entry.epoch = epoch;
                     }
                 }
             }
@@ -2376,6 +2677,7 @@ impl OnDemandStorage {
         *self.delta_file.write() = None;
         let _ = std::fs::remove_file(&delta_path);
         let _ = std::fs::remove_file(Self::delta_meta_path(&delta_path));
+        DELTA_NUMERIC_RANGE_CACHE.write().remove(&delta_path);
 
         Ok(())
     }
@@ -2915,6 +3217,7 @@ impl OnDemandStorage {
         let modified = metadata
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        let epoch = crate::storage::epoch::current(&self.path);
 
         let mut cache = DELTA_STRING_INDEX_CACHE.write();
         if cache.len() > 128 {
@@ -2924,11 +3227,19 @@ impl OnDemandStorage {
         let entry = cache.entry(delta_path.clone()).or_insert_with(|| DeltaStringIndexCache {
             len: 0,
             modified: std::time::SystemTime::UNIX_EPOCH,
+            epoch,
             index: HashMap::new(),
         });
 
+        // This cache still observes the table epoch, but its contents are
+        // derived solely from the append-only `.delta` file. On an epoch
+        // change, matching file metadata is sufficient to adopt the new
+        // epoch without rebuilding an unchanged index.
         let up_to_date = entry.len == file_len && entry.modified >= modified;
-        let can_append = entry.len > 0 && entry.len < file_len && entry.modified <= modified;
+        let can_append = entry.len > 0
+            && entry.len < file_len
+            && entry.modified <= modified;
+        let epoch_changed = entry.epoch != epoch;
         if !up_to_date && !can_append {
             entry.len = 0;
             entry.index.clear();
@@ -2940,6 +3251,10 @@ impl OnDemandStorage {
             parse_delta_string_index(&bytes[start..], &mut entry.index)?;
             entry.len = file_len;
             entry.modified = modified;
+            entry.epoch = epoch;
+        }
+        if epoch_changed {
+            entry.epoch = epoch;
         }
 
         Ok(entry
@@ -3086,6 +3401,142 @@ impl OnDemandStorage {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
+    #[inline]
+    fn read_delta_bytes_bounded(file: &mut File, buffer: &mut [u8], snapshot_len: u64) -> bool {
+        let Ok(position) = file.stream_position() else {
+            return false;
+        };
+        let Some(end) = position.checked_add(buffer.len() as u64) else {
+            return false;
+        };
+        end <= snapshot_len && file.read_exact(buffer).is_ok()
+    }
+
+    #[inline]
+    fn skip_delta_bytes_bounded(file: &mut File, bytes: u64, snapshot_len: u64) -> bool {
+        let Ok(position) = file.stream_position() else {
+            return false;
+        };
+        let Some(end) = position.checked_add(bytes) else {
+            return false;
+        };
+        end <= snapshot_len && file.seek(SeekFrom::Start(end)).is_ok()
+    }
+
+    fn scan_delta_row_count(file: &mut File, snapshot_len: u64, mut total: usize) -> usize {
+        'records: loop {
+            let mut count_buf = [0u8; 8];
+            if !Self::read_delta_bytes_bounded(file, &mut count_buf, snapshot_len) {
+                break;
+            }
+            let record_count = u64::from_le_bytes(count_buf) as usize;
+            let Some(fixed_width_bytes) = (record_count as u64).checked_mul(8) else {
+                break;
+            };
+
+            // IDs
+            if !Self::skip_delta_bytes_bounded(file, fixed_width_bytes, snapshot_len) {
+                break;
+            }
+
+            // Int columns
+            let mut count_buf4 = [0u8; 4];
+            if !Self::read_delta_bytes_bounded(file, &mut count_buf4, snapshot_len) {
+                break;
+            }
+            let int_col_count = u32::from_le_bytes(count_buf4) as usize;
+            for _ in 0..int_col_count {
+                let mut len_buf = [0u8; 2];
+                if !Self::read_delta_bytes_bounded(file, &mut len_buf, snapshot_len) {
+                    break 'records;
+                }
+                let name_len = u16::from_le_bytes(len_buf) as u64;
+                let Some(column_bytes) = name_len.checked_add(fixed_width_bytes) else {
+                    break 'records;
+                };
+                if !Self::skip_delta_bytes_bounded(file, column_bytes, snapshot_len) {
+                    break 'records;
+                }
+            }
+
+            // Float columns
+            if !Self::read_delta_bytes_bounded(file, &mut count_buf4, snapshot_len) {
+                break;
+            }
+            let float_col_count = u32::from_le_bytes(count_buf4) as usize;
+            for _ in 0..float_col_count {
+                let mut len_buf = [0u8; 2];
+                if !Self::read_delta_bytes_bounded(file, &mut len_buf, snapshot_len) {
+                    break 'records;
+                }
+                let name_len = u16::from_le_bytes(len_buf) as u64;
+                let Some(column_bytes) = name_len.checked_add(fixed_width_bytes) else {
+                    break 'records;
+                };
+                if !Self::skip_delta_bytes_bounded(file, column_bytes, snapshot_len) {
+                    break 'records;
+                }
+            }
+
+            // String columns
+            if !Self::read_delta_bytes_bounded(file, &mut count_buf4, snapshot_len) {
+                break;
+            }
+            let string_col_count = u32::from_le_bytes(count_buf4) as usize;
+            for _ in 0..string_col_count {
+                let mut len_buf = [0u8; 2];
+                if !Self::read_delta_bytes_bounded(file, &mut len_buf, snapshot_len)
+                    || !Self::skip_delta_bytes_bounded(
+                        file,
+                        u16::from_le_bytes(len_buf) as u64,
+                        snapshot_len,
+                    )
+                {
+                    break 'records;
+                }
+                for _ in 0..record_count {
+                    let mut str_len_buf = [0u8; 4];
+                    if !Self::read_delta_bytes_bounded(file, &mut str_len_buf, snapshot_len)
+                        || !Self::skip_delta_bytes_bounded(
+                            file,
+                            u32::from_le_bytes(str_len_buf) as u64,
+                            snapshot_len,
+                        )
+                    {
+                        break 'records;
+                    }
+                }
+            }
+
+            // Bool columns
+            if !Self::read_delta_bytes_bounded(file, &mut count_buf4, snapshot_len) {
+                break;
+            }
+            let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
+            for _ in 0..bool_col_count {
+                let mut len_buf = [0u8; 2];
+                if !Self::read_delta_bytes_bounded(file, &mut len_buf, snapshot_len) {
+                    break 'records;
+                }
+                let Some(column_bytes) =
+                    (u16::from_le_bytes(len_buf) as u64).checked_add(record_count as u64)
+                else {
+                    break 'records;
+                };
+                if !Self::skip_delta_bytes_bounded(file, column_bytes, snapshot_len) {
+                    break 'records;
+                }
+            }
+
+            let Some(next_total) = total.checked_add(record_count) else {
+                break;
+            };
+            total = next_total;
+        }
+
+        total
+    }
+
     /// Get the total row count including delta rows (for accurate row_count reporting)
     fn delta_row_count(&self) -> usize {
         let delta_path = Self::delta_path(&self.path);
@@ -3098,11 +3549,31 @@ impl OnDemandStorage {
         let modified = metadata
             .modified()
             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-
+        let epoch = crate::storage::epoch::current(&self.path);
         {
             let cache = DELTA_ROW_COUNT_CACHE.read();
-            if let Some((cached_len, cached_modified, cached_count)) = cache.get(&delta_path) {
+            if let Some((cached_len, cached_modified, cached_count, observed_epoch)) =
+                cache.get(&delta_path)
+            {
+                if *observed_epoch == epoch
+                    && *cached_len == file_len
+                    && *cached_modified >= modified
+                {
+                    return *cached_count;
+                }
+            }
+        }
+
+        // An unrelated logical write may advance the table epoch without
+        // changing the append-only delta bytes. Revalidate that cheap file
+        // identity once, then let subsequent reads use the normal epoch hit.
+        {
+            let mut cache = DELTA_ROW_COUNT_CACHE.write();
+            if let Some((cached_len, cached_modified, cached_count, observed_epoch)) =
+                cache.get_mut(&delta_path)
+            {
                 if *cached_len == file_len && *cached_modified >= modified {
+                    *observed_epoch = epoch;
                     return *cached_count;
                 }
             }
@@ -3110,7 +3581,7 @@ impl OnDemandStorage {
 
         let (start, mut total) = {
             let cache = DELTA_ROW_COUNT_CACHE.read();
-            if let Some((cached_len, cached_modified, cached_count)) = cache.get(&delta_path) {
+            if let Some((cached_len, cached_modified, cached_count, _)) = cache.get(&delta_path) {
                 if *cached_len < file_len && *cached_modified <= modified {
                     (*cached_len, *cached_count)
                 } else {
@@ -3129,118 +3600,21 @@ impl OnDemandStorage {
             let _ = file.seek(SeekFrom::Start(0));
         }
 
-        loop {
-            let mut count_buf = [0u8; 8];
-            match file.read_exact(&mut count_buf) {
-                Ok(_) => {}
-                Err(_) => break,
-            }
-            let record_count = u64::from_le_bytes(count_buf) as usize;
-            total += record_count;
-
-            // Skip the rest of this record block
-            // IDs
-            if file
-                .seek(SeekFrom::Current((record_count * 8) as i64))
-                .is_err()
-            {
-                break;
-            }
-
-            // Int columns
-            let mut count_buf4 = [0u8; 4];
-            if file.read_exact(&mut count_buf4).is_err() {
-                break;
-            }
-            let int_col_count = u32::from_le_bytes(count_buf4) as usize;
-            for _ in 0..int_col_count {
-                let mut len_buf = [0u8; 2];
-                if file.read_exact(&mut len_buf).is_err() {
-                    break;
-                }
-                let name_len = u16::from_le_bytes(len_buf) as usize;
-                if file
-                    .seek(SeekFrom::Current(
-                        name_len as i64 + (record_count * 8) as i64,
-                    ))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-
-            // Float columns
-            if file.read_exact(&mut count_buf4).is_err() {
-                break;
-            }
-            let float_col_count = u32::from_le_bytes(count_buf4) as usize;
-            for _ in 0..float_col_count {
-                let mut len_buf = [0u8; 2];
-                if file.read_exact(&mut len_buf).is_err() {
-                    break;
-                }
-                let name_len = u16::from_le_bytes(len_buf) as usize;
-                if file
-                    .seek(SeekFrom::Current(
-                        name_len as i64 + (record_count * 8) as i64,
-                    ))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-
-            // String columns - variable length, need to read each
-            if file.read_exact(&mut count_buf4).is_err() {
-                break;
-            }
-            let string_col_count = u32::from_le_bytes(count_buf4) as usize;
-            for _ in 0..string_col_count {
-                let mut len_buf = [0u8; 2];
-                if file.read_exact(&mut len_buf).is_err() {
-                    break;
-                }
-                let name_len = u16::from_le_bytes(len_buf) as usize;
-                if file.seek(SeekFrom::Current(name_len as i64)).is_err() {
-                    break;
-                }
-                for _ in 0..record_count {
-                    let mut str_len_buf = [0u8; 4];
-                    if file.read_exact(&mut str_len_buf).is_err() {
-                        break;
-                    }
-                    let str_len = u32::from_le_bytes(str_len_buf) as usize;
-                    if file.seek(SeekFrom::Current(str_len as i64)).is_err() {
-                        break;
-                    }
-                }
-            }
-
-            // Bool columns
-            if file.read_exact(&mut count_buf4).is_err() {
-                break;
-            }
-            let bool_col_count = u32::from_le_bytes(count_buf4) as usize;
-            for _ in 0..bool_col_count {
-                let mut len_buf = [0u8; 2];
-                if file.read_exact(&mut len_buf).is_err() {
-                    break;
-                }
-                let name_len = u16::from_le_bytes(len_buf) as usize;
-                if file
-                    .seek(SeekFrom::Current(name_len as i64 + record_count as i64))
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        }
+        total = Self::scan_delta_row_count(&mut file, file_len, total);
 
         let mut cache = DELTA_ROW_COUNT_CACHE.write();
         if cache.len() > 128 {
             cache.clear();
         }
-        cache.insert(delta_path, (file_len, modified, total));
+        cache.insert(
+            delta_path,
+            (
+                file_len,
+                modified,
+                total,
+                epoch,
+            ),
+        );
         total
     }
 }

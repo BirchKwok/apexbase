@@ -36,6 +36,22 @@ def test_register_temp_table_csv(temp_dir):
     client.close()
 
 
+def test_register_temp_table_csv_skips_bad_lines(temp_dir):
+    csv_path = os.path.join(temp_dir, "dirty.csv")
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write("name,age\nAlice,30\nbroken,40,extra\nBob,25\n")
+
+    strict = ApexClient(dirpath=temp_dir)
+    strict.create_table("_dummy")
+    strict.use_table("_dummy")
+    with pytest.raises(Exception):
+        strict.register_temp_table("strict_dirty", csv_path)
+    strict.register_temp_table("cleaned", csv_path, on_bad_lines="skip")
+    rows = strict.execute("SELECT name, age FROM cleaned ORDER BY name").to_dict()
+    assert rows == [{"name": "Alice", "age": 30}, {"name": "Bob", "age": 25}]
+    strict.close()
+
+
 def test_register_temp_table_json_ndjson(temp_dir):
     client = ApexClient(temp_dir, drop_if_exists=True)
     client.create_table("_dummy")

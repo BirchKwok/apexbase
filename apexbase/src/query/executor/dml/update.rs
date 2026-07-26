@@ -1,7 +1,7 @@
 use super::*;
 
 impl ApexExecutor {
-    pub(super) fn execute_update(
+    pub(in crate::query::executor) fn execute_update(
         storage_path: &Path,
         assignments: &[(String, SqlExpr)],
         where_clause: Option<&SqlExpr>,
@@ -14,6 +14,7 @@ impl ApexExecutor {
                 "Table does not exist",
             ));
         }
+        let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
@@ -78,6 +79,7 @@ impl ApexExecutor {
         if indexed_cols.is_empty()
             && !fts_enabled
             && !storage.storage.has_constraints()
+            && !storage.has_delta()
             && storage.pending_v4_in_memory_rows() == 0
         {
             let all_lit = assignments
@@ -753,7 +755,7 @@ impl ApexExecutor {
         Ok(ApexResult::Scalar(updated))
     }
 
-    pub(super) fn extract_numeric_range_from_where(expr: &SqlExpr) -> Option<(String, f64, f64)> {
+    pub(in crate::query::executor) fn extract_numeric_range_from_where(expr: &SqlExpr) -> Option<(String, f64, f64)> {
         match expr {
             SqlExpr::Between {
                 column,
@@ -821,7 +823,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn literal_to_f64(expr: &SqlExpr) -> Option<f64> {
+    pub(in crate::query::executor) fn literal_to_f64(expr: &SqlExpr) -> Option<f64> {
         match expr {
             SqlExpr::Literal(Value::Int64(v)) => Some(*v as f64),
             SqlExpr::Literal(Value::Float64(v)) => Some(*v),
@@ -829,13 +831,13 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn collect_column_refs(expr: &SqlExpr) -> Vec<String> {
+    pub(in crate::query::executor) fn collect_column_refs(expr: &SqlExpr) -> Vec<String> {
         let mut refs = Vec::new();
         Self::collect_column_refs_inner(expr, &mut refs);
         refs
     }
 
-    pub(super) fn collect_column_refs_inner(expr: &SqlExpr, refs: &mut Vec<String>) {
+    pub(in crate::query::executor) fn collect_column_refs_inner(expr: &SqlExpr, refs: &mut Vec<String>) {
         match expr {
             SqlExpr::Column(name) => refs.push(name.trim_matches('"').to_string()),
             SqlExpr::BinaryOp { left, right, .. } => {
@@ -883,7 +885,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn get_value_at(array: &ArrayRef, row: usize) -> Option<Value> {
+    pub(in crate::query::executor) fn get_value_at(array: &ArrayRef, row: usize) -> Option<Value> {
         if array.is_null(row) {
             return Some(Value::Null);
         }
@@ -902,7 +904,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn evaluate_expr_to_value(
+    pub(in crate::query::executor) fn evaluate_expr_to_value(
         batch: &RecordBatch,
         expr: &SqlExpr,
         row: usize,

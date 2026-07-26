@@ -98,20 +98,11 @@ pub struct TableStats {
     pub source_size: u64,
 }
 
-/// Global stats cache: table_path → TableStats
-static STATS_CACHE: Lazy<RwLock<HashMap<String, TableStats>>> =
+/// Global stats cache: table_path → (TableStats, observed table epoch)
+static STATS_CACHE: Lazy<RwLock<HashMap<String, (TableStats, u64)>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 const STATS_SCHEMA_VERSION: u32 = 1;
-
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
-struct TableGeneration {
-    schema: u64,
-    data: u64,
-}
-
-static TABLE_GENERATIONS: Lazy<RwLock<HashMap<String, TableGeneration>>> =
-    Lazy::new(|| RwLock::new(HashMap::new()));
 
 #[derive(Debug, Clone)]
 struct PlanFeedback {
@@ -126,23 +117,26 @@ static PLAN_FEEDBACK: Lazy<RwLock<HashMap<u64, PlanFeedback>>> =
 
 /// Store ANALYZE results into the stats cache
 pub fn store_table_stats(table_key: &str, mut stats: TableStats) {
-    let generation = current_generation(table_key);
     stats.schema_version = STATS_SCHEMA_VERSION;
-    stats.schema_generation = generation.schema;
-    stats.data_generation = generation.data;
+    stats.schema_generation = 0;
+    stats.data_generation = 0;
     if let Ok(data) = bincode::serialize(&stats) {
         let _ = std::fs::write(stats_sidecar_path(table_key), data);
     }
-    if let Ok(data) = bincode::serialize(&generation) {
-        let _ = std::fs::write(generation_sidecar_path(table_key), data);
-    }
-    STATS_CACHE.write().insert(table_key.to_string(), stats);
+    let epoch = crate::storage::epoch::current(std::path::Path::new(table_key));
+    STATS_CACHE
+        .write()
+        .insert(table_key.to_string(), (stats, epoch));
 }
 
 /// Retrieve cached stats for a table
 pub fn get_table_stats(table_key: &str) -> Option<TableStats> {
-    if let Some(stats) = STATS_CACHE.read().get(table_key).cloned() {
-        return stats_are_fresh(table_key, &stats).then_some(stats);
+    let epoch = crate::storage::epoch::current(std::path::Path::new(table_key));
+    if let Some((stats, observed_epoch)) = STATS_CACHE.read().get(table_key).cloned() {
+        if observed_epoch == epoch {
+            return stats_are_fresh(table_key, &stats).then_some(stats);
+        }
+        STATS_CACHE.write().remove(table_key);
     }
 
     let sidecar = stats_sidecar_path(table_key);
@@ -153,29 +147,18 @@ pub fn get_table_stats(table_key: &str) -> Option<TableStats> {
     }
     STATS_CACHE
         .write()
-        .insert(table_key.to_string(), stats.clone());
+        .insert(table_key.to_string(), (stats.clone(), epoch));
     Some(stats)
 }
 
 /// Invalidate stats for a table (e.g., after DML)
 pub fn invalidate_table_stats(table_key: &str) {
     STATS_CACHE.write().remove(table_key);
-    let mut generations = TABLE_GENERATIONS.write();
-    let generation = generations
-        .entry(table_key.to_string())
-        .or_insert_with(|| load_generation(table_key));
-    generation.data = generation.data.saturating_add(1);
 }
 
 /// Invalidate statistics after a schema-changing DDL operation.
 pub fn invalidate_table_schema_stats(table_key: &str) {
     STATS_CACHE.write().remove(table_key);
-    let mut generations = TABLE_GENERATIONS.write();
-    let generation = generations
-        .entry(table_key.to_string())
-        .or_insert_with(|| load_generation(table_key));
-    generation.schema = generation.schema.saturating_add(1);
-    generation.data = generation.data.saturating_add(1);
 }
 
 fn feedback_key(table_key: &str, select: &SelectStatement) -> u64 {
@@ -214,28 +197,6 @@ fn stats_sidecar_path(table_key: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}.cbo_stats", table_key))
 }
 
-fn generation_sidecar_path(table_key: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(format!("{}.cbo_generation", table_key))
-}
-
-fn load_generation(table_key: &str) -> TableGeneration {
-    std::fs::read(generation_sidecar_path(table_key))
-        .ok()
-        .and_then(|data| bincode::deserialize(&data).ok())
-        .unwrap_or_default()
-}
-
-fn current_generation(table_key: &str) -> TableGeneration {
-    if let Some(generation) = TABLE_GENERATIONS.read().get(table_key).copied() {
-        return generation;
-    }
-    let loaded = load_generation(table_key);
-    TABLE_GENERATIONS
-        .write()
-        .insert(table_key.to_string(), loaded);
-    loaded
-}
-
 fn table_data_paths(table_key: &str) -> [std::path::PathBuf; 3] {
     let base = std::path::PathBuf::from(table_key);
     let name = base.file_name().unwrap_or_default().to_string_lossy();
@@ -255,10 +216,6 @@ pub fn table_data_size(table_key: &str) -> u64 {
 
 fn stats_are_fresh(table_key: &str, stats: &TableStats) -> bool {
     if stats.schema_version != STATS_SCHEMA_VERSION {
-        return false;
-    }
-    let generation = current_generation(table_key);
-    if stats.schema_generation != generation.schema || stats.data_generation != generation.data {
         return false;
     }
     let paths = table_data_paths(table_key);

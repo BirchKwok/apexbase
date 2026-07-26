@@ -5,7 +5,11 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 
 ## Unreleased
 
-- No unreleased changes recorded yet. New features and fixes will be listed here before the next public release.
+- Fix `REPLACE(...)` parsing in general expressions while preserving `SELECT * REPLACE (...)`.
+- Add SQL scientific-notation literals and move single-query vector TopK to binary FFI parameters.
+- Execute expression equality JOIN keys with hash join instead of Cartesian materialization.
+- Add `error`, `skip`, and `warn` malformed-row policies to CSV table functions, COPY, and temporary-table registration.
+- Align `metric="cosine"` with documented cosine-distance semantics; older releases could return the least similar rows for this alias.
 
 ---
 

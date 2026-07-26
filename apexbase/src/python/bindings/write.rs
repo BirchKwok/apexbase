@@ -12,6 +12,7 @@ impl ApexStorageImpl {
     fn store(&self, py: Python<'_>, data: &Bound<'_, PyDict>) -> PyResult<i64> {
         let fields = dict_to_values(data)?;
         let (table_path, table_name) = self.get_current_table_info()?;
+        let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let durability = self.durability;
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
@@ -63,6 +64,7 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let durability = self.durability;
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
@@ -162,10 +164,7 @@ impl ApexStorageImpl {
                                     })
                                     .collect();
                                 let _ = py.allow_threads(|| {
-                                    crate::query::executor::wait_fts_backfill(
-                                        &base_dir,
-                                        &table_name,
-                                    );
+                                    crate::Database::wait_fts_backfill(&base_dir, &table_name);
                                     engine.add_documents_arrow_str(&doc_ids_u64, columns_ref)
                                 });
                             }
@@ -256,24 +255,23 @@ impl ApexStorageImpl {
         let durability = self.durability;
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
         let result = py.allow_threads(|| {
-            crate::storage::engine::engine()
-                .write_typed(
-                    &table_path,
-                    int_columns,
-                    float_columns,
-                    string_columns,
-                    binary_columns_map,
-                    fixedlist_columns_map,
-                    bool_columns,
-                    null_positions,
-                    durability,
-                )
-                .map_err(|e| PyIOError::new_err(e.to_string()))
+            crate::Database::write_typed(
+                &table_path,
+                int_columns,
+                float_columns,
+                string_columns,
+                binary_columns_map,
+                fixedlist_columns_map,
+                bool_columns,
+                null_positions,
+                durability,
+            )
+            .map_err(|e| PyIOError::new_err(e.to_string()))
         })?;
 
         self.invalidate_backend(&table_name);
         #[cfg(target_os = "windows")]
-        crate::storage::engine::engine().invalidate(&table_path);
+        crate::Database::invalidate(&table_path);
 
         Ok(result.into_iter().map(|id| id as i64).collect())
     }
@@ -319,7 +317,7 @@ impl ApexStorageImpl {
         if let Some(id) = Self::try_insert_schema_stable_borrowed_row(row, &schema, &backend)? {
             let cache_key = Self::backend_cache_key(&table_path, &table_name);
             self.cached_backends.insert(cache_key, Arc::clone(&backend));
-            crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
+            crate::Database::cache_backend(&table_path, Arc::clone(&backend));
             crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
 
             let database = self.current_database.read().clone();
@@ -452,7 +450,7 @@ impl ApexStorageImpl {
 
         let cache_key = Self::backend_cache_key(&table_path, &table_name);
         self.cached_backends.insert(cache_key, Arc::clone(&backend));
-        crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
+        crate::Database::cache_backend(&table_path, Arc::clone(&backend));
         crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
 
         Ok(Some(result.into_iter().map(|id| id as i64).collect()))
@@ -535,7 +533,7 @@ impl ApexStorageImpl {
         // and rescan the delta file. Read/query caches must still be invalidated.
         self.cached_backends
             .remove(&Self::backend_cache_key(&table_path, &table_name));
-        crate::query::executor::invalidate_storage_cache(&table_path);
+        crate::Database::invalidate_query_cache(&table_path);
         crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
         crate::Database::notify_indexes_after_write(&table_path, &ids);
 
@@ -622,7 +620,7 @@ impl ApexStorageImpl {
         })?;
         self.cached_backends
             .remove(&Self::backend_cache_key(&table_path, &table_name));
-        crate::query::executor::invalidate_storage_cache(&table_path);
+        crate::Database::invalidate_query_cache(&table_path);
         crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
         crate::Database::notify_indexes_after_write(&table_path, &ids);
 
@@ -692,7 +690,7 @@ impl ApexStorageImpl {
         let ids = result?;
         self.cached_backends
             .remove(&Self::backend_cache_key(&table_path, &table_name));
-        crate::query::executor::invalidate_storage_cache(&table_path);
+        crate::Database::invalidate_query_cache(&table_path);
         crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
 
         Ok(Some(ids.into_iter().map(|id| id as i64).collect()))
@@ -964,20 +962,18 @@ impl ApexStorageImpl {
                 None
             };
 
-            let engine = crate::storage::engine::engine();
-            let result = engine
-                .write_typed(
-                    &table_path,
-                    int_columns,
-                    float_columns,
-                    string_columns,
-                    binary_columns_map,
-                    fixedlist_columns_map,
-                    bool_columns,
-                    null_positions,
-                    durability,
-                )
-                .map_err(|e| PyIOError::new_err(e.to_string()));
+            let result = crate::Database::write_typed(
+                &table_path,
+                int_columns,
+                float_columns,
+                string_columns,
+                binary_columns_map,
+                fixedlist_columns_map,
+                bool_columns,
+                null_positions,
+                durability,
+            )
+            .map_err(|e| PyIOError::new_err(e.to_string()));
 
             if let Some(lf) = lock_file {
                 Self::release_lock(lf);
@@ -993,7 +989,7 @@ impl ApexStorageImpl {
         // Clearing it ensures set_len() in subsequent transaction-commit delete paths succeeds
         // (ERROR_USER_MAPPED_FILE / os error 1224 is triggered when any mmap is open).
         #[cfg(target_os = "windows")]
-        crate::storage::engine::engine().invalidate(&table_path);
+        crate::Database::invalidate(&table_path);
 
         // Index in FTS if enabled - OPTIMIZED: Use add_documents_arrow_str (🥈 zero-copy &str path)
         {
@@ -1036,10 +1032,7 @@ impl ApexStorageImpl {
                                     })
                                     .collect();
                                 let _ = py.allow_threads(|| {
-                                    crate::query::executor::wait_fts_backfill(
-                                        &base_dir,
-                                        &table_name,
-                                    );
+                                    crate::Database::wait_fts_backfill(&base_dir, &table_name);
                                     engine.add_documents_arrow_str(&doc_ids_u64, columns_ref)
                                 });
                             }
@@ -1094,7 +1087,7 @@ impl ApexStorageImpl {
             let joined = fields.values().cloned().collect::<Vec<_>>().join(" ");
             let doc_id = id as u64;
             py.allow_threads(|| {
-                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+                crate::Database::wait_fts_backfill(&base_dir, &table_name);
                 if let Ok(engine) = m.get_engine(&table_name) {
                     let doc_ids = [doc_id];
                     let texts = [joined.as_str()];
@@ -1108,6 +1101,7 @@ impl ApexStorageImpl {
 
     fn delete(&self, py: Python<'_>, id: i64) -> PyResult<bool> {
         let (table_path, table_name) = self.get_current_table_info()?;
+        let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let durability = self.durability;
 
         if id < 0 {
@@ -1123,7 +1117,7 @@ impl ApexStorageImpl {
             if !backend.storage.has_constraints() {
                 if backend.delete_pending_v4_in_memory_row(id as u64) {
                     self.replace_exact_row_cache.remove(&replace_cache_key);
-                    crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
+                    crate::Database::cache_backend(&table_path, Arc::clone(&backend));
                     crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
                     return Ok(true);
                 }
@@ -1135,7 +1129,7 @@ impl ApexStorageImpl {
                 })?;
                 if result {
                     self.replace_exact_row_cache.remove(&replace_cache_key);
-                    crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
+                    crate::Database::cache_backend(&table_path, Arc::clone(&backend));
                     crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
                 }
                 return Ok(result);
@@ -1154,9 +1148,7 @@ impl ApexStorageImpl {
             };
 
             // Use StorageEngine for unified delete
-            let engine = crate::storage::engine::engine();
-            let result = engine
-                .delete_one(&table_path, id as u64, durability)
+            let result = crate::Database::delete_one(&table_path, id as u64, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
             if let Some(lf) = lock_file {
@@ -1179,6 +1171,7 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let durability = self.durability;
 
         if durability == DurabilityLevel::Fast
@@ -1212,7 +1205,7 @@ impl ApexStorageImpl {
                         ));
                 }
                 if !deleted_ids.is_empty() {
-                    crate::query::executor::cache_backend_pub(&table_path, Arc::clone(&backend));
+                    crate::Database::cache_backend(&table_path, Arc::clone(&backend));
                     crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
                 }
                 return Ok(!deleted_ids.is_empty());
@@ -1232,9 +1225,7 @@ impl ApexStorageImpl {
             };
 
             // Use StorageEngine for unified delete
-            let engine = crate::storage::engine::engine();
-            let deleted = engine
-                .delete(&table_path, &ids_u64, durability)
+            let deleted = crate::Database::delete(&table_path, &ids_u64, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
             if let Some(lf) = lock_file {
@@ -1260,17 +1251,16 @@ impl ApexStorageImpl {
         let base_dir = self.current_base_dir();
         let root_dir = self.root_dir.clone();
         let exec_result = py.allow_threads(|| {
-            crate::query::executor::set_query_root_dir(&root_dir);
-            let exec_result = crate::Database::execute(&sql, &base_dir, &table_path);
-            crate::query::executor::clear_query_root_dir();
-            exec_result
+            crate::Session::new(&base_dir, &table_path)
+                .with_root_dir(&root_dir)
+                .execute(&sql)
         });
         let result = exec_result.map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         // Invalidate cached backend since data changed
         self.invalidate_backend(&table_name);
         // Invalidate StorageEngine cache so count_rows() sees updated state
-        crate::storage::engine::engine().invalidate(&table_path);
+        crate::Database::invalidate(&table_path);
 
         // Extract scalar result (number of deleted rows)
         match result {
@@ -1289,17 +1279,16 @@ impl ApexStorageImpl {
         let base_dir = self.current_base_dir();
         let root_dir = self.root_dir.clone();
         let exec_result = py.allow_threads(|| {
-            crate::query::executor::set_query_root_dir(&root_dir);
-            let exec_result = crate::Database::execute(&sql, &base_dir, &table_path);
-            crate::query::executor::clear_query_root_dir();
-            exec_result
+            crate::Session::new(&base_dir, &table_path)
+                .with_root_dir(&root_dir)
+                .execute(&sql)
         });
         let result = exec_result.map_err(|e| PyIOError::new_err(e.to_string()))?;
 
         // Invalidate cached backend since data changed
         self.invalidate_backend(&table_name);
         // Invalidate StorageEngine cache so count_rows() sees updated state
-        crate::storage::engine::engine().invalidate(&table_path);
+        crate::Database::invalidate(&table_path);
 
         // Extract scalar result (number of deleted rows)
         match result {
@@ -1319,6 +1308,7 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let backend_cache_key = Self::backend_cache_key(&table_path, &table_name);
         let cache_key = format!("{}\0{}", backend_cache_key, column);
         let replace_cache_key = Self::replace_row_cache_key(&table_path, &table_name, id as u64);
@@ -1328,15 +1318,13 @@ impl ApexStorageImpl {
             .get(&backend_cache_key)
             .map(|v| Arc::clone(&v))
             .or_else(|| {
-                crate::query::get_cached_backend_pub(&table_path)
-                    .ok()
-                    .map(|b| {
-                        self.cached_backends
-                            .insert(backend_cache_key.clone(), Arc::clone(&b));
-                        b
-                    })
+                crate::Database::cached_backend(&table_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(backend_cache_key.clone(), Arc::clone(&b));
+                    b
+                })
             })
-            .or_else(|| TableStorageBackend::open(&table_path).ok().map(Arc::new));
+            .or_else(|| crate::Database::open_backend(&table_path, DurabilityLevel::Fast).ok());
 
         let Some(backend) = backend_opt else {
             return Ok(None);
@@ -1345,8 +1333,16 @@ impl ApexStorageImpl {
             return Ok(None);
         }
 
-        let col_type = if let Some(entry) = self.update_by_id_numeric_cache.get(&cache_key) {
-            *entry.value()
+        let table_epoch = crate::storage::epoch::current(&table_path);
+        let cached_col_type = self
+            .update_by_id_numeric_cache
+            .get(&cache_key)
+            .and_then(|entry| (entry.value().1 == table_epoch).then_some(entry.value().0));
+        if cached_col_type.is_none() {
+            self.update_by_id_numeric_cache.remove(&cache_key);
+        }
+        let col_type = if let Some(col_type) = cached_col_type {
+            col_type
         } else {
             let base_dir = table_path
                 .parent()
@@ -1394,7 +1390,8 @@ impl ApexStorageImpl {
             if !is_numeric {
                 return Ok(None);
             }
-            self.update_by_id_numeric_cache.insert(cache_key, col_type);
+            self.update_by_id_numeric_cache
+                .insert(cache_key, (col_type, table_epoch));
             col_type
         };
 
@@ -1415,8 +1412,14 @@ impl ApexStorageImpl {
         };
 
         let cell_cache_key = format!("{}\0{}\0{}", backend_cache_key, column, id);
-        if let Some(entry) = self.update_by_id_cell_cache.get(&cell_cache_key) {
-            let cached = *entry.value();
+        let cached_cell = self
+            .update_by_id_cell_cache
+            .get(&cell_cache_key)
+            .and_then(|entry| (entry.value().1 == table_epoch).then_some(entry.value().0));
+        if cached_cell.is_none() {
+            self.update_by_id_cell_cache.remove(&cell_cache_key);
+        }
+        if let Some(cached) = cached_cell {
             match backend.storage.update_numeric_cell_cached(
                 cached.footer_offset,
                 cached.null_byte_file_offset,
@@ -1426,9 +1429,13 @@ impl ApexStorageImpl {
             ) {
                 Ok(Some((n, physically_written))) => {
                     if physically_written {
+                        self.update_by_id_cell_cache.insert(
+                            cell_cache_key.clone(),
+                            (cached, crate::storage::epoch::current(&table_path)),
+                        );
                         self.replace_exact_row_cache.remove(&replace_cache_key);
-                        crate::storage::engine::engine().invalidate(&table_path);
-                        crate::query::executor::invalidate_storage_cache(&table_path);
+                        crate::Database::invalidate(&table_path);
+                        crate::Database::invalidate_query_cache(&table_path);
                         crate::query::planner::invalidate_table_stats(
                             &table_path.to_string_lossy(),
                         );
@@ -1454,8 +1461,6 @@ impl ApexStorageImpl {
                     null_mask,
                     value_file_offset,
                 };
-                self.update_by_id_cell_cache
-                    .insert(cell_cache_key.clone(), cached);
                 match backend.storage.update_numeric_cell_cached(
                     cached.footer_offset,
                     cached.null_byte_file_offset,
@@ -1465,9 +1470,13 @@ impl ApexStorageImpl {
                 ) {
                     Ok(Some((n, physically_written))) => {
                         if physically_written {
+                            self.update_by_id_cell_cache.insert(
+                                cell_cache_key.clone(),
+                                (cached, crate::storage::epoch::current(&table_path)),
+                            );
                             self.replace_exact_row_cache.remove(&replace_cache_key);
-                            crate::storage::engine::engine().invalidate(&table_path);
-                            crate::query::executor::invalidate_storage_cache(&table_path);
+                            crate::Database::invalidate(&table_path);
+                            crate::Database::invalidate_query_cache(&table_path);
                             crate::query::planner::invalidate_table_stats(
                                 &table_path.to_string_lossy(),
                             );
@@ -1486,8 +1495,8 @@ impl ApexStorageImpl {
             Ok(Some((n, physically_written))) => {
                 if physically_written {
                     self.replace_exact_row_cache.remove(&replace_cache_key);
-                    crate::storage::engine::engine().invalidate(&table_path);
-                    crate::query::executor::invalidate_storage_cache(&table_path);
+                    crate::Database::invalidate(&table_path);
+                    crate::Database::invalidate_query_cache(&table_path);
                     crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
                 }
                 Ok(Some(n))
@@ -1503,14 +1512,25 @@ impl ApexStorageImpl {
         }
 
         let table_path = self.get_current_table_path()?;
+        let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let table_name = self.current_table.read().clone();
         let durability = self.durability;
         let replace_cache_key = Self::replace_row_cache_key(&table_path, &table_name, id as u64);
 
-        if let Some(entry) = self.replace_exact_row_cache.get(&replace_cache_key) {
-            if Self::py_dict_matches_exact_fields(data, entry.value())? {
-                return Ok(true);
-            }
+        let table_epoch = crate::storage::epoch::current(&table_path);
+        let stale_replace =
+            if let Some(entry) = self.replace_exact_row_cache.get(&replace_cache_key) {
+                if entry.value().1 == table_epoch
+                    && Self::py_dict_matches_exact_fields(data, &entry.value().0)?
+                {
+                    return Ok(true);
+                }
+                entry.value().1 != table_epoch
+            } else {
+                false
+            };
+        if stale_replace {
+            self.replace_exact_row_cache.remove(&replace_cache_key);
         }
 
         if let Ok(backend) = self.get_backend_for_overlay(py, &table_path, &table_name) {
@@ -1560,12 +1580,11 @@ impl ApexStorageImpl {
                             .map_err(|e| PyIOError::new_err(e.to_string()))
                     })?;
                     if result {
-                        self.replace_exact_row_cache
-                            .insert(replace_cache_key.clone(), fields.clone());
-                        crate::query::executor::cache_backend_pub(
-                            &table_path,
-                            Arc::clone(&backend),
+                        self.replace_exact_row_cache.insert(
+                            replace_cache_key.clone(),
+                            (fields.clone(), crate::storage::epoch::current(&table_path)),
                         );
+                        crate::Database::cache_backend(&table_path, Arc::clone(&backend));
                         crate::query::planner::invalidate_table_stats(
                             &table_path.to_string_lossy(),
                         );
@@ -1581,9 +1600,7 @@ impl ApexStorageImpl {
         let result = py.allow_threads(|| -> PyResult<bool> {
             let lock_file = Self::acquire_write_lock(&table_path)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            let engine = crate::storage::engine::engine();
-            let result = engine
-                .replace(&table_path, id as u64, &fields, durability)
+            let result = crate::Database::replace(&table_path, id as u64, &fields, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
             Self::release_lock(lock_file);
             result
@@ -1629,9 +1646,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             // Use StorageEngine for unified add_column
-            let engine = crate::storage::engine::engine();
-            let result = engine
-                .add_column(&table_path, &column_name, dtype, durability)
+            let result = crate::Database::add_column(&table_path, &column_name, dtype, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
             Self::release_lock(lock_file);
@@ -1659,9 +1674,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             // Use StorageEngine for unified drop_column
-            let engine = crate::storage::engine::engine();
-            let result = engine
-                .drop_column(&table_path, &column_name, durability)
+            let result = crate::Database::drop_column(&table_path, &column_name, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
             Self::release_lock(lock_file);
@@ -1687,10 +1700,9 @@ impl ApexStorageImpl {
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             // Use StorageEngine for unified rename_column
-            let engine = crate::storage::engine::engine();
-            let result = engine
-                .rename_column(&table_path, &old_name, &new_name, durability)
-                .map_err(|e| PyIOError::new_err(e.to_string()));
+            let result =
+                crate::Database::rename_column(&table_path, &old_name, &new_name, durability)
+                    .map_err(|e| PyIOError::new_err(e.to_string()));
 
             Self::release_lock(lock_file);
             result
@@ -1716,7 +1728,7 @@ impl ApexStorageImpl {
             Self::insert_backend_cache_key(&table_path, &table_name),
         ] {
             if let Some(entry) = self.cached_backends.get(&cache_key) {
-                let backend = Arc::clone(entry.value());
+                let backend = entry;
                 if !backends.iter().any(|cached| Arc::ptr_eq(cached, &backend)) {
                     backends.push(backend);
                 }
@@ -1777,8 +1789,8 @@ impl ApexStorageImpl {
         })?;
 
         if any_needs_save {
-            crate::storage::engine::engine().invalidate(&table_path);
-            crate::query::executor::invalidate_storage_cache(&table_path);
+            crate::Database::invalidate(&table_path);
+            crate::Database::invalidate_query_cache(&table_path);
             crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
             self.invalidate_backend(&table_name);
         }
@@ -1827,22 +1839,22 @@ impl ApexStorageImpl {
         let base_dir = self.current_base_dir();
         let pending_backends: Vec<Arc<TableStorageBackend>> = self
             .cached_backends
-            .iter()
-            .filter_map(|entry| {
-                let backend = entry.value();
+            .all_backends()
+            .into_iter()
+            .filter_map(|backend| {
                 if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
-                    Some(Arc::clone(backend))
+                    Some(backend)
                 } else {
                     None
                 }
             })
             .collect();
-        let has_fts_backfills = crate::query::executor::has_fts_backfills_for_dir(&base_dir);
+        let has_fts_backfills = crate::Database::has_fts_backfills(&base_dir);
 
         if !pending_backends.is_empty() || has_fts_backfills {
             py.allow_threads(|| {
                 if has_fts_backfills {
-                    crate::query::executor::wait_fts_backfills_for_dir(&base_dir);
+                    crate::Database::wait_fts_backfills(&base_dir);
                 }
 
                 for backend in pending_backends {
@@ -1867,7 +1879,7 @@ impl ApexStorageImpl {
         // On Unix: mmaps remain valid after atomic rename; keep STORAGE_CACHE alive
         // so the 50ms fast path in get_cached_backend skips stat() calls on next retrieve().
         #[cfg(target_os = "windows")]
-        crate::storage::epoch::remove_dir(&self.current_base_dir());
+        crate::Database::invalidate_dir(&base_dir);
         Ok(())
     }
 
@@ -1895,7 +1907,7 @@ impl ApexStorageImpl {
         if self.fts_manager.read().is_none() {
             let base_dir = self.current_base_dir();
             let manager = py.allow_threads(|| {
-                if let Some(existing) = crate::query::executor::get_fts_manager(&base_dir) {
+                if let Some(existing) = crate::Database::fts_manager(&base_dir) {
                     existing
                 } else {
                     let fts_dir = base_dir.join("fts_indexes");
@@ -1908,7 +1920,7 @@ impl ApexStorageImpl {
                 }
             });
             py.allow_threads(|| {
-                crate::query::executor::register_fts_manager(&base_dir, manager.clone());
+                crate::Database::register_fts_manager(&base_dir, manager.clone());
             });
             *self.fts_manager.write() = Some(manager);
         } else {
@@ -1917,7 +1929,7 @@ impl ApexStorageImpl {
             if let Some(m) = mgr_arc {
                 let base_dir = self.current_base_dir();
                 py.allow_threads(|| {
-                    crate::query::executor::register_fts_manager(&base_dir, m);
+                    crate::Database::register_fts_manager(&base_dir, m);
                 });
             }
         }
@@ -1938,9 +1950,8 @@ impl ApexStorageImpl {
             })?;
             if needs_rebuild {
                 let base_dir = self.current_base_dir();
-                let backfill_running = py.allow_threads(|| {
-                    crate::query::executor::has_fts_backfill(&base_dir, &table_name)
-                });
+                let backfill_running =
+                    py.allow_threads(|| crate::Database::has_fts_backfill(&base_dir, &table_name));
                 if !backfill_running {
                     let fields = index_fields.clone();
                     py.allow_threads(|| {
@@ -1965,7 +1976,7 @@ impl ApexStorageImpl {
 
         let mgr = self.fts_manager.read().clone();
         py.allow_threads(|| -> PyResult<()> {
-            crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+            crate::Database::wait_fts_backfill(&base_dir, &table_name);
             if let Some(m) = mgr {
                 m.remove_engine(&table_name, delete_files)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
@@ -1990,7 +2001,7 @@ impl ApexStorageImpl {
             fields.insert("content".to_string(), text.to_string());
             // Release GIL during indexing operation
             py.allow_threads(|| {
-                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+                crate::Database::wait_fts_backfill(&base_dir, &table_name);
                 engine
                     .add_document(id as u64, fields)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -2012,7 +2023,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during remove operation
             py.allow_threads(|| {
-                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+                crate::Database::wait_fts_backfill(&base_dir, &table_name);
                 engine
                     .remove_document(id as u64)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
@@ -2067,7 +2078,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             // Release GIL during flush (I/O operation)
             py.allow_threads(|| {
-                crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+                crate::Database::wait_fts_backfill(&base_dir, &table_name);
                 engine
                     .flush()
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))

@@ -2,6 +2,94 @@ use super::*;
 use tempfile::tempdir;
 
 #[test]
+fn delta_row_count_cache_survives_unrelated_table_epoch() {
+    use std::io::Write;
+
+    let dir = tempdir().unwrap();
+    let table_path = dir.path().join("epoch_cache.apex");
+    let delta_path = OnDemandStorage::delta_path(&table_path);
+    std::fs::write(&delta_path, [0u8; 8]).unwrap();
+
+    let before_meta = std::fs::metadata(&delta_path).unwrap();
+    let before_len = before_meta.len();
+    let before_modified = before_meta.modified().unwrap();
+    DELTA_ROW_COUNT_CACHE.write().insert(
+        delta_path.clone(),
+        (
+            before_len,
+            before_modified,
+            5,
+            crate::storage::epoch::current(&table_path),
+        ),
+    );
+
+    crate::storage::epoch::bump(&table_path);
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&delta_path)
+        .unwrap()
+        .write_all(&[1u8; 8])
+        .unwrap();
+
+    OnDemandStorage::refresh_delta_insert_caches(
+        &table_path,
+        &delta_path,
+        Some((before_len, before_modified)),
+        &[10, 11],
+        &HashMap::new(),
+    );
+
+    let cache = DELTA_ROW_COUNT_CACHE.read();
+    let entry = cache.get(&delta_path).unwrap();
+    assert_eq!(entry.0, before_len + 8);
+    assert_eq!(entry.2, 7);
+    assert_eq!(entry.3, crate::storage::epoch::current(&table_path));
+    drop(cache);
+    DELTA_ROW_COUNT_CACHE.write().remove(&delta_path);
+    DELTA_STRING_INDEX_CACHE.write().remove(&delta_path);
+}
+
+#[test]
+fn delta_row_count_scan_stops_at_metadata_snapshot() {
+    let dir = tempdir().unwrap();
+    let table_path = dir.path().join("delta_snapshot.apex");
+    let storage = OnDemandStorage::create(&table_path).unwrap();
+
+    let mut first = HashMap::new();
+    first.insert("value".to_string(), vec![1]);
+    storage
+        .insert_typed_to_delta(
+            first,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+    let delta_path = OnDemandStorage::delta_path(&table_path);
+    let first_len = std::fs::metadata(&delta_path).unwrap().len();
+
+    let mut second = HashMap::new();
+    second.insert("value".to_string(), vec![2]);
+    storage
+        .insert_typed_to_delta(
+            second,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+
+    let mut file = File::open(&delta_path).unwrap();
+    assert_eq!(
+        OnDemandStorage::scan_delta_row_count(&mut file, first_len, 0),
+        1
+    );
+}
+
+#[test]
 fn test_create_and_open() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.apex");

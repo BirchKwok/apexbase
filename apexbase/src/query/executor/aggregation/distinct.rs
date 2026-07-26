@@ -3,7 +3,7 @@ use ahash::AHashSet;
 
 impl ApexExecutor {
     #[inline]
-    pub(super) fn count_distinct(array: &ArrayRef) -> i64 {
+    pub(in crate::query::executor) fn count_distinct(array: &ArrayRef) -> i64 {
         if let Some(values) = array.as_any().downcast_ref::<Int64Array>() {
             values
                 .iter()

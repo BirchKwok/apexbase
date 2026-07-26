@@ -1,7 +1,7 @@
 use super::*;
 
 impl ApexExecutor {
-    pub(super) fn execute_delete(
+    pub(in crate::query::executor) fn execute_delete(
         storage_path: &Path,
         where_clause: Option<&SqlExpr>,
     ) -> io::Result<ApexResult> {
@@ -11,9 +11,7 @@ impl ApexExecutor {
                 "Table does not exist",
             ));
         }
-
-        // Invalidate cache before write
-        invalidate_storage_cache(storage_path);
+        let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         // Collect indexed column names for this table (for index maintenance)
         // Use effective_columns() to include ALL columns of composite indexes,
@@ -92,7 +90,11 @@ impl ApexExecutor {
                     }
                 }
             }
-            let storage = TableStorageBackend::open_for_delete(storage_path)?;
+            // Preserve genuinely in-memory state, but otherwise use the narrow
+            // delete opener instead of populating the general read cache.
+            let storage = get_pending_cached_backend(storage_path).unwrap_or(Arc::new(
+                TableStorageBackend::open_for_delete(storage_path)?,
+            ));
             let count = storage.active_row_count() as i64;
 
             // Read _id + indexed columns for index maintenance
@@ -133,8 +135,13 @@ impl ApexExecutor {
                     }
                 }
             }
-            storage.delete_batch(&all_rids);
-            storage.save_delete_only()?;
+            if storage.has_delta() {
+                storage.delta_delete_rows(&all_rids);
+                storage.save_delta_store()?;
+            } else {
+                storage.delete_batch(&all_rids);
+                storage.save_delete_only()?;
+            }
             Self::notify_index_delete(storage_path, &deleted_entries);
             Self::notify_fts_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
@@ -143,8 +150,12 @@ impl ApexExecutor {
             return Ok(ApexResult::Scalar(count));
         }
 
-        // Soft delete: use mmap-only open (no full column load) + in-place deletion vector update
-        let storage = TableStorageBackend::open_for_delete(storage_path)?;
+        // Python flushes pending overlays before SQL writes, so the common path
+        // uses the mmap-only delete opener. Embedded callers with true
+        // in-memory rows retain their authoritative cached backend.
+        let storage = get_pending_cached_backend(storage_path).unwrap_or(Arc::new(
+            TableStorageBackend::open_for_delete(storage_path)?,
+        ));
 
         // ── Fast scan path: simple numeric/string predicate, no FK, no indexes ──
         // Numeric: delete_where_numeric_range_inplace — single pass, no id_to_idx HashMap.
@@ -152,14 +163,32 @@ impl ApexExecutor {
         if fk_children.is_empty()
             && indexed_cols.is_empty()
             && !Self::table_fts_enabled(&base_dir, &this_table_name)
-            && storage.pending_v4_in_memory_rows() == 0
         {
             if let Some((col, low, high)) =
                 Self::extract_numeric_range_from_where(where_clause.unwrap())
             {
+                let pending_ids = if storage.pending_v4_in_memory_rows() > 0 {
+                    storage.pending_numeric_range_ids(&col, low, high)
+                } else {
+                    Vec::new()
+                };
                 if let Some(deleted) =
                     storage.delete_where_numeric_range_inplace(&col, low, high)?
                 {
+                    let delta_deleted = if storage.has_delta() {
+                        let delta_ids = storage.delta_numeric_range_ids(&col, low, high)?;
+                        storage.delta_delete_rows(&delta_ids)
+                    } else {
+                        0
+                    };
+                    let pending_deleted = pending_ids
+                        .iter()
+                        .filter(|&&id| storage.delete_pending_v4_in_memory_row(id))
+                        .count();
+                    if delta_deleted > 0 {
+                        storage.save_delta_store()?;
+                    }
+                    let deleted = deleted + delta_deleted as i64 + pending_deleted as i64;
                     if deleted > 0 {
                         invalidate_storage_cache(storage_path);
                         crate::storage::engine::engine().invalidate(storage_path);
@@ -170,9 +199,25 @@ impl ApexExecutor {
                 // Inplace path unavailable (non-PLAIN encoding) — scan for IDs then use
                 // ID-based inplace delete (binary search, no 1M-entry id_to_idx HashMap build)
                 if let Some(all_rids) = storage.scan_numeric_range_mmap_with_ids(&col, low, high)? {
-                    let deleted = all_rids.len() as i64;
+                    let delta_deleted = if storage.has_delta() {
+                        let delta_ids = storage.delta_numeric_range_ids(&col, low, high)?;
+                        storage.delta_delete_rows(&delta_ids)
+                    } else {
+                        0
+                    };
+                    let pending_deleted = pending_ids
+                        .iter()
+                        .filter(|&&id| storage.delete_pending_v4_in_memory_row(id))
+                        .count();
+                    if delta_deleted > 0 {
+                        storage.save_delta_store()?;
+                    }
+                    let deleted =
+                        all_rids.len() as i64 + delta_deleted as i64 + pending_deleted as i64;
                     if deleted > 0 {
-                        if storage.delete_ids_inplace_v4(&all_rids)?.is_none() {
+                        if !all_rids.is_empty()
+                            && storage.delete_ids_inplace_v4(&all_rids)?.is_none()
+                        {
                             // Compressed RGs: full in-memory fallback
                             storage.delete_batch(&all_rids);
                             storage.save_delete_only()?;
@@ -184,11 +229,32 @@ impl ApexExecutor {
                     return Ok(ApexResult::Scalar(deleted));
                 }
             } else if let Some((col, val)) = Self::extract_string_equality(where_clause.unwrap()) {
+                let pending_ids = if storage.pending_v4_in_memory_rows() > 0 {
+                    storage.pending_string_equality_ids(&col, &val)
+                } else {
+                    Vec::new()
+                };
                 if let Some(indices) = storage.scan_string_filter_mmap(&col, &val, None)? {
                     let all_rids = storage.get_ids_for_global_indices_mmap(&indices)?;
-                    let deleted = all_rids.len() as i64;
+                    let delta_deleted = if storage.has_delta() {
+                        let delta_ids = storage.delta_string_equality_ids(&col, &val)?;
+                        storage.delta_delete_rows(&delta_ids)
+                    } else {
+                        0
+                    };
+                    let pending_deleted = pending_ids
+                        .iter()
+                        .filter(|&&id| storage.delete_pending_v4_in_memory_row(id))
+                        .count();
+                    if delta_deleted > 0 {
+                        storage.save_delta_store()?;
+                    }
+                    let deleted =
+                        all_rids.len() as i64 + delta_deleted as i64 + pending_deleted as i64;
                     if deleted > 0 {
-                        if storage.delete_ids_inplace_v4(&all_rids)?.is_none() {
+                        if !all_rids.is_empty()
+                            && storage.delete_ids_inplace_v4(&all_rids)?.is_none()
+                        {
                             storage.delete_batch(&all_rids);
                             storage.save_delete_only()?;
                         }
@@ -302,12 +368,17 @@ impl ApexExecutor {
         if deleted > 0 {
             // Fast path: no FK/index notifications — use mmap binary-search delete
             // (bypasses the id_to_idx HashMap build in delete_batch)
-            let used_inplace = if fk_children.is_empty() && indexed_cols.is_empty() {
+            let used_delta = storage.has_delta();
+            if used_delta {
+                storage.delta_delete_rows(&all_rids);
+                storage.save_delta_store()?;
+            }
+            let used_inplace = if !used_delta && fk_children.is_empty() && indexed_cols.is_empty() {
                 storage.delete_ids_inplace_v4(&all_rids)?.is_some()
             } else {
                 false
             };
-            if !used_inplace {
+            if !used_delta && !used_inplace {
                 storage.delete_batch(&all_rids);
                 storage.save_delete_only()?;
             }

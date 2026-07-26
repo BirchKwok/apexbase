@@ -86,6 +86,7 @@ impl ApexExecutor {
                 ));
             }
         }
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
 
         // Create empty storage file with schema
         TableStorageBackend::create(&table_path)?;
@@ -163,6 +164,7 @@ impl ApexExecutor {
         }
 
         storage.save()?;
+        epoch_write.commit();
 
         Ok(ApexResult::Scalar(0))
     }
@@ -188,6 +190,7 @@ impl ApexExecutor {
                 ));
             }
         }
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
 
         std::fs::remove_file(table_path)?;
         invalidate_table_schema_stats(&table_path.to_string_lossy());
@@ -206,6 +209,7 @@ impl ApexExecutor {
                 let _ = std::fs::remove_file(&path);
             }
         }
+        epoch_write.commit();
 
         Ok(ApexResult::Scalar(0))
     }
@@ -224,6 +228,7 @@ impl ApexExecutor {
                 format!("Table '{}' does not exist", table),
             ));
         }
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
 
         // Invalidate all caches before write (executor + StorageEngine)
         invalidate_storage_cache(&table_path);
@@ -256,6 +261,7 @@ impl ApexExecutor {
         invalidate_storage_cache(&table_path);
         invalidate_table_schema_stats(&table_path.to_string_lossy());
         crate::storage::engine::engine().invalidate(&table_path);
+        epoch_write.commit();
 
         Ok(ApexResult::Scalar(0))
     }
@@ -269,6 +275,7 @@ impl ApexExecutor {
                 "Table does not exist",
             ));
         }
+        let epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         // Invalidate caches before write
         invalidate_storage_cache(storage_path);
@@ -295,6 +302,7 @@ impl ApexExecutor {
         invalidate_storage_cache(storage_path);
         invalidate_table_stats(&storage_path.to_string_lossy());
         crate::storage::engine::engine().invalidate(storage_path);
+        epoch_write.commit();
 
         Ok(ApexResult::Scalar(0))
     }
@@ -2279,6 +2287,7 @@ impl ApexExecutor {
                 format!("Table '{}' already exists", table),
             ));
         }
+        let epoch_write = crate::storage::epoch::logical_write(&table_path);
 
         // Step 1: Execute the SELECT query
         let select_result = Self::execute_parsed_multi(query, base_dir, default_table_path)?;
@@ -2325,6 +2334,7 @@ impl ApexExecutor {
         backend.save()?;
         invalidate_storage_cache(&table_path);
         invalidate_table_stats(&table_path.to_string_lossy());
+        epoch_write.commit();
 
         Ok(ApexResult::Scalar(inserted as i64))
     }

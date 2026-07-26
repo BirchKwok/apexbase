@@ -4,10 +4,10 @@ impl OnDemandStorage {
     pub fn topk_binary_direct(
         &self,
         col_name: &str,
-        computer: &crate::query::vector_ops::DistanceComputer,
+        computer: &crate::compute::vector_ops::DistanceComputer,
         k: usize,
     ) -> io::Result<Option<Vec<(usize, f32)>>> {
-        use crate::query::vector_ops::topk_heap_on_floats;
+        use crate::compute::vector_ops::topk_heap_on_floats;
 
         let footer = match self.get_or_load_footer()? {
             Some(f) => f,
@@ -186,7 +186,6 @@ impl OnDemandStorage {
         let total_rows = needed / query_dim;
         let mut result = topk_heap_on_floats(floats, total_rows, query_dim, computer, k);
         drop(buf_guard);
-        result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         result.truncate(k);
         Ok(Some(result))
     }
@@ -194,10 +193,10 @@ impl OnDemandStorage {
     pub fn topk_fixedlist_direct(
         &self,
         col_name: &str,
-        computer: &crate::query::vector_ops::DistanceComputer,
+        computer: &crate::compute::vector_ops::DistanceComputer,
         k: usize,
     ) -> io::Result<Option<Vec<(usize, f32)>>> {
-        use crate::query::vector_ops::topk_heap_on_floats;
+        use crate::compute::vector_ops::topk_heap_on_floats;
 
         let footer = match self.get_or_load_footer()? {
             Some(f) => f,
@@ -367,7 +366,7 @@ impl OnDemandStorage {
 
             let f16_ptr = f16_guard.as_ptr();
             let f16_slice = unsafe { std::slice::from_raw_parts(f16_ptr, f16_needed) };
-            let mut result = crate::query::vector_ops::topk_heap_on_f16_bytes(
+            let mut result = crate::compute::vector_ops::topk_heap_on_f16_bytes(
                 f16_slice,
                 total_active,
                 query_dim,
@@ -375,9 +374,6 @@ impl OnDemandStorage {
                 k,
             );
             drop(f16_guard);
-            result.sort_unstable_by(|a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
             result.truncate(k);
             return Ok(Some(result));
         }
@@ -428,7 +424,6 @@ impl OnDemandStorage {
         let total_rows = needed / query_dim;
         let mut result = topk_heap_on_floats(floats, total_rows, query_dim, computer, k);
         drop(buf_guard);
-        result.sort_unstable_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
         result.truncate(k);
         Ok(Some(result))
     }
@@ -439,9 +434,9 @@ impl OnDemandStorage {
         queries: &[f32],
         n_queries: usize,
         k: usize,
-        metric: crate::query::vector_ops::DistanceMetric,
+        metric: crate::compute::vector_ops::DistanceMetric,
     ) -> io::Result<Option<Vec<Vec<(usize, f32)>>>> {
-        use crate::query::vector_ops::batch_topk_on_floats;
+        use crate::compute::vector_ops::batch_topk_on_floats;
 
         if n_queries == 0 || queries.len() == 0 {
             return Ok(Some(vec![vec![]; n_queries]));
@@ -612,7 +607,7 @@ impl OnDemandStorage {
 
             let f16_ptr = f16_guard.as_ptr();
             let f16_slice = unsafe { std::slice::from_raw_parts(f16_ptr, f16_needed) };
-            let results = crate::query::vector_ops::batch_topk_on_f16_bytes(
+            let results = crate::compute::vector_ops::batch_topk_on_f16_bytes(
                 f16_slice,
                 total_active,
                 query_dim,
@@ -682,9 +677,9 @@ impl OnDemandStorage {
         queries: &[f32],
         n_queries: usize,
         k: usize,
-        metric: crate::query::vector_ops::DistanceMetric,
+        metric: crate::compute::vector_ops::DistanceMetric,
     ) -> io::Result<Option<Vec<Vec<(usize, f32)>>>> {
-        use crate::query::vector_ops::batch_topk_on_floats;
+        use crate::compute::vector_ops::batch_topk_on_floats;
 
         if n_queries == 0 || queries.len() == 0 {
             return Ok(Some(vec![vec![]; n_queries]));

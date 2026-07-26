@@ -1,7 +1,7 @@
 use super::*;
 
 impl ApexExecutor {
-    pub(super) fn execute_aggregation(
+    pub(in crate::query::executor) fn execute_aggregation(
         batch: &RecordBatch,
         stmt: &SelectStatement,
     ) -> io::Result<ApexResult> {
@@ -48,7 +48,7 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result))
     }
 
-    pub(super) fn compute_aggregate(
+    pub(in crate::query::executor) fn compute_aggregate(
         batch: &RecordBatch,
         func: &crate::query::AggregateFunc,
         column: &Option<String>,

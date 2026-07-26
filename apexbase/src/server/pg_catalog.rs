@@ -296,8 +296,6 @@ fn discover_tables(base_dir: &Path) -> Vec<String> {
 
 /// Get column info for a table: (name, arrow_type)
 fn get_table_columns(base_dir: &Path, table_name: &str) -> Vec<(String, ArrowDataType)> {
-    use crate::query::ApexExecutor;
-
     // Try to find the .apex file
     let table_path = base_dir.join(format!("{}.apex", table_name));
     if !table_path.exists() {
@@ -305,7 +303,7 @@ fn get_table_columns(base_dir: &Path, table_name: &str) -> Vec<(String, ArrowDat
     }
 
     // Execute a LIMIT 0 query to get schema
-    match crate::Database::execute("SELECT * FROM data LIMIT 0", &table_path, &table_path) {
+    match crate::Session::new(&table_path, &table_path).execute("SELECT * FROM data LIMIT 0") {
         Ok(result) => match result.to_record_batch() {
             Ok(batch) => batch
                 .schema()

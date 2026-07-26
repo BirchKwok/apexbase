@@ -1101,6 +1101,7 @@ ApexBase provides SQL table functions that read external files directly in a `FR
 ```sql
 SELECT * FROM read_csv('path/to/file.csv')
 SELECT * FROM read_csv('path/to/file.csv', header=true, delimiter=',')
+SELECT * FROM read_csv('path/to/file.csv', on_bad_lines='skip')
 ```
 
 **Parameters:**
@@ -1109,6 +1110,8 @@ SELECT * FROM read_csv('path/to/file.csv', header=true, delimiter=',')
 |--------|---------|-------------|
 | `header` | `true` | Whether the first row is a header. Set to `false` / `0` if the file has no header row. |
 | `delimiter` / `delim` / `sep` | `,` | Field delimiter character. Use `'\t'` for TSV files. |
+| `on_bad_lines` | `error` | Malformed-row policy: `error`, `skip`, or `warn`. |
+| `ignore_errors` | `false` | Compatibility alias: `true` is equivalent to `on_bad_lines='skip'`. |
 
 **Schema inference**: types are inferred automatically from the first 100 data rows (Int64, Float64, Bool, or String).
 
@@ -1226,16 +1229,17 @@ result = client.execute("""
 
 Register external data files (CSV, JSON, Parquet) as temporary native tables. The file is parsed once and materialized into ApexBase's mmap-backed `.apex` format, stored in a `.apex_tmp/` subdirectory. Subsequent queries bypass file parsing entirely — leveraging zone maps, bloom filters, and zero-copy mmap reads for **order-of-magnitude speedups** over repeated `read_csv()` / `read_json()` / `read_parquet()` calls. Temp tables are automatically cleaned up on client close.
 
-### `register_temp_table(name, file_path)`
+### `register_temp_table(name, file_path, on_bad_lines="error")`
 
 ```python
-client.register_temp_table(name: str, file_path: str)
+client.register_temp_table(name: str, file_path: str, on_bad_lines: str = "error")
 ```
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
 | `name` | `str` | Name for the temporary table |
 | `file_path` | `str` | Path to the data file |
+| `on_bad_lines` | `str` | CSV-only malformed-row policy: `error`, `skip`, or `warn` |
 
 **Supported formats** (auto-detected by file extension):
 
@@ -1250,6 +1254,11 @@ client.register_temp_table(name: str, file_path: str)
 ```python
 # CSV — most common use case
 client.register_temp_table("sales", "/data/sales.csv")
+
+# Import a dirty CSV while retaining every valid row
+client.register_temp_table(
+    "catalog", "/data/catalog.csv", on_bad_lines="skip"
+)
 
 # JSON / NDJSON
 client.register_temp_table("logs", "/data/events.ndjson")

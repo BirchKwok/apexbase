@@ -232,6 +232,20 @@ impl DeltaStore {
         self.dirty = true;
     }
 
+    /// Record a set of row deletions with one store lock and one dirty transition.
+    pub fn delete_rows(&mut self, row_ids: &[u64]) -> usize {
+        let before = self.delete_bitmap.count();
+        for &row_id in row_ids {
+            self.delete_bitmap.delete(row_id);
+            self.updates.remove(&row_id);
+        }
+        let deleted = self.delete_bitmap.count() - before;
+        if deleted > 0 {
+            self.dirty = true;
+        }
+        deleted
+    }
+
     /// Record a cell update
     pub fn update_cell(&mut self, row_id: u64, column_name: &str, new_value: Value) {
         let txn_id = self.next_txn_id;
@@ -495,6 +509,19 @@ mod tests {
         assert!(store.is_deleted(5));
         // Updates should be cleared for deleted rows
         assert!(!store.has_updates(5));
+    }
+
+    #[test]
+    fn test_delta_store_batch_delete_deduplicates_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.apex");
+        let mut store = DeltaStore::new(&path);
+
+        assert_eq!(store.delete_rows(&[4, 2, 4, 3]), 3);
+        assert_eq!(store.delete_rows(&[2, 3]), 0);
+        assert!(store.is_deleted(2));
+        assert!(store.is_deleted(3));
+        assert!(store.is_deleted(4));
     }
 
     #[test]

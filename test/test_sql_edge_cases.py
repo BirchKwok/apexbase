@@ -428,7 +428,9 @@ class TestStringFunctions:
         assert self.c.execute("SELECT SUBSTR(s,1,5) as sub FROM t WHERE s='Hello World'").first()['sub'] == 'Hello'
 
     def test_replace(self):
-        rv = xfail_sql(self.c, "SELECT REPLACE(s,'World','ApexBase') as r FROM t WHERE s='Hello World'")
+        rv = self.c.execute(
+            "SELECT REPLACE(s,'World','ApexBase') as r FROM t WHERE s='Hello World'"
+        )
         assert rv.first()['r'] == 'Hello ApexBase'
 
     def test_like_contains(self):
@@ -469,6 +471,15 @@ class TestNumericEdgeCases:
     def test_float_multiply(self):
         val = self.c.execute("SELECT b*2 as v FROM t WHERE a=1").first()['v']
         assert abs(val - 3.0) < 1e-9
+
+    def test_scientific_notation_literals(self):
+        row = self.c.execute(
+            "SELECT 1.23e-5 AS small, 1E10 AS large, -2.5e+3 AS negative "
+            "FROM t WHERE a=0"
+        ).first()
+        assert row['small'] == pytest.approx(1.23e-5)
+        assert row['large'] == pytest.approx(1e10)
+        assert row['negative'] == pytest.approx(-2500.0)
 
     def test_max_min_with_negatives(self):
         row = self.c.execute("SELECT MAX(a) as mx, MIN(a) as mn FROM t").first()

@@ -1,7 +1,7 @@
 use super::*;
 
 impl ApexExecutor {
-    pub(super) fn execute_group_by(
+    pub(in crate::query::executor) fn execute_group_by(
         batch: &RecordBatch,
         stmt: &SelectStatement,
     ) -> io::Result<ApexResult> {
@@ -118,7 +118,7 @@ impl ApexExecutor {
         Ok(result)
     }
 
-    pub(super) fn try_execute_single_key_streaming_group_by(
+    pub(in crate::query::executor) fn try_execute_single_key_streaming_group_by(
         batch: &RecordBatch,
         stmt: &SelectStatement,
         group_cols: &[String],
@@ -721,7 +721,7 @@ impl ApexExecutor {
         Ok(Some(ApexResult::Data(batch)))
     }
 
-    pub(super) fn materialize_group_by_exprs(
+    pub(in crate::query::executor) fn materialize_group_by_exprs(
         batch: &RecordBatch,
         stmt: &SelectStatement,
     ) -> io::Result<RecordBatch> {
@@ -795,7 +795,7 @@ impl ApexExecutor {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
-    pub(super) fn execute_group_by_vectorized(
+    pub(in crate::query::executor) fn execute_group_by_vectorized(
         batch: &RecordBatch,
         stmt: &SelectStatement,
         group_col_name: &str,
@@ -994,7 +994,7 @@ impl ApexExecutor {
         Self::build_group_by_result_from_vectorized(stmt, group_col_name, &hash_agg, has_int_agg)
     }
 
-    pub(super) fn build_group_by_result_from_vectorized(
+    pub(in crate::query::executor) fn build_group_by_result_from_vectorized(
         stmt: &SelectStatement,
         group_col_name: &str,
         hash_agg: &crate::query::vectorized::VectorizedHashAgg,
@@ -1173,7 +1173,7 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result_batch))
     }
 
-    pub(super) fn can_use_incremental_aggregation(stmt: &SelectStatement) -> bool {
+    pub(in crate::query::executor) fn can_use_incremental_aggregation(stmt: &SelectStatement) -> bool {
         let mut aggregate_source: Option<&str> = None;
         for col in &stmt.columns {
             match col {
@@ -1218,7 +1218,7 @@ impl ApexExecutor {
         true
     }
 
-    pub(super) fn group_output_name(stmt: &SelectStatement, group_column: &str) -> String {
+    pub(in crate::query::executor) fn group_output_name(stmt: &SelectStatement, group_column: &str) -> String {
         let clean = group_column.trim_matches('"');
         stmt.columns
             .iter()
@@ -1238,7 +1238,7 @@ impl ApexExecutor {
             .unwrap_or_else(|| clean.rsplit('.').next().unwrap_or(clean).to_string())
     }
 
-    pub(super) fn execute_group_by_string_dict(
+    pub(in crate::query::executor) fn execute_group_by_string_dict(
         batch: &RecordBatch,
         stmt: &SelectStatement,
         _str_arr: &StringArray,
@@ -1510,7 +1510,7 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result_batch))
     }
 
-    pub(super) fn execute_group_by_direct_index(
+    pub(in crate::query::executor) fn execute_group_by_direct_index(
         batch: &RecordBatch,
         stmt: &SelectStatement,
         group_col: &Int64Array,
@@ -1752,7 +1752,7 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result_batch))
     }
 
-    pub(super) fn execute_group_by_incremental(
+    pub(in crate::query::executor) fn execute_group_by_incremental(
         batch: &RecordBatch,
         stmt: &SelectStatement,
         group_cols: &[String],
@@ -3393,7 +3393,7 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result))
     }
 
-    pub(super) fn execute_group_by_with_indices(
+    pub(in crate::query::executor) fn execute_group_by_with_indices(
         batch: &RecordBatch,
         stmt: &SelectStatement,
         group_cols: &[String],
@@ -3583,7 +3583,7 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result))
     }
 
-    pub(super) fn precompute_categorical_conditional_sums(
+    pub(in crate::query::executor) fn precompute_categorical_conditional_sums(
         batch: &RecordBatch,
         stmt: &SelectStatement,
         groups: &[Vec<usize>],
@@ -3736,7 +3736,7 @@ impl ApexExecutor {
         Ok(())
     }
 
-    pub(super) fn precompute_shared_percentiles(
+    pub(in crate::query::executor) fn precompute_shared_percentiles(
         batch: &RecordBatch,
         stmt: &SelectStatement,
         groups: &[Vec<usize>],
@@ -3864,7 +3864,7 @@ impl ApexExecutor {
         Ok(())
     }
 
-    pub(super) fn evaluate_expr_for_groups(
+    pub(in crate::query::executor) fn evaluate_expr_for_groups(
         batch: &RecordBatch,
         expr: &SqlExpr,
         alias: Option<&str>,
@@ -3924,7 +3924,7 @@ impl ApexExecutor {
         ))
     }
 
-    pub(super) fn is_group_aggregate_name(name: &str) -> bool {
+    pub(in crate::query::executor) fn is_group_aggregate_name(name: &str) -> bool {
         matches!(
             name.to_ascii_uppercase().as_str(),
             "SUM"
@@ -3939,7 +3939,7 @@ impl ApexExecutor {
         )
     }
 
-    pub(super) fn lower_group_aggregates(
+    pub(in crate::query::executor) fn lower_group_aggregates(
         batch: &RecordBatch,
         expr: &SqlExpr,
         groups: &[Vec<usize>],
@@ -4032,7 +4032,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn compute_expression_aggregate(
+    pub(in crate::query::executor) fn compute_expression_aggregate(
         batch: &RecordBatch,
         name: &str,
         args: &[SqlExpr],
@@ -4228,7 +4228,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn create_group_batch(
+    pub(in crate::query::executor) fn create_group_batch(
         batch: &RecordBatch,
         indices: &[usize],
     ) -> io::Result<RecordBatch> {
@@ -4237,7 +4237,7 @@ impl ApexExecutor {
         compute::take_record_batch(batch, &indices_array).map_err(|e| err_data(e.to_string()))
     }
 
-    pub(super) fn evaluate_aggregate_condition(
+    pub(in crate::query::executor) fn evaluate_aggregate_condition(
         batch: &RecordBatch,
         expr: &SqlExpr,
     ) -> io::Result<bool> {
@@ -4282,7 +4282,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn evaluate_aggregate_expr_scalar(
+    pub(in crate::query::executor) fn evaluate_aggregate_expr_scalar(
         batch: &RecordBatch,
         expr: &SqlExpr,
     ) -> io::Result<f64> {
@@ -4351,7 +4351,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn take_first_from_groups(
+    pub(in crate::query::executor) fn take_first_from_groups(
         array: &ArrayRef,
         group_indices: &[Vec<usize>],
         output_name: &str,
@@ -4438,7 +4438,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn compute_aggregate_for_groups(
+    pub(in crate::query::executor) fn compute_aggregate_for_groups(
         batch: &RecordBatch,
         func: &crate::query::AggregateFunc,
         column: &Option<String>,

@@ -2399,6 +2399,7 @@ impl OnDemandStorage {
         let low_i = low.ceil() as i64;
         let high_i = high.floor() as i64;
         let mut total_updated: i64 = 0;
+        let mut physically_written = false;
 
         // Need read-write access: open separate write handle
         let mut write_file = std::fs::OpenOptions::new()
@@ -2761,12 +2762,16 @@ impl OnDemandStorage {
                 if let Some(value_buf) = value_buf {
                     write_file.seek(SeekFrom::Start(values_file_offset))?;
                     write_file.write_all(&value_buf)?;
+                    physically_written = true;
                 }
                 total_updated += rg_updated;
             }
         }
         drop(mmap_guard);
         drop(file_guard);
+        if physically_written {
+            crate::storage::epoch::bump(&self.path);
+        }
         Ok(Some(total_updated))
     }
 
@@ -3043,6 +3048,7 @@ impl OnDemandStorage {
 
         drop(mmap_guard);
         drop(file_guard);
+        crate::storage::epoch::bump(&self.path);
         Ok(Some((1, true)))
     }
 
@@ -3097,6 +3103,7 @@ impl OnDemandStorage {
         write_file.seek(SeekFrom::Start(value_file_offset))?;
         write_file.write_all(new_value_bytes)?;
 
+        crate::storage::epoch::bump(&self.path);
         Ok(Some((1, true)))
     }
 

@@ -5270,12 +5270,6 @@ impl ApexExecutor {
             return backend.read_columns_to_arrow(None, 0, Some(0));
         }
 
-        if backend.has_delta() {
-            let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
-            let sorted = Self::apply_order_by_topk(&full_batch, &stmt.order_by, Some(k))?;
-            return Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset);
-        }
-
         // IN-MEMORY FAST PATH: 2-col ORDER BY (string, float64) — skip Arrow string conversion.
         // Uses global dict cache (u16 group_ids) + raw float64 column for typed sort keys.
         if stmt.order_by.len() == 2 && !backend.has_pending_deltas() {
@@ -5308,7 +5302,11 @@ impl ApexExecutor {
         }
 
         // MMAP FAST PATH: single ORDER BY column + mmap-only → direct top-K scan without Arrow
-        if backend.is_mmap_only() && stmt.order_by.len() == 1 && !backend.has_pending_deltas() {
+        if backend.is_mmap_only()
+            && !backend.has_delta()
+            && stmt.order_by.len() == 1
+            && !backend.has_pending_deltas()
+        {
             let clause = &stmt.order_by[0];
             let col_name = clause.column.trim_matches('"');
             let actual_col = if let Some(p) = col_name.rfind('.') {
@@ -5327,7 +5325,7 @@ impl ApexExecutor {
         }
 
         // Step 1: Read only columns needed for ORDER BY
-        let order_cols: Vec<&str> = stmt
+        let mut order_cols: Vec<&str> = stmt
             .order_by
             .iter()
             .map(|o| {
@@ -5339,6 +5337,9 @@ impl ApexExecutor {
                 }
             })
             .collect();
+        if backend.has_delta() {
+            order_cols.push("_id");
+        }
 
         let sort_batch = backend.read_columns_to_arrow(Some(&order_cols), 0, None)?;
         let num_rows = sort_batch.num_rows();
@@ -5471,8 +5472,33 @@ impl ApexExecutor {
             return backend.read_columns_to_arrow(None, 0, Some(0));
         }
 
-        // Step 3: Read ALL columns but only for top-k row indices
-        backend.read_columns_by_indices_to_arrow(&final_indices, None)
+        // Step 3: Read ALL columns but only for top-k rows. Combined base +
+        // append-delta batches use logical IDs because their Arrow positions do
+        // not map one-to-one to physical base-file indices.
+        if backend.has_delta() {
+            let id_col = sort_batch
+                .column_by_name("_id")
+                .ok_or_else(|| err_data("ORDER BY delta batch missing _id"))?;
+            let ids = if let Some(array) = id_col.as_any().downcast_ref::<Int64Array>() {
+                final_indices
+                    .iter()
+                    .map(|&index| array.value(index) as u64)
+                    .collect::<Vec<_>>()
+            } else if let Some(array) = id_col
+                .as_any()
+                .downcast_ref::<arrow::array::UInt64Array>()
+            {
+                final_indices
+                    .iter()
+                    .map(|&index| array.value(index))
+                    .collect::<Vec<_>>()
+            } else {
+                return Err(err_data("ORDER BY delta batch has invalid _id type"));
+            };
+            backend.read_rows_by_ids_to_arrow(&ids)
+        } else {
+            backend.read_columns_by_indices_to_arrow(&final_indices, None)
+        }
     }
 
     /// Pre-evaluate SELECT expression aliases that are referenced by ORDER BY clauses.

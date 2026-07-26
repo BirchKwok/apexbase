@@ -195,6 +195,7 @@ impl OnDemandStorage {
         }
 
         self.active_count.fetch_add(1, Ordering::Relaxed);
+        crate::storage::epoch::bump(&self.path);
         Ok(id)
     }
 
@@ -1070,6 +1071,7 @@ impl OnDemandStorage {
 
         deleted[byte_idx] |= 1 << bit_idx;
         self.active_count.fetch_sub(1, Ordering::Relaxed);
+        crate::storage::epoch::bump(&self.path);
         true
     }
 
@@ -3534,7 +3536,7 @@ impl OnDemandStorage {
         let base_active = self.active_count.load(std::sync::atomic::Ordering::Relaxed);
         let delta_rows = self.delta_row_count() as u64;
         let pending_delta_deletes = self.delta_store.read().delete_count() as u64;
-        base_active.saturating_sub(pending_delta_deletes) + delta_rows
+        (base_active + delta_rows).saturating_sub(pending_delta_deletes)
     }
 
     /// Drop a column from schema (logical delete - data stays but column is removed from schema)
@@ -4077,6 +4079,7 @@ impl OnDemandStorage {
             let delta_path = Self::delta_path(&self.path);
             let _ = std::fs::remove_file(&delta_path);
             let _ = std::fs::remove_file(Self::delta_meta_path(&delta_path));
+            DELTA_NUMERIC_RANGE_CACHE.write().remove(&delta_path);
         }
         result
     }
@@ -4154,7 +4157,6 @@ impl OnDemandStorage {
         // On Unix/Linux, only executor cache needs invalidation (mmaps don't block writes).
         #[cfg(target_os = "windows")]
         super::engine::engine().invalidate(&self.path);
-        #[cfg(not(target_os = "windows"))]
         crate::storage::epoch::bump(&self.path);
 
         // Atomic write: write to .tmp file, then rename over the original.

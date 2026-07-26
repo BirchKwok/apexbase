@@ -63,7 +63,7 @@ impl ApexStorageImpl {
                     }
                 }
             }
-            if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+            if let Ok(backend) = crate::Database::cached_backend(&target_path) {
                 self.cached_backends
                     .insert(target_table.clone(), Arc::clone(&backend));
                 if !backend.has_pending_deltas() {
@@ -119,13 +119,11 @@ impl ApexStorageImpl {
                 .get(&target_table)
                 .map(|v| Arc::clone(&v))
                 .or_else(|| {
-                    crate::query::get_cached_backend_pub(&target_path)
-                        .ok()
-                        .map(|b| {
-                            self.cached_backends
-                                .insert(target_table.clone(), Arc::clone(&b));
-                            b
-                        })
+                    crate::Database::cached_backend(&target_path).ok().map(|b| {
+                        self.cached_backends
+                            .insert(target_table.clone(), Arc::clone(&b));
+                        b
+                    })
                 });
 
             if let Some(backend) = maybe_backend {
@@ -166,13 +164,11 @@ impl ApexStorageImpl {
                 .get(&target_table)
                 .map(|v| Arc::clone(&v))
                 .or_else(|| {
-                    crate::query::get_cached_backend_pub(&target_path)
-                        .ok()
-                        .map(|b| {
-                            self.cached_backends
-                                .insert(target_table.clone(), Arc::clone(&b));
-                            b
-                        })
+                    crate::Database::cached_backend(&target_path).ok().map(|b| {
+                        self.cached_backends
+                            .insert(target_table.clone(), Arc::clone(&b));
+                        b
+                    })
                 });
 
             if let Some(backend) = maybe_backend {
@@ -219,13 +215,11 @@ impl ApexStorageImpl {
                 .get(&target_table)
                 .map(|v| Arc::clone(&v))
                 .or_else(|| {
-                    crate::query::get_cached_backend_pub(&target_path)
-                        .ok()
-                        .map(|b| {
-                            self.cached_backends
-                                .insert(target_table.clone(), Arc::clone(&b));
-                            b
-                        })
+                    crate::Database::cached_backend(&target_path).ok().map(|b| {
+                        self.cached_backends
+                            .insert(target_table.clone(), Arc::clone(&b));
+                        b
+                    })
                 });
 
             if let Some(backend) = maybe_backend {
@@ -298,13 +292,11 @@ impl ApexStorageImpl {
                 .get(&target_table)
                 .map(|v| Arc::clone(&v))
                 .or_else(|| {
-                    crate::query::get_cached_backend_pub(&target_path)
-                        .ok()
-                        .map(|b| {
-                            self.cached_backends
-                                .insert(target_table.clone(), Arc::clone(&b));
-                            b
-                        })
+                    crate::Database::cached_backend(&target_path).ok().map(|b| {
+                        self.cached_backends
+                            .insert(target_table.clone(), Arc::clone(&b));
+                        b
+                    })
                 });
 
             if let Some(backend) = maybe_backend {
@@ -391,13 +383,11 @@ impl ApexStorageImpl {
                     .get(&target_table)
                     .map(|v| Arc::clone(&v))
                     .or_else(|| {
-                        crate::query::get_cached_backend_pub(&target_path)
-                            .ok()
-                            .map(|b| {
-                                self.cached_backends
-                                    .insert(target_table.clone(), Arc::clone(&b));
-                                b
-                            })
+                        crate::Database::cached_backend(&target_path).ok().map(|b| {
+                            self.cached_backends
+                                .insert(target_table.clone(), Arc::clone(&b));
+                            b
+                        })
                     });
 
                 if let Some(backend) = maybe_backend {
@@ -503,13 +493,11 @@ impl ApexStorageImpl {
                     .get(&target_table)
                     .map(|v| Arc::clone(&v))
                     .or_else(|| {
-                        crate::query::get_cached_backend_pub(&target_path)
-                            .ok()
-                            .map(|b| {
-                                self.cached_backends
-                                    .insert(target_table.clone(), Arc::clone(&b));
-                                b
-                            })
+                        crate::Database::cached_backend(&target_path).ok().map(|b| {
+                            self.cached_backends
+                                .insert(target_table.clone(), Arc::clone(&b));
+                            b
+                        })
                     });
 
                 if let Some(backend) = maybe_backend {
@@ -612,7 +600,7 @@ impl ApexStorageImpl {
         {
             let (_, target_path) =
                 self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
-            if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+            if let Ok(backend) = crate::Database::cached_backend(&target_path) {
                 if backend.pending_v4_in_memory_rows() == 0 {
                     let limit = *limit;
                     let offset = *offset;
@@ -676,7 +664,7 @@ impl ApexStorageImpl {
                     &table_path,
                     &base_dir,
                 );
-                if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+                if let Ok(backend) = crate::Database::cached_backend(&target_path) {
                     if backend.pending_v4_in_memory_rows() == 0 {
                         let col_refs: Vec<&str> = columns.iter().map(String::as_str).collect();
                         let batch_result = py.allow_threads(|| {
@@ -720,7 +708,7 @@ impl ApexStorageImpl {
                     &table_path,
                     &base_dir,
                 );
-                if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+                if let Ok(backend) = crate::Database::cached_backend(&target_path) {
                     if !backend.has_pending_deltas()
                         && !backend.has_delta()
                         && backend.pending_v4_in_memory_rows() == 0
@@ -803,7 +791,7 @@ impl ApexStorageImpl {
                     &table_path,
                     &base_dir,
                 );
-                if let Ok(backend) = crate::query::get_cached_backend_pub(&target_path) {
+                if let Ok(backend) = crate::Database::cached_backend(&target_path) {
                     if backend.is_mmap_only()
                         && !backend.has_pending_deltas()
                         && !backend.has_delta()
@@ -1031,9 +1019,6 @@ impl ApexStorageImpl {
             );
 
         let sql = sql.to_string();
-        crate::query::executor::set_query_root_dir(&self.root_dir);
-        crate::query::executor::set_temp_dir(&self.temp_dir);
-
         // Return enum to avoid per-cell arrow_value_at inside allow_threads
         enum ExecOut {
             Scalar(String, i64), // key, value — for txn commands
@@ -1042,10 +1027,13 @@ impl ApexStorageImpl {
         }
 
         let exec_out = py.allow_threads(|| -> PyResult<ExecOut> {
+            let session = crate::Session::new(&base_dir, &table_path)
+                .with_root_dir(&self.root_dir)
+                .with_temp_dir(&self.temp_dir);
             if is_begin {
-                let result =
-                    crate::Database::execute_classified(&sql, &sig, &base_dir, &table_path)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let result = session
+                    .execute_classified(&sql, &sig)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 if let ApexResult::Scalar(txn_id) = &result {
                     return Ok(ExecOut::Scalar("txn_id".to_string(), *txn_id));
                 }
@@ -1054,7 +1042,8 @@ impl ApexStorageImpl {
 
             if is_commit {
                 if let Some(txn_id) = current_txn {
-                    let result = crate::Database::commit_txn(txn_id, &base_dir, &table_path)
+                    let result = session
+                        .commit_txn(txn_id)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                     if let ApexResult::Scalar(n) = &result {
                         return Ok(ExecOut::Scalar("rows_applied".to_string(), *n));
@@ -1065,7 +1054,8 @@ impl ApexStorageImpl {
 
             if is_rollback {
                 if let Some(txn_id) = current_txn {
-                    crate::Database::rollback_txn(txn_id)
+                    session
+                        .rollback_txn(txn_id)
                         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 }
                 return Ok(ExecOut::Empty);
@@ -1135,9 +1125,9 @@ impl ApexStorageImpl {
                 let txn_id = current_txn.unwrap();
                 let parsed =
                     SqlParser::parse(&sql).map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let result =
-                    crate::Database::execute_in_txn(txn_id, parsed, &base_dir, &table_path)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let result = session
+                    .execute_in_txn(txn_id, parsed)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 if let ApexResult::Scalar(n) = &result {
                     return Ok(ExecOut::Scalar("rows_buffered".to_string(), *n));
                 }
@@ -1148,7 +1138,8 @@ impl ApexStorageImpl {
             }
 
             // Normal execution (non-transaction writes, DDL, and fallback reads)
-            let result = crate::Database::execute_classified(&sql, &sig, &base_dir, &table_path)
+            let result = session
+                .execute_classified(&sql, &sig)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             if let ApexResult::Scalar(n) = &result {
                 return Ok(ExecOut::Scalar("rows_affected".to_string(), *n));
@@ -1158,9 +1149,6 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Ok(ExecOut::Batch(batch))
         })?;
-        crate::query::executor::clear_temp_dir();
-        crate::query::executor::clear_query_root_dir();
-
         // Update transaction state after execution
         if is_begin {
             if let ExecOut::Scalar(_, txn_id) = &exec_out {
@@ -1235,11 +1223,11 @@ impl ApexStorageImpl {
             queries
                 .par_iter()
                 .map(|sql| {
-                    crate::query::executor::set_query_root_dir(&root_dir);
-                    crate::query::executor::set_temp_dir(&temp_dir);
-
                     // Execute query in Rust thread pool
-                    let result = crate::Database::execute(sql, &base_dir, &table_path);
+                    let result = crate::Session::new(&base_dir, &table_path)
+                        .with_root_dir(&root_dir)
+                        .with_temp_dir(&temp_dir)
+                        .execute(sql);
                     let batch = match result {
                         Ok(r) => r.to_record_batch(),
                         Err(e) => return Err(e.to_string()),
@@ -1248,9 +1236,6 @@ impl ApexStorageImpl {
                         Ok(b) => b,
                         Err(e) => return Err(e.to_string()),
                     };
-
-                    crate::query::executor::clear_temp_dir();
-                    crate::query::executor::clear_query_root_dir();
 
                     // Serialize to IPC format
                     let estimated_size = batch.get_array_memory_size() + 512;
@@ -1339,7 +1324,6 @@ impl ApexStorageImpl {
         }
 
         let table_path = self.current_base_dir().join(format!("{}.apex", name));
-        let engine = crate::storage::engine::engine();
         let schema_cols = if let Some(schema_dict) = schema {
             Some(Self::parse_schema_dict(schema_dict)?)
         } else {
@@ -1348,12 +1332,10 @@ impl ApexStorageImpl {
 
         py.allow_threads(|| {
             if let Some(schema_cols) = schema_cols.as_ref() {
-                engine
-                    .create_table_with_schema(&table_path, self.durability, schema_cols)
+                crate::Database::create_table_with_schema(&table_path, self.durability, schema_cols)
                     .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))
             } else {
-                engine
-                    .create_table(&table_path, self.durability)
+                crate::Database::create_table(&table_path, self.durability)
                     .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))
             }
         })?;
@@ -1387,9 +1369,14 @@ impl ApexStorageImpl {
         Ok(())
     }
 
-    fn register_temp_table(&self, py: Python<'_>, name: &str, file_path: &str) -> PyResult<()> {
-        use crate::query::executor::ApexExecutor;
-
+    #[pyo3(signature = (name, file_path, on_bad_lines = "error"))]
+    fn register_temp_table(
+        &self,
+        py: Python<'_>,
+        name: &str,
+        file_path: &str,
+        on_bad_lines: &str,
+    ) -> PyResult<()> {
         let temp_path = self.temp_dir.join(format!("{}.apex", name));
         let temp_dir = self.temp_dir.clone();
         let _ = py.allow_threads(|| fs::create_dir_all(&temp_dir));
@@ -1415,20 +1402,13 @@ impl ApexStorageImpl {
             }
         };
 
-        crate::query::executor::set_temp_dir(&self.temp_dir);
         let base_dir = self.current_base_dir();
+        let options = vec![("on_bad_lines".to_string(), on_bad_lines.to_string())];
         let result = py.allow_threads(|| {
-            crate::Database::copy_import(
-                &temp_path,
-                name,
-                file_path,
-                fmt,
-                &[],
-                &base_dir,
-                &base_dir,
-            )
+            crate::Session::new(&base_dir, &base_dir)
+                .with_temp_dir(&self.temp_dir)
+                .copy_import(&temp_path, name, file_path, fmt, &options)
         });
-        crate::query::executor::clear_temp_dir();
 
         match result {
             Ok(_) => {
@@ -1450,7 +1430,7 @@ impl ApexStorageImpl {
             py.allow_threads(|| {
                 let _ = fs::remove_file(&path);
                 let _ = fs::remove_file(path.with_extension("apex.wal"));
-                crate::storage::engine::engine().invalidate(&path);
+                crate::Database::invalidate(&path);
             });
         }
         Ok(())
@@ -1558,7 +1538,8 @@ impl ApexStorageImpl {
                 format!("SELECT * FROM {} WHERE {}", table_name, where_clause)
             };
 
-            let result = crate::Database::execute(&sql, &table_path, &table_path)
+            let result = crate::Session::new(&table_path, &table_path)
+                .execute(&sql)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
 
             let batch = result

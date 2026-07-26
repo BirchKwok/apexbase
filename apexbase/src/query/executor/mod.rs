@@ -470,7 +470,15 @@ fn evict_lru_cache_entries() {
 // Key: base_dir path, Value: table_name -> IndexManager
 // Lazily loaded from disk catalog on first access per table
 static INDEX_CACHE: Lazy<
-    RwLock<AHashMap<PathBuf, Arc<parking_lot::Mutex<crate::storage::index::IndexManager>>>>,
+    RwLock<
+        AHashMap<
+            PathBuf,
+            (
+                Arc<parking_lot::Mutex<crate::storage::index::IndexManager>>,
+                u64,
+            ),
+        >,
+    >,
 > = Lazy::new(|| RwLock::new(AHashMap::with_capacity(32)));
 
 /// Get or create an IndexManager for a table. Returns None if base_dir is not available.
@@ -481,12 +489,16 @@ fn get_index_manager(
 ) -> Arc<parking_lot::Mutex<crate::storage::index::IndexManager>> {
     use crate::storage::index::IndexManager;
     let cache_key = base_dir.join(table_name);
+    let table_path = base_dir.join(format!("{table_name}.apex"));
+    let epoch = crate::storage::epoch::current(&table_path);
 
     // Fast path: check read lock
     {
         let cache = INDEX_CACHE.read();
-        if let Some(mgr) = cache.get(&cache_key) {
-            return mgr.clone();
+        if let Some((mgr, observed_epoch)) = cache.get(&cache_key) {
+            if *observed_epoch == epoch {
+                return Arc::clone(mgr);
+            }
         }
     }
 
@@ -496,7 +508,7 @@ fn get_index_manager(
     let mgr = Arc::new(parking_lot::Mutex::new(mgr));
 
     let mut cache = INDEX_CACHE.write();
-    cache.entry(cache_key).or_insert_with(|| mgr.clone());
+    cache.insert(cache_key, (Arc::clone(&mgr), epoch));
     mgr
 }
 
@@ -831,12 +843,24 @@ pub fn get_cached_backend_pub(path: &Path) -> io::Result<Arc<TableStorageBackend
     get_cached_backend(path)
 }
 
+/// Return the cached backend only when it owns in-memory state that cannot be
+/// reconstructed by reopening the table.
+#[inline]
+fn get_pending_cached_backend(path: &Path) -> Option<Arc<TableStorageBackend>> {
+    let entry = STORAGE_CACHE.get(path)?;
+    let backend = &entry.value().0;
+    (backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0)
+        .then(|| Arc::clone(backend))
+}
+
 /// Get or open a cached storage backend.
 /// Read paths merge pending `.delta` rows on demand; they must not compact,
 /// because a small transaction append would otherwise become a full-table rewrite.
 #[inline]
 fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     let cache_key = path.to_path_buf();
+    let current_epoch = crate::storage::epoch::current(path);
+
     let delta_path = {
         let mut dp = cache_key.clone();
         let name = dp.file_name().unwrap_or_default().to_string_lossy();
@@ -845,22 +869,31 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     };
     let delta_meta_initial = std::fs::metadata(&delta_path).ok();
 
-    // FASTEST PATH: if backend was validated within last 500ms, skip ALL stat() syscalls.
-    // Uses AtomicU64 for last_access so no write-lock is needed on the warm hit path.
-    // DashMap::get is lock-free for reads
-    if delta_meta_initial.is_none() {
-        if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
-            let pair = entry.pair();
-            let value = pair.1;
-            let last_access = &value.3;
-            if value.2 == crate::storage::epoch::current(path)
-                && nanos_elapsed(last_access.load(Ordering::Relaxed)) < 500_000_000
-            {
-                let backend = Arc::clone(&value.0);
-                // Refresh last_access atomically — no write lock needed
-                last_access.store(now_nanos(), Ordering::Relaxed);
-                return Ok(backend);
+    // Inspect the cache under its read lock. A write lock is only needed when
+    // an authoritative backend with pending state must adopt a newer epoch.
+    if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
+        let value = entry.value();
+        if value.2 != current_epoch {
+            if value.0.has_pending_deltas() || value.0.pending_v4_in_memory_rows() > 0 {
+                drop(entry);
+                if let Some(mut entry) = STORAGE_CACHE.get_mut(&cache_key) {
+                    let value = entry.value_mut();
+                    if value.2 != current_epoch
+                        && (value.0.has_pending_deltas() || value.0.pending_v4_in_memory_rows() > 0)
+                    {
+                        value.1 = storage_effective_modified(path);
+                        value.2 = current_epoch;
+                        value.3.store(now_nanos(), Ordering::Relaxed);
+                        return Ok(Arc::clone(&value.0));
+                    }
+                }
             }
+        } else if delta_meta_initial.is_none()
+            && nanos_elapsed(value.3.load(Ordering::Relaxed)) < 500_000_000
+        {
+            let backend = Arc::clone(&value.0);
+            value.3.store(now_nanos(), Ordering::Relaxed);
+            return Ok(backend);
         }
     }
 
@@ -899,7 +932,7 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         let value = pair.1;
         let cached_time = value.1;
         let last_access = &value.3;
-        if value.2 == crate::storage::epoch::current(path) && cached_time >= effective_modified {
+        if value.2 == current_epoch && cached_time >= effective_modified {
             let backend = Arc::clone(&value.0);
             last_access.store(now_nanos(), Ordering::Relaxed);
             return Ok(backend);

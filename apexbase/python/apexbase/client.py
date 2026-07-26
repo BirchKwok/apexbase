@@ -94,7 +94,6 @@ import struct
 # Null context manager for lock-free SELECT execution paths
 _NULL_CONTEXT = contextlib.nullcontext()
 _HOT_CACHE_MISS = object()
-_TABLE_RESULT_GENERATIONS = {}
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Auto Scheduler - Initialize scheduler lazily for parallel query execution
@@ -967,9 +966,6 @@ class ApexClient:
         """
         Clear exact-replace / numeric-update / missing-delete and numeric-range caches.
 
-        Also bumps the current table's result generation token so cached SQL
-        results cannot be reused across mutations.
-
         Returns:
             None
         """
@@ -981,14 +977,6 @@ class ApexClient:
         cache = getattr(self, '_numeric_range_rows_cache', None)
         if cache is not None:
             cache.clear()
-        table = getattr(self, '_current_table', None)
-        if table:
-            key = (
-                str(getattr(self, '_dirpath', '')),
-                getattr(self, '_current_database', 'default'),
-                table,
-            )
-            _TABLE_RESULT_GENERATIONS[key] = _TABLE_RESULT_GENERATIONS.get(key, 0) + 1
 
     def _numeric_range_cache_token(self):
         """
@@ -1006,12 +994,7 @@ class ApexClient:
         try:
             if self._storage.has_pending_overlay_writes():
                 return None
-            key = (
-                str(self._dirpath),
-                self._current_database,
-                self._current_table,
-            )
-            return _TABLE_RESULT_GENERATIONS.get(key, 0)
+            return self._storage._table_epoch()
         except (AttributeError, RuntimeError):
             return None
 
@@ -1303,7 +1286,9 @@ class ApexClient:
         with self._lock:
             return self._storage.list_tables()
 
-    def register_temp_table(self, name: str, file_path: str):
+    def register_temp_table(
+        self, name: str, file_path: str, on_bad_lines: str = "error"
+    ):
         """
         Register a data file (CSV, JSON, Parquet) as a temporary table.
 
@@ -1315,6 +1300,8 @@ class ApexClient:
             name: Name for the temporary table.
             file_path: Path to the data file (``.csv``/``.tsv``,
                 ``.json``/``.ndjson``/``.jsonl``, or ``.parquet``).
+            on_bad_lines: CSV malformed-row policy: ``"error"`` (default),
+                ``"skip"``, or ``"warn"``. Ignored for non-CSV files.
 
         Returns:
             None
@@ -1323,7 +1310,7 @@ class ApexClient:
         with self._lock:
             self._flush_pending_memtable_rows_for_read()
             self.flush_buffered_writes()
-            self._storage.register_temp_table(name, file_path)
+            self._storage.register_temp_table(name, file_path, on_bad_lines)
 
     def drop_temp_table(self, name: str):
         """
@@ -3704,13 +3691,26 @@ class ApexClient:
         """
         self._check_connection()
         self._ensure_table_selected()
-        q_str = ','.join(f'{float(v):.7g}' for v in (query.tolist() if hasattr(query, 'tolist') else query))
-        sql = (
-            f"SELECT explode_rename(topk_distance({col}, [{q_str}], {k}, '{metric}'), "
-            f"'{id_col}', '{dist_col}') "
-            f"FROM {self._current_table}"
+        query_array = np.asarray(query, dtype='<f4')
+        if query_array.ndim != 1:
+            raise ValueError("topk_distance: query must be a 1-D vector")
+        if query_array.size == 0:
+            raise ValueError("topk_distance: query must not be empty")
+        schema_ptr, array_ptr = self._storage._topk_distance_ffi(
+            col, query_array.tobytes(), k, metric
         )
-        return self.execute(sql)
+        if schema_ptr == 0 or array_ptr == 0:
+            rv = ResultView(lazy_pydict={id_col: [], dist_col: []})
+            rv._show_internal_id = True
+            return rv
+        pa_mod = _ensure_pyarrow()
+        batch = pa_mod.RecordBatch._import_from_c(array_ptr, schema_ptr)
+        table = pa_mod.Table.from_batches([batch])
+        if table.column_names != [id_col, dist_col]:
+            table = table.rename_columns([id_col, dist_col])
+        rv = ResultView(arrow_table=table, data=None)
+        rv._show_internal_id = True
+        return rv
 
     def batch_topk_distance(
         self,

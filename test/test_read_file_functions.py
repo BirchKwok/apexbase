@@ -156,6 +156,48 @@ class TestReadCsv:
         with pytest.raises(Exception):
             self.c.execute(f"SELECT * FROM read_csv('{self.d}/no_such_file.csv')")
 
+    def test_bad_lines_default_error_and_skip(self):
+        dirty = os.path.join(self.d, 'dirty.csv')
+        with open(dirty, 'w', encoding='utf-8') as f:
+            f.write("name,age\nAlice,30\nbroken,40,extra\nBob,25\n")
+
+        with pytest.raises(Exception, match="fields; expected"):
+            self.c.execute(f"SELECT * FROM read_csv('{dirty}')")
+
+        rows = self.c.execute(
+            f"SELECT name, age FROM read_csv('{dirty}', on_bad_lines='skip') ORDER BY name"
+        ).to_dict()
+        assert rows == [{'name': 'Alice', 'age': 30}, {'name': 'Bob', 'age': 25}]
+
+        warned = self.c.execute(
+            f"SELECT name FROM read_csv('{dirty}', on_bad_lines='warn') ORDER BY name"
+        ).to_dict()
+        assert [row['name'] for row in warned] == ['Alice', 'Bob']
+
+    def test_expression_key_join_uses_replace(self):
+        styles = os.path.join(self.d, 'styles.csv')
+        images = os.path.join(self.d, 'images.csv')
+        _write_csv(styles, [
+            {'id': 1001, 'product': 'shirt'},
+            {'id': 1002, 'product': 'shoes'},
+            {'id': 9999, 'product': 'missing'},
+        ])
+        _write_csv(images, [
+            {'filename': '1002.jpg'},
+            {'filename': '1001.jpg'},
+        ])
+        rows = self.c.execute(f"""
+            SELECT CAST(s.id AS INT) AS product_id, i.filename
+            FROM read_csv('{styles}') s
+            JOIN read_csv('{images}') i
+              ON CAST(s.id AS TEXT) = REPLACE(i.filename, '.jpg', '')
+            ORDER BY product_id
+        """).to_dict()
+        assert rows == [
+            {'product_id': 1001, 'filename': '1001.jpg'},
+            {'product_id': 1002, 'filename': '1002.jpg'},
+        ]
+
 
 # ============================================================
 # read_parquet

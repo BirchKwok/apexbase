@@ -16,6 +16,7 @@ pub mod vector_ops;
 pub mod vectorized;
 pub mod vectorized_join;
 
+pub use crate::data::AggregateFunc;
 pub use executor::{
     get_cached_backend_pub, get_session_variable, reset_session_variable, set_session_variable,
     ApexExecutor, ApexResult,
@@ -24,7 +25,6 @@ pub use expr_compiler::sql_expr_to_filter;
 pub use filter::{CompareOp, Filter, LikeMatcher, RegexpMatcher};
 pub use query_signature::QuerySignature;
 pub use sql_parser::{
-    AggregateFunc,
     AlterTableOp,
     // DDL types
     ColumnDef,

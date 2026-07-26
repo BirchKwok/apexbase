@@ -34,6 +34,7 @@ const GLOBAL_DICT_CACHE_MAX_ENTRIES: usize = 64;
 
 struct GlobalDictCacheEntry {
     modified_time: SystemTime,
+    epoch: u64,
     data: Arc<(Vec<String>, Vec<u16>)>,
     bytes: usize,
     last_access: AtomicU64,
@@ -88,12 +89,13 @@ pub fn get_global_dict_cache(
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let key = (path.to_path_buf(), col_name.to_string());
+    let epoch = crate::storage::epoch::current(path);
 
     // Check cache
     {
         let cache = GLOBAL_DICT_CACHE.read();
         if let Some(entry) = cache.get(&key) {
-            if entry.modified_time >= mtime {
+            if entry.epoch == epoch && entry.modified_time >= mtime {
                 entry.last_access.store(
                     GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
                     Ordering::Relaxed,
@@ -124,6 +126,7 @@ pub fn get_global_dict_cache(
             key,
             GlobalDictCacheEntry {
                 modified_time: mtime,
+                epoch,
                 data: Arc::clone(&data),
                 bytes,
                 last_access: AtomicU64::new(
@@ -630,12 +633,15 @@ impl TableStorageBackend {
     /// Used by execute_delete to avoid the expensive load_all_columns_into_memory() + save_v4()
     /// cycle. Deletion vectors are updated in-place via save_delete_only().
     pub fn open_for_delete(path: &Path) -> io::Result<Self> {
-        // Light-weight open: skips tmp file cleanup, DeltaStore::load, and WAL init.
-        // None of these are needed for the in-place delete fast path (~50µs savings).
-        // Falls back to Self::open() if file::open or metadata fails.
+        // The delete backend still loads DeltaStore state for correctness, but
+        // its wrapper-level row_count is never consulted by DELETE execution.
+        // Avoid parsing the append-only delta file solely to initialize that
+        // unused field; active_row_count() remains authoritative when needed.
         if let Ok(file) = std::fs::File::open(path) {
             if let Ok(meta) = file.metadata() {
-                return Self::open_with_file(path, file, meta.len());
+                let storage = OnDemandStorage::open_for_read_with_file(path, file, meta.len())?;
+                let base_rows = storage.base_row_count();
+                return Ok(Self::from_storage_with_row_count(path, storage, base_rows));
             }
         }
         Self::open(path)
@@ -1277,6 +1283,48 @@ impl TableStorageBackend {
         Ok(result)
     }
 
+    pub fn delta_delete_rows(&self, row_ids: &[u64]) -> usize {
+        let deleted = self.storage.delta_delete_rows(row_ids);
+        if deleted > 0 {
+            self.invalidate_read_caches();
+            *self.dirty.write() = true;
+        }
+        deleted
+    }
+
+    pub fn delta_numeric_range_ids(
+        &self,
+        column_name: &str,
+        low: f64,
+        high: f64,
+    ) -> io::Result<Vec<u64>> {
+        self.storage.delta_numeric_range_ids(column_name, low, high)
+    }
+
+    pub fn delta_string_equality_ids(
+        &self,
+        column_name: &str,
+        expected: &str,
+    ) -> io::Result<Vec<u64>> {
+        self.storage
+            .delta_string_equality_ids(column_name, expected)
+    }
+
+    pub fn pending_numeric_range_ids(&self, column_name: &str, low: f64, high: f64) -> Vec<u64> {
+        self.storage
+            .pending_numeric_range_ids(column_name, low, high)
+    }
+
+    pub fn pending_string_equality_ids(&self, column_name: &str, expected: &str) -> Vec<u64> {
+        self.storage
+            .pending_string_equality_ids(column_name, expected)
+    }
+
+    #[inline]
+    pub fn persisted_row_count(&self) -> u64 {
+        self.storage.persisted_row_count()
+    }
+
     /// Mark an unflushed V4 memtable row deleted without creating DeltaStore work.
     pub fn delete_pending_v4_in_memory_row(&self, row_id: u64) -> bool {
         let result = self.storage.delete_pending_v4_in_memory_row(row_id);
@@ -1648,7 +1696,7 @@ impl TableStorageBackend {
     pub fn topk_binary_direct(
         &self,
         col_name: &str,
-        computer: &crate::query::vector_ops::DistanceComputer,
+        computer: &crate::compute::vector_ops::DistanceComputer,
         k: usize,
     ) -> io::Result<Option<Vec<(usize, f32)>>> {
         self.storage.topk_binary_direct(col_name, computer, k)
@@ -1660,7 +1708,7 @@ impl TableStorageBackend {
     pub fn topk_fixedlist_direct(
         &self,
         col_name: &str,
-        computer: &crate::query::vector_ops::DistanceComputer,
+        computer: &crate::compute::vector_ops::DistanceComputer,
         k: usize,
     ) -> io::Result<Option<Vec<(usize, f32)>>> {
         self.storage.topk_fixedlist_direct(col_name, computer, k)
@@ -1674,7 +1722,7 @@ impl TableStorageBackend {
         queries: &[f32],
         n_queries: usize,
         k: usize,
-        metric: crate::query::vector_ops::DistanceMetric,
+        metric: crate::compute::vector_ops::DistanceMetric,
     ) -> io::Result<Option<Vec<Vec<(usize, f32)>>>> {
         self.storage
             .batch_topk_fixedlist_direct(col_name, queries, n_queries, k, metric)
@@ -1687,7 +1735,7 @@ impl TableStorageBackend {
         queries: &[f32],
         n_queries: usize,
         k: usize,
-        metric: crate::query::vector_ops::DistanceMetric,
+        metric: crate::compute::vector_ops::DistanceMetric,
     ) -> io::Result<Option<Vec<Vec<(usize, f32)>>>> {
         self.storage
             .batch_topk_binary_direct(col_name, queries, n_queries, k, metric)
@@ -1857,9 +1905,15 @@ impl TableStorageBackend {
             .map(|cols| cols.contains(&"_id"))
             .unwrap_or(true);
         let expected_row_count: usize;
+        let pending_delta_row_ids: Option<Vec<u64>>;
         if include_id {
             let ids = self.storage.read_ids(start_row, row_count)?;
             expected_row_count = ids.len();
+            let row_ids_for_delta = if self.has_pending_deltas() {
+                Some(ids.clone())
+            } else {
+                None
+            };
             fields.push(Field::new("_id", ArrowDataType::Int64, false));
             // OPTIMIZATION: Direct transmute from Vec<u64> to Vec<i64> - same memory layout
             let ids_i64: Vec<i64> = unsafe {
@@ -1867,9 +1921,18 @@ impl TableStorageBackend {
                 Vec::from_raw_parts(ids.as_mut_ptr() as *mut i64, ids.len(), ids.capacity())
             };
             arrays.push(Arc::new(Int64Array::from(ids_i64)));
+            // The general reader is used when append-delta rows are present.
+            // Preserve the physical IDs so the cell-level DeltaStore can be
+            // overlaid on the combined base + append batch below.
+            pending_delta_row_ids = row_ids_for_delta;
         } else {
             // If no _id, get row count from any column
             expected_row_count = col_data.values().next().map(|d| d.len()).unwrap_or(0);
+            pending_delta_row_ids = if self.has_pending_deltas() {
+                Some(self.storage.read_ids(start_row, row_count)?)
+            } else {
+                None
+            };
         }
 
         // Determine column order from schema (or from column_names if specified)
@@ -2132,8 +2195,13 @@ impl TableStorageBackend {
         }
 
         let schema = Arc::new(arrow::datatypes::Schema::new(fields));
-        arrow::record_batch::RecordBatch::try_new(schema, arrays)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+        let batch = arrow::record_batch::RecordBatch::try_new(schema, arrays)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        if let Some(row_ids) = pending_delta_row_ids {
+            let delta = self.storage.delta_store();
+            return crate::storage::DeltaMerger::merge(&batch, &delta, &row_ids);
+        }
+        Ok(batch)
     }
 
     /// Read an Arrow row window without forcing V4 mmap callers to rescan from row 0.
@@ -4329,13 +4397,13 @@ impl TableStorageBackend {
         filter_val: &str,
         group_col: &str,
         agg_col: Option<&str>,
-        agg_func: crate::query::AggregateFunc,
+        agg_func: crate::data::AggregateFunc,
         _order_col: &str,
         descending: bool,
         limit: usize,
         offset: usize,
     ) -> io::Result<Option<RecordBatch>> {
-        use crate::query::AggregateFunc;
+        use crate::data::AggregateFunc;
         use arrow::array::{DictionaryArray, Float64Array, Int64Array, StringArray, UInt32Array};
         use arrow::datatypes::UInt32Type;
         use std::cmp::Ordering;
@@ -4621,6 +4689,7 @@ mod tests {
     fn test_dict_entry(bytes: usize, access: u64) -> GlobalDictCacheEntry {
         GlobalDictCacheEntry {
             modified_time: SystemTime::UNIX_EPOCH,
+            epoch: 0,
             data: Arc::new((Vec::new(), Vec::new())),
             bytes,
             last_access: AtomicU64::new(access),

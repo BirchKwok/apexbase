@@ -1,7 +1,7 @@
 use super::*;
 
 impl ApexExecutor {
-    pub(super) fn execute_copy_to_parquet(
+    pub(in crate::query::executor) fn execute_copy_to_parquet(
         storage_path: &Path,
         table_name: &str,
         file_path: &str,
@@ -40,7 +40,7 @@ impl ApexExecutor {
         Ok(ApexResult::Scalar(batch.num_rows() as i64))
     }
 
-    pub(super) fn execute_copy_export(
+    pub(in crate::query::executor) fn execute_copy_export(
         storage_path: &Path,
         table_name: &str,
         file_path: &str,
@@ -129,13 +129,14 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn execute_copy_from_parquet(
+    pub(in crate::query::executor) fn execute_copy_from_parquet(
         storage_path: &Path,
         table_name: &str,
         file_path: &str,
         base_dir: &Path,
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
+        let _epoch_write = crate::storage::epoch::logical_write(storage_path);
         let file = std::fs::File::open(file_path).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::NotFound,
@@ -250,7 +251,7 @@ impl ApexExecutor {
         ))
     }
 
-    pub(super) fn read_csv_to_batch(
+    pub(in crate::query::executor) fn read_csv_to_batch(
         path: &str,
         options: &[(String, String)],
     ) -> io::Result<RecordBatch> {
@@ -268,6 +269,7 @@ impl ApexExecutor {
             .and_then(|(_, v)| v.chars().next())
             .map(|c| c as u8)
             .unwrap_or(b',');
+        let bad_line_policy = csv_bad_line_policy(options)?;
 
         let file = std::fs::File::open(path).map_err(|e| {
             io::Error::new(
@@ -346,7 +348,13 @@ impl ApexExecutor {
                 if chunk.is_empty() {
                     return Ok(RecordBatch::new_empty(Arc::clone(&schema_ref)));
                 }
-                Self::parse_csv_chunk_fast(chunk, &schema_ref, delimiter, filter_info.as_ref())
+                Self::parse_csv_chunk_fast(
+                    chunk,
+                    &schema_ref,
+                    delimiter,
+                    filter_info.as_ref(),
+                    bad_line_policy,
+                )
             })
             .collect();
 
@@ -354,11 +362,12 @@ impl ApexExecutor {
         Self::merge_record_batches(all)
     }
 
-    pub(super) fn parse_csv_chunk_fast(
+    pub(in crate::query::executor) fn parse_csv_chunk_fast(
         data: &[u8],
         schema: &arrow::datatypes::Schema,
         delimiter: u8,
         filter_info: Option<&PushdownFilter>,
+        bad_line_policy: CsvBadLinePolicy,
     ) -> io::Result<RecordBatch> {
         use arrow::array::{BooleanArray, BooleanBuilder};
         use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -516,6 +525,7 @@ impl ApexExecutor {
         // Single forward pass — outer newline search via SIMD memchr_iter.
         // Inner delimiter search also uses SIMD memchr_iter (replaces scalar byte loop).
         let mut line_start = 0usize;
+        let mut line_number = 1usize;
         for nl in memchr::memchr_iter(b'\n', data) {
             let raw = &data[line_start..nl];
             line_start = nl + 1;
@@ -525,12 +535,27 @@ impl ApexExecutor {
                 raw
             };
             if line.is_empty() {
+                line_number += 1;
                 continue;
+            }
+            if bad_line_policy != CsvBadLinePolicy::Error {
+                let actual_fields = csv_field_count(line, delimiter);
+                if actual_fields != n_cols {
+                    if bad_line_policy == CsvBadLinePolicy::Warn {
+                        eprintln!(
+                            "ApexBase CSV warning: skipped row {} with {} fields; expected {}",
+                            line_number, actual_fields, n_cols
+                        );
+                    }
+                    line_number += 1;
+                    continue;
+                }
             }
             // Pushdown filter: skip row if filter column's value doesn't match
             if let Some(ref fi) = filter_info {
                 let fv = Self::get_csv_field(line, fi.col_idx, delimiter);
                 if !csv_filter_match(fv, fi) {
+                    line_number += 1;
                     continue;
                 }
             }
@@ -543,6 +568,17 @@ impl ApexExecutor {
                 col += 1;
                 fs = i + 1;
             }
+            if bad_line_policy == CsvBadLinePolicy::Error && col + 1 != n_cols {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "CSV row {} has {} fields; expected {}",
+                        line_number,
+                        col + 1,
+                        n_cols
+                    ),
+                ));
+            }
             if col < n_cols {
                 push_field!(&mut cols[col], &line[fs..]);
                 col += 1;
@@ -551,6 +587,7 @@ impl ApexExecutor {
                 push_null!(&mut cols[col]);
                 col += 1;
             }
+            line_number += 1;
         }
         if line_start < data.len() {
             let raw = &data[line_start..];
@@ -560,22 +597,51 @@ impl ApexExecutor {
                 raw
             };
             if !line.is_empty() {
-                let mut fs = 0usize;
-                let mut col = 0usize;
-                for i in memchr::memchr_iter(delimiter, line) {
-                    if col < n_cols {
-                        push_field!(&mut cols[col], &line[fs..i]);
+                let parse_tail = if bad_line_policy == CsvBadLinePolicy::Error {
+                    true
+                } else {
+                    let actual_fields = csv_field_count(line, delimiter);
+                    if actual_fields == n_cols {
+                        true
+                    } else {
+                        if bad_line_policy == CsvBadLinePolicy::Warn {
+                            eprintln!(
+                                "ApexBase CSV warning: skipped row {} with {} fields; expected {}",
+                                line_number, actual_fields, n_cols
+                            );
+                        }
+                        false
                     }
-                    col += 1;
-                    fs = i + 1;
-                }
-                if col < n_cols {
-                    push_field!(&mut cols[col], &line[fs..]);
-                    col += 1;
-                }
-                while col < n_cols {
-                    push_null!(&mut cols[col]);
-                    col += 1;
+                };
+                if parse_tail {
+                    let mut fs = 0usize;
+                    let mut col = 0usize;
+                    for i in memchr::memchr_iter(delimiter, line) {
+                        if col < n_cols {
+                            push_field!(&mut cols[col], &line[fs..i]);
+                        }
+                        col += 1;
+                        fs = i + 1;
+                    }
+                    if bad_line_policy == CsvBadLinePolicy::Error && col + 1 != n_cols {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "CSV row {} has {} fields; expected {}",
+                                line_number,
+                                col + 1,
+                                n_cols
+                            ),
+                        ));
+                    }
+                    if col < n_cols {
+                        push_field!(&mut cols[col], &line[fs..]);
+                        col += 1;
+                    }
+                    while col < n_cols {
+                        push_null!(&mut cols[col]);
+                        col += 1;
+                    }
                 }
             }
         }
@@ -622,7 +688,7 @@ impl ApexExecutor {
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))
     }
 
-    pub(super) fn infer_csv_schema_fast(
+    pub(in crate::query::executor) fn infer_csv_schema_fast(
         data: &[u8],
         has_header: bool,
         delimiter: u8,
@@ -760,7 +826,7 @@ impl ApexExecutor {
         Ok(Schema::new(fields))
     }
 
-    pub(super) fn update_col_type(col_type: &mut u8, field: &[u8]) {
+    pub(in crate::query::executor) fn update_col_type(col_type: &mut u8, field: &[u8]) {
         if *col_type >= 3 {
             return;
         } // already String — no point checking
@@ -800,7 +866,7 @@ impl ApexExecutor {
         *col_type = 3;
     }
 
-    pub(super) fn parse_i64_bytes(b: &[u8]) -> i64 {
+    pub(in crate::query::executor) fn parse_i64_bytes(b: &[u8]) -> i64 {
         let (neg, digits) = match b.first() {
             Some(&b'-') => (true, &b[1..]),
             Some(&b'+') => (false, &b[1..]),
@@ -817,7 +883,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn parse_u64_bytes(b: &[u8]) -> u64 {
+    pub(in crate::query::executor) fn parse_u64_bytes(b: &[u8]) -> u64 {
         let digits = if b.first() == Some(&b'+') { &b[1..] } else { b };
         let mut v = 0u64;
         for &d in digits {
@@ -826,7 +892,7 @@ impl ApexExecutor {
         v
     }
 
-    pub(super) fn get_csv_field(line: &[u8], col: usize, delimiter: u8) -> &[u8] {
+    pub(in crate::query::executor) fn get_csv_field(line: &[u8], col: usize, delimiter: u8) -> &[u8] {
         let mut count = 0usize;
         let mut start = 0usize;
         for (i, &b) in line.iter().enumerate() {
@@ -845,7 +911,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn extract_csv_column(
+    pub(in crate::query::executor) fn extract_csv_column(
         data: &[u8],
         col_idx: usize,
         dtype: &arrow::datatypes::DataType,
@@ -934,7 +1000,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn read_json_to_batch(
+    pub(in crate::query::executor) fn read_json_to_batch(
         path: &str,
         _options: &[(String, String)],
     ) -> io::Result<RecordBatch> {
@@ -1079,7 +1145,7 @@ impl ApexExecutor {
         Self::merge_record_batches(all)
     }
 
-    pub(super) fn try_fast_json_count(
+    pub(in crate::query::executor) fn try_fast_json_count(
         path: &str,
         where_clause: Option<&SqlExpr>,
     ) -> io::Result<Option<i64>> {
@@ -1161,7 +1227,7 @@ impl ApexExecutor {
         Ok(Some(count as i64))
     }
 
-    pub(super) fn looks_like_ndjson(bytes: &[u8]) -> bool {
+    pub(in crate::query::executor) fn looks_like_ndjson(bytes: &[u8]) -> bool {
         let mut checked = 0usize;
         let mut line_start = 0usize;
         for nl in memchr::memchr_iter(b'\n', bytes).take(16) {
@@ -1188,7 +1254,7 @@ impl ApexExecutor {
         checked > 0 && memchr::memchr(b'\n', bytes).is_some()
     }
 
-    pub(super) fn trim_ascii_json_line(mut line: &[u8]) -> &[u8] {
+    pub(in crate::query::executor) fn trim_ascii_json_line(mut line: &[u8]) -> &[u8] {
         while line.first().is_some_and(|b| b.is_ascii_whitespace()) {
             line = &line[1..];
         }
@@ -1198,7 +1264,7 @@ impl ApexExecutor {
         line
     }
 
-    pub(super) fn extract_json_numeric_filter(expr: &SqlExpr) -> Option<JsonNumericFilter> {
+    pub(in crate::query::executor) fn extract_json_numeric_filter(expr: &SqlExpr) -> Option<JsonNumericFilter> {
         let SqlExpr::BinaryOp { left, op, right } = expr else {
             return None;
         };
@@ -1234,7 +1300,7 @@ impl ApexExecutor {
         })
     }
 
-    pub(super) fn count_json_chunk_rows(data: &[u8], filter: Option<&JsonNumericFilter>) -> usize {
+    pub(in crate::query::executor) fn count_json_chunk_rows(data: &[u8], filter: Option<&JsonNumericFilter>) -> usize {
         let mut count = 0usize;
         let mut line_start = 0usize;
         for nl in memchr::memchr_iter(b'\n', data) {
@@ -1253,7 +1319,7 @@ impl ApexExecutor {
         count
     }
 
-    pub(super) fn json_line_matches_filter(
+    pub(in crate::query::executor) fn json_line_matches_filter(
         line: &[u8],
         filter: Option<&JsonNumericFilter>,
     ) -> bool {
@@ -1282,7 +1348,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn json_line_numeric_value(line: &[u8], key: &[u8]) -> Option<f64> {
+    pub(in crate::query::executor) fn json_line_numeric_value(line: &[u8], key: &[u8]) -> Option<f64> {
         let mut search_from = 0usize;
         while search_from < line.len() {
             let pos = memchr::memmem::find(&line[search_from..], key)?;
@@ -1322,7 +1388,7 @@ impl ApexExecutor {
         None
     }
 
-    pub(super) fn try_columns_format_fast(content: &str) -> io::Result<Option<RecordBatch>> {
+    pub(in crate::query::executor) fn try_columns_format_fast(content: &str) -> io::Result<Option<RecordBatch>> {
         use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
         use arrow::datatypes::{DataType as ArrowDT, Field, Schema};
         use serde_json::value::RawValue;
@@ -1419,7 +1485,7 @@ impl ApexExecutor {
         Ok(Some(batch))
     }
 
-    pub(super) fn peek_first_json_value(obj_json: &str) -> Option<&str> {
+    pub(in crate::query::executor) fn peek_first_json_value(obj_json: &str) -> Option<&str> {
         let bytes = obj_json.as_bytes();
         let mut i = 0;
         // Skip opening '{'
@@ -1504,7 +1570,7 @@ impl ApexExecutor {
         None
     }
 
-    pub(super) fn json_value_to_batch(value: serde_json::Value) -> io::Result<RecordBatch> {
+    pub(in crate::query::executor) fn json_value_to_batch(value: serde_json::Value) -> io::Result<RecordBatch> {
         use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
         use arrow::datatypes::{DataType as ArrowDT, Field, Schema};
 
@@ -1668,7 +1734,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn column_vecs_to_batch(
+    pub(in crate::query::executor) fn column_vecs_to_batch(
         col_names: Vec<String>,
         cols: Vec<Vec<&serde_json::Value>>,
     ) -> io::Result<RecordBatch> {
@@ -1712,7 +1778,7 @@ impl ApexExecutor {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
-    pub(super) fn normalize_json_to_ndjson(content: &str) -> io::Result<String> {
+    pub(in crate::query::executor) fn normalize_json_to_ndjson(content: &str) -> io::Result<String> {
         let trimmed = content.trim();
         let value: serde_json::Value = match serde_json::from_str(trimmed) {
             Ok(v) => v,
@@ -1759,7 +1825,7 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn read_parquet_to_batch(
+    pub(in crate::query::executor) fn read_parquet_to_batch(
         path: &str,
         options: &[(String, String)],
     ) -> io::Result<RecordBatch> {
@@ -2013,7 +2079,7 @@ impl ApexExecutor {
         Self::merge_record_batches(all)
     }
 
-    pub(super) fn try_fast_parquet_count(
+    pub(in crate::query::executor) fn try_fast_parquet_count(
         path: &str,
         filter: Option<&str>,
     ) -> io::Result<Option<i64>> {
@@ -2081,14 +2147,14 @@ impl ApexExecutor {
         Ok(Some(counts?.into_iter().sum()))
     }
 
-    pub(super) fn parquet_filter_type_supported(data_type: &arrow::datatypes::DataType) -> bool {
+    pub(in crate::query::executor) fn parquet_filter_type_supported(data_type: &arrow::datatypes::DataType) -> bool {
         matches!(
             data_type,
             arrow::datatypes::DataType::Float32 | arrow::datatypes::DataType::Float64
         )
     }
 
-    pub(super) fn parquet_numeric_filter(
+    pub(in crate::query::executor) fn parquet_numeric_filter(
         array: &ArrayRef,
         filter: PushdownFilter,
     ) -> arrow::error::Result<BooleanArray> {
@@ -2135,7 +2201,7 @@ impl ApexExecutor {
         )))
     }
 
-    pub(super) fn merge_record_batches(batches: Vec<RecordBatch>) -> io::Result<RecordBatch> {
+    pub(in crate::query::executor) fn merge_record_batches(batches: Vec<RecordBatch>) -> io::Result<RecordBatch> {
         if batches.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(
                 arrow::datatypes::Schema::empty(),
@@ -2151,7 +2217,7 @@ impl ApexExecutor {
         })
     }
 
-    pub(super) fn for_each_import_batch<F>(
+    pub(in crate::query::executor) fn for_each_import_batch<F>(
         file_path: &str,
         format: &str,
         options: &[(String, String)],
@@ -2162,6 +2228,13 @@ impl ApexExecutor {
     {
         match format.to_uppercase().as_str() {
             "CSV" | "TSV" => {
+                if csv_bad_line_policy(options)? != CsvBadLinePolicy::Error {
+                    let batch = Self::read_csv_to_batch(file_path, options)?;
+                    if batch.num_rows() > 0 {
+                        visit(batch)?;
+                    }
+                    return Ok(());
+                }
                 let has_header = options
                     .iter()
                     .find(|(key, _)| key == "header")
@@ -2284,7 +2357,7 @@ impl ApexExecutor {
         Ok(())
     }
 
-    pub(super) fn ensure_import_table(
+    pub(in crate::query::executor) fn ensure_import_table(
         storage_path: &Path,
         table_name: &str,
         schema: &arrow::datatypes::Schema,
@@ -2326,7 +2399,7 @@ impl ApexExecutor {
         Ok(())
     }
 
-    pub(super) fn append_import_batch(
+    pub(in crate::query::executor) fn append_import_batch(
         storage_path: &Path,
         table_name: &str,
         batch: &RecordBatch,
@@ -2378,6 +2451,7 @@ impl ApexExecutor {
         _base_dir: &Path,
         _default_table_path: &Path,
     ) -> io::Result<ApexResult> {
+        let _epoch_write = crate::storage::epoch::logical_write(storage_path);
         let mut num_rows = 0usize;
         Self::for_each_import_batch(file_path, format, options, |batch| {
             num_rows += Self::append_import_batch(storage_path, table_name, &batch)?;

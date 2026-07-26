@@ -1,12 +1,12 @@
 use super::*;
 
 impl ApexExecutor {
-    pub(super) fn epoch_days(date: chrono::NaiveDate) -> i32 {
+    pub(in crate::query::executor) fn epoch_days(date: chrono::NaiveDate) -> i32 {
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         (date - epoch).num_days() as i32
     }
 
-    pub(super) fn default_value_to_value(
+    pub(in crate::query::executor) fn default_value_to_value(
         default: &crate::storage::on_demand::DefaultValue,
         col_type: Option<crate::storage::on_demand::ColumnType>,
         ctx: &DefaultEvalContext,
@@ -111,20 +111,20 @@ impl ApexExecutor {
         }
     }
 
-    pub(super) fn date_string_from_days(days: i32) -> String {
+    pub(in crate::query::executor) fn date_string_from_days(days: i32) -> String {
         let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
         (epoch + chrono::Duration::days(days as i64))
             .format("%Y-%m-%d")
             .to_string()
     }
 
-    pub(super) fn timestamp_string_from_micros(micros: i64) -> String {
+    pub(in crate::query::executor) fn timestamp_string_from_micros(micros: i64) -> String {
         chrono::DateTime::from_timestamp_micros(micros)
             .map(|dt| dt.format("%Y-%m-%d %H:%M:%S").to_string())
             .unwrap_or_else(|| micros.to_string())
     }
 
-    pub(super) fn resolve_insert_values_for_path(
+    pub(in crate::query::executor) fn resolve_insert_values_for_path(
         storage_path: &Path,
         columns: Option<&[String]>,
         values: &[Vec<InsertValue>],
@@ -204,7 +204,7 @@ impl ApexExecutor {
             .collect())
     }
 
-    pub(super) fn is_insert_default_values(
+    pub(in crate::query::executor) fn is_insert_default_values(
         columns: Option<&[String]>,
         values: &[Vec<InsertValue>],
     ) -> bool {
@@ -213,7 +213,7 @@ impl ApexExecutor {
             && values.first().is_some_and(|row| row.is_empty())
     }
 
-    pub(super) fn resolve_default_values_insert_for_path(
+    pub(in crate::query::executor) fn resolve_default_values_insert_for_path(
         storage_path: &Path,
     ) -> io::Result<(Vec<String>, Vec<Vec<Value>>)> {
         if !storage_path.exists() {
@@ -256,7 +256,7 @@ impl ApexExecutor {
         Ok((columns, vec![row]))
     }
 
-    pub(super) fn execute_insert_items(
+    pub(in crate::query::executor) fn execute_insert_items(
         storage_path: &Path,
         columns: Option<&[String]>,
         values: &[Vec<InsertValue>],
@@ -270,7 +270,7 @@ impl ApexExecutor {
         Self::execute_insert(storage_path, columns, &resolved)
     }
 
-    pub(super) fn execute_insert(
+    pub(in crate::query::executor) fn execute_insert(
         storage_path: &Path,
         columns: Option<&[String]>,
         values: &[Vec<Value>],
@@ -283,6 +283,7 @@ impl ApexExecutor {
                 "Table does not exist",
             ));
         }
+        let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
@@ -756,7 +757,7 @@ impl ApexExecutor {
         Ok(ApexResult::Scalar(rows_inserted))
     }
 
-    pub(super) fn execute_insert_on_conflict(
+    pub(in crate::query::executor) fn execute_insert_on_conflict(
         storage_path: &Path,
         columns: Option<&[String]>,
         values: &[Vec<InsertValue>],
@@ -771,6 +772,7 @@ impl ApexExecutor {
                 "Table does not exist",
             ));
         }
+        let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         invalidate_storage_cache(storage_path);
         let storage = TableStorageBackend::open_for_write(storage_path)?;
