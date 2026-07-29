@@ -133,6 +133,9 @@ impl OnDemandStorage {
                 return Err(err_input("schema-stable insert value type mismatch"));
             }
         }
+        if self.columns.read().len() < schema_len {
+            return Err(err_data("column storage shorter than schema"));
+        }
 
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let row_idx = {
@@ -144,9 +147,6 @@ impl OnDemandStorage {
 
         {
             let mut columns = self.columns.write();
-            if columns.len() < schema_len {
-                return Err(err_data("column storage shorter than schema"));
-            }
             for (idx, value) in values.iter().enumerate() {
                 match (schema.columns[idx].1, value) {
                     (ColumnType::Bool, SchemaStableValue::Bool(v)) => columns[idx].push_bool(*v),
@@ -195,6 +195,8 @@ impl OnDemandStorage {
         }
 
         self.active_count.fetch_add(1, Ordering::Relaxed);
+        self.record_pending_rows(1)?;
+        self.maybe_auto_flush()?;
         crate::storage::epoch::bump(&self.path);
         Ok(id)
     }
@@ -450,6 +452,7 @@ impl OnDemandStorage {
         // Update active count (new rows are not deleted)
         self.active_count
             .fetch_add(row_count as u64, Ordering::Relaxed);
+        self.record_pending_rows(row_count)?;
 
         Ok(ids)
     }
@@ -723,6 +726,50 @@ impl OnDemandStorage {
         bool_columns: HashMap<String, Vec<bool>>,
         null_positions: HashMap<String, Vec<bool>>,
     ) -> io::Result<Vec<u64>> {
+        // Validate vector row widths before mutating IDs or column buffers.  A
+        // mixed-width append would otherwise corrupt the fixed-stride layout and
+        // make subsequent SIMD reads cross row boundaries.
+        {
+            let schema = self.schema.read();
+            let columns = self.columns.read();
+            for (name, values) in &fixedlist_columns {
+                let existing_dim = schema
+                    .get_index(name)
+                    .and_then(|idx| columns.get(idx))
+                    .and_then(|column| match column {
+                        ColumnData::FixedList { dim, .. }
+                        | ColumnData::Float16List { dim, .. } if *dim > 0 => {
+                            Some(*dim as usize)
+                        }
+                        _ => None,
+                    });
+                let nulls = null_positions.get(name);
+                let mut expected_dim = existing_dim;
+                for (row, value) in values.iter().enumerate() {
+                    if nulls.and_then(|mask| mask.get(row)).copied().unwrap_or(false) {
+                        continue;
+                    }
+                    if value.is_empty() || value.len() % std::mem::size_of::<f32>() != 0 {
+                        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!(
+                            "Vector column '{}' requires non-empty float32 vectors",
+                            name
+                        )));
+                    }
+                    let dim = value.len() / std::mem::size_of::<f32>();
+                    match expected_dim {
+                        Some(expected) if expected != dim => {
+                            return Err(io::Error::new(io::ErrorKind::InvalidInput, format!(
+                                "Vector column '{}' dimension mismatch: expected {}, got {} at row {}",
+                                name, expected, dim, row
+                            )));
+                        }
+                        None => expected_dim = Some(dim),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         // Determine row count as maximum across all columns
         let row_count = int_columns
             .values()
@@ -986,6 +1033,7 @@ impl OnDemandStorage {
         // Update active count (new rows are not deleted)
         self.active_count
             .fetch_add(row_count as u64, Ordering::Relaxed);
+        self.record_pending_rows(row_count)?;
 
         Ok(ids)
     }
@@ -1131,6 +1179,9 @@ impl OnDemandStorage {
     /// Check if an ID exists and is not deleted
     /// Also checks delta file for IDs not yet merged into base
     pub fn exists(&self, id: u64) -> bool {
+        if self.delta_store.read().is_deleted(id) {
+            return false;
+        }
         // First check base file IDs
         self.ensure_id_index();
         let id_to_idx = self.id_to_idx.read();
@@ -1151,6 +1202,9 @@ impl OnDemandStorage {
 
     /// Get row index for an ID (None if not found or deleted)
     pub fn get_row_idx(&self, id: u64) -> Option<usize> {
+        if self.delta_store.read().is_deleted(id) {
+            return None;
+        }
         self.ensure_id_index();
         let id_to_idx = self.id_to_idx.read();
         let map = id_to_idx.as_ref().unwrap();
@@ -3664,7 +3718,16 @@ impl OnDemandStorage {
                 ColumnData::Float16List { .. } => {}
             }
             columns.push(col);
-            nulls.push(Vec::new());
+            // SQL schema evolution has no implicit zero/empty default. Keep the
+            // physical padding cheap, but mark every pre-existing row NULL.
+            let mut null_bitmap = vec![0xFF; (existing_row_count + 7) / 8];
+            if existing_row_count % 8 != 0 {
+                let valid_bits = existing_row_count % 8;
+                if let Some(last) = null_bitmap.last_mut() {
+                    *last = (1u8 << valid_bits) - 1;
+                }
+            }
+            nulls.push(null_bitmap);
         }
 
         // Update header
@@ -3679,6 +3742,17 @@ impl OnDemandStorage {
     /// Replace a row by ID (delete old row, insert new with SAME ID)
     /// Returns true if successful
     pub fn replace(&self, id: u64, data: &HashMap<String, ColumnValue>) -> io::Result<bool> {
+        // Replacement reuses an existing ID and therefore cannot be represented as
+        // an independent append row group: leaving the old and replacement copies
+        // in separate groups makes point lookup order determine which value wins.
+        // Materialize V4 data first so save() performs one coherent rewrite.
+        if self.is_v4_format()
+            && self.persisted_row_count.load(Ordering::SeqCst) > 0
+            && !self.v4_base_loaded.load(Ordering::SeqCst)
+        {
+            self.load_all_columns_into_memory()?;
+        }
+
         // Check if ID exists
         if !self.exists(id) {
             return Ok(false);
@@ -3928,6 +4002,11 @@ impl OnDemandStorage {
             deleted.resize(new_len, 0);
         }
 
+        // delete() decremented the active count; the replacement restores it.
+        self.active_count.fetch_add(1, Ordering::Relaxed);
+        // Mark the appended replacement so save() cannot take the deletion-only path.
+        self.pending_rows.fetch_add(1, Ordering::Relaxed);
+
         Ok(true)
     }
 
@@ -3971,12 +4050,10 @@ impl OnDemandStorage {
 
         if is_v4 {
             let on_disk_rows = self.persisted_row_count.load(Ordering::SeqCst) as usize;
-            let ids = self.ids.read();
-            let in_memory_ids = ids.len();
-            let has_new_rows = in_memory_ids > 0;
+            let pending_rows = self.pending_rows.load(Ordering::SeqCst) as usize;
+            let has_new_rows = pending_rows > 0;
             let base_loaded = self.v4_base_loaded.load(Ordering::SeqCst);
-            let has_unloaded_base = on_disk_rows > 0 && in_memory_ids > 0 && !base_loaded;
-            drop(ids);
+            let has_unloaded_base = on_disk_rows > 0 && has_new_rows && !base_loaded;
 
             // If base data isn't loaded but we have new rows, append the
             // already-buffered rows incrementally. Do not call append_row_group()
@@ -3985,7 +4062,8 @@ impl OnDemandStorage {
             // buffer itself, so extending again duplicates them on every flush.
             if has_unloaded_base {
                 let ids = self.ids.read();
-                let new_ids: Vec<u64> = ids.clone();
+                let pending_start = ids.len().saturating_sub(pending_rows);
+                let new_ids: Vec<u64> = ids[pending_start..].to_vec();
                 drop(ids);
                 let cols = self.columns.read();
                 let new_cols: Vec<ColumnData> = cols.clone();
@@ -3994,7 +4072,12 @@ impl OnDemandStorage {
                 let new_nulls: Vec<Vec<u8>> = nulls.clone();
                 drop(nulls);
                 self.pending_rows.store(0, Ordering::SeqCst);
-                self.write_row_group_to_disk(&new_ids, &new_cols, &new_nulls)?;
+                self.write_row_group_to_disk(
+                    &new_ids,
+                    &new_cols,
+                    &new_nulls,
+                    Some(pending_start),
+                )?;
 
                 // Keep a warm insert backend as metadata-only after persistence.
                 // Future single-row appends can reuse the schema/next_id/footer
@@ -5802,6 +5885,7 @@ impl OnDemandStorage {
         new_ids: &[u64],
         new_columns: &[ColumnData],
         new_nulls: &[Vec<u8>],
+        pending_delete_start: Option<usize>,
     ) -> io::Result<()> {
         let header = self.header.read();
         if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
@@ -5842,7 +5926,7 @@ impl OnDemandStorage {
         *self.file.write() = None;
         *self.write_file.write() = None;
         crate::storage::epoch::bump(&self.path);
-        self.delete_col_stats_sidecar();
+        self.delete_col_stats_sidecar()?;
 
         // Open file for append — seek to old footer position (overwrite it)
         let mut file = OpenOptions::new().write(true).open(&self.path)?;
@@ -5867,21 +5951,27 @@ impl OnDemandStorage {
 
         // Serialize RG body to buffer (IDs + deletion vector + columns)
         let null_bitmap_len = (rg_rows + 7) / 8;
-        let (delete_bitmap, deletion_count) = {
+        let (delete_bitmap, deletion_count) = if let Some(start_row) = pending_delete_start {
             let deleted = self.deleted.read();
             let mut bitmap = vec![0u8; null_bitmap_len];
-            let copy_len = deleted.len().min(null_bitmap_len);
-            if copy_len > 0 {
-                bitmap[..copy_len].copy_from_slice(&deleted[..copy_len]);
+            let mut count = 0u32;
+            for row_idx in 0..rg_rows {
+                let source_row = start_row + row_idx;
+                let source_byte = source_row / 8;
+                let source_bit = source_row % 8;
+                if source_byte < deleted.len()
+                    && (deleted[source_byte] >> source_bit) & 1 == 1
+                {
+                    bitmap[row_idx / 8] |= 1 << (row_idx % 8);
+                    count += 1;
+                }
             }
-            let count = (0..rg_rows)
-                .filter(|row_idx| {
-                    let byte_idx = row_idx / 8;
-                    let bit_idx = row_idx % 8;
-                    byte_idx < bitmap.len() && (bitmap[byte_idx] >> bit_idx) & 1 == 1
-                })
-                .count() as u32;
             (bitmap, count)
+        } else {
+            // append_row_group() receives brand-new rows that are not present in
+            // this backend's in-memory deleted bitmap. Reusing old tombstones
+            // here would make new rows invisible and corrupt active row counts.
+            (vec![0u8; null_bitmap_len], 0)
         };
         let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + rg_rows * col_count);
         {
@@ -6031,7 +6121,7 @@ impl OnDemandStorage {
         new_nulls: &[Vec<u8>],
     ) -> io::Result<()> {
         let rg_rows = new_ids.len();
-        self.write_row_group_to_disk(new_ids, new_columns, new_nulls)?;
+        self.write_row_group_to_disk(new_ids, new_columns, new_nulls, None)?;
 
         // Update in-memory state (caller hasn't added these rows yet)
         {
@@ -6323,10 +6413,12 @@ impl OnDemandStorage {
         let _ = std::fs::write(self.stats_sidecar_path(), &buf);
     }
 
-    fn delete_col_stats_sidecar(&self) {
+    fn delete_col_stats_sidecar(&self) -> io::Result<()> {
         let p = self.stats_sidecar_path();
-        if p.exists() {
-            let _ = std::fs::remove_file(&p);
+        match std::fs::remove_file(&p) {
+            Ok(()) => Ok(()),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(err),
         }
     }
 }

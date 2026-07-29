@@ -91,6 +91,7 @@ PUBLIC_API_CASES = (
     "ApexClient.store_durable_one",
     "ApexClient.execute",
     "ApexClient.execute_batch",
+    "ApexClient.execute_batch_parallel",
     "ApexClient.topk_distance",
     "ApexClient.batch_topk_distance",
     "ApexClient.query",
@@ -150,6 +151,8 @@ PUBLIC_API_CASES = (
     "ResultView.to_pandas",
     "ResultView.to_polars",
     "ResultView.to_arrow",
+    "ResultView.to_record_batches",
+    "ResultView.iter_batches",
     "ResultView.to_lance",
     "ResultView.shape",
     "ResultView.columns",
@@ -331,7 +334,7 @@ class Fixture:
             self.prepared["vectors"] = self._vector_ready()
         elif name.startswith("read_blob"):
             self.prepared["payload"] = self._blob_ready()
-        elif name in {"retrieve", "retrieve_many", "retrieve_all", "list_fields", "delete", "replace", "batch_replace", "execute", "execute_batch", "query", "count_rows"}:
+        elif name in {"retrieve", "retrieve_many", "retrieve_all", "list_fields", "delete", "replace", "batch_replace", "execute", "execute_batch", "execute_batch_parallel", "query", "count_rows"}:
             c.use_table("main")
         elif name in {"from_pandas", "from_pyarrow", "from_polars", "from_lance"}:
             data = _columnar()
@@ -470,6 +473,11 @@ class Fixture:
         if name == "execute_batch":
             c.use_table("main")
             return c.execute_batch(["SELECT COUNT(*) FROM main", "SELECT MAX(value) FROM main"])
+        if name == "execute_batch_parallel":
+            c.use_table("main")
+            return c.execute_batch_parallel(
+                ["SELECT COUNT(*) FROM main", "SELECT MAX(value) FROM main"]
+            )
         if name in {"topk_distance", "batch_topk_distance"}:
             vectors = self.prepared["vectors"]
             if name == "topk_distance":

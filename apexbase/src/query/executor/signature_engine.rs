@@ -100,7 +100,10 @@ impl ApexExecutor {
                 }
             },
             ReadPredicate::Id(id) => {
-                if backend.has_pending_deltas() || backend.has_delta() {
+                if backend.has_pending_deltas()
+                    || backend.has_delta()
+                    || backend.active_row_count() != backend.row_count()
+                {
                     None
                 } else if matches!(read.projection, ReadProjection::All) {
                     if backend.storage.is_v4_format()
@@ -120,7 +123,7 @@ impl ApexExecutor {
                     if let Some(batch) = backend.read_row_by_id_to_arrow(id).ok().flatten() {
                         Self::project_batch_by_names(&batch, columns)?
                     } else {
-                        backend.read_columns_to_arrow(column_refs.as_deref(), 0, Some(0)).ok()
+                        None
                     }
                 } else {
                     None

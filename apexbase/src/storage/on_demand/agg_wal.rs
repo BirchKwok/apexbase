@@ -9,6 +9,54 @@ pub struct NativeStringGroupAgg {
     pub max_values: Vec<Option<String>>,
 }
 
+#[inline(never)]
+unsafe fn aggregate_validated_2col_count_f64(
+    group_ids1: &[u16],
+    group_ids2: &[u16],
+    values: *const u8,
+    rows: usize,
+    dict2_size: usize,
+    counts: &mut [i64],
+    sums: &mut [f64],
+) {
+    let counts_ptr = counts.as_mut_ptr();
+    let sums_ptr = sums.as_mut_ptr();
+    for row in 0..rows {
+        unsafe {
+            let idx1 = *group_ids1.get_unchecked(row) as usize;
+            let idx2 = *group_ids2.get_unchecked(row) as usize;
+            let slot = (idx1 * dict2_size + idx2) * 2;
+            *counts_ptr.add(slot) += 1;
+            *sums_ptr.add(slot + 1) +=
+                std::ptr::read_unaligned(values.add(row * 8) as *const f64);
+        }
+    }
+}
+
+#[inline(never)]
+unsafe fn aggregate_validated_2col_count_i64(
+    group_ids1: &[u16],
+    group_ids2: &[u16],
+    values: *const u8,
+    rows: usize,
+    dict2_size: usize,
+    counts: &mut [i64],
+    sums: &mut [f64],
+) {
+    let counts_ptr = counts.as_mut_ptr();
+    let sums_ptr = sums.as_mut_ptr();
+    for row in 0..rows {
+        unsafe {
+            let idx1 = *group_ids1.get_unchecked(row) as usize;
+            let idx2 = *group_ids2.get_unchecked(row) as usize;
+            let slot = (idx1 * dict2_size + idx2) * 2;
+            *counts_ptr.add(slot) += 1;
+            *sums_ptr.add(slot + 1) +=
+                std::ptr::read_unaligned(values.add(row * 8) as *const i64) as f64;
+        }
+    }
+}
+
 impl OnDemandStorage {
     /// Execute simple aggregation (no GROUP BY, no WHERE) directly on V4 columns.
     /// Supports both in-memory and mmap-only paths.
@@ -115,7 +163,14 @@ impl OnDemandStorage {
                         results.push((count, sum, min_v, max_v, false));
                     }
                 }
-                _ => { results.push((active_count, 0.0, 0.0, 0.0, false)); }
+                _ => {
+                    let null_count = if has_nulls {
+                        (0..total_rows).filter(|&i| is_null_at(null_bm, i)).count() as i64
+                    } else {
+                        0
+                    };
+                    results.push((active_count - null_count, 0.0, 0.0, 0.0, false));
+                }
             }
         }
         
@@ -349,11 +404,33 @@ impl OnDemandStorage {
                         _ => {
                             // Non-numeric (String/StringDict/Bool/Binary): count elements for COUNT(col)
                             let n = count.min(rg_rows);
-                            if !has_deleted {
+                            let null_bm = if col_off + null_bitmap_len <= body.len() {
+                                &body[col_off..col_off + null_bitmap_len]
+                            } else {
+                                &[][..]
+                            };
+                            let del = if has_deleted {
+                                &body[del_start_body..del_start_body + del_vec_len]
+                            } else {
+                                &[][..]
+                            };
+                            if !has_deleted && null_bm.iter().all(|&byte| byte == 0) {
                                 col_counts[ci] += n as i64;
                             } else {
-                                let del = &body[del_start_body..del_start_body + del_vec_len];
-                                for i in 0..n { if (del[i / 8] >> (i % 8)) & 1 == 0 { col_counts[ci] += 1; } }
+                                for i in 0..n {
+                                    let deleted =
+                                        has_deleted && (del[i / 8] >> (i % 8)) & 1 != 0;
+                                    let is_null = (null_bm
+                                        .get(i / 8)
+                                        .copied()
+                                        .unwrap_or(0)
+                                        >> (i % 8))
+                                        & 1
+                                        != 0;
+                                    if !deleted && !is_null {
+                                        col_counts[ci] += 1;
+                                    }
+                                }
                             }
                         }
                     }
@@ -2693,12 +2770,62 @@ impl OnDemandStorage {
         if col_idx < nulls.len() && nulls[col_idx].iter().any(|&b| b != 0) {
             return true;
         }
+        drop(nulls);
+        drop(schema);
         if let Ok(Some(footer)) = self.get_or_load_footer() {
             for rg_zms in &footer.zone_maps {
                 for zm in rg_zms {
                     if zm.col_idx as usize == col_idx && zm.has_nulls {
                         return true;
                     }
+                }
+            }
+
+            // String zone maps are not guaranteed to carry null metadata.
+            // Inspect only the compact per-column validity bitmaps; this avoids
+            // materializing values and keeps the common no-null GROUP BY fast.
+            let file_guard = self.file.read();
+            let Some(file) = file_guard.as_ref() else {
+                return true;
+            };
+            let Ok(mmap_arc) = self.mmap_cache.write().get_mmap_arc(file) else {
+                return true;
+            };
+            drop(file_guard);
+            let mmap: &[u8] = &mmap_arc;
+            for (group_idx, group) in footer.row_groups.iter().enumerate() {
+                if group.row_count == 0 {
+                    continue;
+                }
+                let Some(offsets) = footer.col_offsets.get(group_idx) else {
+                    return true;
+                };
+                let Some(&column_offset) = offsets.get(col_idx) else {
+                    return true;
+                };
+                let group_start = group.offset as usize;
+                let Some(group_end) = group_start.checked_add(group.data_size as usize) else {
+                    return true;
+                };
+                if group_end > mmap.len() || group_end.saturating_sub(group_start) < 32 {
+                    return true;
+                }
+                let group_bytes = &mmap[group_start..group_end];
+                let decompressed = match decompress_rg_body(group_bytes[28], &group_bytes[32..]) {
+                    Ok(body) => body,
+                    Err(_) => return true,
+                };
+                let body = decompressed.as_deref().unwrap_or(&group_bytes[32..]);
+                let bitmap_len = (group.row_count as usize + 7) / 8;
+                let start = column_offset as usize;
+                let Some(end) = start.checked_add(bitmap_len) else {
+                    return true;
+                };
+                if end > body.len() {
+                    return true;
+                }
+                if body[start..end].iter().any(|&byte| byte != 0) {
+                    return true;
                 }
             }
         }
@@ -3916,6 +4043,7 @@ impl OnDemandStorage {
         dict1_strings: &[String], group_ids1: &[u16],
         dict2_strings: &[String], group_ids2: &[u16],
         agg_cols: &[(&str, bool)], // (col_name, is_count_star)
+        ids_validated: bool,
     ) -> io::Result<Option<Vec<((String, String), Vec<(f64, i64)>)>>> {
         // 0-based: dict indices 0..len-1 (no null slot)
         let dict1_size = dict1_strings.len();
@@ -3925,6 +4053,18 @@ impl OnDemandStorage {
         if total_size > 200_000 { return Ok(None); }
 
         let num_aggs = agg_cols.len();
+        if num_aggs == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let group_rows = group_ids1.len().min(group_ids2.len());
+        if !ids_validated
+            && group_ids1[..group_rows]
+            .iter()
+            .zip(&group_ids2[..group_rows])
+            .any(|(&idx1, &idx2)| idx1 as usize >= dict1_size || idx2 as usize >= dict2_size)
+        {
+            return Ok(None);
+        }
         let flat_len = total_size * num_aggs;
         let mut flat_sums = vec![0.0f64; flat_len];
         let mut flat_counts = vec![0i64; flat_len];
@@ -3940,14 +4080,13 @@ impl OnDemandStorage {
                 .map(|(name, is_count)| if *is_count { None } else { schema.get_index(name) })
                 .collect();
             let needed: Vec<usize> = agg_col_indices.iter().filter_map(|&x| x).collect();
-            let scan_rows = group_ids1.len().min(group_ids2.len());
+            let scan_rows = group_rows;
 
             if needed.is_empty() {
                 // COUNT(*) only — no column read needed
                 for i in 0..scan_rows {
                     let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
                     let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
-                    if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
                     let composite = idx1 * dict2_size + idx2;
                     unsafe { *flat_counts.get_unchecked_mut(composite * num_aggs) += 1; }
                 }
@@ -4005,20 +4144,22 @@ impl OnDemandStorage {
                                                     let ct = schema.columns[ci].1;
                                                     if matches!(ct, ColumnType::Float64 | ColumnType::Float32) {
                                                         if !has_del {
-                                                            for i in 0..n {
-                                                                let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
-                                                                let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
-                                                                if i1 >= dict1_size || i2 >= dict2_size { continue; }
-                                                                let c = (i1 * dict2_size + i2) * 2;
-                                                                let v = unsafe { std::ptr::read_unaligned(base_ptr.add(i * 8) as *const f64) };
-                                                                unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += v; }
+                                                            unsafe {
+                                                                aggregate_validated_2col_count_f64(
+                                                                    gids1,
+                                                                    gids2,
+                                                                    base_ptr,
+                                                                    n,
+                                                                    dict2_size,
+                                                                    &mut flat_counts,
+                                                                    &mut flat_sums,
+                                                                );
                                                             }
                                                         } else {
                                                             for i in 0..n {
                                                                 if !del_bm.is_empty() && (del_bm[i/8] >> (i%8)) & 1 != 0 { continue; }
                                                                 let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
                                                                 let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
-                                                                if i1 >= dict1_size || i2 >= dict2_size { continue; }
                                                                 let c = (i1 * dict2_size + i2) * 2;
                                                                 let v = unsafe { std::ptr::read_unaligned(base_ptr.add(i * 8) as *const f64) };
                                                                 unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += v; }
@@ -4028,20 +4169,22 @@ impl OnDemandStorage {
                                                         row_off += rg_rows; continue;
                                                     } else if matches!(ct, ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date) {
                                                         if !has_del {
-                                                            for i in 0..n {
-                                                                let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
-                                                                let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
-                                                                if i1 >= dict1_size || i2 >= dict2_size { continue; }
-                                                                let c = (i1 * dict2_size + i2) * 2;
-                                                                let v = unsafe { std::ptr::read_unaligned(base_ptr.add(i * 8) as *const i64) };
-                                                                unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += v as f64; }
+                                                            unsafe {
+                                                                aggregate_validated_2col_count_i64(
+                                                                    gids1,
+                                                                    gids2,
+                                                                    base_ptr,
+                                                                    n,
+                                                                    dict2_size,
+                                                                    &mut flat_counts,
+                                                                    &mut flat_sums,
+                                                                );
                                                             }
                                                         } else {
                                                             for i in 0..n {
                                                                 if !del_bm.is_empty() && (del_bm[i/8] >> (i%8)) & 1 != 0 { continue; }
                                                                 let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
                                                                 let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
-                                                                if i1 >= dict1_size || i2 >= dict2_size { continue; }
                                                                 let c = (i1 * dict2_size + i2) * 2;
                                                                 let v = unsafe { std::ptr::read_unaligned(base_ptr.add(i * 8) as *const i64) };
                                                                 unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += v as f64; }
@@ -4070,7 +4213,6 @@ impl OnDemandStorage {
                                     if has_del && !del_bm.is_empty() && (del_bm[i/8] >> (i%8)) & 1 != 0 { continue; }
                                     let i1 = unsafe { *gids1.get_unchecked(i) } as usize;
                                     let i2 = unsafe { *gids2.get_unchecked(i) } as usize;
-                                    if i1 >= dict1_size || i2 >= dict2_size { continue; }
                                     let base = (i1 * dict2_size + i2) * num_aggs;
                                     for (ai, &opt_ci) in agg_col_indices.iter().enumerate() {
                                         unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
@@ -4119,7 +4261,6 @@ impl OnDemandStorage {
                         if has_deleted { let b = i/8; let bit = i%8; if b < del_bytes.len() && (del_bytes[b] >> bit) & 1 != 0 { continue; } }
                         let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
                         let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
-                        if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
                         let composite = idx1 * dict2_size + idx2;
                         let base = composite * num_aggs;
                         for (ai, sl) in slices.iter().enumerate() {
@@ -4138,7 +4279,7 @@ impl OnDemandStorage {
             let columns = self.columns.read();
             let deleted = self.deleted.read();
             let total_rows = self.ids.read().len();
-            let scan_rows = total_rows.min(group_ids1.len()).min(group_ids2.len());
+            let scan_rows = total_rows.min(group_rows);
             let has_deleted = deleted.iter().any(|&b| b != 0);
 
             struct AggSl<'a> { f64v: Option<&'a [f64]>, i64v: Option<&'a [i64]>, is_count: bool }
@@ -4165,7 +4306,6 @@ impl OnDemandStorage {
                         for i in 0..n {
                             let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
                             let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
-                            if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
                             let c = (idx1 * dict2_size + idx2) * 2;
                             unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += *fv.get_unchecked(i); }
                         }
@@ -4175,7 +4315,6 @@ impl OnDemandStorage {
                         for i in 0..n {
                             let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
                             let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
-                            if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
                             let c = (idx1 * dict2_size + idx2) * 2;
                             unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_sums.get_unchecked_mut(c + 1) += *iv.get_unchecked(i) as f64; }
                         }
@@ -4184,7 +4323,6 @@ impl OnDemandStorage {
                         for i in 0..scan_rows {
                             let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
                             let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
-                            if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
                             let c = (idx1 * dict2_size + idx2) * 2;
                             unsafe { *flat_counts.get_unchecked_mut(c) += 1; *flat_counts.get_unchecked_mut(c + 1) += 1; }
                         }
@@ -4194,7 +4332,6 @@ impl OnDemandStorage {
                     for i in 0..scan_rows {
                         let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
                         let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
-                        if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
                         let base = (idx1 * dict2_size + idx2) * 2;
                         for (ai, sl) in slices.iter().enumerate() {
                             unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
@@ -4210,7 +4347,6 @@ impl OnDemandStorage {
                     if has_deleted { let b = i/8; let bit = i%8; if b < deleted.len() && (deleted[b] >> bit) & 1 != 0 { continue; } }
                     let idx1 = unsafe { *group_ids1.get_unchecked(i) } as usize;
                     let idx2 = unsafe { *group_ids2.get_unchecked(i) } as usize;
-                    if idx1 >= dict1_size || idx2 >= dict2_size { continue; }
                     let base = (idx1 * dict2_size + idx2) * num_aggs;
                     for (ai, sl) in slices.iter().enumerate() {
                         unsafe { *flat_counts.get_unchecked_mut(base + ai) += 1; }
@@ -5613,11 +5749,8 @@ impl OnDemandStorage {
             bool_columns,
             null_positions,
         )?;
-        
-        // Update pending rows counter and check auto-flush
-        self.pending_rows.fetch_add(result.len() as u64, Ordering::Relaxed);
         self.maybe_auto_flush()?;
-        
+
         Ok(result)
     }
 

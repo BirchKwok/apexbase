@@ -40,6 +40,25 @@ impl ApexExecutor {
         // merged into the base file via apply_pending_deltas_in_place() on next
         // open_for_write (e.g., DELETE), which is safe because of Fix B.
         let storage = TableStorageBackend::open(storage_path)?;
+        let schema_types: StdHashMap<String, crate::data::DataType> =
+            storage.get_schema().into_iter().collect();
+        let mut normalized_assignments = Vec::with_capacity(assignments.len());
+        for (column, expr) in assignments {
+            if column == "_id" {
+                return Err(err_input("UPDATE cannot assign to internal _id"));
+            }
+            let target = schema_types.get(column).ok_or_else(|| {
+                err_input(format!("UPDATE column '{}' does not exist", column))
+            })?;
+            let normalized = match expr {
+                SqlExpr::Literal(value) => {
+                    SqlExpr::Literal(Self::coerce_update_literal(value, *target, column)?)
+                }
+                other => other.clone(),
+            };
+            normalized_assignments.push((column.clone(), normalized));
+        }
+        let assignments = normalized_assignments.as_slice();
 
         let (fts_base_dir, fts_table_name) = base_dir_and_table(storage_path);
         let fts_cfg = Self::read_fts_config(&fts_base_dir);
@@ -76,6 +95,10 @@ impl ApexExecutor {
         // For: all-literal SET + simple numeric WHERE + no constraints + no indexes.
         // Uses scan_and_update_inplace: single pass per SET column, writes directly to
         // the base .apex file — no DeltaStore serialization, no Arrow batch, no bincode.
+        // The storage helpers widen affected zone maps and invalidate exact
+        // aggregate sidecars before mutating cells.  This keeps the mmap path
+        // safe for both exact-ID and numeric-range updates without leaving a
+        // large DeltaStore overlay that would penalize subsequent reads.
         if indexed_cols.is_empty()
             && !fts_enabled
             && !storage.storage.has_constraints()
@@ -753,6 +776,69 @@ impl ApexExecutor {
         invalidate_table_stats(&storage_path.to_string_lossy());
 
         Ok(ApexResult::Scalar(updated))
+    }
+
+    fn coerce_update_literal(
+        value: &Value,
+        target: crate::data::DataType,
+        column: &str,
+    ) -> io::Result<Value> {
+        use crate::data::DataType;
+
+        if matches!(value, Value::Null) {
+            return Ok(Value::Null);
+        }
+        if matches!(target, DataType::Float32 | DataType::Float64 | DataType::Decimal) {
+            return value.as_f64().map(Value::Float64).ok_or_else(|| {
+                err_input(format!(
+                    "Cannot assign {} to numeric column '{}'",
+                    value.data_type(),
+                    column
+                ))
+            });
+        }
+        if matches!(
+            target,
+            DataType::Int8
+                | DataType::Int16
+                | DataType::Int32
+                | DataType::Int64
+                | DataType::UInt8
+                | DataType::UInt16
+                | DataType::UInt32
+                | DataType::UInt64
+        ) {
+            if let Some(integer) = value.as_i64() {
+                return Ok(Value::Int64(integer));
+            }
+            if let Some(number) = value.as_f64() {
+                if number.is_finite()
+                    && number >= i64::MIN as f64
+                    && number <= i64::MAX as f64
+                {
+                    return Ok(Value::Int64(number.trunc() as i64));
+                }
+            }
+            return Err(err_input(format!(
+                "Cannot safely assign {} to integer column '{}'",
+                value.data_type(),
+                column
+            )));
+        }
+        match target {
+            DataType::String => Ok(Value::String(value.to_string_value())),
+            DataType::Bool => value
+                .as_bool()
+                .map(Value::Bool)
+                .ok_or_else(|| err_input(format!("Column '{}' requires BOOL", column))),
+            _ if value.data_type() == target => Ok(value.clone()),
+            _ => Err(err_input(format!(
+                "Cannot assign {} to {} column '{}'",
+                value.data_type(),
+                target,
+                column
+            ))),
+        }
     }
 
     pub(in crate::query::executor) fn extract_numeric_range_from_where(expr: &SqlExpr) -> Option<(String, f64, f64)> {

@@ -611,7 +611,7 @@ pub fn unregister_fts_manager(base_dir: &Path) {
 
 /// Get or lazily create a FtsManager for a base_dir.
 /// Creates the manager with default config; actual per-table engine is created on demand.
-fn get_or_create_fts_manager(base_dir: &Path) -> Arc<crate::fts::FtsManager> {
+pub(super) fn get_or_create_fts_manager(base_dir: &Path) -> Arc<crate::fts::FtsManager> {
     if let Some(mgr) = FTS_MANAGER_CACHE.read().get(base_dir).cloned() {
         return mgr;
     }
@@ -1926,6 +1926,11 @@ impl ApexExecutor {
             }
             SqlStatement::AlterFtsIndexEnable { table } => {
                 Self::execute_alter_fts_index_enable(base_dir, &table)
+            }
+            SqlStatement::ShowTables => Self::execute_show_tables(base_dir),
+            SqlStatement::ShowDatabases => Self::execute_show_databases(base_dir),
+            SqlStatement::ShowColumns { table } | SqlStatement::Describe { table } => {
+                Self::execute_describe_table(base_dir, default_table_path, &table)
             }
             SqlStatement::ShowFtsIndexes => Self::execute_show_fts_indexes(base_dir),
             SqlStatement::SetVariable { name, value } => {

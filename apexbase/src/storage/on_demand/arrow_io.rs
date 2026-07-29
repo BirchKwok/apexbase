@@ -268,7 +268,14 @@ impl OnDemandStorage {
                                 None
                             }
                         }).collect();
-                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                        if data.len() > i32::MAX as usize {
+                            (
+                                ArrowDataType::LargeUtf8,
+                                Arc::new(arrow::array::LargeStringArray::from(strings)),
+                            )
+                        } else {
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                        }
                     } else if null_buf.is_some() {
                         let null_bitmap = &nulls[col_idx];
                         let strings: Vec<Option<&str>> = (0..count.min(active_count)).map(|i| {
@@ -282,14 +289,23 @@ impl OnDemandStorage {
                                 std::str::from_utf8(&data[start..end]).ok()
                             }
                         }).collect();
-                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                        if data.len() > i32::MAX as usize {
+                            (
+                                ArrowDataType::LargeUtf8,
+                                Arc::new(arrow::array::LargeStringArray::from(strings)),
+                            )
+                        } else {
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                        }
                     } else {
                         // No nulls, no deletes: fastest path
                         let row_count = count.min(active_count);
                         
                         // OPTIMIZATION: Try to build DictionaryArray for low-cardinality columns
                         // Only when dict_encode_strings=true (GROUP BY queries)
-                        let try_dict = dict_encode_strings && row_count >= 100;
+                        let try_dict = dict_encode_strings
+                            && row_count >= 100
+                            && offsets[row_count] <= i32::MAX as u32;
                         if try_dict {
                             // Sample first 1000 rows to estimate cardinality
                             let sample_size = row_count.min(1000);
@@ -346,6 +362,21 @@ impl OnDemandStorage {
                             // OPTIMIZATION: build StringArray directly from u32 offsets + data bytes
                             // Avoids intermediate Vec<&str> and per-string from_utf8 validation
                             let data_end = offsets[row_count] as usize;
+                            if data_end > i32::MAX as usize {
+                                let strings: Vec<&str> = (0..row_count)
+                                    .map(|i| {
+                                        let start = offsets[i] as usize;
+                                        let end = offsets[i + 1] as usize;
+                                        std::str::from_utf8(&data[start..end]).unwrap_or("")
+                                    })
+                                    .collect();
+                                (
+                                    ArrowDataType::LargeUtf8,
+                                    Arc::new(arrow::array::LargeStringArray::from_iter_values(
+                                        strings,
+                                    )) as ArrayRef,
+                                )
+                            } else {
                             let mut offsets_i32: Vec<i32> = Vec::with_capacity(row_count + 1);
                             unsafe {
                                 std::ptr::copy_nonoverlapping(
@@ -359,6 +390,7 @@ impl OnDemandStorage {
                             let data_buf = Buffer::from_slice_ref(&data[..data_end]);
                             // SAFETY: data written by our storage engine is valid UTF-8
                             (ArrowDataType::Utf8, Arc::new(unsafe { StringArray::new_unchecked(offset_buf, data_buf, None) }) as ArrayRef)
+                            }
                         }
                     }
                 }
@@ -482,7 +514,19 @@ impl OnDemandStorage {
                     } else {
                         (0..active_count).map(value_at).collect()
                     };
-                    (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    let output_bytes = strings
+                        .iter()
+                        .filter_map(|value| value.as_ref())
+                        .try_fold(0usize, |total, value| total.checked_add(value.len()))
+                        .unwrap_or(usize::MAX);
+                    if output_bytes > i32::MAX as usize {
+                        (
+                            ArrowDataType::LargeUtf8,
+                            Arc::new(arrow::array::LargeStringArray::from(strings)),
+                        )
+                    } else {
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
                 }
                 Some(ColumnData::Float16List { data, dim }) => {
                     use arrow::array::{FixedSizeListArray, Float32Array};
@@ -780,7 +824,14 @@ impl OnDemandStorage {
                             Some(&data[start..end])
                         })
                         .collect();
-                    (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    if data.len() > i32::MAX as usize {
+                        (
+                            ArrowDataType::LargeBinary,
+                            Arc::new(arrow::array::LargeBinaryArray::from(binary_data)),
+                        )
+                    } else {
+                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
                     }
                 }
                 Some(ColumnData::StringDict { indices, dict_offsets, dict_data }) => {

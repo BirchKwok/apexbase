@@ -31,6 +31,7 @@ CANARY_SPECS = (
     ("Insert 1 row", "bench_oltp_insert_one", "median"),
     ("UPDATE by ID", "bench_oltp_update_by_id", "median"),
     ("DELETE 1K", "bench_delete_1k_only", "setup"),
+    ("TopK JOIN with unused BLOB", "bench_topk_join_canary", "median"),
 )
 
 
@@ -65,6 +66,8 @@ def run_canary(rows, warmup, iterations):
     try:
         bench.setup()
         for name, method_name, mode in CANARY_SPECS:
+            if method_name == "bench_topk_join_canary":
+                bench.setup_topk_join_canary()
             elapsed_ms = _run_metric(bench, method_name, mode, warmup, iterations)
             results.append({
                 "category": "ApexBase canary",

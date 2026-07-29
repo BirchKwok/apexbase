@@ -373,7 +373,10 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+        if backend.has_pending_deltas()
+            || backend.has_delta()
+            || backend.pending_v4_in_memory_rows() > 0
+        {
             return Ok(None);
         }
 
@@ -429,7 +432,10 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+        if backend.has_pending_deltas()
+            || backend.has_delta()
+            || backend.pending_v4_in_memory_rows() > 0
+        {
             return Ok(None);
         }
 
@@ -996,7 +1002,7 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas() {
+        if backend.has_pending_deltas() || backend.has_delta() {
             return Ok(None);
         }
 
@@ -1110,16 +1116,19 @@ impl ApexStorageImpl {
             let ids_u64: Vec<u64> = ids.iter().map(|&id| id as u64).collect();
 
             // Fast path: direct mmap-to-Python columns — one footer lock + one mmap slice per RG.
-            let batch_cols_opt =
-                if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
-                    backend
-                        .storage
-                        .retrieve_many_mmap_columns(&ids_u64)
-                        .ok()
-                        .flatten()
-                } else {
-                    None
-                };
+            let batch_cols_opt = if !backend.has_pending_deltas()
+                && !backend.has_delta()
+                && backend.storage.is_v4_format()
+                && !backend.storage.has_v4_in_memory_data()
+            {
+                backend
+                    .storage
+                    .retrieve_many_mmap_columns(&ids_u64)
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            };
 
             if let Some(batch_cols) = batch_cols_opt {
                 let row_count = batch_cols.row_count;
@@ -1135,9 +1144,11 @@ impl ApexStorageImpl {
 
             // Fallback: per-row retrieve_rcix (non-RCIX RGs)
             let mut all_rows: Vec<Vec<(String, Value)>> = Vec::with_capacity(ids_u64.len());
-            for &id in &ids_u64 {
-                if let Ok(Some(row)) = backend.storage.retrieve_rcix(id) {
-                    all_rows.push(row);
+            if !backend.has_pending_deltas() && !backend.has_delta() {
+                for &id in &ids_u64 {
+                    if let Ok(Some(row)) = backend.storage.retrieve_rcix(id) {
+                        all_rows.push(row);
+                    }
                 }
             }
 

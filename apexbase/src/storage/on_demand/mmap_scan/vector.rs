@@ -9,6 +9,11 @@ impl OnDemandStorage {
     ) -> io::Result<Option<Vec<(usize, f32)>>> {
         use crate::compute::vector_ops::topk_heap_on_floats;
 
+        // Direct mmap row offsets match visible Arrow row positions only while
+        // no overlay update or deletion is pending.
+        if self.has_pending_deltas() {
+            return Ok(None);
+        }
         let footer = match self.get_or_load_footer()? {
             Some(f) => f,
             None => return Ok(None),
@@ -198,6 +203,9 @@ impl OnDemandStorage {
     ) -> io::Result<Option<Vec<(usize, f32)>>> {
         use crate::compute::vector_ops::topk_heap_on_floats;
 
+        if self.has_pending_deltas() {
+            return Ok(None);
+        }
         let footer = match self.get_or_load_footer()? {
             Some(f) => f,
             None => return Ok(None),
@@ -441,6 +449,9 @@ impl OnDemandStorage {
         if n_queries == 0 || queries.len() == 0 {
             return Ok(Some(vec![vec![]; n_queries]));
         }
+        if self.has_pending_deltas() {
+            return Ok(None);
+        }
         let query_dim = queries.len() / n_queries;
         if query_dim == 0 || queries.len() != n_queries * query_dim {
             return Ok(None);
@@ -683,6 +694,9 @@ impl OnDemandStorage {
 
         if n_queries == 0 || queries.len() == 0 {
             return Ok(Some(vec![vec![]; n_queries]));
+        }
+        if self.has_pending_deltas() {
+            return Ok(None);
         }
         let query_dim = queries.len() / n_queries;
         if query_dim == 0 || queries.len() != n_queries * query_dim {

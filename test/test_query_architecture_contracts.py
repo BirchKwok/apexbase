@@ -143,7 +143,7 @@ def test_delta_compaction_and_reopen_preserve_query_contract(tmp_path):
     assert after_compaction == before
     retrieve_many_after = client.retrieve_many([1, 4]).to_dict()
     assert retrieve_many_after == [
-        {**row, "note": ""}
+        {**row, "note": None}
         for row in retrieve_many_before
     ]
     client.close()

@@ -1310,8 +1310,8 @@ impl ApexExecutor {
 
     pub(in crate::query::executor) fn arrow_value_at_col(col: &ArrayRef, row: usize) -> Value {
         use arrow::array::{
-            BooleanArray, DictionaryArray, Float32Array, Int16Array, Int32Array, Int8Array,
-            LargeStringArray, UInt16Array, UInt32Array, UInt8Array,
+            BinaryArray, BooleanArray, DictionaryArray, Float32Array, Int16Array, Int32Array,
+            Int8Array, LargeBinaryArray, LargeStringArray, UInt16Array, UInt32Array, UInt8Array,
         };
         use arrow::datatypes::{
             Int16Type, Int32Type, Int64Type, Int8Type, UInt16Type, UInt32Type, UInt64Type,
@@ -1366,6 +1366,10 @@ impl ApexExecutor {
             Value::String(arr.value(row).to_string())
         } else if let Some(arr) = col.as_any().downcast_ref::<LargeStringArray>() {
             Value::String(arr.value(row).to_string())
+        } else if let Some(arr) = col.as_any().downcast_ref::<BinaryArray>() {
+            Value::Binary(arr.value(row).to_vec())
+        } else if let Some(arr) = col.as_any().downcast_ref::<LargeBinaryArray>() {
+            Value::Binary(arr.value(row).to_vec())
         } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
             Value::Bool(arr.value(row))
         } else {

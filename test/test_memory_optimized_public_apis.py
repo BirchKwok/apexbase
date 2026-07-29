@@ -29,8 +29,8 @@ def test_dataframe_import_helpers_keep_columnar_inputs(tmp_path):
     client.use_table("pandas_rows")
     assert client.retrieve_all().to_dict() == [
         {"value": 1, "label": "a"},
-        # Preserve the existing inferred-string behavior of the row-dict path.
-        {"value": 2, "label": ""},
+        # Preserve missing string values instead of coercing them to empty text.
+        {"value": 2, "label": None},
     ]
     client.close()
 

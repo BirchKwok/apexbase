@@ -124,8 +124,8 @@ def test_schema_rewrite_invalidates_cached_backend_schema(tmp_path):
 
         assert reader.list_fields() == ["name", "score", "category", "note"]
         assert reader.execute("SELECT name, note FROM cache_contract").to_dict() == [
-            {"name": "alpha", "note": ""},
-            {"name": "beta", "note": ""},
+            {"name": "alpha", "note": None},
+            {"name": "beta", "note": None},
         ]
     finally:
         reader.close()

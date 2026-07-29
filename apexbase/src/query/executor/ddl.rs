@@ -1,6 +1,102 @@
 // DDL execution: CREATE TABLE, DROP TABLE, ALTER TABLE, TRUNCATE, EXPLAIN, CTE
 
 impl ApexExecutor {
+    pub(super) fn execute_show_tables(base_dir: &Path) -> io::Result<ApexResult> {
+        let mut tables = Vec::new();
+        if base_dir.exists() {
+            for entry in std::fs::read_dir(base_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_file() && path.extension().is_some_and(|ext| ext == "apex") {
+                    if let Some(name) = path.file_stem().and_then(|name| name.to_str()) {
+                        tables.push(name.to_string());
+                    }
+                }
+            }
+        }
+        tables.sort_unstable();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "table_name",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let values: ArrayRef = Arc::new(StringArray::from(tables));
+        Ok(ApexResult::Data(
+            RecordBatch::try_new(schema, vec![values])
+                .map_err(|error| err_data(error.to_string()))?,
+        ))
+    }
+
+    pub(super) fn execute_show_databases(base_dir: &Path) -> io::Result<ApexResult> {
+        let mut databases = vec!["main".to_string()];
+        if base_dir.exists() {
+            for entry in std::fs::read_dir(base_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir()
+                    && std::fs::read_dir(&path)?
+                        .filter_map(Result::ok)
+                        .any(|child| {
+                            child.path().extension().is_some_and(|ext| ext == "apex")
+                                || child.file_name() == "fts_config.json"
+                        })
+                {
+                    if let Some(name) = path.file_name().and_then(|name| name.to_str()) {
+                        databases.push(name.to_string());
+                    }
+                }
+            }
+        }
+        databases.sort_unstable();
+        databases.dedup();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "database_name",
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let values: ArrayRef = Arc::new(StringArray::from(databases));
+        Ok(ApexResult::Data(
+            RecordBatch::try_new(schema, vec![values])
+                .map_err(|error| err_data(error.to_string()))?,
+        ))
+    }
+
+    pub(super) fn execute_describe_table(
+        base_dir: &Path,
+        default_table_path: &Path,
+        table: &str,
+    ) -> io::Result<ApexResult> {
+        let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+        if !table_path.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' does not exist", table),
+            ));
+        }
+        let backend = TableStorageBackend::open(&table_path)?;
+        let schema_entries = backend.get_schema();
+        let names: Vec<String> = schema_entries
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect();
+        let types: Vec<String> = schema_entries
+            .iter()
+            .map(|(_, dtype)| format!("{:?}", dtype))
+            .collect();
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("column_name", ArrowDataType::Utf8, false),
+            Field::new("data_type", ArrowDataType::Utf8, false),
+        ]));
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(names)),
+            Arc::new(StringArray::from(types)),
+        ];
+        Ok(ApexResult::Data(
+            RecordBatch::try_new(schema, arrays)
+                .map_err(|error| err_data(error.to_string()))?,
+        ))
+    }
+
     // ========== DDL Execution Methods ==========
 
     fn delta_path_for_table(table_path: &Path) -> PathBuf {
@@ -1860,18 +1956,36 @@ impl ApexExecutor {
             return Ok(ApexResult::Scalar(0));
         }
 
-        // Step 2: Convert Arrow batch rows to Value rows for execute_insert
+        // Step 2: map source expressions to target columns strictly by
+        // position.  Source aliases never become new target schema columns.
         let schema = select_batch.schema();
-        let num_cols = if let Some(cols) = columns {
-            cols.len().min(schema.fields().len())
+        let source_indices = schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| (field.name() != "_id").then_some(index))
+            .collect::<Vec<_>>();
+        let target_names = if let Some(cols) = columns {
+            cols.to_vec()
         } else {
-            schema.fields().len()
+            TableStorageBackend::open(target_path)?
+                .get_schema()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect::<Vec<_>>()
         };
+        if source_indices.len() != target_names.len() {
+            return Err(err_input(format!(
+                "INSERT SELECT returns {} columns but target has {} columns",
+                source_indices.len(),
+                target_names.len()
+            )));
+        }
 
         let mut values: Vec<Vec<crate::data::Value>> = Vec::with_capacity(select_batch.num_rows());
         for row_idx in 0..select_batch.num_rows() {
-            let mut row: Vec<crate::data::Value> = Vec::with_capacity(num_cols);
-            for col_idx in 0..num_cols {
+            let mut row: Vec<crate::data::Value> = Vec::with_capacity(source_indices.len());
+            for &col_idx in &source_indices {
                 let col = select_batch.column(col_idx);
                 let val = Self::arrow_value_at_col(col, row_idx);
                 row.push(val);
@@ -1879,48 +1993,7 @@ impl ApexExecutor {
             values.push(row);
         }
 
-        // Step 3: Determine column names
-        let col_names: Option<Vec<String>> = if let Some(cols) = columns {
-            Some(cols.to_vec())
-        } else {
-            // Use column names from the SELECT result, excluding _id
-            let names: Vec<String> = schema
-                .fields()
-                .iter()
-                .take(num_cols)
-                .map(|f| f.name().clone())
-                .filter(|n| n != "_id")
-                .collect();
-            if names.len() < num_cols {
-                // Had _id column, need to rebuild values without _id
-                let id_indices: Vec<usize> = schema
-                    .fields()
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, f)| f.name() == "_id")
-                    .map(|(i, _)| i)
-                    .collect();
-                if !id_indices.is_empty() {
-                    let mut new_values: Vec<Vec<crate::data::Value>> =
-                        Vec::with_capacity(values.len());
-                    for row in &values {
-                        let filtered: Vec<crate::data::Value> = row
-                            .iter()
-                            .enumerate()
-                            .filter(|(i, _)| !id_indices.contains(i))
-                            .map(|(_, v)| v.clone())
-                            .collect();
-                        new_values.push(filtered);
-                    }
-                    return Self::execute_insert(target_path, Some(&names), &new_values);
-                }
-                Some(names)
-            } else {
-                Some(names)
-            }
-        };
-
-        Self::execute_insert(target_path, col_names.as_deref(), &values)
+        Self::execute_insert(target_path, Some(&target_names), &values)
     }
 
     /// Hive-compatible `INSERT OVERWRITE TABLE ... PARTITION (...) SELECT ...`.
@@ -2306,6 +2379,9 @@ impl ApexExecutor {
                 ArrowDataType::Int64 | ArrowDataType::UInt64 => crate::data::DataType::Int64,
                 ArrowDataType::Float64 => crate::data::DataType::Float64,
                 ArrowDataType::Utf8 | ArrowDataType::LargeUtf8 => crate::data::DataType::String,
+                ArrowDataType::Binary | ArrowDataType::LargeBinary => {
+                    crate::data::DataType::Blob
+                }
                 ArrowDataType::Boolean => crate::data::DataType::Bool,
                 _ => crate::data::DataType::String,
             };
@@ -2324,7 +2400,17 @@ impl ApexExecutor {
                         continue;
                     }
                     let col = select_batch.column(col_idx);
-                    let val = Self::arrow_value_at_col(col, row_idx);
+                    let val = match Self::arrow_value_at_col(col, row_idx) {
+                        Value::Binary(bytes)
+                            if matches!(
+                                field.data_type(),
+                                ArrowDataType::Binary | ArrowDataType::LargeBinary
+                            ) =>
+                        {
+                            Value::Blob(bytes)
+                        }
+                        value => value,
+                    };
                     row.insert(field.name().clone(), val);
                 }
                 rows.push(row);
@@ -2347,7 +2433,7 @@ impl ApexExecutor {
     }
 
     /// Read the fts_config.json as a serde_json::Value (object).  Returns empty object if missing.
-    fn read_fts_config(base_dir: &Path) -> serde_json::Value {
+    pub(in crate::query::executor) fn read_fts_config(base_dir: &Path) -> serde_json::Value {
         let path = Self::fts_config_path(base_dir);
         if !path.exists() {
             return serde_json::Value::Object(serde_json::Map::new());

@@ -247,7 +247,10 @@ impl OnDemandStorage {
         };
         let col_type = schema.columns[col_idx].1;
         if !matches!(col_type, ColumnType::String | ColumnType::StringDict) {
-            return Ok(None);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("column '{col_name}' is not a string column"),
+            ));
         }
         let col_count = schema.column_count();
         let file_guard = self.file.read();
@@ -269,6 +272,7 @@ impl OnDemandStorage {
         if limit.is_none()
             && footer.row_groups.len() > 1
             && matches!(col_type, ColumnType::StringDict)
+            && !target_bytes.is_empty()
         {
             // Check whether every RG qualifies for the parallel fast path
             let all_fast = footer.row_groups.iter().enumerate().all(|(rg_i, rg_meta)| {
@@ -338,9 +342,7 @@ impl OnDemandStorage {
                     });
                 }
 
-                let all_rg_matches: Vec<Vec<usize>> = rg_descs
-                    .par_iter()
-                    .map(|desc| {
+                let scan_rg = |desc: &RgDesc| {
                         let mmap =
                             unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
                         let rg_end = desc.rg_offset + desc.rg_data_size;
@@ -400,8 +402,12 @@ impl OnDemandStorage {
                             });
                         }
                         local
-                    })
-                    .collect();
+                    };
+                let all_rg_matches: Vec<Vec<usize>> = if rg_descs.len() <= 1 {
+                    rg_descs.iter().map(&scan_rg).collect()
+                } else {
+                    rg_descs.par_iter().map(scan_rg).collect()
+                };
 
                 // Merge results in RG order (already ordered since RGs are enumerated in order)
                 matches = all_rg_matches.into_iter().flatten().collect();
@@ -2360,7 +2366,7 @@ impl OnDemandStorage {
         set_col: &str,
         new_value_bytes: &[u8; 8], // raw little-endian bytes of the new value (f64 or i64)
     ) -> io::Result<Option<i64>> {
-        let footer = match self.get_or_load_footer()? {
+        let mut footer = match self.get_or_load_footer()? {
             Some(f) => f,
             None => return Ok(None),
         };
@@ -2400,6 +2406,8 @@ impl OnDemandStorage {
         let high_i = high.floor() as i64;
         let mut total_updated: i64 = 0;
         let mut physically_written = false;
+        let mut footer_changed = false;
+        let mut pending_writes: Vec<(u64, Vec<u8>)> = Vec::new();
 
         // Need read-write access: open separate write handle
         let mut write_file = std::fs::OpenOptions::new()
@@ -2760,8 +2768,35 @@ impl OnDemandStorage {
             }
             if rg_updated > 0 {
                 if let Some(value_buf) = value_buf {
-                    write_file.seek(SeekFrom::Start(values_file_offset))?;
-                    write_file.write_all(&value_buf)?;
+                    if let Some(zone_map) = footer.zone_maps.get_mut(rg_i).and_then(|maps| {
+                        maps.iter_mut()
+                            .find(|map| map.col_idx as usize == set_idx)
+                    }) {
+                        if zone_map.is_float {
+                            let value = f64::from_le_bytes(*new_value_bytes);
+                            let old_min = f64::from_bits(zone_map.min_bits as u64);
+                            let old_max = f64::from_bits(zone_map.max_bits as u64);
+                            if !value.is_nan() && value < old_min {
+                                zone_map.min_bits = value.to_bits() as i64;
+                                footer_changed = true;
+                            }
+                            if !value.is_nan() && value > old_max {
+                                zone_map.max_bits = value.to_bits() as i64;
+                                footer_changed = true;
+                            }
+                        } else {
+                            let value = i64::from_le_bytes(*new_value_bytes);
+                            if value < zone_map.min_bits {
+                                zone_map.min_bits = value;
+                                footer_changed = true;
+                            }
+                            if value > zone_map.max_bits {
+                                zone_map.max_bits = value;
+                                footer_changed = true;
+                            }
+                        }
+                    }
+                    pending_writes.push((values_file_offset, value_buf));
                     physically_written = true;
                 }
                 total_updated += rg_updated;
@@ -2770,6 +2805,22 @@ impl OnDemandStorage {
         drop(mmap_guard);
         drop(file_guard);
         if physically_written {
+            // Exact aggregate stats and pruning metadata must become
+            // conservative before any cell bytes change. A crash at any later
+            // point can therefore only cause extra scanning, never stale
+            // aggregates or false-negative pruning.
+            self.delete_col_stats_sidecar()?;
+            if footer_changed {
+                write_file.seek(SeekFrom::Start(self.footer_offset_hint()))?;
+                write_file.write_all(&footer.to_bytes())?;
+            }
+            for (offset, value_buf) in pending_writes {
+                write_file.seek(SeekFrom::Start(offset))?;
+                write_file.write_all(&value_buf)?;
+            }
+            self.mmap_cache.write().invalidate();
+            self.invalidate_page_cache();
+            *self.v4_footer.write() = Some(footer);
             crate::storage::epoch::bump(&self.path);
         }
         Ok(Some(total_updated))
@@ -2912,7 +2963,7 @@ impl OnDemandStorage {
             return Ok(None);
         }
 
-        let footer = match self.get_or_load_footer()? {
+        let mut footer = match self.get_or_load_footer()? {
             Some(f) => f,
             None => return Ok(None),
         };
@@ -3039,6 +3090,53 @@ impl OnDemandStorage {
         let write_file = write_file_guard
             .as_mut()
             .ok_or_else(|| err_not_conn("Write file not open"))?;
+
+        // Zone maps are a pruning hint, so widening is sufficient for
+        // correctness and avoids rescanning the whole row group.  Persist the
+        // widened footer before the cell write: after a crash, readers may see
+        // the old or new value, but the pruning range covers both.
+        let mut footer_changed = false;
+        if let Some(zone_map) = footer
+            .zone_maps
+            .get_mut(rg_i)
+            .and_then(|maps| maps.iter_mut().find(|map| map.col_idx as usize == set_idx))
+        {
+            if zone_map.is_float {
+                let value = f64::from_le_bytes(*new_value_bytes);
+                let old_min = f64::from_bits(zone_map.min_bits as u64);
+                let old_max = f64::from_bits(zone_map.max_bits as u64);
+                if value.is_finite() {
+                    if value < old_min {
+                        zone_map.min_bits = value.to_bits() as i64;
+                        footer_changed = true;
+                    }
+                    if value > old_max {
+                        zone_map.max_bits = value.to_bits() as i64;
+                        footer_changed = true;
+                    }
+                }
+            } else {
+                let value = i64::from_le_bytes(*new_value_bytes);
+                if value < zone_map.min_bits {
+                    zone_map.min_bits = value;
+                    footer_changed = true;
+                }
+                if value > zone_map.max_bits {
+                    zone_map.max_bits = value;
+                    footer_changed = true;
+                }
+            }
+        }
+        if footer_changed {
+            let footer_bytes = footer.to_bytes();
+            write_file.seek(SeekFrom::Start(self.footer_offset_hint()))?;
+            write_file.write_all(&footer_bytes)?;
+        }
+
+        // The sidecar contains exact SUM/MIN/MAX values. Remove it before the
+        // cell mutation so a crash can never leave exact-looking stale stats;
+        // the next aggregation falls back to the mmap scan.
+        self.delete_col_stats_sidecar()?;
         let mut null_byte = null_byte;
         null_byte &= !(1u8 << (guess % 8));
         write_file.seek(SeekFrom::Start(null_byte_file_offset))?;
@@ -3048,6 +3146,9 @@ impl OnDemandStorage {
 
         drop(mmap_guard);
         drop(file_guard);
+        self.mmap_cache.write().invalidate();
+        self.invalidate_page_cache();
+        *self.v4_footer.write() = Some(footer);
         crate::storage::epoch::bump(&self.path);
         Ok(Some((1, true)))
     }

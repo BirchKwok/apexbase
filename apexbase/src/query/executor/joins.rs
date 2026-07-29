@@ -15,6 +15,10 @@ impl ApexExecutor {
             base_dir,
             default_table_path,
         );
+        let required_columns = stmt.required_columns();
+        let required_refs: Option<Vec<&str>> = required_columns
+            .as_ref()
+            .map(|columns| columns.iter().map(String::as_str).collect());
 
         // Get the left (base) table - supports both Table and Subquery (VIEW)
         let mut result_batch = match &stmt.from {
@@ -24,7 +28,7 @@ impl ApexExecutor {
                     batch
                 } else {
                     let left_backend = get_cached_backend(&left_path)?;
-                    left_backend.read_columns_to_arrow(None, 0, None)?
+                    left_backend.read_columns_to_arrow(required_refs.as_deref(), 0, None)?
                 }
             }
             Some(FromItem::Subquery { stmt: sub_stmt, .. }) => match sub_stmt.as_ref() {
@@ -147,7 +151,7 @@ impl ApexExecutor {
                         batch
                     } else {
                         let right_backend = get_cached_backend(&right_path)?;
-                        right_backend.read_columns_to_arrow(None, 0, None)?
+                        right_backend.read_columns_to_arrow(required_refs.as_deref(), 0, None)?
                     }
                 }
                 FromItem::Subquery { stmt: sub_stmt, .. } => match sub_stmt.as_ref() {
@@ -233,12 +237,38 @@ impl ApexExecutor {
 
             // CROSS JOIN has no ON clause — use cartesian product directly
             if join_clause.join_type == JoinType::Cross {
-                result_batch = Self::cross_join(&result_batch, &right_batch)?;
+                let right_qualifier = match &join_clause.right {
+                    FromItem::Table { table, alias, .. } => {
+                        alias.as_deref().unwrap_or(table.as_str())
+                    }
+                    FromItem::DirectFile { file, alias, .. } => {
+                        alias.as_deref().unwrap_or(file.as_str())
+                    }
+                    FromItem::TableFunction { func, alias, .. } => {
+                        alias.as_deref().unwrap_or(func.as_str())
+                    }
+                    FromItem::Subquery { alias, .. } => alias.as_str(),
+                    _ => "",
+                };
+                let prepared_right = Self::prepare_right_join_columns(
+                    &right_batch,
+                    &result_batch,
+                    "",
+                    (!right_qualifier.is_empty()).then_some(right_qualifier),
+                    None,
+                )?;
+                result_batch = Self::cross_join(&result_batch, &prepared_right)?;
             } else {
                 let right_alias = match &join_clause.right {
-                    FromItem::Table { alias, .. }
-                    | FromItem::DirectFile { alias, .. }
-                    | FromItem::TableFunction { alias, .. } => alias.clone(),
+                    FromItem::Table { table, alias, .. } => {
+                        Some(alias.clone().unwrap_or_else(|| table.clone()))
+                    }
+                    FromItem::DirectFile { file, alias, .. } => {
+                        Some(alias.clone().unwrap_or_else(|| file.clone()))
+                    }
+                    FromItem::TableFunction { func, alias, .. } => {
+                        Some(alias.clone().unwrap_or_else(|| func.clone()))
+                    }
                     FromItem::Subquery { alias, .. } => Some(alias.clone()),
                     _ => None,
                 };

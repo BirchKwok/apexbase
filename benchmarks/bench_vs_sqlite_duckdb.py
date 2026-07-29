@@ -1859,6 +1859,40 @@ class ApexBaseBench:
             "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM default"
         )
 
+    def setup_topk_join_canary(self):
+        """Build the narrow-result/wide-source TopK JOIN regression fixture."""
+        rng = np.random.default_rng(20260728)
+        row_count = min(self.n, 20_000)
+        dim = 16
+        vectors = rng.standard_normal((row_count, dim), dtype=np.float32)
+        vectors /= np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-12
+        self.client.execute(
+            "CREATE TABLE __perf_topk "
+            "(name TEXT, payload BLOB, vec FLOAT16_VECTOR)"
+        )
+        self.client.use_table("__perf_topk")
+        for start in range(0, row_count, 2_000):
+            end = min(start + 2_000, row_count)
+            self.client.store(
+                {
+                    "name": [f"vec_{idx}" for idx in range(start, end)],
+                    "payload": [b"x" * 2048] * (end - start),
+                    "vec": [vectors[idx] for idx in range(start, end)],
+                }
+            )
+        self.client.flush()
+        query = ", ".join(f"{float(value):.8g}" for value in vectors[0])
+        self._topk_join_canary_sql = (
+            "SELECT p.name, k.dist FROM __perf_topk p "
+            "JOIN (SELECT explode_rename("
+            f"topk_distance(vec, [{query}], 8, 'cosine_distance'), "
+            "'_id', 'dist') FROM __perf_topk) k ON p._id = k._id"
+        )
+
+    def bench_topk_join_canary(self):
+        """TopK must materialize k IDs before reading projected source columns."""
+        return self._query_all(self._topk_join_canary_sql)
+
     def bench_filtered_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*), AVG(score), MAX(score) FROM default WHERE category = 'Electronics'"

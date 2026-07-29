@@ -250,6 +250,14 @@ pub enum SqlStatement {
     AlterFtsIndexEnable {
         table: String,
     },
+    ShowTables,
+    ShowDatabases,
+    ShowColumns {
+        table: String,
+    },
+    Describe {
+        table: String,
+    },
     ShowFtsIndexes,
 }
 
@@ -638,7 +646,7 @@ impl SelectStatement {
                                 .unwrap_or(false)
                         {
                             // Skip constants like "1", "2" and "*" - only add real column names
-                            columns.push(col.clone());
+                            columns.push(col.rsplit('.').next().unwrap_or(col).to_string());
                         }
                     }
                 }
@@ -689,7 +697,13 @@ impl SelectStatement {
                 // extract all column references from the expression.
                 Self::extract_columns_from_expr(expr, &mut columns);
             } else if ob.column != "_id" {
-                columns.push(ob.column.clone());
+                columns.push(
+                    ob.column
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&ob.column)
+                        .to_string(),
+                );
             }
         }
 
@@ -698,13 +712,32 @@ impl SelectStatement {
             if let Some(Some(expr)) = self.group_by_exprs.get(i) {
                 Self::extract_columns_from_expr(expr, &mut columns);
             } else if col != "_id" {
-                columns.push(col.clone());
+                columns.push(col.rsplit('.').next().unwrap_or(col).to_string());
             }
         }
 
         // Extract from HAVING
         if let Some(ref expr) = self.having {
             Self::extract_columns_from_expr(expr, &mut columns);
+        }
+
+        // JOIN keys and additional ON predicates are required even when they
+        // are not projected. Keeping them in this shared list also lets the
+        // executor avoid reading unrelated wide/BLOB columns before a join.
+        for join in &self.joins {
+            Self::extract_columns_from_expr(&join.on, &mut columns);
+            match &join.right {
+                FromItem::LateralExplode { expr, .. }
+                | FromItem::LateralPosExplode { expr, .. } => {
+                    Self::extract_columns_from_expr(expr, &mut columns);
+                }
+                FromItem::LateralStack { values, .. } => {
+                    for value in values {
+                        Self::extract_columns_from_expr(value, &mut columns);
+                    }
+                }
+                _ => {}
+            }
         }
 
         if has_star {
@@ -1390,18 +1423,27 @@ impl SqlParser {
             if c == b'\'' {
                 let start0 = i;
                 i += 1;
-                let start = i;
-                while i < len && bytes[i] != b'\'' {
+                let mut s = String::new();
+                loop {
+                    let segment_start = i;
+                    while i < len && bytes[i] != b'\'' {
+                        i += 1;
+                    }
+                    if i >= len {
+                        return Err(ApexError::QueryParseError(format!(
+                            "Syntax error at byte {}: Unterminated string literal",
+                            start0
+                        )));
+                    }
+                    s.push_str(&sql[segment_start..i]);
+                    if i + 1 < len && bytes[i + 1] == b'\'' {
+                        s.push('\'');
+                        i += 2;
+                        continue;
+                    }
                     i += 1;
+                    break;
                 }
-                if i >= len {
-                    return Err(ApexError::QueryParseError(format!(
-                        "Syntax error at byte {}: Unterminated string literal",
-                        start0
-                    )));
-                }
-                let s = sql[start..i].to_string();
-                i += 1;
                 tokens.push(SpannedToken {
                     token: Token::StringLit(s),
                     start: start0,
@@ -2756,8 +2798,37 @@ impl SqlParser {
                         }
                         "SHOW" => {
                             self.advance();
-                            // SHOW FTS INDEXES
                             match self.current().clone() {
+                                Token::Identifier(ref s)
+                                    if s.eq_ignore_ascii_case("TABLES") =>
+                                {
+                                    self.advance();
+                                    return Ok(SqlStatement::ShowTables);
+                                }
+                                Token::Identifier(ref s)
+                                    if s.eq_ignore_ascii_case("DATABASES") =>
+                                {
+                                    self.advance();
+                                    return Ok(SqlStatement::ShowDatabases);
+                                }
+                                Token::ColumnsKw => {
+                                    self.advance();
+                                    if matches!(self.current(), Token::From) {
+                                        self.advance();
+                                    }
+                                    let table = self.parse_identifier()?;
+                                    return Ok(SqlStatement::ShowColumns { table });
+                                }
+                                Token::Identifier(ref s)
+                                    if s.eq_ignore_ascii_case("COLUMNS") =>
+                                {
+                                    self.advance();
+                                    if matches!(self.current(), Token::From) {
+                                        self.advance();
+                                    }
+                                    let table = self.parse_identifier()?;
+                                    return Ok(SqlStatement::ShowColumns { table });
+                                }
                                 Token::Identifier(ref s) if s.to_uppercase() == "FTS" => {
                                     self.advance();
                                     // consume INDEXES or INDEX
@@ -2770,11 +2841,19 @@ impl SqlParser {
                                 }
                                 other => {
                                     return Err(ApexError::QueryParseError(format!(
-                                        "Expected FTS after SHOW, got {:?}",
+                                        "Expected TABLES, DATABASES, COLUMNS, or FTS after SHOW, got {:?}",
                                         other
                                     )))
                                 }
                             }
+                        }
+                        "DESCRIBE" | "DESC" => {
+                            self.advance();
+                            if matches!(self.current(), Token::Table) {
+                                self.advance();
+                            }
+                            let table = self.parse_identifier()?;
+                            return Ok(SqlStatement::Describe { table });
                         }
                         "REINDEX" => {
                             self.advance();
@@ -5369,11 +5448,16 @@ impl SqlParser {
                 self.advance(); // consume '['
                 let mut values: Vec<f64> = Vec::new();
                 while !matches!(self.current(), Token::RBracket | Token::Eof) {
-                    let neg = if matches!(self.current(), Token::Minus) {
-                        self.advance();
-                        true
-                    } else {
-                        false
+                    let neg = match self.current() {
+                        Token::Minus => {
+                            self.advance();
+                            true
+                        }
+                        Token::Plus => {
+                            self.advance();
+                            false
+                        }
+                        _ => false,
                     };
                     let v = match self.current().clone() {
                         Token::FloatLit(f) => {

@@ -36,6 +36,8 @@ struct GlobalDictCacheEntry {
     modified_time: SystemTime,
     epoch: u64,
     data: Arc<(Vec<String>, Vec<u16>)>,
+    has_nulls: bool,
+    max_group_id: Option<u16>,
     bytes: usize,
     last_access: AtomicU64,
 }
@@ -45,6 +47,9 @@ static GLOBAL_DICT_CACHE: once_cell::sync::Lazy<
 > = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 static GLOBAL_DICT_CACHE_BYTES: AtomicUsize = AtomicUsize::new(0);
 static GLOBAL_DICT_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
+static GLOBAL_COLUMN_NULL_CACHE: once_cell::sync::Lazy<
+    RwLock<HashMap<(PathBuf, String), (SystemTime, u64, bool)>>,
+> = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
 fn global_dict_entry_bytes(key: &(PathBuf, String), data: &(Vec<String>, Vec<u16>)) -> usize {
     key.0.as_os_str().len()
@@ -79,12 +84,11 @@ fn evict_global_dict_cache(
 
 type FirstStringRowIdCache = ahash::AHashMap<Box<str>, u64>;
 
-/// Get or build a global dict cache entry. Returns Arc to avoid cloning 1M+ entries.
-pub fn get_global_dict_cache(
+fn get_global_dict_cache_entry(
     path: &Path,
     col_name: &str,
     storage: &OnDemandStorage,
-) -> io::Result<Option<Arc<(Vec<String>, Vec<u16>)>>> {
+) -> io::Result<Option<(Arc<(Vec<String>, Vec<u16>)>, bool, Option<u16>)>> {
     let mtime = std::fs::metadata(path)
         .and_then(|m| m.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
@@ -100,7 +104,11 @@ pub fn get_global_dict_cache(
                     GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
                     Ordering::Relaxed,
                 );
-                return Ok(Some(Arc::clone(&entry.data)));
+                return Ok(Some((
+                    Arc::clone(&entry.data),
+                    entry.has_nulls,
+                    entry.max_group_id,
+                )));
             }
         }
     }
@@ -108,6 +116,8 @@ pub fn get_global_dict_cache(
     // Build and cache
     if let Some((dict_strings, group_ids)) = storage.build_string_dict_cache(col_name)? {
         let data = Arc::new((dict_strings, group_ids));
+        let has_nulls = storage.column_has_nulls(col_name);
+        let max_group_id = data.1.iter().copied().max();
         let mut cache = GLOBAL_DICT_CACHE.write();
         let mut current_bytes = GLOBAL_DICT_CACHE_BYTES.load(Ordering::Relaxed);
         if let Some(replaced) = cache.remove(&key) {
@@ -128,6 +138,8 @@ pub fn get_global_dict_cache(
                 modified_time: mtime,
                 epoch,
                 data: Arc::clone(&data),
+                has_nulls,
+                max_group_id,
                 bytes,
                 last_access: AtomicU64::new(
                     GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
@@ -135,14 +147,62 @@ pub fn get_global_dict_cache(
             },
         );
         GLOBAL_DICT_CACHE_BYTES.store(current_bytes, Ordering::Relaxed);
-        Ok(Some(data))
+        Ok(Some((data, has_nulls, max_group_id)))
     } else {
         Ok(None)
     }
 }
 
+/// Get or build a global dict cache entry. Returns Arc to avoid cloning 1M+ entries.
+pub fn get_global_dict_cache(
+    path: &Path,
+    col_name: &str,
+    storage: &OnDemandStorage,
+) -> io::Result<Option<Arc<(Vec<String>, Vec<u16>)>>> {
+    Ok(get_global_dict_cache_entry(path, col_name, storage)?.map(|(data, _, _)| data))
+}
+
+/// Get the cached dictionary and its NULL metadata using one cache lookup and
+/// one file metadata check. This keeps GROUP BY NULL checks off the hot path
+/// without weakening invalidation on file or table-epoch changes.
+pub fn get_global_dict_cache_with_nulls(
+    path: &Path,
+    col_name: &str,
+    storage: &OnDemandStorage,
+) -> io::Result<Option<(Arc<(Vec<String>, Vec<u16>)>, bool, Option<u16>)>> {
+    get_global_dict_cache_entry(path, col_name, storage)
+}
+
+fn get_global_column_has_nulls(path: &Path, col_name: &str, storage: &OnDemandStorage) -> bool {
+    let modified_time = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let epoch = crate::storage::epoch::current(path);
+    let key = (path.to_path_buf(), col_name.to_string());
+    if let Some((cached_mtime, cached_epoch, has_nulls)) =
+        GLOBAL_COLUMN_NULL_CACHE.read().get(&key).copied()
+    {
+        if cached_epoch == epoch && cached_mtime >= modified_time {
+            return has_nulls;
+        }
+    }
+
+    let has_nulls = storage.column_has_nulls(col_name);
+    let mut cache = GLOBAL_COLUMN_NULL_CACHE.write();
+    if cache.len() >= GLOBAL_DICT_CACHE_MAX_ENTRIES * 2 && !cache.contains_key(&key) {
+        if let Some(oldest) = cache.keys().next().cloned() {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, (modified_time, epoch, has_nulls));
+    has_nulls
+}
+
 /// Invalidate global dict cache for a file path
 pub fn invalidate_global_dict_cache(path: &Path) {
+    GLOBAL_COLUMN_NULL_CACHE
+        .write()
+        .retain(|(cached_path, _), _| cached_path != path);
     let mut cache = GLOBAL_DICT_CACHE.write();
     if cache.is_empty() {
         return;
@@ -196,7 +256,8 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Bool => DataType::Bool,
         ColumnType::Binary => DataType::Binary,
         ColumnType::Blob => DataType::Blob,
-        ColumnType::FixedList | ColumnType::Float16List => DataType::Binary,
+        ColumnType::FixedList => DataType::Binary,
+        ColumnType::Float16List => DataType::Float16Vector,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Date => DataType::Date,
         ColumnType::Null => DataType::String,
@@ -3004,7 +3065,7 @@ impl TableStorageBackend {
 
         // Fast path: one footer lock + one mmap body slice per RG
         if self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data() {
-            if let Ok(Some(batch)) = self.storage.retrieve_many_mmap(ids) {
+            if let Ok(Some(batch)) = self.storage.retrieve_many_mmap_persisted(ids) {
                 let batch = self.apply_delta_overlay_to_batch(batch)?;
                 if batch.num_rows() > 0 && (!self.has_delta() || batch.num_rows() == ids.len()) {
                     return Ok(batch);
@@ -4252,7 +4313,7 @@ impl TableStorageBackend {
 
     /// Returns true if the column has any NULL values in the in-memory store.
     pub fn column_has_nulls(&self, col_name: &str) -> bool {
-        self.storage.column_has_nulls(col_name)
+        get_global_column_has_nulls(self.path(), col_name, &self.storage)
     }
 
     /// Fast COUNT(DISTINCT col) for string columns. Null-aware via bitmaps.
@@ -4311,13 +4372,14 @@ impl TableStorageBackend {
     }
 
     /// Execute 2-column GROUP BY + aggregate using pre-built dict caches.
-    pub fn execute_group_agg_2col_cached(
+    pub(crate) fn execute_group_agg_2col_cached(
         &self,
         dict1_strings: &[String],
         group_ids1: &[u16],
         dict2_strings: &[String],
         group_ids2: &[u16],
         agg_cols: &[(&str, bool)],
+        ids_validated: bool,
     ) -> io::Result<Option<Vec<((String, String), Vec<(f64, i64)>)>>> {
         self.storage.execute_group_agg_2col_cached(
             dict1_strings,
@@ -4325,6 +4387,7 @@ impl TableStorageBackend {
             dict2_strings,
             group_ids2,
             agg_cols,
+            ids_validated,
         )
     }
 
@@ -4691,6 +4754,8 @@ mod tests {
             modified_time: SystemTime::UNIX_EPOCH,
             epoch: 0,
             data: Arc::new((Vec::new(), Vec::new())),
+            has_nulls: false,
+            max_group_id: None,
             bytes,
             last_access: AtomicU64::new(access),
         }

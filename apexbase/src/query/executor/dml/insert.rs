@@ -164,6 +164,34 @@ impl ApexExecutor {
                 .map(|(n, _)| n.clone())
                 .collect()
         };
+        let table_schema = storage.get_schema();
+        let known_columns: std::collections::HashSet<&str> =
+            table_schema.iter().map(|(name, _)| name.as_str()).collect();
+        let mut seen_columns = std::collections::HashSet::new();
+        for column in &col_names {
+            if !known_columns.contains(column.as_str()) {
+                return Err(err_input(format!(
+                    "INSERT target column '{}' does not exist",
+                    column
+                )));
+            }
+            if !seen_columns.insert(column.as_str()) {
+                return Err(err_input(format!(
+                    "INSERT target column '{}' is specified more than once",
+                    column
+                )));
+            }
+        }
+        for (row_index, row) in values.iter().enumerate() {
+            if row.len() != col_names.len() {
+                return Err(err_input(format!(
+                    "INSERT row {} has {} values but {} target columns",
+                    row_index + 1,
+                    row.len(),
+                    col_names.len()
+                )));
+            }
+        }
         let schema_types: std::collections::HashMap<String, crate::storage::on_demand::ColumnType> =
             storage
                 .get_schema()
@@ -301,6 +329,34 @@ impl ApexExecutor {
                 .map(|(n, _)| n.clone())
                 .collect()
         };
+        let table_schema = storage.get_schema();
+        let known_columns: std::collections::HashSet<&str> =
+            table_schema.iter().map(|(name, _)| name.as_str()).collect();
+        let mut seen_columns = std::collections::HashSet::with_capacity(col_names.len());
+        for column in &col_names {
+            if !known_columns.contains(column.as_str()) {
+                return Err(err_input(format!(
+                    "INSERT target column '{}' does not exist",
+                    column
+                )));
+            }
+            if !seen_columns.insert(column.as_str()) {
+                return Err(err_input(format!(
+                    "INSERT target column '{}' is specified more than once",
+                    column
+                )));
+            }
+        }
+        for (row_index, row) in values.iter().enumerate() {
+            if row.len() != col_names.len() {
+                return Err(err_input(format!(
+                    "INSERT row {} has {} values but {} target columns",
+                    row_index + 1,
+                    row.len(),
+                    col_names.len()
+                )));
+            }
+        }
 
         // Build a schema type lookup for auto-coercing string→timestamp/date
         let schema_types: std::collections::HashMap<String, crate::storage::on_demand::ColumnType> = {
@@ -326,6 +382,25 @@ impl ApexExecutor {
                     let col_name = &col_names[i];
                     let col_schema_type = schema_types.get(col_name).copied();
                     let coerced = match value {
+                        Value::Binary(bytes)
+                            if matches!(
+                                col_schema_type,
+                                Some(crate::storage::on_demand::ColumnType::Blob)
+                            ) =>
+                        {
+                            Value::Blob(bytes.clone())
+                        }
+                        Value::Int64(number)
+                            if matches!(
+                                col_schema_type,
+                                Some(
+                                    crate::storage::on_demand::ColumnType::Float32
+                                        | crate::storage::on_demand::ColumnType::Float64
+                                )
+                            ) =>
+                        {
+                            Value::Float64(*number as f64)
+                        }
                         Value::String(v) => {
                             match col_schema_type {
                                 Some(crate::storage::on_demand::ColumnType::Timestamp) => {

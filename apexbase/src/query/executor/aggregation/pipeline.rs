@@ -1031,7 +1031,10 @@ impl ApexExecutor {
                     } else if let Some(arr) = batch.column_by_name(bare_col) {
                         (bare_col, arr)
                     } else {
-                        continue;
+                        return Err(err_input(format!(
+                            "Projected column '{}' does not exist",
+                            col_name
+                        )));
                     };
                     if !added_columns.contains(out_name) {
                         fields.push(Field::new(out_name, array.data_type().clone(), true));
@@ -1051,11 +1054,12 @@ impl ApexExecutor {
                     let array = batch
                         .column_by_name(col_name)
                         .or_else(|| batch.column_by_name(bare_col));
-                    if let Some(array) = array {
-                        fields.push(Field::new(alias, array.data_type().clone(), true));
-                        arrays.push(array.clone());
-                        added_columns.insert(alias.clone());
-                    }
+                    let array = array.ok_or_else(|| {
+                        err_input(format!("Projected column '{}' does not exist", col_name))
+                    })?;
+                    fields.push(Field::new(alias, array.data_type().clone(), true));
+                    arrays.push(array.clone());
+                    added_columns.insert(alias.clone());
                 }
                 SelectColumn::Expression { expr, alias } => {
                     // Use storage-aware evaluation for expressions that may contain scalar subqueries

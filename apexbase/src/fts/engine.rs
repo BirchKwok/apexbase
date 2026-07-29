@@ -202,12 +202,16 @@ impl FtsEngine {
 
     pub fn search(&self, query: &str) -> FtsResult<ResultHandle> {
         self.core.search_count.fetch_add(1, Ordering::Relaxed);
+        let config = self.core.config.read().clone();
+        let state = self.core.state.read();
+        if let Some(result) = matching_boolean_query(&state, query, &config)? {
+            return Ok(ResultHandle::new(result));
+        }
         let (query, phrase) = phrase_query(query);
-        let analyzed = analyze_document(query, &self.core.config.read());
+        let analyzed = analyze_document(query, &config);
         if analyzed.terms.is_empty() {
             return Ok(ResultHandle::new(RoaringTreemap::new()));
         }
-        let state = self.core.state.read();
         let result = matching_docs(&state, &analyzed, phrase)?;
         Ok(ResultHandle::new(result))
     }
@@ -226,35 +230,47 @@ impl FtsEngine {
         let mut all_terms: AHashSet<&str> = state.base_terms()?.into_iter().collect();
         all_terms.extend(state.delta_postings.keys().map(String::as_str));
         let max_candidates = config.fuzzy_max_candidates.clamp(1, 256);
-        let mut result: Option<RoaringTreemap> = None;
-        for query_term in query_terms {
-            let mut candidates: Vec<(&str, usize, f64)> = all_terms
-                .iter()
-                .filter_map(|term| {
-                    let distance = levenshtein(&query_term, term, config.fuzzy_max_distance)?;
-                    let width = query_term.chars().count().max(term.chars().count()).max(1);
-                    let similarity = 1.0 - distance as f64 / width as f64;
-                    (similarity >= config.fuzzy_threshold).then_some((*term, distance, similarity))
-                })
-                .collect();
-            candidates.sort_unstable_by(|a, b| {
-                a.1.cmp(&b.1)
-                    .then_with(|| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal))
-            });
-            candidates.truncate(max_candidates);
-            let mut word_docs = RoaringTreemap::new();
-            for (term, _, _) in candidates {
-                word_docs |= state.posting(term)?;
-            }
-            result = Some(match result {
-                Some(mut current) => {
-                    current &= word_docs;
-                    current
+        let mut best = RoaringTreemap::new();
+        let mut threshold = config.fuzzy_threshold;
+        loop {
+            let mut result: Option<RoaringTreemap> = None;
+            for query_term in &query_terms {
+                let mut candidates: Vec<(&str, usize, f64)> = all_terms
+                    .iter()
+                    .filter_map(|term| {
+                        let distance =
+                            levenshtein(query_term, term, config.fuzzy_max_distance)?;
+                        let width = query_term.chars().count().max(term.chars().count()).max(1);
+                        let similarity = 1.0 - distance as f64 / width as f64;
+                        (similarity >= threshold).then_some((*term, distance, similarity))
+                    })
+                    .collect();
+                candidates.sort_unstable_by(|a, b| {
+                    a.1.cmp(&b.1).then_with(|| {
+                        b.2.partial_cmp(&a.2)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    })
+                });
+                candidates.truncate(max_candidates);
+                let mut word_docs = RoaringTreemap::new();
+                for (term, _, _) in candidates {
+                    word_docs |= state.posting(term)?;
                 }
-                None => word_docs,
-            });
+                result = Some(match result {
+                    Some(mut current) => {
+                        current &= word_docs;
+                        current
+                    }
+                    None => word_docs,
+                });
+            }
+            best = result.unwrap_or_default();
+            if best.len() >= min_results as u64 || threshold <= 0.0 {
+                break;
+            }
+            threshold = (threshold - 0.1).max(0.0);
         }
-        Ok(ResultHandle::new(result.unwrap_or_default()))
+        Ok(ResultHandle::new(best))
     }
 
     pub fn search_ids(&self, query: &str) -> FtsResult<Vec<u64>> {
@@ -412,16 +428,13 @@ impl FtsEngine {
         let state = self.core.state.read();
         let mut stats = HashMap::new();
         stats.insert("doc_count".into(), state.live_docs().len());
-        stats.insert(
-            "term_count".into(),
-            state.base_term_count().saturating_add(
-                state
-                    .delta_postings
-                    .keys()
-                    .filter(|term| !state.contains_base_term(term))
-                    .count(),
-            ) as u64,
-        );
+        let mut terms: AHashSet<&str> = state.base_terms().unwrap_or_default().into_iter().collect();
+        terms.extend(state.delta_postings.keys().map(String::as_str));
+        let live_term_count = terms
+            .into_iter()
+            .filter(|term| state.posting(term).is_ok_and(|posting| !posting.is_empty()))
+            .count();
+        stats.insert("term_count".into(), live_term_count as u64);
         stats.insert("deleted_count".into(), state.deleted_docs.len());
         stats.insert(
             "search_count".into(),

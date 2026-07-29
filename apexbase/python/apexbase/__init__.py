@@ -483,6 +483,22 @@ class ResultView:
             return self._arrow_table
         return pa_mod.Table.from_pylist(self._ensure_data())
 
+    def to_record_batches(self, max_chunksize: int = None):
+        """Return Arrow record batches without merging chunk payload buffers.
+
+        Args:
+            max_chunksize: Optional maximum rows per batch.
+
+        Returns:
+            List of ``pyarrow.RecordBatch`` objects preserving the result schema.
+        """
+        table = self.to_arrow()
+        return table.to_batches(max_chunksize=max_chunksize)
+
+    def iter_batches(self, max_chunksize: int = None):
+        """Iterate Arrow record batches, suitable for bounded-memory consumers."""
+        yield from self.to_record_batches(max_chunksize=max_chunksize)
+
     def to_lance(self, uri, mode: str = "create", **write_options):
         """Write results to a Lance dataset using the Arrow table path.
 
@@ -500,6 +516,8 @@ class ResultView:
     @property
     def shape(self):
         self._ensure_arrow()
+        if self._num_rows == 0:
+            return (0, 0)
         if self._arrow_table is not None:
             return (self._arrow_table.num_rows, self._arrow_table.num_columns)
         if self._data:

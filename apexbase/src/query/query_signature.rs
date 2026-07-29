@@ -1088,6 +1088,11 @@ fn parse_string_equality_clause(clause: &str) -> Option<(String, String)> {
     }
     let val_end = rhs[1..].find('\'')?;
     let val = rhs[1..1 + val_end].to_string();
+    // Empty strings are distinct from NULL. Route this uncommon literal
+    // through the general SQL evaluator instead of the mmap string fast path.
+    if val.is_empty() {
+        return None;
+    }
     let rest = rhs[1 + val_end + 1..].trim();
     if !rest.is_empty() {
         return None;

@@ -2462,7 +2462,9 @@ impl OnDemandStorage {
                         ColBuf::Str(StringBuilder::with_capacity(n_out, n_out * 10))
                     }
                     ColumnType::Bool => ColBuf::Bool(vec![None; n_out]),
-                    ColumnType::Binary => ColBuf::Bin(vec![None; n_out]),
+                    ColumnType::Binary | ColumnType::Blob => {
+                        ColBuf::Bin(vec![None; n_out])
+                    }
                     ColumnType::FixedList | ColumnType::Float16List => {
                         ColBuf::FixedVec(vec![None; n_out], 0)
                     }
@@ -2483,7 +2485,28 @@ impl OnDemandStorage {
         // Then process each column independently in parallel via rayon.
         let needed_col_indices: Vec<usize> = (0..col_count).filter(|&ci| col_needed[ci]).collect();
         let mut par_col_offsets: Vec<Option<Vec<u32>>> = Vec::new(); // per-RG col offsets
-        let mut par_eligible = needed_col_indices.len() >= 2 && n_out >= 500;
+        let mut par_eligible = needed_col_indices.len() >= 2
+            && n_out >= 500
+            && needed_col_indices.iter().all(|&ci| {
+                matches!(
+                    schema.columns[ci].1,
+                    ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date
+                        | ColumnType::Float64
+                        | ColumnType::Float32
+                        | ColumnType::String
+                        | ColumnType::StringDict
+                        | ColumnType::Bool
+                )
+            });
         if par_eligible {
             for (rg_i, local_pairs) in rg_local_indices.iter().enumerate() {
                 if local_pairs.is_empty() {
@@ -3433,10 +3456,27 @@ impl OnDemandStorage {
                     arrays.push(Arc::new(arr));
                 }
                 ColBuf::Bin(vals) => {
-                    use arrow::array::BinaryArray;
-                    let bin_data: Vec<Option<&[u8]>> = vals.iter().map(|v| v.as_deref()).collect();
-                    fields.push(Field::new(col_name, ArrowDataType::Binary, true));
-                    arrays.push(Arc::new(BinaryArray::from(bin_data)) as ArrayRef);
+                    if matches!(ct, ColumnType::Blob) {
+                        use arrow::array::LargeBinaryArray;
+                        let mut payloads = Vec::with_capacity(vals.len());
+                        for descriptor in vals {
+                            payloads.push(
+                                descriptor
+                                    .as_deref()
+                                    .map(|bytes| self.read_blob_value(bytes))
+                                    .transpose()?,
+                            );
+                        }
+                        let refs = payloads.iter().map(|value| value.as_deref()).collect::<Vec<_>>();
+                        fields.push(Field::new(col_name, ArrowDataType::LargeBinary, true));
+                        arrays.push(Arc::new(LargeBinaryArray::from(refs)) as ArrayRef);
+                    } else {
+                        use arrow::array::BinaryArray;
+                        let bin_data: Vec<Option<&[u8]>> =
+                            vals.iter().map(|value| value.as_deref()).collect();
+                        fields.push(Field::new(col_name, ArrowDataType::Binary, true));
+                        arrays.push(Arc::new(BinaryArray::from(bin_data)) as ArrayRef);
+                    }
                 }
                 ColBuf::FixedVec(vals, dim) => {
                     let d = dim as usize;
@@ -3946,6 +3986,27 @@ impl OnDemandStorage {
         }))
     }
 
+    fn retrieve_many_mmap_columns_visible(
+        &self,
+        ids: &[u64],
+    ) -> io::Result<Option<MmapBatchColumns>> {
+        let active_ids = {
+            let delta_store = self.delta_store.read();
+            if delta_store.delete_count() == 0 {
+                drop(delta_store);
+                return self.retrieve_many_mmap_columns(ids);
+            }
+            let deletes = delta_store.delete_bitmap();
+            ids.iter()
+                .copied()
+                .filter(|id| !deletes.is_deleted(*id))
+                .collect::<Vec<_>>()
+        };
+        self.retrieve_many_mmap_columns(&active_ids)
+    }
+
+    /// Decode persisted rows. Callers must prove there are no pending delta
+    /// deletions or apply a delta overlay before exposing the result.
     pub(crate) fn retrieve_many_mmap_columns(
         &self,
         ids: &[u64],
@@ -4463,15 +4524,34 @@ impl OnDemandStorage {
         &self,
         ids: &[u64],
     ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        let Some(batch_cols) = self.retrieve_many_mmap_columns_visible(ids)? else {
+            return Ok(None);
+        };
+        Self::mmap_batch_columns_to_arrow(batch_cols)
+    }
+
+    /// Decode persisted rows without consulting DeltaStore.
+    ///
+    /// Callers must apply their own delta overlay before exposing the batch.
+    pub(crate) fn retrieve_many_mmap_persisted(
+        &self,
+        ids: &[u64],
+    ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        let Some(batch_cols) = self.retrieve_many_mmap_columns(ids)? else {
+            return Ok(None);
+        };
+        Self::mmap_batch_columns_to_arrow(batch_cols)
+    }
+
+    fn mmap_batch_columns_to_arrow(
+        batch_cols: MmapBatchColumns,
+    ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
         use arrow::array::{
             ArrayRef, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray,
         };
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
-        let Some(batch_cols) = self.retrieve_many_mmap_columns(ids)? else {
-            return Ok(None);
-        };
         if batch_cols.row_count == 0 {
             return Ok(Some(arrow::record_batch::RecordBatch::new_empty(Arc::new(
                 Schema::empty(),

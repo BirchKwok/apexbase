@@ -1295,26 +1295,21 @@ impl ApexExecutor {
                 let values = int_arr.values();
                 for row_idx in 0..num_rows {
                     let group_idx = unsafe { *indices.get_unchecked(row_idx) as usize };
-                    if group_idx != 0 {
-                        unsafe {
-                            *counts.get_unchecked_mut(group_idx) += 1;
-                            let val = *values.get_unchecked(row_idx);
-                            *sums_int.get_unchecked_mut(group_idx) =
-                                sums_int.get_unchecked(group_idx).wrapping_add(val);
-                            let min_slot = mins_int.get_unchecked_mut(group_idx);
-                            *min_slot = Some(min_slot.map_or(val, |m| m.min(val)));
-                            let max_slot = maxs_int.get_unchecked_mut(group_idx);
-                            *max_slot = Some(max_slot.map_or(val, |m| m.max(val)));
-                        }
+                    unsafe {
+                        *counts.get_unchecked_mut(group_idx) += 1;
+                        let val = *values.get_unchecked(row_idx);
+                        *sums_int.get_unchecked_mut(group_idx) =
+                            sums_int.get_unchecked(group_idx).wrapping_add(val);
+                        let min_slot = mins_int.get_unchecked_mut(group_idx);
+                        *min_slot = Some(min_slot.map_or(val, |m| m.min(val)));
+                        let max_slot = maxs_int.get_unchecked_mut(group_idx);
+                        *max_slot = Some(max_slot.map_or(val, |m| m.max(val)));
                     }
                 }
             } else {
                 // Slow path: has nulls
                 for row_idx in 0..num_rows {
                     let group_idx = indices[row_idx] as usize;
-                    if group_idx == 0 {
-                        continue;
-                    }
                     counts[group_idx] += 1;
                     if !int_arr.is_null(row_idx) {
                         let val = int_arr.value(row_idx);
@@ -1329,20 +1324,15 @@ impl ApexExecutor {
                 let values = float_arr.values();
                 for row_idx in 0..num_rows {
                     let group_idx = unsafe { *indices.get_unchecked(row_idx) as usize };
-                    if group_idx != 0 {
-                        unsafe {
-                            *counts.get_unchecked_mut(group_idx) += 1;
-                            *sums_float.get_unchecked_mut(group_idx) +=
-                                *values.get_unchecked(row_idx);
-                        }
+                    unsafe {
+                        *counts.get_unchecked_mut(group_idx) += 1;
+                        *sums_float.get_unchecked_mut(group_idx) +=
+                            *values.get_unchecked(row_idx);
                     }
                 }
             } else {
                 for row_idx in 0..num_rows {
                     let group_idx = indices[row_idx] as usize;
-                    if group_idx == 0 {
-                        continue;
-                    }
                     counts[group_idx] += 1;
                     if !float_arr.is_null(row_idx) {
                         sums_float[group_idx] += float_arr.value(row_idx);
@@ -1353,16 +1343,14 @@ impl ApexExecutor {
             // COUNT(*) only
             for row_idx in 0..num_rows {
                 let group_idx = unsafe { *indices.get_unchecked(row_idx) as usize };
-                if group_idx != 0 {
-                    unsafe {
-                        *counts.get_unchecked_mut(group_idx) += 1;
-                    }
+                unsafe {
+                    *counts.get_unchecked_mut(group_idx) += 1;
                 }
             }
         }
 
-        // Collect non-empty groups (skip index 0 which is NULL)
-        let active_groups: Vec<usize> = (1..dict_size).filter(|&i| counts[i] > 0).collect();
+        // Index 0 is the NULL group; real strings start at 1, including "".
+        let active_groups: Vec<usize> = (0..dict_size).filter(|&i| counts[i] > 0).collect();
 
         // Build result arrays
         let mut result_fields: Vec<Field> = Vec::new();
@@ -1406,11 +1394,17 @@ impl ApexExecutor {
                 }
             });
 
-        let group_values: Vec<&str> = active_groups
+        let group_values: Vec<Option<&str>> = active_groups
             .iter()
-            .map(|&i| dict_values[i - 1]) // -1 because dict_values is 0-indexed, indices are 1-indexed
+            .map(|&i| {
+                if i == 0 {
+                    None
+                } else {
+                    Some(dict_values[i - 1])
+                }
+            })
             .collect();
-        result_fields.push(Field::new(&group_col_name, ArrowDataType::Utf8, false));
+        result_fields.push(Field::new(&group_col_name, ArrowDataType::Utf8, true));
         result_arrays.push(Arc::new(StringArray::from(group_values)));
 
         // Add aggregate columns

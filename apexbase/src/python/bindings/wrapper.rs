@@ -756,7 +756,7 @@ impl ApexStorageImpl {
             .truncate(false)
             .open(&lock_path)?;
 
-        let max_wait = std::time::Duration::from_millis(50);
+        let max_wait = std::time::Duration::from_secs(30);
         let mut backoff = std::time::Duration::from_micros(100);
         let start = std::time::Instant::now();
 
@@ -830,11 +830,13 @@ impl ApexStorageImpl {
                 "str" | "string" | "text" | "varchar" => ColumnType::String,
                 "bytes" | "binary" => ColumnType::Binary,
                 "blob" | "large_binary" | "largebinary" => ColumnType::Blob,
+                "float16_vector" | "float16vector" | "f16_vector" => ColumnType::Float16List,
                 "timestamp" | "datetime" => ColumnType::Timestamp,
                 "date" => ColumnType::Date,
                 _ => return Err(PyValueError::new_err(format!(
                     "Unknown column type '{}' for column '{}'. Supported: int8, int16, int32, int64, \
-                     uint8, uint16, uint32, uint64, float32, float64, bool, string, binary, timestamp, date",
+                     uint8, uint16, uint32, uint64, float32, float64, bool, string, binary, blob, \
+                     float16_vector, timestamp, date",
                     type_str, col_name
                 ))),
             };

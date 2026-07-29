@@ -34,7 +34,15 @@ impl ApexExecutor {
         // FAST PATH: explode_rename(topk_distance(col,[q],k,'m'), "name1", "name2") FROM table
         // Single-pass O(n log k) topk that generates k rows with 2 user-named columns.
         if let Some((col, query, k, metric, names)) = Self::detect_topk_explode(&stmt) {
-            let result = Self::execute_topk_explode(storage_path, col, query, k, metric, names)?;
+            let result = Self::execute_topk_explode(
+                storage_path,
+                col,
+                query,
+                k,
+                metric,
+                names,
+                stmt.where_clause.as_ref(),
+            )?;
             return Ok(ApexResult::Data(result));
         }
 
@@ -191,6 +199,9 @@ impl ApexExecutor {
                         ));
                     } else {
                         let backend = get_cached_backend(storage_path)?;
+                        if let Some(where_clause) = stmt.where_clause.as_mut() {
+                            Self::coerce_predicate_literals(where_clause, &backend)?;
+                        }
 
                         // Check if any SELECT column contains a scalar subquery
                         // Scalar subqueries may reference arbitrary columns, so read all
@@ -404,19 +415,25 @@ impl ApexExecutor {
                                     if let Some((filter_col, filter_value)) =
                                         Self::extract_string_equality(where_clause)
                                     {
-                                        let mut grouped_stmt = stmt.clone();
-                                        grouped_stmt.where_clause = None;
-                                        let col_refs = Self::get_col_refs(&grouped_stmt);
-                                        let col_refs_vec: Option<Vec<&str>> = col_refs
-                                            .as_ref()
-                                            .map(|v| v.iter().map(|s| s.as_str()).collect());
-                                        let filtered = backend.read_columns_filtered_string_to_arrow(
-                                            col_refs_vec.as_deref(),
-                                            &filter_col,
-                                            &filter_value,
-                                            true,
-                                        )?;
-                                        return Self::execute_group_by(&filtered, &grouped_stmt);
+                                        if Self::column_is_string(&backend, &filter_col) {
+                                            let mut grouped_stmt = stmt.clone();
+                                            grouped_stmt.where_clause = None;
+                                            let col_refs = Self::get_col_refs(&grouped_stmt);
+                                            let col_refs_vec: Option<Vec<&str>> = col_refs
+                                                .as_ref()
+                                                .map(|v| v.iter().map(|s| s.as_str()).collect());
+                                            let filtered = backend
+                                                .read_columns_filtered_string_to_arrow(
+                                                    col_refs_vec.as_deref(),
+                                                    &filter_col,
+                                                    &filter_value,
+                                                    true,
+                                                )?;
+                                            return Self::execute_group_by(
+                                                &filtered,
+                                                &grouped_stmt,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -740,13 +757,8 @@ impl ApexExecutor {
                                                     }
                                                 } else {
                                                     (None, false)
-                                                };
+                                            };
                                             if let Some(indices) = matching_indices {
-                                                if indices.is_empty() {
-                                                    return Ok(ApexResult::Empty(Arc::new(
-                                                        Schema::empty(),
-                                                    )));
-                                                }
                                                 if has_aggregation_check
                                                     && stmt.group_by.is_empty()
                                                     && stmt.joins.is_empty()
@@ -2075,6 +2087,9 @@ impl ApexExecutor {
             Some(v) => v,
             None => return Ok(None),
         };
+        if !Self::column_is_string(backend, &col_name) {
+            return Ok(None);
+        }
 
         // Column projection pushdown
         let projected_cols: Option<Vec<String>> = if stmt.is_select_star() {
@@ -2338,6 +2353,9 @@ impl ApexExecutor {
             } else {
                 return Ok(None);
             };
+        if !Self::column_is_string(backend, &str_col) {
+            return Ok(None);
+        }
 
         let limit = stmt.limit.unwrap_or(100);
         let offset = stmt.offset.unwrap_or(0);
@@ -3216,6 +3234,9 @@ impl ApexExecutor {
             Some(v) => v,
             None => return Ok(None),
         };
+        if !Self::column_is_string(backend, &filter_col) {
+            return Ok(None);
+        }
 
         // Collect unique aggregation columns. Add "*" when COUNT(*)/COUNT(1)
         // is present so the storage path returns the real match count.
@@ -3794,6 +3815,9 @@ impl ApexExecutor {
         }
 
         let group_col = clean_name(&stmt.group_by[0]);
+        if backend.column_has_nulls(group_col) {
+            return Ok(None);
+        }
         let mut outputs = Vec::with_capacity(stmt.columns.len());
         let mut distinct_cols: Vec<String> = Vec::new();
         let mut case_specs: Vec<(String, Vec<String>)> = Vec::new();
@@ -4005,7 +4029,8 @@ impl ApexExecutor {
         }
 
         // Get or build cached dict (global cache — survives backend reopens)
-        let dict_arc = match crate::storage::backend::get_global_dict_cache(
+        let (dict_arc, group_has_nulls, _) =
+            match crate::storage::backend::get_global_dict_cache_with_nulls(
             backend.path(),
             group_col,
             &backend.storage,
@@ -4013,6 +4038,9 @@ impl ApexExecutor {
             Some(c) => c,
             None => return Ok(None),
         };
+        if group_has_nulls {
+            return Ok(None);
+        }
         let (dict_strings, group_ids) = (dict_arc.0.as_slice(), dict_arc.1.as_slice());
 
         let agg_cols: Vec<(&str, bool)> = agg_info
@@ -4150,7 +4178,8 @@ impl ApexExecutor {
         }
 
         // Get dict caches for both group columns
-        let dict1_arc = match crate::storage::backend::get_global_dict_cache(
+        let (dict1_arc, dict1_has_nulls, dict1_max_group_id) =
+            match crate::storage::backend::get_global_dict_cache_with_nulls(
             backend.path(),
             group_col1,
             &backend.storage,
@@ -4158,7 +4187,8 @@ impl ApexExecutor {
             Some(c) => c,
             None => return Ok(None),
         };
-        let dict2_arc = match crate::storage::backend::get_global_dict_cache(
+        let (dict2_arc, dict2_has_nulls, dict2_max_group_id) =
+            match crate::storage::backend::get_global_dict_cache_with_nulls(
             backend.path(),
             group_col2,
             &backend.storage,
@@ -4166,6 +4196,16 @@ impl ApexExecutor {
             Some(c) => c,
             None => return Ok(None),
         };
+        if dict1_has_nulls || dict2_has_nulls {
+            return Ok(None);
+        }
+        if dict1_max_group_id
+            .is_some_and(|max_id| max_id as usize >= dict1_arc.0.len())
+            || dict2_max_group_id
+                .is_some_and(|max_id| max_id as usize >= dict2_arc.0.len())
+        {
+            return Ok(None);
+        }
 
         let (dict1_strings, group_ids1) = (dict1_arc.0.as_slice(), dict1_arc.1.as_slice());
         let (dict2_strings, group_ids2) = (dict2_arc.0.as_slice(), dict2_arc.1.as_slice());
@@ -4181,6 +4221,7 @@ impl ApexExecutor {
             dict2_strings,
             group_ids2,
             &agg_cols,
+            true,
         )? {
             Some(r) if !r.is_empty() => r,
             _ => return Ok(None),
@@ -4283,12 +4324,122 @@ impl ApexExecutor {
                 right,
             } => match (left.as_ref(), right.as_ref()) {
                 (SqlExpr::Column(col), SqlExpr::Literal(Value::String(val)))
-                | (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
-                    Some((col.trim_matches('"').to_string(), val.clone()))
+                | (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col))
+                    if !val.is_empty() =>
+                {
+                    let clean = col.trim_matches('"');
+                    Some((
+                        clean.rsplit('.').next().unwrap_or(clean).to_string(),
+                        val.clone(),
+                    ))
                 }
                 _ => None,
             },
             _ => None,
+        }
+    }
+
+    #[inline]
+    fn column_is_string(backend: &TableStorageBackend, column: &str) -> bool {
+        matches!(
+            backend.get_column_type(column),
+            Some(crate::data::DataType::String)
+        )
+    }
+
+    fn coerce_predicate_literal(
+        backend: &TableStorageBackend,
+        column: &str,
+        value: &mut Value,
+    ) -> io::Result<()> {
+        let Value::String(text) = value else {
+            return Ok(());
+        };
+        let clean = column.trim_matches('"');
+        let clean = clean.rsplit('.').next().unwrap_or(clean);
+        let data_type = if clean == "_id" {
+            None
+        } else {
+            backend.get_column_type(clean)
+        };
+        let coerced = match data_type {
+            Some(
+                crate::data::DataType::Int64
+                | crate::data::DataType::Int32
+                | crate::data::DataType::Int16
+                | crate::data::DataType::Int8,
+            ) => Value::Int64(text.parse::<i64>().map_err(|_| {
+                err_input(format!(
+                    "cannot compare integer column '{}' with non-integer string {:?}",
+                    clean, text
+                ))
+            })?),
+            Some(crate::data::DataType::Float64 | crate::data::DataType::Float32) => {
+                let parsed = text.parse::<f64>().map_err(|_| {
+                    err_input(format!(
+                        "cannot compare floating-point column '{}' with non-numeric string {:?}",
+                        clean, text
+                    ))
+                })?;
+                if !parsed.is_finite() {
+                    return Err(err_input(format!(
+                        "floating-point comparison for column '{}' requires a finite value",
+                        clean
+                    )));
+                }
+                Value::Float64(parsed)
+            }
+            None if clean == "_id" => Value::UInt64(text.parse::<u64>().map_err(|_| {
+                err_input(format!(
+                    "cannot compare unsigned integer column '_id' with non-integer string {:?}",
+                    text
+                ))
+            })?),
+            _ => return Ok(()),
+        };
+        *value = coerced;
+        Ok(())
+    }
+
+    fn coerce_predicate_literals(
+        expr: &mut SqlExpr,
+        backend: &TableStorageBackend,
+    ) -> io::Result<()> {
+        match expr {
+            SqlExpr::BinaryOp { left, right, .. } => {
+                match (left.as_mut(), right.as_mut()) {
+                    (SqlExpr::Column(column), SqlExpr::Literal(value)) => {
+                        Self::coerce_predicate_literal(backend, column, value)?;
+                    }
+                    (SqlExpr::Literal(value), SqlExpr::Column(column)) => {
+                        Self::coerce_predicate_literal(backend, column, value)?;
+                    }
+                    _ => {}
+                }
+                Self::coerce_predicate_literals(left, backend)?;
+                Self::coerce_predicate_literals(right, backend)
+            }
+            SqlExpr::Between {
+                column, low, high, ..
+            } => {
+                if let SqlExpr::Literal(value) = low.as_mut() {
+                    Self::coerce_predicate_literal(backend, column, value)?;
+                }
+                if let SqlExpr::Literal(value) = high.as_mut() {
+                    Self::coerce_predicate_literal(backend, column, value)?;
+                }
+                Ok(())
+            }
+            SqlExpr::In { column, values, .. } => {
+                for value in values {
+                    Self::coerce_predicate_literal(backend, column, value)?;
+                }
+                Ok(())
+            }
+            SqlExpr::Paren(inner) | SqlExpr::UnaryOp { expr: inner, .. } => {
+                Self::coerce_predicate_literals(inner, backend)
+            }
+            _ => Ok(()),
         }
     }
 
@@ -4352,9 +4503,9 @@ impl ApexExecutor {
                         } else {
                             f64::from_bits(val.to_bits() - 1)
                         };
-                        (next, f64::MAX)
+                        (next, f64::INFINITY)
                     }
-                    BinaryOperator::Ge => (val, f64::MAX),
+                    BinaryOperator::Ge => (val, f64::INFINITY),
                     BinaryOperator::Lt => {
                         // col < N: largest representable value strictly below N
                         let prev = if val > 0.0 {
@@ -4362,9 +4513,9 @@ impl ApexExecutor {
                         } else {
                             f64::from_bits(val.to_bits() + 1)
                         };
-                        (f64::MIN, prev)
+                        (f64::NEG_INFINITY, prev)
                     }
-                    BinaryOperator::Le => (f64::MIN, val),
+                    BinaryOperator::Le => (f64::NEG_INFINITY, val),
                     BinaryOperator::Eq => (val, val), // exact match as degenerate range [N, N]
                     _ => return None,
                 };
@@ -4482,7 +4633,7 @@ impl ApexExecutor {
                 let offset = stmt.offset.unwrap_or(0);
                 if offset > 0 {
                     if offset >= intersected.len() {
-                        return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+                        return Ok(None);
                     }
                     intersected = intersected[offset..].to_vec();
                 }
@@ -4490,7 +4641,7 @@ impl ApexExecutor {
                     intersected.truncate(lim);
                 }
                 if intersected.is_empty() {
-                    return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+                    return Ok(None);
                 }
                 let batch = Self::read_matching_rows_adaptive(backend, stmt, &intersected)?;
                 if !stmt.is_pure_star() {
@@ -4535,7 +4686,7 @@ impl ApexExecutor {
         let offset = stmt.offset.unwrap_or(0);
         if offset > 0 {
             if offset >= intersected.len() {
-                return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+                return Ok(None);
             }
             intersected = intersected[offset..].to_vec();
         }
@@ -4544,7 +4695,7 @@ impl ApexExecutor {
         }
 
         if intersected.is_empty() {
-            return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+            return Ok(None);
         }
 
         let batch = Self::read_matching_rows_adaptive(backend, stmt, &intersected)?;
@@ -4576,7 +4727,7 @@ impl ApexExecutor {
                         _ => return None,
                     }
                 }
-                if strs.is_empty() {
+                if strs.is_empty() || strs.iter().any(String::is_empty) {
                     return None;
                 }
                 Some((col, strs))
@@ -4926,7 +5077,7 @@ impl ApexExecutor {
         let offset = stmt.offset.unwrap_or(0);
         if offset > 0 {
             if offset >= all_indices.len() {
-                return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+                return Ok(None);
             }
             all_indices = all_indices[offset..].to_vec();
         }
@@ -4935,7 +5086,7 @@ impl ApexExecutor {
         }
 
         if all_indices.is_empty() {
-            return Ok(Some(ApexResult::Empty(Arc::new(Schema::empty()))));
+            return Ok(None);
         }
 
         let batch = Self::read_matching_rows_by_indices(backend, stmt, &all_indices)?;
@@ -6102,6 +6253,23 @@ impl ApexExecutor {
 
     // ========== FTS Helper: resolve MATCH()/FUZZY_MATCH() to a compressed bitmap ==========
 
+    fn ensure_fts_enabled_for_query(base_dir: &Path, table_name: &str) -> io::Result<()> {
+        let config = Self::read_fts_config(base_dir);
+        let enabled = config
+            .get(table_name)
+            .and_then(|entry| entry.get("enabled"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        if enabled {
+            Ok(())
+        } else {
+            Err(err_data(format!(
+                "FTS is disabled for table '{}'",
+                table_name
+            )))
+        }
+    }
+
     fn collect_fts_queries(expr: &SqlExpr, matches: &mut Vec<String>, scores: &mut Vec<Option<String>>) {
         match expr {
             SqlExpr::FtsMatch { query, fuzzy: false } => matches.push(query.clone()),
@@ -6219,6 +6387,7 @@ impl ApexExecutor {
         if requested.is_empty() {
             return Ok(());
         }
+        Self::ensure_fts_enabled_for_query(base_dir, table_name)?;
 
         matches.sort_unstable();
         matches.dedup();
@@ -6235,12 +6404,7 @@ impl ApexExecutor {
         queries.sort_unstable();
         queries.dedup();
 
-        let manager = crate::query::executor::get_fts_manager(base_dir).ok_or_else(|| {
-            err_data(format!(
-                "FTS not initialised for this database. Run CREATE FTS INDEX ON {} first.",
-                table_name
-            ))
-        })?;
+        let manager = crate::query::executor::get_or_create_fts_manager(base_dir);
         crate::query::executor::wait_fts_backfill(base_dir, table_name);
         let engine = manager
             .get_engine(table_name)
@@ -6294,11 +6458,11 @@ impl ApexExecutor {
     ) -> io::Result<SqlExpr> {
         match expr {
             SqlExpr::FtsMatch { query, fuzzy } => {
-                let mgr = crate::query::executor::get_fts_manager(base_dir)
-                    .ok_or_else(|| io::Error::new(
-                        io::ErrorKind::Other,
-                        format!("FTS not initialised for this database. Run CREATE FTS INDEX ON {} first.", table_name),
-                    ))?;
+                Self::ensure_fts_enabled_for_query(base_dir, table_name)?;
+                // A query server such as Arrow Flight may not share the Python
+                // client's process-local registry. The persisted enablement
+                // marker above is authoritative, so lazily load the same index.
+                let mgr = crate::query::executor::get_or_create_fts_manager(base_dir);
                 crate::query::executor::wait_fts_backfill(base_dir, table_name);
                 let engine = mgr
                     .get_engine(table_name)
@@ -6383,8 +6547,9 @@ impl ApexExecutor {
         k: usize,
         metric: &str,
         names: &[String],
+        where_clause: Option<&SqlExpr>,
     ) -> io::Result<RecordBatch> {
-        use crate::query::vector_ops::{topk_heap_direct, DistanceMetric};
+        use crate::query::vector_ops::DistanceMetric;
         use arrow::array::{BinaryArray, Float64Array, Int64Array};
 
         if !storage_path.exists() {
@@ -6406,6 +6571,11 @@ impl ApexExecutor {
         })?;
 
         let query_f32: Vec<f32> = query.iter().map(|&x| x as f32).collect();
+        if query_f32.is_empty() || query_f32.iter().any(|value| !value.is_finite()) {
+            return Err(err_input(
+                "topk_distance: query vector must be non-empty and contain only finite values",
+            ));
+        }
 
         let backend = get_cached_backend(storage_path)?;
 
@@ -6418,6 +6588,25 @@ impl ApexExecutor {
             topk_heap_direct_parallel, topk_heap_direct_parallel_fixed, DistanceComputer,
         };
         let computer = DistanceComputer::new(metric_enum, query_f32);
+
+        // A TopK expression is an aggregate over its input relation.  When a WHERE
+        // clause is present, filter the narrow input (_id, vector, predicate
+        // columns) before computing TopK.  This also avoids touching unrelated
+        // wide/BLOB columns.
+        if let Some(predicate) = where_clause {
+            let mut required = vec!["_id".to_string(), col.to_string()];
+            Self::collect_columns_from_expr(predicate, &mut required);
+            let refs = required.iter().map(String::as_str).collect::<Vec<_>>();
+            let input = backend.read_columns_to_arrow(Some(&refs), 0, None)?;
+            let filtered = Self::apply_filter_with_storage(&input, predicate, storage_path)?;
+            return Self::topk_explode_from_batch(
+                &filtered,
+                col,
+                &computer,
+                k,
+                out_schema,
+            );
+        }
 
         // FAST PATH: zero-copy scan directly on OS mmap (no Arrow batch, no memcpy)
         let direct_topk = backend
@@ -6473,19 +6662,66 @@ impl ApexExecutor {
             .map_err(|e| err_data(e.to_string()));
         }
 
-        let bin_col = full_batch.column_by_name(col).ok_or_else(|| {
+        Self::topk_explode_from_batch(&full_batch, col, &computer, k, out_schema)
+    }
+
+    fn topk_explode_from_batch(
+        batch: &RecordBatch,
+        col: &str,
+        computer: &crate::query::vector_ops::DistanceComputer,
+        k: usize,
+        out_schema: Arc<Schema>,
+    ) -> io::Result<RecordBatch> {
+        use crate::query::vector_ops::{
+            topk_heap_direct_parallel, topk_heap_direct_parallel_fixed,
+        };
+        use arrow::array::{BinaryArray, Float64Array, Int64Array};
+
+        if batch.num_rows() == 0 {
+            return RecordBatch::try_new(
+                out_schema,
+                vec![
+                    Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
+                    Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                ],
+            )
+            .map_err(|e| err_data(e.to_string()));
+        }
+
+        let bin_col = batch.column_by_name(col).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("topk_distance: column '{}' not found", col),
             )
         })?;
+        let effective_k = k.min(batch.num_rows());
         let topk = if let Some(fixed_arr) = bin_col
             .as_any()
             .downcast_ref::<arrow::array::FixedSizeListArray>()
         {
-            topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
+            if fixed_arr.value_length() as usize != computer.query.len() {
+                return Err(err_input(format!(
+                    "topk_distance: query dimension {} does not match column dimension {}",
+                    computer.query.len(),
+                    fixed_arr.value_length()
+                )));
+            }
+            topk_heap_direct_parallel_fixed(fixed_arr, computer, effective_k)
         } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
-            topk_heap_direct_parallel(bin_arr, &computer, k)
+            let expected = computer.query.len() * std::mem::size_of::<f32>();
+            if let Some(actual) = (0..bin_arr.len())
+                .find(|&idx| !bin_arr.is_null(idx))
+                .map(|idx| bin_arr.value(idx).len())
+            {
+                if actual != expected {
+                    return Err(err_input(format!(
+                        "topk_distance: query dimension {} does not match column dimension {}",
+                        computer.query.len(),
+                        actual / std::mem::size_of::<f32>()
+                    )));
+                }
+            }
+            topk_heap_direct_parallel(bin_arr, computer, effective_k)
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -6493,7 +6729,7 @@ impl ApexExecutor {
             ));
         };
 
-        let id_col = full_batch.column_by_name("_id");
+        let id_col = batch.column_by_name("_id");
         let ids: Vec<i64> = topk
             .iter()
             .map(|(row_idx, _)| {
@@ -6556,6 +6792,11 @@ impl ApexExecutor {
         })?;
 
         let query_f32: Vec<f32> = query.iter().map(|&x| x as f32).collect();
+        if query_f32.is_empty() || query_f32.iter().any(|value| !value.is_finite()) {
+            return Err(err_input(
+                "topk_distance: query vector must be non-empty and contain only finite values",
+            ));
+        }
 
         let backend = get_cached_backend(storage_path)?;
         let full_batch = backend.read_columns_to_arrow(None, 0, None)?;
@@ -6592,13 +6833,34 @@ impl ApexExecutor {
             topk_heap_direct_parallel, topk_heap_direct_parallel_fixed, DistanceComputer,
         };
         let computer = DistanceComputer::new(metric_enum, query_f32);
+        let effective_k = k.min(full_batch.num_rows());
         let topk = if let Some(fixed_arr) = bin_col
             .as_any()
             .downcast_ref::<arrow::array::FixedSizeListArray>()
         {
-            topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
+            if fixed_arr.value_length() as usize != computer.query.len() {
+                return Err(err_input(format!(
+                    "topk_distance: query dimension {} does not match column dimension {}",
+                    computer.query.len(),
+                    fixed_arr.value_length()
+                )));
+            }
+            topk_heap_direct_parallel_fixed(fixed_arr, &computer, effective_k)
         } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
-            topk_heap_direct_parallel(bin_arr, &computer, k)
+            let expected = computer.query.len() * std::mem::size_of::<f32>();
+            if let Some(actual) = (0..bin_arr.len())
+                .find(|&idx| !bin_arr.is_null(idx))
+                .map(|idx| bin_arr.value(idx).len())
+            {
+                if actual != expected {
+                    return Err(err_input(format!(
+                        "topk_distance: query dimension {} does not match column dimension {}",
+                        computer.query.len(),
+                        actual / std::mem::size_of::<f32>()
+                    )));
+                }
+            }
+            topk_heap_direct_parallel(bin_arr, &computer, effective_k)
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

@@ -135,6 +135,57 @@ pub struct OnDemandStorage {
 }
 
 impl OnDemandStorage {
+    fn validate_v4_layout(
+        header: &OnDemandHeader,
+        footer: &V4Footer,
+        file_len: u64,
+    ) -> io::Result<usize> {
+        if header.footer_offset < HEADER_SIZE as u64 || header.footer_offset > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Corrupt Apex file: footer offset {} is outside file length {}",
+                    header.footer_offset, file_len
+                ),
+            ));
+        }
+        if header.column_count as usize != footer.schema.column_count() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Corrupt Apex file: header/footer column counts differ",
+            ));
+        }
+        let footer_rows = footer.row_groups.iter().try_fold(0u64, |total, group| {
+            if group.deletion_count > group.row_count {
+                return None;
+            }
+            total.checked_add((group.row_count - group.deletion_count) as u64)
+        });
+        if footer_rows != Some(header.row_count) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Corrupt Apex file: header/footer row counts differ",
+            ));
+        }
+        for group in &footer.row_groups {
+            let end = group.offset.checked_add(group.data_size).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Corrupt Apex row-group bounds")
+            })?;
+            if group.offset < HEADER_SIZE as u64 || end > header.footer_offset {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Corrupt Apex file: row group lies outside the data region",
+                ));
+            }
+        }
+        usize::try_from(header.row_count).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Corrupt Apex file: row count exceeds platform capacity",
+            )
+        })
+    }
+
     /// Create a new storage file with default durability (Fast)
     pub fn create(path: &Path) -> io::Result<Self> {
         Self::create_with_durability(path, super::DurabilityLevel::Fast)
@@ -286,14 +337,21 @@ impl OnDemandStorage {
             ));
         }
 
-        let id_count = header.row_count as usize;
-
         // V4 Row Group format: read schema from footer
         let file_len = file.metadata()?.len();
-        let footer_byte_count = (file_len - header.footer_offset) as usize;
+        if header.footer_offset < HEADER_SIZE as u64 || header.footer_offset > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Corrupt Apex file: invalid footer offset",
+            ));
+        }
+        let footer_byte_count = usize::try_from(file_len - header.footer_offset).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Corrupt Apex file: footer is too large")
+        })?;
         let mut footer_bytes = vec![0u8; footer_byte_count];
         mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
         let footer = V4Footer::from_bytes(&footer_bytes)?;
+        let id_count = Self::validate_v4_layout(&header, &footer, file_len)?;
         let schema = footer.schema.clone();
         let column_index: Vec<ColumnIndexEntry> = Vec::new();
         // Use max_id from non-empty RG metadata (row_count may be < max _id after deletes)
@@ -480,11 +538,19 @@ impl OnDemandStorage {
             ));
         }
 
-        let id_count = header.row_count as usize;
-        let footer_byte_count = (file_len - header.footer_offset) as usize;
+        if header.footer_offset < HEADER_SIZE as u64 || header.footer_offset > file_len {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Corrupt Apex file: invalid footer offset",
+            ));
+        }
+        let footer_byte_count = usize::try_from(file_len - header.footer_offset).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidData, "Corrupt Apex file: footer is too large")
+        })?;
         let mut footer_bytes = vec![0u8; footer_byte_count];
         mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
         let footer = V4Footer::from_bytes(&footer_bytes)?;
+        let id_count = Self::validate_v4_layout(&header, &footer, file_len)?;
         let schema = footer.schema.clone();
         let column_index: Vec<ColumnIndexEntry> = Vec::new();
         let next_id = footer
@@ -777,6 +843,23 @@ impl OnDemandStorage {
         }
 
         Ok(false)
+    }
+
+    /// Record rows appended through a typed/backend entry point.
+    ///
+    /// The low-level typed encoders are also used by compaction, so pending-row
+    /// ownership lives at the public backend boundary instead of inside those
+    /// encoders. Keeping this counter accurate prevents save() from mistaking
+    /// buffered data for a schema-only metadata update. Auto-flush is invoked
+    /// by the buffering entry points after their schema/cache bookkeeping is
+    /// complete; immediate-persist callers invoke save() themselves.
+    pub(crate) fn record_pending_rows(&self, row_count: usize) -> io::Result<()> {
+        if row_count == 0 {
+            return Ok(());
+        }
+        self.pending_rows
+            .fetch_add(row_count as u64, Ordering::Relaxed);
+        Ok(())
     }
 
     /// Get the current compression type.

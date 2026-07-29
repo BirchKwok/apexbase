@@ -17,15 +17,13 @@ impl ApexStorageImpl {
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
         let id = py.allow_threads(|| -> PyResult<i64> {
-            // Skip file lock for 'fast' durability. StorageEngine handles thread safety
-            // internally via parking_lot::RwLock; file locks are for cross-process safety.
-            let lock_file = if durability != DurabilityLevel::Fast {
+            // The in-process locks do not protect independent Python workers.
+            // Every durability mode therefore participates in the same OS lock.
+            let lock_file = {
                 Some(
                     Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                 )
-            } else {
-                None
             };
 
             let result = crate::Database::write(&table_path, &[fields], durability)
@@ -69,14 +67,11 @@ impl ApexStorageImpl {
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
-            // Skip file lock for 'fast' durability
-            let lock_file = if durability != DurabilityLevel::Fast {
+            let lock_file = {
                 Some(
                     Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                 )
-            } else {
-                None
             };
 
             let result = crate::Database::write(&table_path, &rows, durability)
@@ -510,13 +505,11 @@ impl ApexStorageImpl {
 
         let durability = self.durability;
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
-            let lock_file = if durability != DurabilityLevel::Fast {
+            let lock_file = {
                 Some(
                     Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                 )
-            } else {
-                None
             };
 
             let result = backend
@@ -599,13 +592,11 @@ impl ApexStorageImpl {
 
         let durability = self.durability;
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
-            let lock_file = if durability != DurabilityLevel::Fast {
+            let lock_file = {
                 Some(
                     Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                 )
-            } else {
-                None
             };
 
             let result = backend
@@ -953,13 +944,11 @@ impl ApexStorageImpl {
 
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
             // Skip file lock for 'fast' durability
-            let lock_file = if durability != DurabilityLevel::Fast {
+            let lock_file = {
                 Some(
                     Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                 )
-            } else {
-                None
             };
 
             let result = crate::Database::write_typed(
@@ -1123,9 +1112,15 @@ impl ApexStorageImpl {
                 }
 
                 let result = py.allow_threads(|| {
-                    backend
+                    let deleted = backend
                         .delta_delete_row(id as u64)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                    if deleted {
+                        backend
+                            .save_delta_store()
+                            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                    }
+                    Ok::<bool, PyErr>(deleted)
                 })?;
                 if result {
                     self.replace_exact_row_cache.remove(&replace_cache_key);
@@ -1138,13 +1133,11 @@ impl ApexStorageImpl {
 
         let result = py.allow_threads(|| -> PyResult<bool> {
             // Skip file lock for 'fast' durability
-            let lock_file = if durability != DurabilityLevel::Fast {
+            let lock_file = {
                 Some(
                     Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                 )
-            } else {
-                None
             };
 
             // Use StorageEngine for unified delete
@@ -1194,6 +1187,11 @@ impl ApexStorageImpl {
                             deleted_ids.push(row_id);
                         }
                     }
+                    if !deleted_ids.is_empty() {
+                        backend
+                            .save_delta_store()
+                            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+                    }
                     Ok(deleted_ids)
                 })?;
                 for row_id in &deleted_ids {
@@ -1215,13 +1213,11 @@ impl ApexStorageImpl {
         let ids_u64: Vec<u64> = ids.into_iter().map(|id| id as u64).collect();
         let deleted = py.allow_threads(|| -> PyResult<usize> {
             // Skip file lock for 'fast' durability
-            let lock_file = if durability != DurabilityLevel::Fast {
+            let lock_file = {
                 Some(
                     Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                 )
-            } else {
-                None
             };
 
             // Use StorageEngine for unified delete
@@ -1410,86 +1406,6 @@ impl ApexStorageImpl {
             | crate::storage::on_demand::ColumnType::Date => (value as i64).to_le_bytes(),
             _ => return Ok(None),
         };
-
-        let cell_cache_key = format!("{}\0{}\0{}", backend_cache_key, column, id);
-        let cached_cell = self
-            .update_by_id_cell_cache
-            .get(&cell_cache_key)
-            .and_then(|entry| (entry.value().1 == table_epoch).then_some(entry.value().0));
-        if cached_cell.is_none() {
-            self.update_by_id_cell_cache.remove(&cell_cache_key);
-        }
-        if let Some(cached) = cached_cell {
-            match backend.storage.update_numeric_cell_cached(
-                cached.footer_offset,
-                cached.null_byte_file_offset,
-                cached.null_mask,
-                cached.value_file_offset,
-                &bytes,
-            ) {
-                Ok(Some((n, physically_written))) => {
-                    if physically_written {
-                        self.update_by_id_cell_cache.insert(
-                            cell_cache_key.clone(),
-                            (cached, crate::storage::epoch::current(&table_path)),
-                        );
-                        self.replace_exact_row_cache.remove(&replace_cache_key);
-                        crate::Database::invalidate(&table_path);
-                        crate::Database::invalidate_query_cache(&table_path);
-                        crate::query::planner::invalidate_table_stats(
-                            &table_path.to_string_lossy(),
-                        );
-                    }
-                    return Ok(Some(n));
-                }
-                Ok(None) => {
-                    self.update_by_id_cell_cache.remove(&cell_cache_key);
-                }
-                Err(e) => return Err(PyIOError::new_err(e.to_string())),
-            }
-        }
-
-        if let Ok(Some((footer_offset, null_byte_file_offset, null_mask, value_file_offset))) =
-            backend
-                .storage
-                .locate_numeric_cell_for_update(id as u64, &column)
-        {
-            if footer_offset != 0 && value_file_offset != 0 {
-                let cached = NumericUpdateCellCache {
-                    footer_offset,
-                    null_byte_file_offset,
-                    null_mask,
-                    value_file_offset,
-                };
-                match backend.storage.update_numeric_cell_cached(
-                    cached.footer_offset,
-                    cached.null_byte_file_offset,
-                    cached.null_mask,
-                    cached.value_file_offset,
-                    &bytes,
-                ) {
-                    Ok(Some((n, physically_written))) => {
-                        if physically_written {
-                            self.update_by_id_cell_cache.insert(
-                                cell_cache_key.clone(),
-                                (cached, crate::storage::epoch::current(&table_path)),
-                            );
-                            self.replace_exact_row_cache.remove(&replace_cache_key);
-                            crate::Database::invalidate(&table_path);
-                            crate::Database::invalidate_query_cache(&table_path);
-                            crate::query::planner::invalidate_table_stats(
-                                &table_path.to_string_lossy(),
-                            );
-                        }
-                        return Ok(Some(n));
-                    }
-                    Ok(None) => {
-                        self.update_by_id_cell_cache.remove(&cell_cache_key);
-                    }
-                    Err(e) => return Err(PyIOError::new_err(e.to_string())),
-                }
-            }
-        }
 
         match backend.update_by_id_inplace(id as u64, &column, &bytes) {
             Ok(Some((n, physically_written))) => {
@@ -1759,7 +1675,7 @@ impl ApexStorageImpl {
             let any_needs_save = actions.iter().any(|(_, needs_save)| *needs_save);
             let lock_file = if any_needs_save {
                 Some(
-                    Self::acquire_read_lock(&table_path)
+                    Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?,
                 )
             } else {

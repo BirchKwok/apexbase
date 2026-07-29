@@ -1,6 +1,7 @@
 //! PyO3 binding methods split by domain.
 
 use super::*;
+use arrow::array::Array;
 
 #[pymethods]
 impl ApexStorageImpl {
@@ -33,11 +34,6 @@ impl ApexStorageImpl {
         })?;
         if is_write && !table_name.is_empty() {
             self.invalidate_backend(&table_name);
-        }
-
-        // Empty result
-        if batch.num_rows() == 0 {
-            return Ok((0, 0));
         }
 
         // Convert RecordBatch to StructArray for FFI export
@@ -379,6 +375,11 @@ impl ApexStorageImpl {
                 "_topk_distance_ffi: query_bytes must be raw little-endian float32 bytes",
             )
         })?;
+        if query_f32.is_empty() || query_f32.iter().any(|value| !value.is_finite()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "_topk_distance_ffi: query vector must be non-empty and contain only finite values",
+            ));
+        }
 
         let table_path = self
             .get_current_table_path()
@@ -484,9 +485,29 @@ impl ApexStorageImpl {
                 .as_any()
                 .downcast_ref::<arrow::array::FixedSizeListArray>()
             {
+                if fixed_arr.value_length() as usize != computer.query.len() {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "topk_distance: query dimension {} does not match column dimension {}",
+                        computer.query.len(),
+                        fixed_arr.value_length()
+                    )));
+                }
                 use crate::compute::vector_ops::topk_heap_direct_parallel_fixed;
                 topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
             } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
+                let expected = computer.query.len() * std::mem::size_of::<f32>();
+                if let Some(actual) = (0..bin_arr.len())
+                    .find(|&idx| !bin_arr.is_null(idx))
+                    .map(|idx| bin_arr.value(idx).len())
+                {
+                    if actual != expected {
+                        return Err(PyRuntimeError::new_err(format!(
+                            "topk_distance: query dimension {} does not match column dimension {}",
+                            computer.query.len(),
+                            actual / std::mem::size_of::<f32>()
+                        )));
+                    }
+                }
                 topk_heap_direct_parallel(bin_arr, &computer, k)
             } else {
                 return Err(PyRuntimeError::new_err(format!(
@@ -569,6 +590,11 @@ impl ApexStorageImpl {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
+        if dim == 0 || queries_f32.iter().any(|value| !value.is_finite()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "_batch_topk_ffi: query vectors must be non-empty and contain only finite values",
+            ));
+        }
 
         let table_path = self
             .get_current_table_path()
@@ -624,6 +650,33 @@ impl ApexStorageImpl {
                     let bin_col = full_batch.column_by_name(&col_owned).ok_or_else(|| {
                         PyRuntimeError::new_err(format!("column '{}' not found", col_owned))
                     })?;
+                    if let Some(fixed_arr) =
+                        bin_col.as_any().downcast_ref::<FixedSizeListArray>()
+                    {
+                        if fixed_arr.value_length() as usize != dim {
+                            return Err(PyRuntimeError::new_err(format!(
+                                "topk_distance: query dimension {} does not match column dimension {}",
+                                dim,
+                                fixed_arr.value_length()
+                            )));
+                        }
+                    } else if let Some(bin_arr) =
+                        bin_col.as_any().downcast_ref::<BinaryArray>()
+                    {
+                        let expected = dim * std::mem::size_of::<f32>();
+                        if let Some(actual) = (0..bin_arr.len())
+                            .find(|&idx| !bin_arr.is_null(idx))
+                            .map(|idx| bin_arr.value(idx).len())
+                        {
+                            if actual != expected {
+                                return Err(PyRuntimeError::new_err(format!(
+                                    "topk_distance: query dimension {} does not match column dimension {}",
+                                    dim,
+                                    actual / std::mem::size_of::<f32>()
+                                )));
+                            }
+                        }
+                    }
 
                     // Run N queries sequentially (Arrow fallback — uncommon path)
                     let mut results = Vec::with_capacity(n_q);

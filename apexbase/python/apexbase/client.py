@@ -286,6 +286,10 @@ _RE_SIMPLE_INSERT_VALUES = re.compile(
     r"^\s*insert\s+into\s+([A-Za-z_][\w]*)\s*\(([^)]*)\)\s*values\s*(.+?)\s*;?\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+_RE_BOUND_TOPK = re.compile(
+    r"""^\s*select\s+explode_rename\(\s*topk_distance\(\s*([A-Za-z_][\w]*)\s*,\s*\?\s*,\s*(\d+)\s*,\s*'([^']+)'\s*\)\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*\)\s+from\s+([A-Za-z_][\w]*)\s*;?\s*$""",
+    re.IGNORECASE,
+)
 
 
 def _projection_columns_from_text(projection: str) -> Optional[List[str]]:
@@ -765,6 +769,7 @@ class ApexClient:
         self._last_missing_delete_key = None
         self._simple_sql_cache = {}
         self._numeric_range_rows_cache = {}
+        self._schemaless_tables = set()
         self._buffered_writes_enabled = False
         self._buffered_write_rows = []
         self._buffered_write_table = None
@@ -998,6 +1003,26 @@ class ApexClient:
         except (AttributeError, RuntimeError):
             return None
 
+    def _pending_memtable_point_miss(self) -> bool:
+        """Return whether a point-read miss is authoritative for a pending memtable."""
+        try:
+            return bool(
+                self._storage.has_pending_overlay_writes()
+                and self._storage.has_pending_memtable_rows()
+            )
+        except (AttributeError, RuntimeError):
+            return False
+
+    def _recover_projected_point_row(self, point_id: int, columns) -> Optional[dict]:
+        """Recover a projected point miss through the visibility-aware full-row path."""
+        try:
+            row = self._storage.retrieve(point_id)
+        except (AttributeError, RuntimeError):
+            return None
+        if row is None or any(column not in row for column in columns):
+            return None
+        return {column: row[column] for column in columns}
+
     def _remember_exact_replace(self, id_: int, data: dict) -> None:
         """
         Cache the last successful exact ``replace`` payload for idempotent repeats.
@@ -1222,6 +1247,10 @@ class ApexClient:
                     raise ValueError(str(e)) from e
                 self._invalidate_replace_cache()
         self._current_table = table_name
+        if schema is None:
+            self._schemaless_tables.add(table_name)
+        else:
+            self._schemaless_tables.discard(table_name)
 
     def drop_table(self, table_name: str):
         """
@@ -1274,6 +1303,7 @@ class ApexClient:
         
         if self._current_table == table_name:
             self._current_table = None
+        self._schemaless_tables.discard(table_name)
 
     def list_tables(self) -> List[str]:
         """
@@ -1287,7 +1317,11 @@ class ApexClient:
             return self._storage.list_tables()
 
     def register_temp_table(
-        self, name: str, file_path: str, on_bad_lines: str = "error"
+        self,
+        name: str,
+        file_path: str,
+        on_bad_lines: str = "error",
+        encoding: str = "utf-8",
     ):
         """
         Register a data file (CSV, JSON, Parquet) as a temporary table.
@@ -1302,6 +1336,8 @@ class ApexClient:
                 ``.json``/``.ndjson``/``.jsonl``, or ``.parquet``).
             on_bad_lines: CSV malformed-row policy: ``"error"`` (default),
                 ``"skip"``, or ``"warn"``. Ignored for non-CSV files.
+            encoding: Source text encoding for CSV/TSV files. Non-UTF-8
+                input is transcoded once into the private temp area.
 
         Returns:
             None
@@ -1310,7 +1346,35 @@ class ApexClient:
         with self._lock:
             self._flush_pending_memtable_rows_for_read()
             self.flush_buffered_writes()
-            self._storage.register_temp_table(name, file_path, on_bad_lines)
+            source_path = file_path
+            transcoded_path = None
+            lower_path = str(file_path).lower()
+            if encoding.lower().replace("_", "-") not in {"utf-8", "utf8"} and lower_path.endswith(
+                (".csv", ".tsv")
+            ):
+                import tempfile
+
+                suffix = ".tsv" if lower_path.endswith(".tsv") else ".csv"
+                with open(file_path, "r", encoding=encoding, errors="strict", newline="") as src:
+                    text = src.read()
+                with tempfile.NamedTemporaryFile(
+                    mode="w",
+                    encoding="utf-8",
+                    newline="",
+                    suffix=suffix,
+                    delete=False,
+                ) as dst:
+                    dst.write(text)
+                    transcoded_path = dst.name
+                source_path = transcoded_path
+            try:
+                self._storage.register_temp_table(name, source_path, on_bad_lines)
+            finally:
+                if transcoded_path is not None:
+                    try:
+                        os.unlink(transcoded_path)
+                    except OSError:
+                        pass
 
     def drop_temp_table(self, name: str):
         """
@@ -1398,24 +1462,76 @@ class ApexClient:
         try:
             if need_switch:
                 self.use_table(table)
-            
-            self._fts_tables[table] = {
+
+            available_fields = set(self.list_fields())
+            string_fields = {
+                field
+                for field in available_fields
+                if str(self._storage.get_column_dtype(field)).lower() == "string"
+            }
+            if index_fields is not None:
+                if not index_fields:
+                    raise ValueError("index_fields must contain at least one text column")
+                normalized_fields = list(dict.fromkeys(str(field) for field in index_fields))
+                # Schemaless tables may predeclare fields for later dynamic rows.
+                # Explicit schemas fail loudly for unknown or non-text fields.
+                if available_fields and table not in self._schemaless_tables:
+                    unknown = [
+                        field for field in normalized_fields
+                        if field not in available_fields
+                    ]
+                    if unknown:
+                        raise ValueError(
+                            f"Unknown FTS index field(s): {', '.join(unknown)}"
+                        )
+                    non_text = [
+                        field for field in normalized_fields
+                        if field not in string_fields
+                    ]
+                    if non_text:
+                        raise ValueError(
+                            f"FTS index fields must be text columns: {', '.join(non_text)}"
+                        )
+                resolved_fields = normalized_fields
+            else:
+                if available_fields and not string_fields:
+                    raise ValueError(
+                        f"Table '{table}' has no text columns available for FTS"
+                    )
+                resolved_fields = None
+
+            previous = self._fts_tables.get(table, {})
+            previous_fields = previous.get('index_fields') if isinstance(previous, dict) else None
+            fields_changed = (
+                isinstance(previous, dict)
+                and previous.get('enabled', False)
+                and previous_fields != resolved_fields
+            )
+            if fields_changed:
+                # Native engines retain their original field layout. Remove the
+                # old index before re-initialising so metadata and postings
+                # cannot diverge.
+                self._storage._fts_remove_engine(True)
+                self._fts_initialized_tables.discard(table)
+
+            new_config = {
                 'enabled': True,
-                'index_fields': index_fields,
+                'index_fields': resolved_fields,
                 'config': {
                     'lazy_load': lazy_load,
                     'cache_size': cache_size,
                 }
             }
-            
+
             self._storage._init_fts(
-                index_fields=index_fields,
+                index_fields=resolved_fields,
                 lazy_load=lazy_load,
                 cache_size=cache_size
             )
             self._fts_initialized_tables.add(table)
 
-            # Persist config so it auto-enables on reopen
+            # Publish configuration only after the native index is ready.
+            self._fts_tables[table] = new_config
             self._save_fts_config()
             
         finally:
@@ -1808,22 +1924,18 @@ class ApexClient:
                 if not isinstance(data, pa_mod.Table):
                     pa_mod = None
                 else:
-                    self._store_columnar(data.to_pydict())
+                    self._store_columnar(self._arrow_table_to_apex_columns(data))
                     return
 
             # 3. Pandas DataFrame - Convert to columnar dict for optimized storage
             if PANDAS_AVAILABLE and data_module.startswith("pandas"):
                 pd_mod = _ensure_pandas()
                 if isinstance(data, pd_mod.DataFrame):
-                    # Convert DataFrame to columnar dict
-                    columns = {}
-                    for name in data.columns:
-                        column = data[name]
-                        if column.dtype.kind == 'O':
-                            columns[name] = column.fillna('').tolist()
-                        else:
-                            columns[name] = column.tolist()
-                    self._store_columnar(columns)
+                    # Arrow preserves pandas extension nulls, object None values,
+                    # and floating NaN-as-null consistently with from_pyarrow.
+                    pa_mod = _ensure_pyarrow()
+                    table = pa_mod.Table.from_pandas(data, preserve_index=False)
+                    self._store_columnar(self._arrow_table_to_apex_columns(table))
                     return
 
             # 4. Polars DataFrame - Convert to columnar dict for optimized storage
@@ -2261,7 +2373,12 @@ class ApexClient:
             self._fast_txn_active = old_fast_txn_active
         return None
 
-    def execute(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
+    def execute(
+        self,
+        sql: str,
+        show_internal_id: bool = None,
+        params=None,
+    ) -> 'ResultView':
         """
         Execute a SQL statement and return a :class:`ResultView`.
 
@@ -2273,12 +2390,45 @@ class ApexClient:
             sql: SQL statement to execute.
             show_internal_id: If ``True``, include the internal ``_id`` column
                 in SELECT results when applicable. ``None`` uses default policy.
+            params: Optional positional parameters. Parameter binding currently
+                supports the TopK vector query shape with one ``?`` placeholder;
+                the query vector is passed directly to the native FFI path
+                without formatting or reparsing a large SQL array literal.
 
         Returns:
             :class:`ResultView` containing query rows or an empty view for
             statements without a result set.
         """
         self._check_connection()
+
+        if params is not None:
+            match = _RE_BOUND_TOPK.match(sql)
+            if match is None:
+                raise ValueError(
+                    "parameter binding currently supports only "
+                    "explode_rename(topk_distance(column, ?, k, metric), ...)"
+                )
+            try:
+                bound = list(params)
+            except TypeError as exc:
+                raise ValueError("params must be an iterable with one query vector") from exc
+            if len(bound) != 1:
+                raise ValueError("the bound TopK query requires exactly one parameter")
+            col, k_text, metric, id_col, dist_col, table = match.groups()
+            self._ensure_table_selected()
+            if self._current_table is None or table.lower() != self._current_table.lower():
+                raise ValueError(
+                    f"bound TopK query targets table {table!r}, "
+                    f"but the selected table is {self._current_table!r}"
+                )
+            return self.topk_distance(
+                col,
+                bound[0],
+                k=int(k_text),
+                metric=metric,
+                id_col=id_col,
+                dist_col=dist_col,
+            )
 
         if sql == "BEGIN" and not getattr(self, '_in_txn', False):
             return self._start_fast_txn(show_internal_id=show_internal_id)
@@ -2303,19 +2453,20 @@ class ApexClient:
                         show_flag = bool(show_internal_id) if show_internal_id is not None else False
                         if kind == 'point':
                             row = self._storage.retrieve(cached_simple[2])
-                            if row is None:
-                                rv = ResultView(data=None)
+                            if row is not None:
+                                if not show_flag and '_id' in row:
+                                    row = {k: v for k, v in row.items() if k != '_id'}
+                                rv = ResultView(data=[row])
                                 rv._show_internal_id = show_flag
                                 return rv
-                            if not show_flag and '_id' in row:
-                                row = {k: v for k, v in row.items() if k != '_id'}
-                            rv = ResultView(data=[row])
-                            rv._show_internal_id = show_flag
-                            return rv
                         if kind == 'projected_point':
                             row = self._storage.retrieve_projected_row(
                                 cached_simple[2], list(cached_simple[3])
                             )
+                            if row is None:
+                                row = self._recover_projected_point_row(
+                                    cached_simple[2], cached_simple[3]
+                                )
                             if row is not None:
                                 rv = ResultView(data=[row])
                                 rv._show_internal_id = show_flag
@@ -2571,8 +2722,15 @@ class ApexClient:
                 if isinstance(result, dict):
                     columns_dict = result.get('columns_dict')
                     if columns_dict is not None:
+                        if not columns_dict:
+                            return _HOT_CACHE_MISS
                         if not next(iter(columns_dict.values()), []):
-                            rv = ResultView(data=None)
+                            requested = _simple_projection_columns(sql)
+                            if requested:
+                                available = set(self.list_fields())
+                                if any(column not in available for column in requested):
+                                    return _HOT_CACHE_MISS
+                            rv = ResultView(lazy_pydict=columns_dict)
                             rv._show_internal_id = show_flag
                             return rv
                         return self._result_view_from_columns_dict(sql, columns_dict, show_flag)
@@ -2625,18 +2783,24 @@ class ApexClient:
                 show_internal_id = show_flag
                 row = self._storage.retrieve(point_id)
                 if row is None:
-                    rv = ResultView(data=None)
-                    rv._show_internal_id = show_internal_id
-                    return rv
+                    if self._pending_memtable_point_miss():
+                        rv = ResultView(data=None)
+                        rv._show_internal_id = show_internal_id
+                        return rv
+                    return _HOT_CACHE_MISS
                 if not show_internal_id and '_id' in row:
                     row = {k: v for k, v in row.items() if k != '_id'}
             else:
                 row = self._storage.retrieve_projected_row(point_id, list(cached_simple[3]))
                 show_internal_id = show_flag
                 if row is None:
-                    rv = ResultView(data=None)
-                    rv._show_internal_id = show_internal_id
-                    return rv
+                    row = self._recover_projected_point_row(point_id, cached_simple[3])
+                if row is None:
+                    if self._pending_memtable_point_miss():
+                        rv = ResultView(data=None)
+                        rv._show_internal_id = show_internal_id
+                        return rv
+                    return _HOT_CACHE_MISS
             rows = [row]
             rv = ResultView(data=rows)
             rv._show_internal_id = show_internal_id
@@ -3067,15 +3231,16 @@ class ApexClient:
                         if show_internal_id is None:
                             show_internal_id = False
                         row = self._storage.retrieve(point_id)
-                        if row is None:
+                        if row is not None:
+                            if not show_internal_id and '_id' in row:
+                                row = {k: v for k, v in row.items() if k != '_id'}
+                            rv = ResultView(data=[row])
+                            rv._show_internal_id = show_internal_id
+                            return rv
+                        if self._pending_memtable_point_miss():
                             rv = ResultView(data=None)
                             rv._show_internal_id = show_internal_id
                             return rv
-                        if not show_internal_id and '_id' in row:
-                            row = {k: v for k, v in row.items() if k != '_id'}
-                        rv = ResultView(data=[row])
-                        rv._show_internal_id = show_internal_id
-                        return rv
                 except Exception:
                     pass  # fall through to the general SQL executor
 
@@ -3085,6 +3250,8 @@ class ApexClient:
                     self._ensure_table_selected()
                     if self._current_table and table_name.lower() == self._current_table.lower():
                         row = self._storage.retrieve_projected_row(point_id, list(columns))
+                        if row is None:
+                            row = self._recover_projected_point_row(point_id, columns)
                         if row is not None:
                             rv = ResultView(data=[row])
                             rv._show_internal_id = show_internal_id if show_internal_id is not None else False
@@ -3247,15 +3414,12 @@ class ApexClient:
                 if point_id is not None:
                     try:
                         row = self.retrieve(point_id)
-                        if row is None:
-                            rv = ResultView(data=None)
+                        if row is not None:
+                            if not show_internal_id and '_id' in row:
+                                row = {k: v for k, v in row.items() if k != '_id'}
+                            rv = ResultView(data=[row])
                             rv._show_internal_id = show_internal_id
                             return rv
-                        if not show_internal_id and '_id' in row:
-                            row = {k: v for k, v in row.items() if k != '_id'}
-                        rv = ResultView(data=[row])
-                        rv._show_internal_id = show_internal_id
-                        return rv
                     except Exception:
                         pass  # fall through to Rust execute()
 
@@ -3280,11 +3444,27 @@ class ApexClient:
                             if result is not None:
                                 columns_dict = result.get('columns_dict')
                                 if columns_dict is not None:
-                                    return self._result_view_from_columns_dict(
-                                        sql,
-                                        columns_dict,
-                                        show_internal_id,
+                                    if any(columns_dict.values()):
+                                        return self._result_view_from_columns_dict(
+                                            sql,
+                                            columns_dict,
+                                            show_internal_id,
+                                        )
+                                    row = self._recover_projected_point_row(
+                                        point_id, _simple_projection
                                     )
+                                    if row is not None:
+                                        rv = ResultView(data=[row])
+                                        rv._show_internal_id = show_internal_id
+                                        return rv
+                                    if self._pending_memtable_point_miss():
+                                        rv = ResultView(data=None)
+                                        rv._show_internal_id = show_internal_id
+                                        return rv
+                            if self._pending_memtable_point_miss():
+                                rv = ResultView(data=None)
+                                rv._show_internal_id = show_internal_id
+                                return rv
                     except Exception:
                         pass  # fall through to Rust execute()
                 elif _sig == 'projected_string_filter_limit':
@@ -3379,7 +3559,18 @@ class ApexClient:
                         if columns_dict is not None:
                             row_count = len(next(iter(columns_dict.values()), []))
                             if row_count == 0:
-                                rv = ResultView(data=None)
+                                requested = _simple_projection_columns(sql)
+                                if requested:
+                                    available = set(self.list_fields())
+                                    missing = [
+                                        column for column in requested
+                                        if column not in available
+                                    ]
+                                    if missing:
+                                        raise KeyError(
+                                            f"Projected column {missing[0]!r} does not exist"
+                                        )
+                                rv = ResultView(lazy_pydict=columns_dict)
                                 rv._show_internal_id = show_internal_id
                                 return rv
                             return self._result_view_from_columns_dict(
@@ -3387,6 +3578,8 @@ class ApexClient:
                                 columns_dict,
                                 show_internal_id,
                             )
+                except KeyError as exc:
+                    raise RuntimeError(str(exc)) from exc
                 except Exception:
                     pass  # fall through to Arrow FFI
 
@@ -3493,8 +3686,6 @@ class ApexClient:
                 pa_mod = _ensure_pyarrow()
                 reader = pa_mod.ipc.open_stream(pa_mod.BufferReader(ipc_bytes))
                 table = reader.read_all()
-                if table.num_rows == 0:
-                    table = None
                 rv = ResultView(arrow_table=table, data=None)
                 rv._show_internal_id = show_internal_id
                 return rv
@@ -3516,7 +3707,11 @@ class ApexClient:
                                     self._simple_sql_cache[sql] = ('columnar_select', table_name)
                             row_count = len(next(iter(columns_dict.values()), []))
                             if row_count == 0:
-                                rv = ResultView(data=None)
+                                if not columns_dict:
+                                    raise LookupError(
+                                        "empty column metadata; use Arrow FFI"
+                                    )
+                                rv = ResultView(lazy_pydict=columns_dict)
                                 rv._show_internal_id = show_internal_id
                                 return rv
                             return self._result_view_from_columns_dict(
@@ -3524,6 +3719,8 @@ class ApexClient:
                                 columns_dict,
                                 show_internal_id,
                             )
+                except LookupError:
+                    pass  # Empty dict cannot preserve schema; use Arrow FFI.
                 except Exception:
                     pass  # fall through to Arrow FFI
 
@@ -3534,7 +3731,7 @@ class ApexClient:
                     if schema_ptr != 0 and array_ptr != 0:
                         pa_mod = _ensure_pyarrow()
                         batch = pa_mod.RecordBatch._import_from_c(array_ptr, schema_ptr)
-                        table = pa_mod.Table.from_batches([batch]) if batch.num_rows > 0 else None
+                        table = pa_mod.Table.from_batches([batch])
                         rv = ResultView(arrow_table=table, data=None)
                         rv._show_internal_id = show_internal_id
                         return rv
@@ -3557,7 +3754,7 @@ class ApexClient:
                 if schema_ptr != 0 and array_ptr != 0:
                     pa_mod = _ensure_pyarrow()
                     batch = pa_mod.RecordBatch._import_from_c(array_ptr, schema_ptr)
-                    table = pa_mod.Table.from_batches([batch]) if batch.num_rows > 0 else None
+                    table = pa_mod.Table.from_batches([batch])
                 else:
                     table = None
             except Exception:
@@ -3566,8 +3763,6 @@ class ApexClient:
                 pa_mod = _ensure_pyarrow()
                 reader = pa_mod.ipc.open_stream(pa_mod.BufferReader(ipc_bytes))
                 table = reader.read_all()
-                if table.num_rows == 0:
-                    table = None
 
             # Sync Python state after DDL
             if sql_upper.startswith('CREATE TABLE'):
@@ -3585,67 +3780,44 @@ class ApexClient:
             return rv
 
     def execute_batch(self, queries: List[str]) -> List['ResultView']:
-        """Execute multiple queries in parallel using Rust's Query Scheduler.
-
-        This is more efficient than calling execute() multiple times from Python
-        because it avoids Python GIL contention and thread creation overhead.
-        Uses the internal thread pool scheduler for optimal parallel execution.
+        """Execute a SQL script in list order with read-after-write visibility.
 
         Args:
-            queries: List of SQL queries to execute
+            queries: Statements to execute sequentially.
 
         Returns:
-            List of ResultView objects, one for each query
+            One :class:`ResultView` per statement, in input order.
         """
-        global _auto_scheduler_enabled, _auto_scheduler_initialized
+        return [self.execute(query) for query in queries]
 
+    def execute_batch_parallel(self, queries: List[str]) -> List['ResultView']:
+        """Execute independent read-only statements concurrently.
+
+        Statements that may mutate state are rejected so callers cannot
+        accidentally depend on nondeterministic write ordering.
+        """
+        for query in queries:
+            head = query.lstrip().split(None, 1)[0].upper() if query.strip() else ""
+            if head not in {"SELECT", "WITH", "EXPLAIN"}:
+                raise ValueError(
+                    "execute_batch_parallel accepts independent read-only queries only; "
+                    "use execute_batch for ordered scripts"
+                )
         if not queries:
             return []
-
-        # For single queries, skip scheduler overhead and execute directly
-        # The scheduler is optimized for batch workloads (multiple queries)
         if len(queries) == 1:
             return [self.execute(queries[0])]
-
-        # Auto-enable scheduler on first batch execution
-        if not _auto_scheduler_initialized:
-            _init_auto_scheduler()
-
-        # Try to use scheduler if available
-        try:
-            from apexbase import _core
-            table_path = self._current_table
-            if table_path:
-                full_path = os.path.join(self._storage._base_dir, f"{table_path}")
-                results = _core.execute_scheduled_batch(queries, full_path)
-                # Convert results to ResultView
-                view_results = []
-                for success, error in results:
-                    if success:
-                        view_results.append(ResultView(arrow_table=None, data=None))
-                    else:
-                        raise Exception(error)
-                return view_results
-        except Exception:
-            pass  # Fall back to Rust batch execute
-
-        # Call Rust batch execute
         ipc_bytes_list = self._storage.execute_batch(queries)
-
-        # Parse each IPC result
         results = []
         for ipc_bytes in ipc_bytes_list:
             if ipc_bytes:
                 pa_mod = _ensure_pyarrow()
                 reader = pa_mod.ipc.open_stream(pa_mod.BufferReader(ipc_bytes))
                 table = reader.read_all()
-                if table.num_rows == 0:
-                    table = None
                 rv = ResultView(arrow_table=table, data=None)
                 results.append(rv)
             else:
                 results.append(ResultView(arrow_table=None, data=None))
-
         return results
 
     def topk_distance(
@@ -3691,11 +3863,15 @@ class ApexClient:
         """
         self._check_connection()
         self._ensure_table_selected()
+        if not isinstance(k, (int, np.integer)) or isinstance(k, (bool, np.bool_)) or k <= 0:
+            raise ValueError("topk_distance: k must be a positive integer")
         query_array = np.asarray(query, dtype='<f4')
         if query_array.ndim != 1:
             raise ValueError("topk_distance: query must be a 1-D vector")
         if query_array.size == 0:
             raise ValueError("topk_distance: query must not be empty")
+        if not np.isfinite(query_array).all():
+            raise ValueError("topk_distance: query must contain only finite values")
         schema_ptr, array_ptr = self._storage._topk_distance_ffi(
             col, query_array.tobytes(), k, metric
         )
@@ -3759,6 +3935,10 @@ class ApexClient:
         if queries.ndim != 2:
             raise ValueError("batch_topk_distance: queries must be a 2-D array of shape (N, D)")
         n, _d = queries.shape
+        if n == 0 or _d == 0:
+            raise ValueError("batch_topk_distance: queries must be non-empty")
+        if not np.isfinite(queries).all():
+            raise ValueError("batch_topk_distance: queries must contain only finite values")
         raw = self._storage._batch_topk_ffi(col, queries.tobytes(), n, k, metric)
         return np.frombuffer(raw, dtype=np.float64).reshape(n, k, 2)
 
@@ -4326,10 +4506,49 @@ class ApexClient:
             ``self`` for method chaining.
         """
         if table_name is not None:
-            self._select_or_create_table(table_name)
+            self._select_or_create_table(
+                table_name, self._arrow_schema_to_apex_schema(table.schema)
+            )
         self._ensure_table_selected()
         self.store(table)
         return self
+
+    @staticmethod
+    def _arrow_table_to_apex_columns(table) -> Dict[str, list]:
+        """Convert Arrow columns without losing temporal storage semantics."""
+        pa_mod = _ensure_pyarrow()
+        columns = {}
+        for field in table.schema:
+            column = table.column(field.name)
+            typ = field.type
+            if pa_mod.types.is_date32(typ):
+                columns[field.name] = column.cast(pa_mod.int32()).to_pylist()
+            elif pa_mod.types.is_date64(typ):
+                millis = column.cast(pa_mod.int64()).to_pylist()
+                columns[field.name] = [
+                    None if value is None else value // 86_400_000
+                    for value in millis
+                ]
+            elif pa_mod.types.is_timestamp(typ):
+                raw = column.cast(pa_mod.int64()).to_pylist()
+                unit = typ.unit
+                if unit == "s":
+                    columns[field.name] = [
+                        None if value is None else value * 1_000_000 for value in raw
+                    ]
+                elif unit == "ms":
+                    columns[field.name] = [
+                        None if value is None else value * 1_000 for value in raw
+                    ]
+                elif unit == "ns":
+                    columns[field.name] = [
+                        None if value is None else value // 1_000 for value in raw
+                    ]
+                else:
+                    columns[field.name] = raw
+            else:
+                columns[field.name] = column.to_pylist()
+        return columns
 
     def from_lance(
         self,
@@ -4484,6 +4703,16 @@ class ApexClient:
                 mapped[field.name] = "binary"
             elif pa_mod.types.is_large_binary(typ):
                 mapped[field.name] = "blob"
+            elif pa_mod.types.is_fixed_size_list(typ) and (
+                pa_mod.types.is_float16(typ.value_type)
+                or pa_mod.types.is_float32(typ.value_type)
+                or pa_mod.types.is_float64(typ.value_type)
+            ):
+                mapped[field.name] = "float16_vector"
+            elif pa_mod.types.is_date32(typ) or pa_mod.types.is_date64(typ):
+                mapped[field.name] = "date"
+            elif pa_mod.types.is_timestamp(typ):
+                mapped[field.name] = "timestamp"
             else:
                 mapped[field.name] = "string"
         return mapped
@@ -4740,6 +4969,8 @@ class ApexClient:
         self._check_connection()
         if old_column_name == '_id':
             raise ValueError("Cannot rename _id column")
+        if new_column_name in self.list_fields():
+            raise ValueError(f"Column '{new_column_name}' already exists")
         self._invalidate_replace_cache()
         self._storage.rename_column(old_column_name, new_column_name)
 
@@ -4789,18 +5020,26 @@ class ApexClient:
         
         return np.array([r[0] for r in results], dtype=np.int64)
 
-    def search_text_with_scores(self, query: str, table_name: str = None,
-                                limit: int = 1000) -> List[Tuple[int, float]]:
+    def search_text_with_scores(
+        self,
+        query: str,
+        table_name: str = None,
+        limit: int = 1000,
+        fuzzy: bool = False,
+        min_results: int = 1,
+    ) -> List[Tuple[int, float]]:
         """
-        Full-text search returning BM25-ranked ``(document_id, score)`` pairs.
+        Full-text search returning ranked internal ``(_id, score)`` pairs.
 
         Args:
             query: Search query text.
             table_name: Table to search. Defaults to the current table.
             limit: Maximum number of hits (default ``1000``).
+            fuzzy: Relax term matching when exact search is insufficient.
+            min_results: Soft minimum used while relaxing fuzzy matching.
 
         Returns:
-            List of ``(doc_id, score)`` tuples sorted by relevance.
+            List of internal ``(_id, score)`` tuples sorted by relevance.
 
         Raises:
             ValueError: If FTS is not enabled for the table.
@@ -4813,12 +5052,19 @@ class ApexClient:
         with self._fts_table_context(table):
             if not self._ensure_fts_initialized(table):
                 return []
-            results = self._storage.search_text(query, limit=max(0, limit))
+            if fuzzy:
+                results = self._storage.fuzzy_search_text(
+                    query,
+                    limit=max(0, limit),
+                    min_results=max(0, min_results),
+                )
+            else:
+                results = self._storage.search_text(query, limit=max(0, limit))
         return [(int(doc_id), float(score)) for doc_id, score in (results or [])]
 
     def fuzzy_search_text(self, query: str, min_results: int = 1, table_name: str = None) -> Optional[np.ndarray]:
         """
-        Fuzzy full-text search returning matching document IDs.
+        Fuzzy full-text search returning matching internal ``_id`` values.
 
         Args:
             query: Search query text.
@@ -4826,7 +5072,7 @@ class ApexClient:
             table_name: Table to search. Defaults to the current table.
 
         Returns:
-            ``numpy.ndarray`` of ``int64`` document IDs (possibly empty).
+            ``numpy.ndarray`` of internal ``_id`` values (possibly empty).
 
         Raises:
             ValueError: If FTS is not enabled for the table.

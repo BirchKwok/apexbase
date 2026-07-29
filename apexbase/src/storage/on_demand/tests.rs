@@ -136,6 +136,47 @@ fn test_create_and_open() {
 }
 
 #[test]
+fn persisted_string_null_detection_does_not_confuse_values_with_bitmap() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("string_null_detection.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    storage.set_compression(CompressionType::Zstd).unwrap();
+    let mut strings = HashMap::new();
+    strings.insert(
+        "name".to_string(),
+        (0..DEFAULT_ROW_GROUP_SIZE as usize + 1)
+            .map(|index| format!("value_{}", index % 10))
+            .collect(),
+    );
+    storage
+        .insert_typed(
+            HashMap::new(),
+            HashMap::new(),
+            strings,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save_v4().unwrap();
+    drop(storage);
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert!(!reopened.column_has_nulls("name"));
+}
+
+#[test]
+fn two_column_group_cache_rejects_unvalidated_out_of_range_ids() {
+    let dir = tempdir().unwrap();
+    let storage = OnDemandStorage::create(&dir.path().join("invalid_group_ids.apex")).unwrap();
+    let dict1 = vec!["city".to_string()];
+    let dict2 = vec!["category".to_string()];
+    let result = storage
+        .execute_group_agg_2col_cached(&dict1, &[1], &dict2, &[0], &[("*", true)], false)
+        .unwrap();
+    assert!(result.is_none());
+}
+
+#[test]
 fn test_column_projection() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_proj.apex");
@@ -520,6 +561,9 @@ fn test_v4_append_row_group() {
     drop(schema);
     let new_nulls: Vec<Vec<u8>> = vec![Vec::new(); col_count];
 
+    // A reused insert backend may still hold tombstones for older row groups.
+    // Brand-new append inputs must never inherit those deletion bits.
+    *storage.deleted.write() = vec![0b0000_0111];
     storage
         .append_row_group(&new_ids, &new_columns, &new_nulls)
         .unwrap();
@@ -529,6 +573,14 @@ fn test_v4_append_row_group() {
     assert_eq!(header.row_count, 6); // 3 + 3
     assert_eq!(header.row_group_count, 2);
     drop(header);
+
+    // Loading only the ID index must not make a metadata-only save append the
+    // already-persisted base a second time.
+    let storage2 = OnDemandStorage::open(&path).unwrap();
+    storage2.ensure_ids_loaded_v4().unwrap();
+    assert_eq!(storage2.ids.read().len(), 6);
+    storage2.save().unwrap();
+    drop(storage2);
 
     // Reopen and load all data to verify
     let storage2 = OnDemandStorage::open(&path).unwrap();

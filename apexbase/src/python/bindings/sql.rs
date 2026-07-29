@@ -45,7 +45,10 @@ impl ApexStorageImpl {
                 .get(&target_table)
                 .map(|v| Arc::clone(&v));
             if let Some(backend) = maybe_backend {
-                if backend.has_pending_deltas() {
+                if backend.has_pending_deltas()
+                    || backend.has_delta()
+                    || backend.active_row_count() != backend.row_count()
+                {
                     // Fall back to the Arrow executor path below so DeltaMerger overlays updates.
                 } else {
                     let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
@@ -66,7 +69,10 @@ impl ApexStorageImpl {
             if let Ok(backend) = crate::Database::cached_backend(&target_path) {
                 self.cached_backends
                     .insert(target_table.clone(), Arc::clone(&backend));
-                if !backend.has_pending_deltas() {
+                if !backend.has_pending_deltas()
+                    && !backend.has_delta()
+                    && backend.active_row_count() == backend.row_count()
+                {
                     let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
                     if let Ok(Some(vals)) = rcix_result {
                         let out = PyDict::new_bound(py);
@@ -127,7 +133,10 @@ impl ApexStorageImpl {
                 });
 
             if let Some(backend) = maybe_backend {
-                if !backend.has_pending_deltas() {
+                if !backend.has_pending_deltas()
+                    && !backend.has_delta()
+                    && backend.active_row_count() == backend.row_count()
+                {
                     let projected_cols: Vec<&str> = columns.iter().map(String::as_str).collect();
                     let rcix_result = py.allow_threads(|| {
                         backend
@@ -222,7 +231,12 @@ impl ApexStorageImpl {
                     })
                 });
 
-            if let Some(backend) = maybe_backend {
+            if let Some(backend) = maybe_backend.filter(|backend| {
+                matches!(
+                    backend.get_column_type(column),
+                    Some(crate::data::DataType::String)
+                )
+            }) {
                 let can_use_limit_scan = !backend.has_pending_deltas()
                     || (backend.pending_delta_delete_count() == 0
                         && !backend.pending_delta_updates_column(column));
@@ -299,7 +313,12 @@ impl ApexStorageImpl {
                     })
                 });
 
-            if let Some(backend) = maybe_backend {
+            if let Some(backend) = maybe_backend.filter(|backend| {
+                matches!(
+                    backend.get_column_type(column),
+                    Some(crate::data::DataType::String)
+                )
+            }) {
                 let can_use_limit_scan = !backend.has_pending_deltas()
                     || (backend.pending_delta_delete_count() == 0
                         && !backend.pending_delta_updates_column(column));
@@ -796,6 +815,10 @@ impl ApexStorageImpl {
                         && !backend.has_pending_deltas()
                         && !backend.has_delta()
                         && backend.pending_v4_in_memory_rows() == 0
+                        && matches!(
+                            backend.get_column_type(filter_column),
+                            Some(crate::data::DataType::String)
+                        )
                     {
                         let filter_col = filter_column.clone();
                         let filter_val = filter_value.clone();

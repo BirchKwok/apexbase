@@ -1245,7 +1245,25 @@ impl ApexExecutor {
         if let Some(int_arr) = col_array.as_any().downcast_ref::<Int64Array>() {
             let int_val = match lit_val {
                 Value::Int64(i) => *i,
-                Value::Float64(f) => *f as i64,
+                Value::Float64(f)
+                    if f.is_finite()
+                        && f.fract() == 0.0
+                        && *f >= i64::MIN as f64
+                        && *f <= i64::MAX as f64 =>
+                {
+                    *f as i64
+                }
+                Value::Float64(_) => {
+                    return Err(err_input(
+                        "integer comparison requires an integral, finite value",
+                    ))
+                }
+                Value::String(s) => s.parse::<i64>().map_err(|_| {
+                    err_input(format!(
+                        "cannot compare integer column with non-integer string {:?}",
+                        s
+                    ))
+                })?,
                 _ => return Ok(None),
             };
 
@@ -1328,9 +1346,25 @@ impl ApexExecutor {
         if let Some(uint_arr) = col_array.as_any().downcast_ref::<UInt64Array>() {
             let uint_val = match lit_val {
                 Value::UInt64(i) => *i,
-                Value::Int64(i) => *i as u64,
+                Value::Int64(i) if *i >= 0 => *i as u64,
+                Value::Int64(_) => {
+                    return Err(err_input(
+                        "unsigned integer comparison cannot use a negative value",
+                    ))
+                }
                 Value::UInt32(i) => *i as u64,
-                Value::Int32(i) => *i as u64,
+                Value::Int32(i) if *i >= 0 => *i as u64,
+                Value::Int32(_) => {
+                    return Err(err_input(
+                        "unsigned integer comparison cannot use a negative value",
+                    ))
+                }
+                Value::String(s) => s.parse::<u64>().map_err(|_| {
+                    err_input(format!(
+                        "cannot compare unsigned integer column with non-integer string {:?}",
+                        s
+                    ))
+                })?,
                 _ => return Ok(None),
             };
             let scalar = Scalar::new(UInt64Array::from(vec![uint_val]));
@@ -1359,8 +1393,19 @@ impl ApexExecutor {
             let float_val = match lit_val {
                 Value::Float64(f) => *f,
                 Value::Int64(i) => *i as f64,
+                Value::String(s) => s.parse::<f64>().map_err(|_| {
+                    err_input(format!(
+                        "cannot compare floating-point column with non-numeric string {:?}",
+                        s
+                    ))
+                })?,
                 _ => return Ok(None),
             };
+            if !float_val.is_finite() {
+                return Err(err_input(
+                    "floating-point comparison requires a finite value",
+                ));
+            }
 
             // VECTORIZED OPTIMIZATION: Use batch filtering for Float64
             let num_rows = float_arr.len();
@@ -2625,26 +2670,30 @@ impl ApexExecutor {
 
                 let num_rows = batch.num_rows();
 
-                // Determine result type from first non-null argument (skip arrays that are all null)
-                let mut result_type: Option<&str> = None;
+                // Determine a common result type across every argument. Numeric
+                // COALESCE follows normal SQL promotion: a DOUBLE input makes
+                // the whole expression DOUBLE, including integer fallbacks.
+                let mut has_string = false;
+                let mut has_int = false;
+                let mut has_float = false;
                 let mut arrays: Vec<ArrayRef> = Vec::new();
                 for arg in args {
                     let arr = Self::evaluate_expr_to_array(batch, arg)?;
-                    // Only set type from arrays that have at least one non-null value
-                    let has_non_null = (0..arr.len()).any(|i| !arr.is_null(i));
-                    if result_type.is_none() && has_non_null {
-                        if arr.as_any().downcast_ref::<StringArray>().is_some() {
-                            result_type = Some("string");
-                        } else if arr.as_any().downcast_ref::<Int64Array>().is_some() {
-                            result_type = Some("int");
-                        } else if arr.as_any().downcast_ref::<Float64Array>().is_some() {
-                            result_type = Some("float");
-                        }
-                    }
+                    has_string |= arr.as_any().downcast_ref::<StringArray>().is_some();
+                    has_int |= arr.as_any().downcast_ref::<Int64Array>().is_some();
+                    has_float |= arr.as_any().downcast_ref::<Float64Array>().is_some();
                     arrays.push(arr);
                 }
 
-                match result_type.unwrap_or("int") {
+                let result_type = if has_string {
+                    "string"
+                } else if has_float {
+                    "float"
+                } else {
+                    "int"
+                };
+
+                match result_type {
                     "string" => {
                         let mut result: Vec<Option<String>> = vec![None; num_rows];
                         let mut assigned = vec![false; num_rows];
@@ -2653,6 +2702,24 @@ impl ApexExecutor {
                                 for i in 0..num_rows {
                                     if !assigned[i] && !str_arr.is_null(i) {
                                         result[i] = Some(str_arr.value(i).to_string());
+                                        assigned[i] = true;
+                                    }
+                                }
+                            } else if let Some(int_arr) =
+                                arr.as_any().downcast_ref::<Int64Array>()
+                            {
+                                for i in 0..num_rows {
+                                    if !assigned[i] && !int_arr.is_null(i) {
+                                        result[i] = Some(int_arr.value(i).to_string());
+                                        assigned[i] = true;
+                                    }
+                                }
+                            } else if let Some(float_arr) =
+                                arr.as_any().downcast_ref::<Float64Array>()
+                            {
+                                for i in 0..num_rows {
+                                    if !assigned[i] && !float_arr.is_null(i) {
+                                        result[i] = Some(float_arr.value(i).to_string());
                                         assigned[i] = true;
                                     }
                                 }
@@ -2670,6 +2737,13 @@ impl ApexExecutor {
                                 for i in 0..num_rows {
                                     if !assigned[i] && !f_arr.is_null(i) {
                                         result[i] = Some(f_arr.value(i));
+                                        assigned[i] = true;
+                                    }
+                                }
+                            } else if let Some(i_arr) = arr.as_any().downcast_ref::<Int64Array>() {
+                                for i in 0..num_rows {
+                                    if !assigned[i] && !i_arr.is_null(i) {
+                                        result[i] = Some(i_arr.value(i) as f64);
                                         assigned[i] = true;
                                     }
                                 }

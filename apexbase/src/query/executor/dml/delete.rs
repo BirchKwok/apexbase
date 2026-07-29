@@ -160,9 +160,14 @@ impl ApexExecutor {
         // ── Fast scan path: simple numeric/string predicate, no FK, no indexes ──
         // Numeric: delete_where_numeric_range_inplace — single pass, no id_to_idx HashMap.
         // String:  scan_string_filter_mmap → get_ids → delete_batch + save_delete_only.
+        let predicate_delta_override = Self::extract_numeric_range_from_where(
+            where_clause.expect("DELETE predicate checked above"),
+        )
+        .is_some_and(|(column, _, _)| storage.pending_delta_updates_column(&column));
         if fk_children.is_empty()
             && indexed_cols.is_empty()
             && !Self::table_fts_enabled(&base_dir, &this_table_name)
+            && !predicate_delta_override
         {
             if let Some((col, low, high)) =
                 Self::extract_numeric_range_from_where(where_clause.unwrap())
