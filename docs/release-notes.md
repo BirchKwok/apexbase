@@ -3,6 +3,24 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.26.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.26.0)
+*2026-07-29*
+
+[Compare with v1.25.0](https://github.com/BirchKwok/ApexBase/compare/v1.25.0...v1.26.0)
+
+- Harden V4 `.apex` file validation at open time: verify header/footer offsets, schema column counts, visible row counts, and row-group bounds, returning a clean corruption error for truncated or malformed files instead of risking a Rust panic
+- Strengthen SQL DDL/DML validation and read-your-write consistency across `INSERT`, `UPDATE`, `DELETE`, schema changes, cached reads, numeric range statistics, and zone maps, including clearer errors for invalid types, column arity, and unsafe schema mutations
+- Preserve SQL null semantics across expressions, grouping, aggregates, Arrow/Pandas conversion, temporary CSV tables, and projected row reads
+- Improve vector `topk_distance` execution by validating query vectors and dimensions, applying filters before distance computation, and avoiding unnecessary reads of wide or unused BLOB columns in TopK JOINs
+- Add binary parameter binding for single-query `topk_distance` calls, eliminating vector text interpolation in the Python API
+- Extend full-text search with Boolean `AND`/`OR`/`NOT` expressions, configurable fuzzy matching, safer index reconfiguration, and richer index status information
+- Add `ApexClient.execute_batch_parallel` for independent read-only SQL statements while retaining ordered `execute_batch` semantics for scripts
+- Improve BLOB projection, `CREATE TABLE AS SELECT`, `INSERT ... SELECT`, Lance vector/temporal round-trips, correlated text subqueries, and process-safe concurrent writes
+- Expand regression and performance coverage for storage corruption handling, DML and null edge cases, FTS, TopK JOINs with BLOB data, parallel batch execution, and Arrow batch-result APIs
+- Update the Rust crate and Python package version metadata to 1.26.0
+
+---
+
 ## [v1.25.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.25.0)
 *2026-07-26*
 
