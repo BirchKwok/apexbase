@@ -639,6 +639,12 @@ def test_truncated_storage_fails_without_rust_panic(tmp_path):
     client.store({"id": list(range(20)), "name": [f"r{i}" for i in range(20)]})
     client.flush()
     client.close()
+    assert client._storage is None
+    assert client._shared_storage is None
+    assert client._store_one is None
+    assert client._store_one_memtable is None
+    assert client._store_one_delta is None
+    assert client._store_one_delta_durable is None
 
     apex_file = next(root.rglob("t.apex"))
     with apex_file.open("r+b") as handle:

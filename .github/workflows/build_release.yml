@@ -11,12 +11,17 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 env:
   # The repo's local Cargo config uses target-cpu=native for developer and
   # benchmark builds. CI builds must stay portable because GitHub runners and
   # restored proc-macro artifacts can land on hosts with different CPU features.
   RUSTFLAGS: "-C target-cpu=generic"
   APEXBASE_CI_CPU: "generic"
+  REGISTRY_USER_AGENT: "apexbase-release-workflow/1.0 (https://github.com/BirchKwok/ApexBase)"
 
 jobs:
   # Resolve the requested tag before choosing the legacy Python or maturin path.
@@ -63,6 +68,12 @@ jobs:
         cargo_file = Path("Cargo.toml")
         if package_kind == "maturin" and cargo_file.exists():
             cargo = tomllib.loads(cargo_file.read_text(encoding="utf-8"))
+            cargo_version = cargo.get("package", {}).get("version")
+            if cargo_version != version:
+                sys.exit(
+                    f"Cargo package version {cargo_version!r} does not match "
+                    f"Python package version {version!r}."
+                )
             available_features = cargo.get("features", {})
             rust_features.extend(
                 feature for feature in ("server", "flight")
@@ -400,40 +411,23 @@ jobs:
         name: sdist
         path: dist/*.tar.gz
 
-  # ── Publish to PyPI ──
-  publish:
-    needs: [build-wheels-linux, build-wheels, build-sdist]
-    runs-on: ubuntu-latest
-    steps:
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: "3.11"
-    - name: Install twine
-      run: |
-        python -m pip install --upgrade pip
-        pip install twine
-    - name: Download artifacts
-      uses: actions/download-artifact@v4
-      with:
-        path: dist
-    - name: Publish to PyPI
-      env:
-        TWINE_USERNAME: __token__
-        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
-      run: |
-        python -m twine upload --verbose --skip-existing dist/**/*.whl dist/**/*.tar.gz
-
-  # ── Publish to crates.io ──
-  publish-crate:
-    needs: [resolve-release, rust-test]
+  # ── Publish the Python and Rust packages behind one shared gate ──
+  #
+  # PyPI and crates.io do not support a cross-registry transaction. Keep both
+  # uploads in one job, preflight both packages before either upload, and make
+  # retries reconcile a release if a registry/network failure interrupted the
+  # first attempt after only one registry accepted the version.
+  publish-packages:
+    needs: [resolve-release, test, rust-test, build-wheels-linux, build-wheels, build-sdist]
     if: needs.resolve-release.outputs.package_kind == 'maturin'
     runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ needs.resolve-release.outputs.tag_name }}
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
-        ref: ${{ github.event.inputs.tag || github.ref }}
+        ref: ${{ needs.resolve-release.outputs.tag_name }}
 
     - name: Install Rust stable
       uses: dtolnay/rust-toolchain@stable
@@ -441,27 +435,160 @@ jobs:
     - name: Rust cache
       uses: Swatinem/rust-cache@v2
 
-    - name: Install system dependencies
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y protobuf-compiler
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.11"
 
-    - name: Verify crate packaging
+    - name: Install twine
       run: |
-        cargo package --no-default-features --allow-dirty --list
+        python -m pip install --upgrade pip
+        python -m pip install twine
 
-    - name: Publish to crates.io (if version not exists)
+    - name: Download artifacts
+      uses: actions/download-artifact@v4
+      with:
+        path: dist
+
+    - name: Validate Python distributions
+      shell: bash
       run: |
-        VERSION=$(grep "^version" Cargo.toml | head -1 | cut -d'"' -f2)
-        echo "Checking if apexbase v${VERSION} exists on crates.io..."
-        if cargo search apexbase --limit 1 2>/dev/null | grep -q "apexbase = \"${VERSION}\""; then
-          echo "Version ${VERSION} already exists on crates.io, skipping publish."
-          exit 0
+        set -euo pipefail
+        mapfile -d '' distributions < <(
+          find dist -type f \( -name '*.whl' -o -name '*.tar.gz' \) -print0
+        )
+        if [[ "${#distributions[@]}" -eq 0 ]]; then
+          echo "No Python distributions were downloaded."
+          exit 1
         fi
-        echo "Publishing apexbase v${VERSION}..."
-        cargo publish --no-default-features --allow-dirty
+        python -m twine check "${distributions[@]}"
+
+    - name: Check registry state
+      id: registry-state
+      shell: bash
+      run: |
+        set -euo pipefail
+        VERSION="${RELEASE_TAG#v}"
+
+        registry_status() {
+          local registry="$1"
+          local url="$2"
+          local status
+          status="$(
+            curl --silent --show-error \
+              --user-agent "$REGISTRY_USER_AGENT" \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              "$url"
+          )"
+          case "$status" in
+            200)
+              echo "${registry}_exists=true" >> "$GITHUB_OUTPUT"
+              ;;
+            404)
+              echo "${registry}_exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "Unexpected HTTP ${status} while checking ${registry}."
+              exit 1
+              ;;
+          esac
+        }
+
+        registry_status crate "https://crates.io/api/v1/crates/apexbase/${VERSION}"
+        registry_status pypi "https://pypi.org/pypi/apexbase/${VERSION}/json"
+
+    - name: Validate crate package
+      if: steps.registry-state.outputs.crate_exists != 'true'
+      run: cargo publish --dry-run --no-default-features --allow-dirty
+
+    - name: Publish missing packages together
+      shell: bash
       env:
+        TWINE_USERNAME: __token__
+        TWINE_PASSWORD: ${{ secrets.PYPI_API_TOKEN }}
         CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        CRATE_EXISTS: ${{ steps.registry-state.outputs.crate_exists }}
+        PYPI_EXISTS: ${{ steps.registry-state.outputs.pypi_exists }}
+      run: |
+        set -euo pipefail
+
+        cargo_pid=""
+        pypi_pid=""
+
+        if [[ "$CRATE_EXISTS" != "true" ]]; then
+          cargo publish --no-default-features --allow-dirty --no-verify &
+          cargo_pid="$!"
+        else
+          echo "The crate version is already published; no crates.io upload is needed."
+        fi
+
+        if [[ "$PYPI_EXISTS" != "true" ]]; then
+          (
+            mapfile -d '' distributions < <(
+              find dist -type f \( -name '*.whl' -o -name '*.tar.gz' \) -print0
+            )
+            python -m twine upload --verbose "${distributions[@]}"
+          ) &
+          pypi_pid="$!"
+        else
+          echo "The Python package version is already published; no PyPI upload is needed."
+        fi
+
+        cargo_status=0
+        pypi_status=0
+        if [[ -n "$cargo_pid" ]]; then
+          if wait "$cargo_pid"; then
+            echo "crates.io upload completed."
+          else
+            cargo_status="$?"
+          fi
+        fi
+        if [[ -n "$pypi_pid" ]]; then
+          if wait "$pypi_pid"; then
+            echo "PyPI upload completed."
+          else
+            pypi_status="$?"
+          fi
+        fi
+
+        if [[ "$cargo_status" -ne 0 || "$pypi_status" -ne 0 ]]; then
+          echo "Package publication failed: crates.io=${cargo_status}, PyPI=${pypi_status}."
+          echo "Rerun this workflow for the same tag to publish whichever side is missing."
+          exit 1
+        fi
+
+    - name: Confirm both registries contain the version
+      shell: bash
+      run: |
+        set -euo pipefail
+        VERSION="${RELEASE_TAG#v}"
+
+        for attempt in {1..12}; do
+          crate_status="$(
+            curl --silent --show-error \
+              --user-agent "$REGISTRY_USER_AGENT" \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              "https://crates.io/api/v1/crates/apexbase/${VERSION}" || true
+          )"
+          pypi_status="$(
+            curl --silent --show-error \
+              --user-agent "$REGISTRY_USER_AGENT" \
+              --output /dev/null \
+              --write-out '%{http_code}' \
+              "https://pypi.org/pypi/apexbase/${VERSION}/json" || true
+          )"
+          if [[ "$crate_status" == "200" && "$pypi_status" == "200" ]]; then
+            echo "apexbase ${VERSION} is available on both crates.io and PyPI."
+            exit 0
+          fi
+          echo "Registry confirmation ${attempt}/12: crates.io=${crate_status}, PyPI=${pypi_status}."
+          sleep 10
+        done
+
+        echo "The version was not confirmed on both registries."
+        exit 1
 
   # ── Build and publish historical pure-Python releases ──
   build-legacy:
@@ -506,13 +633,22 @@ jobs:
 
   # ── Create GitHub Release ──
   create-release:
-    needs: [resolve-release, publish, publish-crate, publish-legacy]
+    needs: [resolve-release, publish-packages, publish-legacy]
     if: >-
       always() &&
       needs.resolve-release.result == 'success' &&
-      (needs.publish.result == 'success' || needs.publish.result == 'skipped') &&
-      (needs.publish-crate.result == 'success' || needs.publish-crate.result == 'skipped') &&
-      (needs.publish-legacy.result == 'success' || needs.publish-legacy.result == 'skipped')
+      (
+        (
+          needs.resolve-release.outputs.package_kind == 'maturin' &&
+          needs.publish-packages.result == 'success' &&
+          needs.publish-legacy.result == 'skipped'
+        ) ||
+        (
+          needs.resolve-release.outputs.package_kind == 'legacy' &&
+          needs.publish-packages.result == 'skipped' &&
+          needs.publish-legacy.result == 'success'
+        )
+      )
     runs-on: ubuntu-latest
     permissions:
       contents: write

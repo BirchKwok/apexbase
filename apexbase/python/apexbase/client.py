@@ -5290,6 +5290,13 @@ class ApexClient:
                 self._is_closed = True
                 current_storage = getattr(self, '_storage', None)
                 self._storage = None
+                self._shared_storage = None
+                # Cached bound methods keep their ApexStorage instance alive.
+                # Release them before close so Windows can unmap table files.
+                self._store_one = None
+                self._store_one_memtable = None
+                self._store_one_delta = None
+                self._store_one_delta_durable = None
                 if self._auto_manage:
                     client_id = getattr(self, '_client_id', None)
                     storage_to_close = _registry.unregister(str(self._db_path), client_id)
