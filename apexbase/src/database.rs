@@ -215,6 +215,12 @@ impl Database {
         crate::query::executor::invalidate_storage_cache(table_path);
     }
 
+    #[cfg(target_os = "windows")]
+    #[inline]
+    pub(crate) fn invalidate_query_cache_for_dir(base_dir: &Path) {
+        crate::query::executor::ApexExecutor::invalidate_cache_for_dir(base_dir);
+    }
+
     #[inline]
     pub(crate) fn wait_fts_backfill(base_dir: &Path, table_name: &str) {
         crate::query::executor::wait_fts_backfill(base_dir, table_name);
@@ -223,16 +229,6 @@ impl Database {
     #[inline]
     pub(crate) fn has_fts_backfill(base_dir: &Path, table_name: &str) -> bool {
         crate::query::executor::has_fts_backfill(base_dir, table_name)
-    }
-
-    #[inline]
-    pub(crate) fn wait_fts_backfills(base_dir: &Path) {
-        crate::query::executor::wait_fts_backfills_for_dir(base_dir);
-    }
-
-    #[inline]
-    pub(crate) fn has_fts_backfills(base_dir: &Path) -> bool {
-        crate::query::executor::has_fts_backfills_for_dir(base_dir)
     }
 
     #[inline]

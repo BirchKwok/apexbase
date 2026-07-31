@@ -1765,21 +1765,15 @@ impl ApexStorageImpl {
                 }
             })
             .collect();
-        let has_fts_backfills = crate::Database::has_fts_backfills(&base_dir);
 
-        if !pending_backends.is_empty() || has_fts_backfills {
-            py.allow_threads(|| {
-                if has_fts_backfills {
-                    crate::Database::wait_fts_backfills(&base_dir);
+        py.allow_threads(|| {
+            crate::Database::unregister_fts_manager(&base_dir);
+            for backend in pending_backends {
+                if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+                    let _ = backend.save();
                 }
-
-                for backend in pending_backends {
-                    if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
-                        let _ = backend.save();
-                    }
-                }
-            });
-        }
+            }
+        });
 
         // Clear per-instance cached backends (releases per-instance references)
         self.cached_backends.clear();
@@ -1795,7 +1789,10 @@ impl ApexStorageImpl {
         // On Unix: mmaps remain valid after atomic rename; keep STORAGE_CACHE alive
         // so the 50ms fast path in get_cached_backend skips stat() calls on next retrieve().
         #[cfg(target_os = "windows")]
-        crate::Database::invalidate_dir(&base_dir);
+        {
+            crate::Database::invalidate_dir(&base_dir);
+            crate::Database::invalidate_query_cache_for_dir(&base_dir);
+        }
         Ok(())
     }
 

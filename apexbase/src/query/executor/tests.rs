@@ -48,6 +48,28 @@ fn test_simple_select() {
 }
 
 #[test]
+fn unregister_fts_manager_waits_for_background_flush() {
+    let dir = tempdir().unwrap();
+    let manager = Arc::new(crate::fts::FtsManager::new(
+        dir.path().join("fts_indexes"),
+        crate::fts::FtsConfig::default(),
+    ));
+    let engine = manager.get_engine("docs").unwrap();
+    engine
+        .add_document(
+            1,
+            HashMap::from([("body".to_string(), "background flush".to_string())]),
+        )
+        .unwrap();
+    engine.flush_async().unwrap();
+
+    register_fts_manager(dir.path(), manager);
+    unregister_fts_manager(dir.path());
+
+    assert_eq!(engine.wait_flush().unwrap(), 0);
+}
+
+#[test]
 fn test_select_with_where() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test.apex");

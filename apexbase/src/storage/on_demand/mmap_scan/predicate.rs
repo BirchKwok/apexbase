@@ -62,6 +62,38 @@ pub(super) fn bytes_as_u32_slice(bytes: &[u8], n: usize) -> std::borrow::Cow<'_,
     }
 }
 
+/// Find a little-endian u32 in a sorted byte-backed array without requiring
+/// the mmap address to be aligned. Sparse string equality scans only need the
+/// matching offset and its successor, so decoding the whole offsets table on
+/// an unaligned column would add avoidable O(rows) work to an O(matches log rows)
+/// path.
+#[inline(always)]
+fn binary_search_u32_le(bytes: &[u8], n: usize, target: u32) -> Option<usize> {
+    if bytes.len() < n.saturating_mul(4) {
+        return None;
+    }
+    let mut left = 0usize;
+    let mut right = n;
+    while left < right {
+        let mid = left + (right - left) / 2;
+        let offset = mid * 4;
+        let value = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap());
+        match value.cmp(&target) {
+            std::cmp::Ordering::Less => left = mid + 1,
+            std::cmp::Ordering::Greater => right = mid,
+            std::cmp::Ordering::Equal => return Some(mid),
+        }
+    }
+    None
+}
+
+#[inline(always)]
+fn u32_le_at(bytes: &[u8], index: usize) -> Option<u32> {
+    let offset = index.checked_mul(4)?;
+    let end = offset.checked_add(4)?;
+    Some(u32::from_le_bytes(bytes.get(offset..end)?.try_into().ok()?))
+}
+
 #[inline(always)]
 pub(super) fn bitpack_value_at(
     packed: &[u8],
@@ -504,9 +536,7 @@ impl OnDemandStorage {
                             let data_len_off = 8 + all_offsets_len;
                             if data_len_off + 8 <= data.len() {
                                 let data_start = data_len_off + 8;
-                                // FAST: cast offset bytes to &[u32] slice (avoids 2M u32::from_le_bytes calls)
-                                let offsets_cow = bytes_as_u32_slice(&data[8..], count + 1);
-                                let offsets: &[u32] = &offsets_cow;
+                                let offsets_bytes = &data[8..8 + all_offsets_len];
                                 let target_len = target_bytes.len();
                                 let n = count.min(rg_rows);
                                 // FAST: memmem scan raw string data + binary search boundary check
@@ -525,9 +555,15 @@ impl OnDemandStorage {
                                     }
                                     let abs = search_from + rel;
                                     // Binary search: find if abs is a valid string start offset
-                                    if let Ok(di) = offsets[..count].binary_search(&(abs as u32)) {
-                                        let end_off = offsets[di + 1] as usize;
-                                        if end_off - abs == target_len && di < n {
+                                    if let Some(di) =
+                                        binary_search_u32_le(offsets_bytes, count, abs as u32)
+                                    {
+                                        let end_off =
+                                            u32_le_at(offsets_bytes, di + 1).unwrap_or(0) as usize;
+                                        if end_off >= abs
+                                            && end_off - abs == target_len
+                                            && di < n
+                                        {
                                             // Verify not deleted / null
                                             let skip = if has_deletes {
                                                 (del_bytes[di / 8] >> (di % 8)) & 1 == 1
@@ -4717,5 +4753,25 @@ impl OnDemandStorage {
         };
 
         Ok(Some(result))
+    }
+}
+
+#[cfg(test)]
+mod byte_offset_tests {
+    use super::{binary_search_u32_le, u32_le_at};
+
+    #[test]
+    fn unaligned_u32_offsets_support_sparse_binary_search() {
+        let values = [0u32, 4, 11, 19, 31];
+        let mut storage = vec![0xFF];
+        for value in values {
+            storage.extend_from_slice(&value.to_le_bytes());
+        }
+        let unaligned = &storage[1..];
+
+        assert_eq!(binary_search_u32_le(unaligned, values.len(), 11), Some(2));
+        assert_eq!(binary_search_u32_le(unaligned, values.len(), 12), None);
+        assert_eq!(u32_le_at(unaligned, 3), Some(19));
+        assert_eq!(u32_le_at(unaligned, values.len()), None);
     }
 }

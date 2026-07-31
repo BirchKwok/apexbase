@@ -592,13 +592,6 @@ pub fn wait_fts_backfills_for_dir(base_dir: &Path) {
     }
 }
 
-pub fn has_fts_backfills_for_dir(base_dir: &Path) -> bool {
-    FTS_BACKFILL_TASKS
-        .read()
-        .keys()
-        .any(|(dir, _)| dir == base_dir)
-}
-
 /// Remove the FTS manager registered for a base_dir.
 ///
 /// Used when a database directory is recreated in-process, so a later
@@ -606,7 +599,10 @@ pub fn has_fts_backfills_for_dir(base_dir: &Path) -> bool {
 /// indexes whose files were deleted.
 pub fn unregister_fts_manager(base_dir: &Path) {
     wait_fts_backfills_for_dir(base_dir);
-    FTS_MANAGER_CACHE.write().remove(base_dir);
+    let manager = FTS_MANAGER_CACHE.write().remove(base_dir);
+    if let Some(manager) = manager {
+        let _ = manager.flush_all();
+    }
 }
 
 /// Get or lazily create a FtsManager for a base_dir.
