@@ -3,6 +3,21 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.27.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.27.0)
+*2026-08-01*
+
+[Compare with v1.26.0](https://github.com/BirchKwok/ApexBase/compare/v1.26.0...v1.27.0)
+
+- Optimize Arrow record batch processing for large, variable-length result sets, improving throughput for wide string and binary projections and reducing unnecessary materialization in Arrow conversion paths
+- Add end-to-end support for large UTF-8 and binary values in Arrow-backed result batches, preserving correctness across `to_arrow()`, `to_record_batches()`, `CREATE TABLE AS SELECT`, and `INSERT ... SELECT`
+- Improve JOIN and subquery execution so TopK-style lookups prune blob-heavy rows more effectively and keep qualified filters aligned with expected row semantics
+- Introduce shared, mmap-backed table-epoch tracking so logical write invalidation is visible across processes and cached reads are invalidated more reliably after table mutations
+- Strengthen on-demand storage projection and scan behavior for lazy column reads, including more precise pruning of unused columns and better handling of blob-aware reads
+- Expand regression coverage for TopK parser/binding safety, join-filter behavior, blob projection, DML validation, and null/empty-value semantics
+- Update the Rust crate and Python package version metadata to 1.27.0
+
+---
+
 ## [v1.26.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.26.0)
 *2026-07-29*
 

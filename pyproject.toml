@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "apexbase"
-version = "1.26.0"
+version = "1.27.0"
 description = "High-performance HTAP embedded database with Rust core and Python API"
 readme = "README.md"
 requires-python = ">=3.9"
