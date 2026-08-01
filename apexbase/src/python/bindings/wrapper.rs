@@ -476,11 +476,12 @@ struct NumericUpdateCellCache {
 }
 
 /// Per-client backend cache validated by the storage-owned table epoch.
-///
-/// Pending local writes keep their owning backend alive and advance its
-/// observed epoch; otherwise a stale backend is discarded before use.
+/// The epoch is shared through the table lock mapping, so the hot path is an
+/// atomic load even when another process may commit the table.
+type EpochBackendEntry = (Arc<TableStorageBackend>, u64);
+
 struct EpochBackendCache {
-    entries: DashMap<String, (Arc<TableStorageBackend>, u64)>,
+    entries: DashMap<String, EpochBackendEntry>,
 }
 
 impl EpochBackendCache {
@@ -507,17 +508,13 @@ impl EpochBackendCache {
     }
 
     #[inline]
-    fn insert(
-        &self,
-        key: String,
-        backend: Arc<TableStorageBackend>,
-    ) -> Option<(Arc<TableStorageBackend>, u64)> {
+    fn insert(&self, key: String, backend: Arc<TableStorageBackend>) -> Option<EpochBackendEntry> {
         let epoch = crate::storage::epoch::current(backend.path());
         self.entries.insert(key, (backend, epoch))
     }
 
     #[inline]
-    fn remove(&self, key: &str) -> Option<(String, (Arc<TableStorageBackend>, u64))> {
+    fn remove(&self, key: &str) -> Option<(String, EpochBackendEntry)> {
         self.entries.remove(key)
     }
 

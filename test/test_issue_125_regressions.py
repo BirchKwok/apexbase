@@ -26,6 +26,16 @@ def _concurrent_writer(root: str, start: int) -> None:
         client.close()
 
 
+def _external_visibility_writer(root: str, row_id: int) -> None:
+    client = ApexClient(dirpath=root)
+    try:
+        client.use_table("t")
+        client.store({"id": [row_id], "name": [f"child-{row_id}"]})
+        client.flush()
+    finally:
+        client.close()
+
+
 def test_topk_parser_binding_filter_and_safety(tmp_path):
     client = _client(tmp_path, "topk")
     try:
@@ -122,6 +132,37 @@ def test_topk_join_prunes_blob_and_qualified_filters_work(tmp_path):
         ).to_dict()
         assert [row["name"] for row in rows] == ["x", "y"]
 
+        matched = client.execute(
+            """
+            SELECT p.name
+            FROM products p
+            LEFT JOIN (
+                SELECT explode_rename(
+                    topk_distance(vec, [1.0, 0.0], 2, 'l2'),
+                    '_id', 'dist'
+                ) FROM products
+            ) k ON p._id = k._id
+            WHERE k._id IS NOT NULL
+            ORDER BY p.name
+            """
+        ).to_dict()
+        assert [row["name"] for row in matched] == ["x", "y"]
+
+        unmatched = client.execute(
+            """
+            SELECT p.name
+            FROM products p
+            LEFT JOIN (
+                SELECT explode_rename(
+                    topk_distance(vec, [1.0, 0.0], 2, 'l2'),
+                    '_id', 'dist'
+                ) FROM products
+            ) k ON p._id = k._id
+            WHERE k._id IS NULL
+            """
+        ).to_dict()
+        assert unmatched == [{"name": "z"}]
+
         client.execute("CREATE TABLE ids (product_id INT)")
         client.use_table("ids")
         client.store({"product_id": [10, 20, 30]})
@@ -153,6 +194,13 @@ def test_blob_projection_limit_ctas_and_insert_select(tmp_path):
             "SELECT payload FROM src ORDER BY id LIMIT 1 OFFSET 1"
         ).to_dict()
         assert offset == [{"payload": blobs[1]}]
+
+        result = client.execute("SELECT payload FROM src ORDER BY id")
+        arrow_table = result.to_arrow()
+        assert str(arrow_table.schema.field("payload").type) == "large_binary"
+        batches = result.to_record_batches(max_chunksize=1)
+        assert len(batches) == 3
+        assert all(batch.num_rows == 1 for batch in batches)
 
         client.execute("CREATE TABLE copied AS SELECT id, payload FROM src")
         client.execute("CREATE TABLE inserted (id INT, payload BLOB)")
@@ -627,6 +675,43 @@ def test_correlated_text_subquery_and_process_safe_writes(tmp_path):
             "(SELECT MAX(v) FROM correlated b WHERE b.g = a.g) ORDER BY id"
         ).to_dict()
         assert maxima == [{"id": 2}, {"id": 4}]
+    finally:
+        client.close()
+
+
+def test_open_client_observes_external_flush_immediately(tmp_path):
+    root = tmp_path / "external_visibility"
+    client = ApexClient(dirpath=str(root), drop_if_exists=True)
+    try:
+        client.execute("CREATE TABLE t (id INT, name TEXT)")
+        client.use_table("t")
+        client.store({"id": [1], "name": ["seed"]})
+        client.flush()
+
+        assert client.count_rows() == 1
+        assert client.execute("SELECT COUNT(*) FROM t").scalar() == 1
+
+        ctx = multiprocessing.get_context("spawn")
+        writer = ctx.Process(target=_external_visibility_writer, args=(str(root), 2))
+        writer.start()
+        writer.join(30)
+        assert writer.exitcode == 0
+
+        # Direct and SQL paths must both invalidate process-local backends
+        # without a sleep, close, or manual cache reset.
+        assert client.count_rows() == 2
+        assert client.execute("SELECT COUNT(*) FROM t").scalar() == 2
+
+        writer = ctx.Process(target=_external_visibility_writer, args=(str(root), 3))
+        writer.start()
+        writer.join(30)
+        assert writer.exitcode == 0
+
+        # Exercise the opposite order so SQL cache invalidation is independent
+        # of count_rows() refreshing the per-client backend first.
+        assert client.execute("SELECT COUNT(*) FROM t").scalar() == 3
+        assert client.count_rows() == 3
+        assert client.retrieve(3)["name"] == "child-3"
     finally:
         client.close()
 

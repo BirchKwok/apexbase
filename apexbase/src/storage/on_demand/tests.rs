@@ -1173,3 +1173,9 @@ fn test_blob_storage_modes_roundtrip() {
     assert!(storage.blob_sidecar_dir().join("packed.blob").exists());
     assert!(storage.blob_sidecar_dir().join("objects").exists());
 }
+
+#[test]
+fn large_arrow_offset_boundary_uses_64_bit_offsets() {
+    assert!(!super::requires_large_arrow_offsets(i32::MAX as usize));
+    assert!(super::requires_large_arrow_offsets(i32::MAX as usize + 1));
+}

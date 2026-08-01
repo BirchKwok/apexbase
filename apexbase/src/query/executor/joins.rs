@@ -1277,7 +1277,8 @@ impl ApexExecutor {
         let preserve_qualified_left_key =
             *join_type == JoinType::Right && left_key_qualifier.is_some();
         let preserve_qualified_right_key =
-            matches!(join_type, JoinType::Right | JoinType::Full) && right_key_qualifier.is_some();
+            matches!(join_type, JoinType::Left | JoinType::Right | JoinType::Full)
+                && right_key_qualifier.is_some();
         if right_alias.is_none() && !preserve_qualified_left_key && !preserve_qualified_right_key {
             return Self::hash_join(left, right, left_key, right_key, join_type);
         }
@@ -1292,8 +1293,9 @@ impl ApexExecutor {
         };
         // Prepare right-side columns before joining:
         // - preserve alias-qualified conflicting columns for self-joins
-        // - for RIGHT/FULL joins, keep a qualified copy of the right join key so
-        //   explicit projections like `r.id` stay correct for unmatched right rows
+        // - for outer joins, keep a qualified copy of the right join key so
+        //   predicates/projections like `r.id IS NULL` preserve unmatched-row
+        //   semantics instead of falling back to the coalesced left key
         let prepared_right = Self::prepare_right_join_columns(
             right,
             left,
@@ -1312,8 +1314,8 @@ impl ApexExecutor {
     /// Prepare right-side columns for join output.
     ///
     /// - Conflicting non-key columns can be exposed as `{alias}.{col}` for self-joins.
-    /// - RIGHT/FULL joins can retain a qualified copy of the right join key (for
-    ///   projections like `table.id` on unmatched right rows).
+    /// - Outer joins can retain a qualified copy of the right join key (for
+    ///   predicates/projections like `table.id IS NULL` on unmatched rows).
     fn prepare_right_join_columns(
         right: &RecordBatch,
         left: &RecordBatch,

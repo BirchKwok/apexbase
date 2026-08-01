@@ -1,5 +1,10 @@
 // Arrow batch generation, read_columns, filtered reads
 
+#[inline]
+pub(super) fn requires_large_arrow_offsets(value_bytes: usize) -> bool {
+    value_bytes > i32::MAX as usize
+}
+
 impl OnDemandStorage {
     /// Build Arrow RecordBatch directly from in-memory V4 columns.
     /// OPTIMIZATION: bypasses read_columns→HashMap→get_null_mask→Vec<bool> pipeline.
@@ -777,7 +782,14 @@ impl OnDemandStorage {
                             std::str::from_utf8(&data[start..end]).ok()
                         })
                         .collect();
-                    (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    if requires_large_arrow_offsets(data.len()) {
+                        (
+                            ArrowDataType::LargeUtf8,
+                            Arc::new(arrow::array::LargeStringArray::from(strings)),
+                        )
+                    } else {
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
                 }
                 Some(ColumnData::Bool { data, len }) => {
                     let bools: Vec<Option<bool>> = (0..row_count)
@@ -853,7 +865,19 @@ impl OnDemandStorage {
                             std::str::from_utf8(&dict_data[start..end]).ok()
                         })
                         .collect();
-                    (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    let output_bytes = strings
+                        .iter()
+                        .filter_map(|value| value.as_ref())
+                        .try_fold(0usize, |total, value| total.checked_add(value.len()))
+                        .unwrap_or(usize::MAX);
+                    if requires_large_arrow_offsets(output_bytes) {
+                        (
+                            ArrowDataType::LargeUtf8,
+                            Arc::new(arrow::array::LargeStringArray::from(strings)),
+                        )
+                    } else {
+                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                    }
                 }
                 Some(ColumnData::FixedList { data, dim }) => {
                     let dim_usize = *dim as usize;
@@ -1153,7 +1177,19 @@ impl OnDemandStorage {
                                 }
                             }).collect()
                         };
-                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                        let output_bytes = strings
+                            .iter()
+                            .filter_map(|value| value.as_ref())
+                            .try_fold(0usize, |total, value| total.checked_add(value.len()))
+                            .unwrap_or(usize::MAX);
+                        if requires_large_arrow_offsets(output_bytes) {
+                            (
+                                ArrowDataType::LargeUtf8,
+                                Arc::new(arrow::array::LargeStringArray::from(strings)),
+                            )
+                        } else {
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                        }
                     } else {
                         let strings: Vec<&str> = if let Some(ref indices) = row_indices {
                             indices.iter().map(|&i| {
@@ -1171,7 +1207,23 @@ impl OnDemandStorage {
                                 std::str::from_utf8(&data[start..end]).unwrap_or("")
                             }).collect()
                         };
-                        (ArrowDataType::Utf8, Arc::new(StringArray::from_iter_values(strings)))
+                        let output_bytes = strings
+                            .iter()
+                            .try_fold(0usize, |total, value| total.checked_add(value.len()))
+                            .unwrap_or(usize::MAX);
+                        if requires_large_arrow_offsets(output_bytes) {
+                            (
+                                ArrowDataType::LargeUtf8,
+                                Arc::new(arrow::array::LargeStringArray::from_iter_values(
+                                    strings,
+                                )),
+                            )
+                        } else {
+                            (
+                                ArrowDataType::Utf8,
+                                Arc::new(StringArray::from_iter_values(strings)),
+                            )
+                        }
                     }
                 }
                 Some(ColumnData::Bool { data: packed, len }) => {
@@ -1256,7 +1308,19 @@ impl OnDemandStorage {
                             Some(&data[start..end] as &[u8])
                         }).collect()
                     };
-                    (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    let output_bytes = binary_data
+                        .iter()
+                        .filter_map(|value| value.as_ref())
+                        .try_fold(0usize, |total, value| total.checked_add(value.len()))
+                        .unwrap_or(usize::MAX);
+                    if requires_large_arrow_offsets(output_bytes) {
+                        (
+                            ArrowDataType::LargeBinary,
+                            Arc::new(LargeBinaryArray::from(binary_data)),
+                        )
+                    } else {
+                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(binary_data)))
+                    }
                     }
                 }
                 _ => {

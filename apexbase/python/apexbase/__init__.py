@@ -484,19 +484,23 @@ class ResultView:
         return pa_mod.Table.from_pylist(self._ensure_data())
 
     def to_record_batches(self, max_chunksize: int = None):
-        """Return Arrow record batches without merging chunk payload buffers.
+        """Split the materialized Arrow result into record batches.
 
         Args:
             max_chunksize: Optional maximum rows per batch.
 
         Returns:
             List of ``pyarrow.RecordBatch`` objects preserving the result schema.
+
+        Notes:
+            This controls consumer batch size but does not make query execution
+            lazy; large string and binary results use Arrow 64-bit offset types.
         """
         table = self.to_arrow()
         return table.to_batches(max_chunksize=max_chunksize)
 
     def iter_batches(self, max_chunksize: int = None):
-        """Iterate Arrow record batches, suitable for bounded-memory consumers."""
+        """Iterate batches split from the materialized Arrow result."""
         yield from self.to_record_batches(max_chunksize=max_chunksize)
 
     def to_lance(self, uri, mode: str = "create", **write_options):

@@ -6,13 +6,99 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::fs::OpenOptions;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use dashmap::DashMap;
+use memmap2::{MmapMut, MmapOptions};
 use once_cell::sync::Lazy;
 
-static TABLE_EPOCHS: Lazy<DashMap<PathBuf, AtomicU64>> = Lazy::new(DashMap::new);
+const SHARED_EPOCH_BYTES: u64 = std::mem::size_of::<AtomicU64>() as u64;
+
+struct SharedEpoch {
+    mapping: MmapMut,
+}
+
+impl SharedEpoch {
+    fn open(table_path: &Path) -> io::Result<Self> {
+        let path = table_path.with_extension("apex.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        if file.metadata()?.len() < SHARED_EPOCH_BYTES {
+            file.set_len(SHARED_EPOCH_BYTES)?;
+        }
+        let mapping = unsafe {
+            MmapOptions::new()
+                .len(SHARED_EPOCH_BYTES as usize)
+                .map_mut(&file)?
+        };
+        Ok(Self { mapping })
+    }
+
+    #[inline]
+    fn atomic(&self) -> &AtomicU64 {
+        debug_assert_eq!(
+            self.mapping
+                .as_ptr()
+                .align_offset(std::mem::align_of::<AtomicU64>()),
+            0
+        );
+        // SAFETY: file mappings are page-aligned and remain alive for the
+        // lifetime of `self`; all accesses to these bytes use AtomicU64.
+        unsafe { &*self.mapping.as_ptr().cast::<AtomicU64>() }
+    }
+
+    #[inline]
+    fn current(&self) -> u64 {
+        self.atomic().load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn bump(&self) -> u64 {
+        self.atomic().fetch_add(1, Ordering::AcqRel) + 1
+    }
+}
+
+struct TableEpoch {
+    local: AtomicU64,
+    shared: Option<SharedEpoch>,
+}
+
+impl TableEpoch {
+    fn open(table_path: &Path) -> Self {
+        let shared = SharedEpoch::open(table_path).ok();
+        let initial = shared.as_ref().map_or(0, SharedEpoch::current);
+        Self {
+            local: AtomicU64::new(initial),
+            shared,
+        }
+    }
+
+    #[inline]
+    fn current(&self) -> u64 {
+        self.shared
+            .as_ref()
+            .map_or_else(|| self.local.load(Ordering::Acquire), SharedEpoch::current)
+    }
+
+    #[inline]
+    fn bump(&self) -> u64 {
+        let epoch = self.shared.as_ref().map_or_else(
+            || self.local.fetch_add(1, Ordering::AcqRel) + 1,
+            SharedEpoch::bump,
+        );
+        self.local.store(epoch, Ordering::Release);
+        epoch
+    }
+}
+
+static TABLE_EPOCHS: Lazy<DashMap<PathBuf, TableEpoch>> = Lazy::new(DashMap::new);
 static GLOBAL_EPOCH: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Default)]
@@ -83,10 +169,13 @@ pub fn logical_write(table_path: &Path) -> LogicalWrite {
 
 #[inline]
 pub fn current(table_path: &Path) -> u64 {
+    if let Some(entry) = TABLE_EPOCHS.get(table_path) {
+        return entry.current();
+    }
     TABLE_EPOCHS
-        .get(table_path)
-        .map(|entry| entry.load(Ordering::Acquire))
-        .unwrap_or(0)
+        .entry(table_path.to_path_buf())
+        .or_insert_with(|| TableEpoch::open(table_path))
+        .current()
 }
 
 #[inline]
@@ -117,8 +206,8 @@ pub fn bump(table_path: &Path) -> u64 {
 fn bump_now(table_path: &Path) -> u64 {
     let entry = TABLE_EPOCHS
         .entry(table_path.to_path_buf())
-        .or_insert_with(|| AtomicU64::new(0));
-    let epoch = entry.fetch_add(1, Ordering::AcqRel) + 1;
+        .or_insert_with(|| TableEpoch::open(table_path));
+    let epoch = entry.bump();
     GLOBAL_EPOCH.fetch_add(1, Ordering::AcqRel);
     epoch
 }
@@ -167,5 +256,23 @@ mod tests {
         let before = current(&path);
         drop(logical_write(&path));
         assert_eq!(current(&path), before);
+    }
+
+    #[test]
+    fn shared_epoch_mappings_observe_the_same_generation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.apex");
+        let first = SharedEpoch::open(&path).unwrap();
+        let second = SharedEpoch::open(&path).unwrap();
+        let before = second.current();
+
+        assert_eq!(first.bump(), before + 1);
+        assert_eq!(second.current(), before + 1);
+        assert_eq!(
+            std::fs::metadata(path.with_extension("apex.lock"))
+                .unwrap()
+                .len(),
+            8
+        );
     }
 }

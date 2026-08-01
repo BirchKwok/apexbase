@@ -816,32 +816,54 @@ impl OnDemandStorage {
                                 }
                             })
                             .collect();
-                        (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                        if super::requires_large_arrow_offsets(data.len()) {
+                            (
+                                ArrowDataType::LargeUtf8,
+                                Arc::new(arrow::array::LargeStringArray::from(strings)),
+                            )
+                        } else {
+                            (ArrowDataType::Utf8, Arc::new(StringArray::from(strings)))
+                        }
                     } else {
                         // OPTIMIZATION: build StringArray directly from u32 offsets + data bytes
                         let row_count = count.min(active_count);
                         let data_end = offsets[row_count] as usize;
-                        let mut offsets_i32: Vec<i32> = Vec::with_capacity(row_count + 1);
-                        unsafe {
-                            std::ptr::copy_nonoverlapping(
-                                offsets[..row_count + 1].as_ptr() as *const i32,
-                                offsets_i32.as_mut_ptr(),
-                                row_count + 1,
-                            );
-                            offsets_i32.set_len(row_count + 1);
+                        if super::requires_large_arrow_offsets(data_end) {
+                            let strings = (0..row_count).map(|i| {
+                                let start = offsets[i] as usize;
+                                let end = offsets[i + 1] as usize;
+                                std::str::from_utf8(&data[start..end]).unwrap_or("")
+                            });
+                            (
+                                ArrowDataType::LargeUtf8,
+                                Arc::new(arrow::array::LargeStringArray::from_iter_values(
+                                    strings,
+                                )) as ArrayRef,
+                            )
+                        } else {
+                            let mut offsets_i32: Vec<i32> =
+                                Vec::with_capacity(row_count + 1);
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    offsets[..row_count + 1].as_ptr() as *const i32,
+                                    offsets_i32.as_mut_ptr(),
+                                    row_count + 1,
+                                );
+                                offsets_i32.set_len(row_count + 1);
+                            }
+                            let offset_buf = unsafe {
+                                arrow::buffer::OffsetBuffer::new_unchecked(ScalarBuffer::from(
+                                    offsets_i32,
+                                ))
+                            };
+                            let data_buf = Buffer::from_slice_ref(&data[..data_end]);
+                            (
+                                ArrowDataType::Utf8,
+                                Arc::new(unsafe {
+                                    StringArray::new_unchecked(offset_buf, data_buf, None)
+                                }) as ArrayRef,
+                            )
                         }
-                        let offset_buf = unsafe {
-                            arrow::buffer::OffsetBuffer::new_unchecked(ScalarBuffer::from(
-                                offsets_i32,
-                            ))
-                        };
-                        let data_buf = Buffer::from_slice_ref(&data[..data_end]);
-                        (
-                            ArrowDataType::Utf8,
-                            Arc::new(unsafe {
-                                StringArray::new_unchecked(offset_buf, data_buf, None)
-                            }) as ArrayRef,
-                        )
                     }
                 }
                 ColumnData::Bool {
@@ -888,7 +910,14 @@ impl OnDemandStorage {
                                 }
                             })
                             .collect();
-                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(bins)))
+                        if super::requires_large_arrow_offsets(data.len()) {
+                            (
+                                ArrowDataType::LargeBinary,
+                                Arc::new(LargeBinaryArray::from(bins)),
+                            )
+                        } else {
+                            (ArrowDataType::Binary, Arc::new(BinaryArray::from(bins)))
+                        }
                     } else {
                         let bins: Vec<&[u8]> = (0..count.min(active_count))
                             .map(|i| {
@@ -897,7 +926,14 @@ impl OnDemandStorage {
                                 &data[start..end]
                             })
                             .collect();
-                        (ArrowDataType::Binary, Arc::new(BinaryArray::from(bins)))
+                        if super::requires_large_arrow_offsets(data.len()) {
+                            (
+                                ArrowDataType::LargeBinary,
+                                Arc::new(LargeBinaryArray::from(bins)),
+                            )
+                        } else {
+                            (ArrowDataType::Binary, Arc::new(BinaryArray::from(bins)))
+                        }
                     }
                 }
                 ColumnData::FixedList { data, dim } => {
