@@ -171,7 +171,14 @@ impl ApexExecutor {
             std::fs::create_dir_all(parent)?;
         }
 
-        if table_path.exists() {
+        // The per-database table registry is authoritative for table names.
+        // Holding the registry lock across the existence check, file creation
+        // and registration makes CREATE TABLE race-safe between processes.
+        let table_name = crate::storage::table_catalog::bare_name(table);
+        let base_dir = table_path.parent().unwrap_or(table_path);
+        let registry_lock = crate::storage::table_catalog::lock(base_dir)?;
+        let registry = registry_lock.snapshot()?;
+        if registry.contains_key(table_name) || table_path.exists() {
             if if_not_exists {
                 // Return success without error
                 return Ok(ApexResult::Scalar(0));
@@ -260,6 +267,7 @@ impl ApexExecutor {
         }
 
         storage.save()?;
+        registry_lock.insert(table_name)?;
         epoch_write.commit();
 
         Ok(ApexResult::Scalar(0))
@@ -276,7 +284,12 @@ impl ApexExecutor {
         invalidate_storage_cache(table_path);
         crate::storage::engine::engine().invalidate(table_path);
 
-        if !table_path.exists() {
+        let table_name = crate::storage::table_catalog::bare_name(table);
+        let base_dir = table_path.parent().unwrap_or(table_path);
+        let registry_lock = crate::storage::table_catalog::lock(base_dir)?;
+        let registry = registry_lock.snapshot()?;
+        let listed = registry.contains_key(table_name);
+        if !listed && !table_path.exists() {
             if if_exists {
                 return Ok(ApexResult::Scalar(0));
             } else {
@@ -286,26 +299,33 @@ impl ApexExecutor {
                 ));
             }
         }
-        let epoch_write = crate::storage::epoch::logical_write(table_path);
 
-        std::fs::remove_file(table_path)?;
-        invalidate_table_schema_stats(&table_path.to_string_lossy());
-
-        // Clean up associated files (WAL, delta, deltastore) in same directory as table
-        let parent_dir = table_path.parent().unwrap_or(table_path);
-        let file_stem = table_path.file_name().unwrap_or_default().to_string_lossy();
-        let cleanup_extensions = [
-            format!("{}.wal", file_stem),
-            format!("{}.delta", file_stem),
-            format!("{}.deltastore", file_stem),
-        ];
-        for name in &cleanup_extensions {
-            let path = parent_dir.join(name);
-            if path.exists() {
-                let _ = std::fs::remove_file(&path);
-            }
+        if listed {
+            registry_lock.remove(table_name)?;
         }
-        epoch_write.commit();
+
+        if table_path.exists() {
+            let epoch_write = crate::storage::epoch::logical_write(table_path);
+
+            std::fs::remove_file(table_path)?;
+            invalidate_table_schema_stats(&table_path.to_string_lossy());
+
+            // Clean up associated files (WAL, delta, deltastore) in same directory as table
+            let parent_dir = table_path.parent().unwrap_or(table_path);
+            let file_stem = table_path.file_name().unwrap_or_default().to_string_lossy();
+            let cleanup_extensions = [
+                format!("{}.wal", file_stem),
+                format!("{}.delta", file_stem),
+                format!("{}.deltastore", file_stem),
+            ];
+            for name in &cleanup_extensions {
+                let path = parent_dir.join(name);
+                if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                }
+            }
+            epoch_write.commit();
+        }
 
         Ok(ApexResult::Scalar(0))
     }
@@ -334,10 +354,19 @@ impl ApexExecutor {
         // Keep SELECT fast by avoiding auto-compact there; pay this cost only for DDL.
         Self::materialize_table_sidecars(table_path)?;
 
-        // Note: ALTER TABLE operations need to preserve existing data, so we use open_for_write
-        // which loads all column data. For true schema-only operations (like TRUNCATE),
-        // we can use open_for_schema_change which only loads metadata.
-        let storage = TableStorageBackend::open_for_write(&table_path)?;
+        // Pure column operations are schema-only: `open_for_schema_change`
+        // keeps the base data mmap-only and `save()` rewrites just the footer
+        // schema instead of the whole file. If unflushed rows or delta
+        // overlays are pending, fall back to the full in-memory rewrite.
+        let storage = TableStorageBackend::open_for_schema_change(&table_path)?;
+        let storage = if storage.pending_v4_in_memory_rows() > 0
+            || storage.has_pending_deltas()
+        {
+            drop(storage);
+            TableStorageBackend::open_for_write(&table_path)?
+        } else {
+            storage
+        };
 
         match operation {
             AlterTableOp::AddColumn { name, data_type } => {
@@ -2351,7 +2380,11 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
 
-        if table_path.exists() {
+        let table_name = crate::storage::table_catalog::bare_name(table);
+        let table_base_dir = table_path.parent().unwrap_or(base_dir);
+        let registry_lock = crate::storage::table_catalog::lock(table_base_dir)?;
+        let registry = registry_lock.snapshot()?;
+        if registry.contains_key(table_name) || table_path.exists() {
             if if_not_exists {
                 return Ok(ApexResult::Scalar(0));
             }
@@ -2420,6 +2453,7 @@ impl ApexExecutor {
         backend.save()?;
         invalidate_storage_cache(&table_path);
         invalidate_table_stats(&table_path.to_string_lossy());
+        registry_lock.insert(table_name)?;
         epoch_write.commit();
 
         Ok(ApexResult::Scalar(inserted as i64))

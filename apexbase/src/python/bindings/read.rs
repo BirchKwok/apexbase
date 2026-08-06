@@ -1018,7 +1018,11 @@ impl ApexStorageImpl {
         sorted_ids.dedup();
 
         if backend.storage.is_v4_format() && !backend.storage.has_v4_in_memory_data() {
-            if let Ok(Some(batch_cols)) = backend.storage.retrieve_many_mmap_columns(&sorted_ids) {
+            if let Ok(Some(batch_cols)) =
+                backend
+                    .storage
+                    .retrieve_many_mmap_columns_projected(&sorted_ids, &columns)
+            {
                 let row_count = batch_cols.row_count;
                 if row_count != sorted_ids.len() {
                     return Ok(None);

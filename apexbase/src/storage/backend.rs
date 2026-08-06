@@ -4077,6 +4077,18 @@ impl TableStorageBackend {
             .scan_top_k_indices_mmap(col_name, k, descending)
     }
 
+    /// Decode persisted rows for a projection through the mmap fast path.
+    /// Only the requested columns are staged and decoded, which keeps small
+    /// projected point/batch reads fast for both the Python binding and Rust
+    /// crate users.
+    pub fn retrieve_many_mmap_columns_projected(
+        &self,
+        ids: &[u64],
+        columns: &[String],
+    ) -> io::Result<Option<crate::storage::on_demand::MmapBatchColumns>> {
+        self.storage.retrieve_many_mmap_columns_projected(ids, columns)
+    }
+
     /// Get underlying storage for direct access
     pub fn storage(&self) -> &OnDemandStorage {
         &self.storage

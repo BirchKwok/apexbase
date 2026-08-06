@@ -178,7 +178,7 @@ class TestFTSPersistenceLifecycle:
             client.close()
 
             client2 = ApexClient(dirpath=temp_dir)
-            client2.create_table("default")
+            client2.use_table("default")
             assert client2._is_fts_enabled()
 
             # Should work without calling init_fts again (lazy init)
@@ -197,7 +197,7 @@ class TestFTSPersistenceLifecycle:
             client.close()
 
             client2 = ApexClient(dirpath=temp_dir)
-            client2.create_table("default")
+            client2.use_table("default")
             assert not client2._is_fts_enabled()
             with pytest.raises(ValueError, match="Full-text search is not enabled"):
                 client2.search_text("python")
@@ -217,7 +217,7 @@ class TestFTSPersistenceLifecycle:
             index_path = Path(temp_dir) / "fts_indexes" / "default.afts"
             assert index_path.exists()
             client2 = ApexClient(dirpath=temp_dir)
-            client2.create_table("default")
+            client2.use_table("default")
             client2.drop_fts()
             client2.close()
             assert not index_path.exists()
@@ -232,7 +232,7 @@ class TestFTSPersistenceLifecycle:
             assert not index_path.exists()
 
             client3 = ApexClient(dirpath=temp_dir)
-            client3.create_table("default")
+            client3.use_table("default")
             assert not client3._is_fts_enabled()
             with pytest.raises(ValueError, match="Full-text search is not enabled"):
                 client3.search_text("python")

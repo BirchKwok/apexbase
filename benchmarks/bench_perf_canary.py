@@ -30,12 +30,15 @@ CANARY_SPECS = (
     ("Projected string equality", "bench_oltp_projected_string_eq", "median"),
     ("Insert 1 row", "bench_oltp_insert_one", "median"),
     ("UPDATE by ID", "bench_oltp_update_by_id", "median"),
-    ("DELETE 1K", "bench_delete_1k_only", "setup"),
+    ("Batch UPDATE by ID (10K)", "bench_oltp_batch_update_by_id", "once"),
+    ("DELETE 1K", "bench_delete_1k_only", "setup", "bench_delete_1k_setup"),
+    ("Table CREATE+DROP cycle", "bench_table_create_drop_cycle", "once"),
+    ("List tables (10)", "bench_list_tables", "setup", "bench_list_tables_setup"),
     ("TopK JOIN with unused BLOB", "bench_topk_join_canary", "median"),
 )
 
 
-def _run_metric(bench, method_name, mode, warmup, iterations):
+def _run_metric(bench, method_name, mode, warmup, iterations, setup_method=None):
     method = getattr(bench, method_name)
     if mode == "once":
         started = time.perf_counter()
@@ -45,7 +48,7 @@ def _run_metric(bench, method_name, mode, warmup, iterations):
         return full_bench.run_bench_nogc_median(method, warmup, iterations)
     if mode == "setup":
         return full_bench.run_bench_with_setup(
-            bench.bench_delete_1k_setup,
+            getattr(bench, setup_method),
             method,
             warmup,
             iterations,
@@ -65,10 +68,14 @@ def run_canary(rows, warmup, iterations):
     results = []
     try:
         bench.setup()
-        for name, method_name, mode in CANARY_SPECS:
+        for spec in CANARY_SPECS:
+            name, method_name, mode = spec[0], spec[1], spec[2]
+            setup_method = spec[3] if len(spec) > 3 else None
             if method_name == "bench_topk_join_canary":
                 bench.setup_topk_join_canary()
-            elapsed_ms = _run_metric(bench, method_name, mode, warmup, iterations)
+            elapsed_ms = _run_metric(
+                bench, method_name, mode, warmup, iterations, setup_method
+            )
             results.append({
                 "category": "ApexBase canary",
                 "query": name,

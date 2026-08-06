@@ -5186,7 +5186,14 @@ impl ApexExecutor {
                 Some(v) => v,
                 None => return Ok(None),
             };
-            let limit_with_off = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            // With ORDER BY the scan must see the full matching set: applying
+            // LIMIT during the row-group scan truncates to the first matching
+            // row group, so the later sort cannot find the global top-k rows.
+            let limit_with_off = if stmt.order_by.is_empty() {
+                stmt.limit.map(|l| l + stmt.offset.unwrap_or(0))
+            } else {
+                None
+            };
             let indices = match backend.scan_numeric_range_mmap(&col, lo, hi, limit_with_off)? {
                 Some(v) => v,
                 None => return Ok(None),

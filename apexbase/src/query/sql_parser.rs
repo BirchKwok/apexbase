@@ -696,7 +696,10 @@ impl SelectStatement {
                 // Expression ORDER BY (e.g. ORDER BY array_distance(col, [...])):
                 // extract all column references from the expression.
                 Self::extract_columns_from_expr(expr, &mut columns);
-            } else if ob.column != "_id" {
+            } else {
+                // Plain ORDER BY columns (including `_id`) must be read even
+                // when they are not projected; otherwise the top-k sort sees
+                // no sort key and silently returns the unsorted scan prefix.
                 columns.push(
                     ob.column
                         .rsplit('.')

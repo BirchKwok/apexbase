@@ -4047,6 +4047,25 @@ impl OnDemandStorage {
         &self,
         ids: &[u64],
     ) -> io::Result<Option<MmapBatchColumns>> {
+        self.retrieve_many_mmap_columns_impl(ids, None)
+    }
+
+    /// Decode persisted rows for a projection. Only the requested columns are
+    /// staged and decoded, which keeps small projected point/batch reads fast
+    /// and avoids building unrequested column data.
+    pub fn retrieve_many_mmap_columns_projected(
+        &self,
+        ids: &[u64],
+        columns: &[String],
+    ) -> io::Result<Option<MmapBatchColumns>> {
+        self.retrieve_many_mmap_columns_impl(ids, Some(columns))
+    }
+
+    fn retrieve_many_mmap_columns_impl(
+        &self,
+        ids: &[u64],
+        columns: Option<&[String]>,
+    ) -> io::Result<Option<MmapBatchColumns>> {
         if ids.is_empty() {
             return Ok(Some(MmapBatchColumns {
                 row_count: 0,
@@ -4061,6 +4080,19 @@ impl OnDemandStorage {
         let schema = &footer.schema;
         let col_count = schema.column_count();
         let n_ids = ids.len();
+        let col_indices: Vec<usize> = match columns {
+            Some(requested) => {
+                let mut indices = Vec::with_capacity(requested.len());
+                for name in requested {
+                    let Some(index) = schema.get_index(name) else {
+                        return Ok(None);
+                    };
+                    indices.push(index);
+                }
+                indices
+            }
+            None => (0..col_count).collect(),
+        };
 
         // ── Step 1: Map each input ID → rg_i (one footer read, no per-ID lock) ─
         let non_empty_row_groups: Vec<(u64, u64, usize)> = footer
@@ -4121,10 +4153,9 @@ impl OnDemandStorage {
             Bin(Vec<Option<Vec<u8>>>),
         }
 
-        let mut col_bufs: Vec<ColBuf> = schema
-            .columns
+        let mut col_bufs: Vec<ColBuf> = col_indices
             .iter()
-            .map(|(_, ct)| match ct {
+            .map(|&ci| match schema.columns[ci].1 {
                 ColumnType::Int64
                 | ColumnType::Int8
                 | ColumnType::Int16
@@ -4235,8 +4266,8 @@ impl OnDemandStorage {
                 continue;
             }
 
-            // Extract column values for all valid hits in this RG
-            for ci in 0..col_count {
+            // Extract column values for the requested projection only
+            for (buf_pos, &ci) in col_indices.iter().enumerate() {
                 let ct = schema.columns[ci].1;
                 let col_off = rcix[ci] as usize;
                 if col_off + null_bitmap_len > body.len() {
@@ -4251,7 +4282,7 @@ impl OnDemandStorage {
                 let encoding = col_bytes[0];
                 let data_bytes = &col_bytes[1..];
 
-                let extracted = match (encoding, ct, &mut col_bufs[ci]) {
+                let extracted = match (encoding, ct, &mut col_bufs[buf_pos]) {
                     (
                         COL_ENCODING_PLAIN,
                         ColumnType::Int64
@@ -4419,7 +4450,7 @@ impl OnDemandStorage {
                 if !extracted {
                     // Fallback: full column decode, pick values at target indices
                     let (col_data, _) = read_column_encoded(col_bytes, ct)?;
-                    match &mut col_bufs[ci] {
+                    match &mut col_bufs[buf_pos] {
                         ColBuf::I64(vals) => {
                             if let ColumnData::Int64(v) = &col_data {
                                 for &(out_pos, local_idx) in &valid_hits {
@@ -4497,7 +4528,8 @@ impl OnDemandStorage {
             }));
         }
 
-        let mut columns: Vec<(String, MmapBatchColumn)> = Vec::with_capacity(col_count + 1);
+        let mut columns: Vec<(String, MmapBatchColumn)> =
+            Vec::with_capacity(col_indices.len() + 1);
 
         // _id column
         let id_vals: Vec<i64> = (0..n_ids)
@@ -4509,7 +4541,8 @@ impl OnDemandStorage {
             MmapBatchColumn::I64(id_vals.into_iter().map(Some).collect()),
         ));
 
-        for (ci, buf) in col_bufs.into_iter().enumerate() {
+        for (buf_pos, buf) in col_bufs.into_iter().enumerate() {
+            let ci = col_indices[buf_pos];
             let col_name = &schema.columns[ci].0;
             match buf {
                 ColBuf::I64(vals) => {

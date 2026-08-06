@@ -15,6 +15,7 @@ import threading
 import queue
 import contextlib
 import ast
+import math
 
 import json
 
@@ -290,6 +291,159 @@ _RE_BOUND_TOPK = re.compile(
     r"""^\s*select\s+explode_rename\(\s*topk_distance\(\s*([A-Za-z_][\w]*)\s*,\s*\?\s*,\s*(\d+)\s*,\s*'([^']+)'\s*\)\s*,\s*'([^']+)'\s*,\s*'([^']+)'\s*\)\s+from\s+([A-Za-z_][\w]*)\s*;?\s*$""",
     re.IGNORECASE,
 )
+_SQL_NAMED_PARAM = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _sql_literal(value) -> str:
+    """
+    Render a Python value as a safe SQL literal for parameter binding.
+
+    Strings are single-quoted with ``''`` escaping; sequences are rendered as
+    comma-separated literal lists for ``IN (?)`` expansion.
+    """
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValueError("cannot bind non-finite float parameter")
+        if value.is_integer():
+            return str(int(value))
+        return repr(value)
+    if isinstance(value, str):
+        return "'" + value.replace("'", "''") + "'"
+    if isinstance(value, (list, tuple)):
+        if not value:
+            raise ValueError("cannot bind an empty list parameter")
+        return ", ".join(_sql_literal(item) for item in value)
+    raise TypeError(
+        "unsupported parameter type: {} (supported: str, int, float, bool, None, list/tuple)".format(
+            type(value).__name__
+        )
+    )
+
+
+def _bind_sql_params(sql: str, params) -> str:
+    """
+    Bind ``params`` into ``sql`` and return the fully substituted statement.
+
+    Positional ``?`` placeholders are consumed from a list/tuple ``params``;
+    named ``:name``/``@name``/``$name`` placeholders are consumed from a dict
+    ``params``. Placeholders inside string/identifier literals and comments are
+    left untouched. A list/tuple parameter expands to a comma-separated list,
+    intended for ``IN (?)``.
+    """
+    if isinstance(params, dict):
+        named = True
+        bound_params = params
+    elif isinstance(params, (list, tuple)):
+        named = False
+        bound_params = list(params)
+    else:
+        raise ValueError(
+            "params must be a list/tuple of positional values or a dict of named values"
+        )
+
+    out = []
+    i = 0
+    n = len(sql)
+    state = "normal"
+    pos = 0
+    while i < n:
+        ch = sql[i]
+        if state == "normal":
+            if ch == "'":
+                state = "single"
+                out.append(ch)
+            elif ch == '"':
+                state = "double"
+                out.append(ch)
+            elif ch == "`":
+                state = "backtick"
+                out.append(ch)
+            elif ch == "-" and sql.startswith("--", i):
+                state = "line_comment"
+                out.append(ch)
+                i += 1
+            elif ch == "/" and sql.startswith("/*", i):
+                state = "block_comment"
+                out.append(ch)
+                i += 1
+            elif ch == "?":
+                if named:
+                    raise ValueError(
+                        "named params cannot be mixed with '?' placeholders"
+                    )
+                if pos >= len(bound_params):
+                    raise ValueError(
+                        "not enough parameters: {} supplied for {} placeholders".format(
+                            len(bound_params), pos + 1
+                        )
+                    )
+                out.append(_sql_literal(bound_params[pos]))
+                pos += 1
+            elif ch in (":", "@", "$"):
+                name_match = _SQL_NAMED_PARAM.match(sql, i + 1)
+                if name_match:
+                    if not named:
+                        raise ValueError(
+                            "named placeholder {} found but params is not a dict".format(
+                                ch + name_match.group(0)
+                            )
+                        )
+                    name = name_match.group(0)
+                    if name not in bound_params:
+                        raise ValueError(
+                            "missing parameter: {}{}".format(ch, name)
+                        )
+                    out.append(_sql_literal(bound_params[name]))
+                    i = name_match.end() - 1
+                else:
+                    out.append(ch)
+            else:
+                out.append(ch)
+        elif state == "single":
+            out.append(ch)
+            if ch == "'":
+                if i + 1 < n and sql[i + 1] == "'":
+                    out.append(sql[i + 1])
+                    i += 1
+                else:
+                    state = "normal"
+        elif state == "double":
+            out.append(ch)
+            if ch == '"':
+                if i + 1 < n and sql[i + 1] == '"':
+                    out.append(sql[i + 1])
+                    i += 1
+                else:
+                    state = "normal"
+        elif state == "backtick":
+            out.append(ch)
+            if ch == "`":
+                state = "normal"
+        elif state == "line_comment":
+            out.append(ch)
+            if ch == "\n":
+                state = "normal"
+        elif state == "block_comment":
+            out.append(ch)
+            if ch == "/" and i > 0 and sql[i - 1] == "*":
+                state = "normal"
+        i += 1
+
+    if state == "single":
+        raise ValueError("unterminated string literal in SQL")
+    if not named and pos != len(bound_params):
+        raise ValueError(
+            "too many parameters: {} supplied for {} placeholders".format(
+                len(bound_params), pos
+            )
+        )
+    return "".join(out)
 
 
 def _projection_columns_from_text(projection: str) -> Optional[List[str]]:
@@ -768,6 +922,10 @@ class ApexClient:
         self._last_exact_numeric_update_result = None
         self._last_missing_delete_key = None
         self._simple_sql_cache = {}
+        # `_should_show_internal_id` is a pure function of the SQL text; the
+        # cached result keeps the OLTP point/batch lookup hot paths from paying
+        # SELECT-list parsing on every call.
+        self._show_id_cache = {}
         self._numeric_range_rows_cache = {}
         self._schemaless_tables = set()
         self._buffered_writes_enabled = False
@@ -2390,10 +2548,11 @@ class ApexClient:
             sql: SQL statement to execute.
             show_internal_id: If ``True``, include the internal ``_id`` column
                 in SELECT results when applicable. ``None`` uses default policy.
-            params: Optional positional parameters. Parameter binding currently
-                supports the TopK vector query shape with one ``?`` placeholder;
-                the query vector is passed directly to the native FFI path
-                without formatting or reparsing a large SQL array literal.
+            params: Optional bound parameters. The TopK vector query shape keeps
+                its native FFI fast path. All other SQL supports positional
+                ``?`` placeholders (list/tuple) or named ``:name``/``@name``/
+                ``$name`` placeholders (dict); a list/tuple value expands to a
+                comma-separated list for ``IN (?)``.
 
         Returns:
             :class:`ResultView` containing query rows or an empty view for
@@ -2403,32 +2562,38 @@ class ApexClient:
 
         if params is not None:
             match = _RE_BOUND_TOPK.match(sql)
-            if match is None:
-                raise ValueError(
-                    "parameter binding currently supports only "
-                    "explode_rename(topk_distance(column, ?, k, metric), ...)"
+            if match is not None:
+                if isinstance(params, dict):
+                    raise ValueError(
+                        "the bound TopK query requires a positional query vector, not a dict"
+                    )
+                try:
+                    bound = list(params)
+                except TypeError as exc:
+                    raise ValueError(
+                        "params must be an iterable with one query vector"
+                    ) from exc
+                if len(bound) != 1:
+                    raise ValueError(
+                        "the bound TopK query requires exactly one parameter"
+                    )
+                col, k_text, metric, id_col, dist_col, table = match.groups()
+                self._ensure_table_selected()
+                if self._current_table is None or table.lower() != self._current_table.lower():
+                    raise ValueError(
+                        f"bound TopK query targets table {table!r}, "
+                        f"but the selected table is {self._current_table!r}"
+                    )
+                return self.topk_distance(
+                    col,
+                    bound[0],
+                    k=int(k_text),
+                    metric=metric,
+                    id_col=id_col,
+                    dist_col=dist_col,
                 )
-            try:
-                bound = list(params)
-            except TypeError as exc:
-                raise ValueError("params must be an iterable with one query vector") from exc
-            if len(bound) != 1:
-                raise ValueError("the bound TopK query requires exactly one parameter")
-            col, k_text, metric, id_col, dist_col, table = match.groups()
-            self._ensure_table_selected()
-            if self._current_table is None or table.lower() != self._current_table.lower():
-                raise ValueError(
-                    f"bound TopK query targets table {table!r}, "
-                    f"but the selected table is {self._current_table!r}"
-                )
-            return self.topk_distance(
-                col,
-                bound[0],
-                k=int(k_text),
-                metric=metric,
-                id_col=id_col,
-                dist_col=dist_col,
-            )
+            sql = _bind_sql_params(sql, params)
+            params = None
 
         if sql == "BEGIN" and not getattr(self, '_in_txn', False):
             return self._start_fast_txn(show_internal_id=show_internal_id)
@@ -2437,6 +2602,34 @@ class ApexClient:
                 return self._commit_fast_txn(show_internal_id)
             if sql == "ROLLBACK":
                 return self._rollback_fast_txn(show_internal_id)
+
+        sql_stripped = sql.strip()
+        # Thin primary-key wrapper: classification and the direct read happen
+        # inside the Rust binding in one FFI call (classify is cached in the
+        # core), so Python no longer re-parses point/batch `_id` lookups.
+        # Every other SELECT falls through to the existing flow, which keeps
+        # Arrow type fidelity and table-function/qualified-table semantics.
+        if (not getattr(self, '_in_txn', False)
+                and not getattr(self, '_fast_txn_active', False)
+                and sql_stripped[:6].upper() == 'SELECT'
+                and ';' not in sql_stripped.rstrip(';')):
+            result = self._storage.execute_pk(sql)
+            if isinstance(result, dict):
+                row = result.get('row')
+                if row is not None:
+                    rv = ResultView(data=[row])
+                    rv._show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
+                    return rv
+                columns_dict = result.get('columns_dict')
+                if columns_dict is not None:
+                    rv = ResultView(lazy_pydict=columns_dict)
+                    rv._show_internal_id = self._resolve_show_internal_id(
+                        sql, show_internal_id
+                    )
+                    return rv
+                rv = ResultView(data=None)
+                rv._show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
+                return rv
 
         cached_simple = self._simple_sql_cache.get(sql)
         if cached_simple:
@@ -2450,7 +2643,7 @@ class ApexClient:
                     if current_table and (
                             table_name == current_table
                             or table_name.lower() == current_table.lower()):
-                        show_flag = bool(show_internal_id) if show_internal_id is not None else False
+                        show_flag = self._resolve_show_internal_id(sql, show_internal_id)
                         if kind == 'point':
                             row = self._storage.retrieve(cached_simple[2])
                             if row is not None:
@@ -2514,7 +2707,7 @@ class ApexClient:
                 and not getattr(self, '_fast_txn_active', False)):
             view_result = self._execute_simple_group_view_select(
                 sql,
-                bool(show_internal_id) if show_internal_id is not None else False,
+                self._resolve_show_internal_id(sql, show_internal_id),
             )
             if view_result is not _HOT_CACHE_MISS:
                 return view_result
@@ -2671,7 +2864,7 @@ class ApexClient:
             if not self._current_table:
                 self._ensure_table_selected()
             table_name = cached_simple[1]
-            show_flag = bool(show_internal_id) if show_internal_id is not None else False
+            show_flag = self._resolve_show_internal_id(sql, show_internal_id)
             if kind == 'string_filtered_agg':
                 if not self._current_table or table_name.lower() != self._current_table.lower():
                     return _HOT_CACHE_MISS
@@ -2704,9 +2897,10 @@ class ApexClient:
                 return rv
 
             if kind in ('batch', 'projected_batch'):
-                ids = list(cached_simple[2])
-                result = (self._storage.retrieve_many(ids) if kind == 'batch'
-                          else self._storage.retrieve_many_projected(ids, list(cached_simple[3])))
+                result = (self._storage.retrieve_many(cached_simple[2]) if kind == 'batch'
+                          else self._storage.retrieve_many_projected(
+                              cached_simple[2], cached_simple[3]
+                          ))
                 if isinstance(result, dict):
                     columns_dict = result.get('columns_dict')
                     if columns_dict is not None:
@@ -3228,8 +3422,7 @@ class ApexClient:
                 try:
                     self._ensure_table_selected()
                     if self._current_table and table_name.lower() == self._current_table.lower():
-                        if show_internal_id is None:
-                            show_internal_id = False
+                        show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
                         row = self._storage.retrieve(point_id)
                         if row is not None:
                             if not show_internal_id and '_id' in row:
@@ -3254,7 +3447,7 @@ class ApexClient:
                             row = self._recover_projected_point_row(point_id, columns)
                         if row is not None:
                             rv = ResultView(data=[row])
-                            rv._show_internal_id = show_internal_id if show_internal_id is not None else False
+                            rv._show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
                             return rv
                 except Exception:
                     pass  # fall through to the general SQL executor
@@ -3269,7 +3462,7 @@ class ApexClient:
                             columns_dict = result.get('columns_dict')
                             if columns_dict is not None:
                                 rv = ResultView(lazy_pydict=columns_dict)
-                                rv._show_internal_id = show_internal_id if show_internal_id is not None else False
+                                rv._show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
                                 return rv
                 except Exception:
                     pass  # fall through to the general SQL executor
@@ -3284,7 +3477,7 @@ class ApexClient:
                             columns_dict = result.get('columns_dict')
                             if columns_dict is not None:
                                 rv = ResultView(lazy_pydict=columns_dict)
-                                rv._show_internal_id = show_internal_id if show_internal_id is not None else False
+                                rv._show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
                                 return rv
                 except Exception:
                     pass  # fall through to the general SQL executor
@@ -3299,7 +3492,7 @@ class ApexClient:
                             columns_dict = result.get('columns_dict')
                             if columns_dict is not None:
                                 rv = ResultView(lazy_pydict=columns_dict)
-                                rv._show_internal_id = show_internal_id if show_internal_id is not None else False
+                                rv._show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
                                 return rv
                 except Exception:
                     pass  # fall through to the general SQL executor
@@ -3316,7 +3509,7 @@ class ApexClient:
                             columns_dict = result.get('columns_dict')
                             if columns_dict is not None:
                                 rv = ResultView(lazy_pydict=columns_dict)
-                                rv._show_internal_id = show_internal_id if show_internal_id is not None else False
+                                rv._show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
                                 return rv
                 except Exception:
                     pass  # fall through to the general SQL executor
@@ -3326,7 +3519,7 @@ class ApexClient:
                 try:
                     self._ensure_table_selected()
                     if self._current_table and table_name.lower() == self._current_table.lower():
-                        show_flag = show_internal_id if show_internal_id is not None else False
+                        show_flag = self._resolve_show_internal_id(sql, show_internal_id)
                         result = self._storage.retrieve_projected_by_string_eq_limit(
                             filter_col, filter_val, list(columns), limit_val, offset_val
                         )
@@ -3782,13 +3975,79 @@ class ApexClient:
     def execute_batch(self, queries: List[str]) -> List['ResultView']:
         """Execute a SQL script in list order with read-after-write visibility.
 
+        Consecutive simple ``UPDATE ... SET <numeric column> = <literal>
+        WHERE _id = N`` statements against the same table and column are
+        coalesced into one native batch write; all other statements run
+        sequentially through :meth:`execute`.
+
         Args:
             queries: Statements to execute sequentially.
 
         Returns:
             One :class:`ResultView` per statement, in input order.
         """
-        return [self.execute(query) for query in queries]
+        results: List['ResultView'] = []
+        batch_native = getattr(self._storage, "update_numeric_by_id_batch", None)
+        i = 0
+        n_queries = len(queries)
+        while i < n_queries:
+            query = queries[i]
+            if (batch_native is not None
+                    and not getattr(self, '_in_txn', False)
+                    and not getattr(self, '_fast_txn_active', False)):
+                match = _RE_SIMPLE_NUMERIC_UPDATE_BY_ID.match(query)
+                if match is not None:
+                    table_name = match.group(1)
+                    col_name = match.group(2)
+                    if col_name != "_id":
+                        run = [(int(match.group(4)), match.group(3))]
+                        j = i + 1
+                        while j < n_queries:
+                            nxt = _RE_SIMPLE_NUMERIC_UPDATE_BY_ID.match(queries[j])
+                            if (nxt is None
+                                    or nxt.group(1).lower() != table_name.lower()
+                                    or nxt.group(2).lower() != col_name.lower()):
+                                break
+                            run.append((int(nxt.group(4)), nxt.group(3)))
+                            j += 1
+                        try:
+                            with self._lock:
+                                self._ensure_table_selected()
+                                if (self._current_table
+                                        and table_name.lower() != self._current_table.lower()):
+                                    self._storage.use_table(table_name)
+                                    self._current_table = table_name
+                                self._flush_pending_overlay_writes_unlocked()
+                                ids = [row_id for row_id, _ in run]
+                                values = [
+                                    float(value_text) if "." in value_text
+                                    else int(value_text)
+                                    for _, value_text in run
+                                ]
+                                out = batch_native(ids, col_name, values)
+                            if out is not None:
+                                any_written = False
+                                for offset, count in enumerate(out):
+                                    if count is None:
+                                        results.append(self.execute(queries[i + offset]))
+                                    else:
+                                        if count not in (None, 0):
+                                            any_written = True
+                                        rv = ResultView(
+                                            lazy_pydict={"rows_affected": [count]}
+                                        )
+                                        rv._show_internal_id = False
+                                        results.append(rv)
+                                if any_written:
+                                    self._has_writes = True
+                                    self._invalidate_replace_cache()
+                                i = j
+                                continue
+                        except (ValueError, TypeError):
+                            pass  # fall through to sequential execution
+            results.append(self.execute(query))
+            i += 1
+        return results
 
     def execute_batch_parallel(self, queries: List[str]) -> List['ResultView']:
         """Execute independent read-only statements concurrently.
@@ -4079,6 +4338,10 @@ class ApexClient:
         Returns:
             ``True`` if ``_id`` is explicitly projected (and not only via ``*``).
         """
+        cached = self._show_id_cache.get(sql)
+        if cached is not None:
+            return cached
+
         # Fast path: if _id not mentioned at all, skip expensive regex
         if '_id' not in sql:
             return False
@@ -4130,9 +4393,28 @@ class ApexClient:
         has_id = any(has_explicit_id(it) for it in items)
         
         # Show _id if explicitly referenced (and not just SELECT *)
+        result = False
         if has_id and not (len(items) == 1 and has_star):
-            return True
-        return False
+            result = True
+        if len(self._show_id_cache) >= 512:
+            self._show_id_cache.clear()
+        self._show_id_cache[sql] = result
+        return result
+
+    def _resolve_show_internal_id(
+        self, sql: str, show_internal_id: Optional[bool]
+    ) -> bool:
+        """
+        Resolve the effective ``_id`` visibility for a SELECT result.
+
+        An explicit caller-provided flag always wins. When unset, the default
+        policy applies: explicitly projecting ``_id`` shows it; otherwise the
+        internal id stays hidden. The same policy is applied before and after
+        flushes so visibility never depends on storage state.
+        """
+        if show_internal_id is not None:
+            return bool(show_internal_id)
+        return self._should_show_internal_id(sql)
 
     def query(self, sql: str = None, where_clause: str = None, limit: int = None) -> 'ResultView':
         """

@@ -549,7 +549,10 @@ class TestPersistenceRecovery:
         with tempfile.TemporaryDirectory() as temp_dir:
             for session in range(5):
                 client = ApexClient(dirpath=temp_dir)
-                client.create_table("default")
+                if session == 0:
+                    client.create_table("default")
+                else:
+                    client.use_table("default")
                 if session == 0:
                     client.create_table("test")
                 client.use_table("test")
@@ -561,7 +564,7 @@ class TestPersistenceRecovery:
             
             # Final read
             client = ApexClient(dirpath=temp_dir)
-            client.create_table("default")
+            client.use_table("default")
             client.use_table("test")
             result = client.execute("SELECT COUNT(*) as cnt FROM test").to_dict()
             assert result[0]["cnt"] == 500

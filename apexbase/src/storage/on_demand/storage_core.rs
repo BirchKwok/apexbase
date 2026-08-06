@@ -270,8 +270,8 @@ impl OnDemandStorage {
             global_lock: parking_lot::RwLock::new(()),
         };
 
-        // Write initial file
-        storage.save()?;
+        // Write initial file (single-shot empty-file writer).
+        storage.save_initial_file()?;
 
         Ok(storage)
     }

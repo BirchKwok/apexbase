@@ -262,7 +262,10 @@ class TestCrashRecovery:
         with tempfile.TemporaryDirectory() as temp_dir:
             for session in range(5):
                 c = ApexClient(temp_dir)
-                c.create_table('default')
+                if session == 0:
+                    c.create_table('default')
+                else:
+                    c.use_table('default')
                 if session == 0:
                     c.create_table('inc', {'session': 'int', 'row': 'int'})
                 c.use_table('inc')
@@ -272,7 +275,7 @@ class TestCrashRecovery:
 
             # Final verification
             c = ApexClient(temp_dir)
-            c.create_table('default')
+            c.use_table('default')
             c.use_table('inc')
             assert c.count_rows() == 100
             for session in range(5):

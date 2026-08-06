@@ -16,6 +16,7 @@ pub mod incremental;
 pub mod index;
 pub mod mvcc;
 pub mod on_demand;
+pub mod table_catalog;
 
 /// First user-visible row ID. ApexBase uses 1-based `_id` values.
 pub const FIRST_ROW_ID: u64 = 1;

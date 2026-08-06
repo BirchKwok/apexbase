@@ -7,6 +7,18 @@
 //! enum that determines the optimal execution path. This replaces the previous
 //! architecture where 83 fast-path checks were scattered across 4 layers.
 
+use once_cell::sync::Lazy;
+
+/// Bounded cache of `SQL text -> QuerySignature`.
+///
+/// Classification is purely syntactic, so the same SQL string always produces
+/// the same signature. Caching it here keeps repeated OLTP point/batch queries
+/// on the fast path for every consumer (PyO3 bindings, Session, embedded API)
+/// without re-running the classifier on every call.
+const CLASSIFY_CACHE_CAP: usize = 512;
+static CLASSIFY_CACHE: Lazy<dashmap::DashMap<String, QuerySignature>> =
+    Lazy::new(dashmap::DashMap::new);
+
 /// DDL sub-kind — pre-extracted table name avoids re-uppercasing in bindings.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlKind {
@@ -466,6 +478,18 @@ impl QuerySignature {
 /// The function takes a pre-computed uppercase SQL to avoid redundant allocations
 /// when the caller already has it.
 pub fn classify(sql: &str) -> QuerySignature {
+    if let Some(hit) = CLASSIFY_CACHE.get(sql) {
+        return hit.clone();
+    }
+    let signature = classify_impl(sql);
+    if CLASSIFY_CACHE.len() >= CLASSIFY_CACHE_CAP {
+        CLASSIFY_CACHE.clear();
+    }
+    CLASSIFY_CACHE.insert(sql.to_string(), signature.clone());
+    signature
+}
+
+fn classify_impl(sql: &str) -> QuerySignature {
     let s = sql.trim();
     // We work on a bounded prefix for safety. 4 KiB comfortably covers common
     // `IN (...)` lookup lists from benchmarks while keeping classification cheap.

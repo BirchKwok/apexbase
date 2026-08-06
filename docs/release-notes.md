@@ -3,6 +3,23 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.28.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.28.0)
+*2026-08-06*
+
+[Compare with v1.27.0](https://github.com/BirchKwok/ApexBase/compare/v1.27.0...v1.28.0)
+
+- Fix `create_table` silently rebuilding an existing table: table names are now managed by a per-database metadata registry (binary `.apex_tables` catalog), so a fresh process calling `create_table` on an existing table raises `Table already exists` instead of wiping data; `CREATE`/`DROP`/`ALTER` and cross-process creation are serialized by an exclusive catalog lock
+- Fix `WHERE` + `ORDER BY ... DESC LIMIT` returning rows only from the first matching row group: filtered scans now read the full matching set before global top-k sorting, and non-projected `ORDER BY` columns (including `_id`) are read so sorting is always applied
+- Unify internal `_id` visibility: explicitly projecting `_id` returns it consistently before and after flush, independent of which cached read path handles the query
+- Add a native batch numeric UPDATE path used by `execute_batch` for `UPDATE ... SET <numeric col> = <literal> WHERE _id = N`, reducing a 10,000-row backfill from roughly 28-40 seconds to about 0.1 seconds, and expose a projected mmap row-read API on the Rust crate
+- Add general SQL parameter binding to the Python client: positional `?`, named `:name`/`@name`/`$name`, IN-list expansion, string escaping, and arity/type validation, while keeping the TopK vector FFI fast path
+- Introduce a binary, memory-mapped table catalog with per-entry CRC tamper detection, generation-based snapshot caching, and legacy `*.apex` backfill; the registry is the authoritative source of table names across processes
+- Optimize core query routing: SQL classification results are cached in the core, and primary-key point/batch reads execute through a single combined FFI call on direct mmap readers, improving point lookups and projected ID batch reads
+- Add cross-engine table-operation benchmarks (CREATE, DROP, CREATE+DROP, LIST, ALTER) and canary coverage, plus regression tests for the catalog, ORDER BY correctness, parameter binding, and batch updates
+- Update the Rust crate and Python package version metadata to 1.28.0
+
+---
+
 ## [v1.27.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.27.0)
 *2026-08-01*
 

@@ -859,7 +859,10 @@ impl ApexStorageImpl {
         // Lazy: check disk using current base_dir
         let base_dir = self.current_base_dir();
         let p = base_dir.join(format!("{}.apex", table_name));
-        if p.exists() {
+        let registered = crate::storage::table_catalog::resolve(&base_dir, &table_name)
+            .map(|path| path.is_some())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if registered && p.exists() {
             self.table_paths
                 .write()
                 .insert(table_name.clone(), p.clone());
@@ -890,7 +893,10 @@ impl ApexStorageImpl {
         // Lazy: check disk using current base_dir
         let base_dir = self.current_base_dir();
         let p = base_dir.join(format!("{}.apex", table_name));
-        if p.exists() {
+        let registered = crate::storage::table_catalog::resolve(&base_dir, &table_name)
+            .map(|path| path.is_some())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if registered && p.exists() {
             self.table_paths
                 .write()
                 .insert(table_name.clone(), p.clone());
@@ -1459,6 +1465,7 @@ impl ApexStorageImpl {
         if drop_if_exists {
             crate::Database::invalidate_dir(&root_dir);
             crate::Database::unregister_fts_manager(&root_dir);
+            let _ = crate::storage::table_catalog::clear(&root_dir);
 
             // Remove all .apex files in the directory
             if let Ok(entries) = fs::read_dir(&root_dir) {

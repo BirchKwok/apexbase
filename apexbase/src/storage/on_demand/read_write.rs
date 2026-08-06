@@ -4093,10 +4093,15 @@ impl OnDemandStorage {
                 return Ok(());
             }
 
-            if !has_new_rows && !base_loaded && on_disk_rows > 0 {
+            if !has_new_rows
+                && !base_loaded
+                && (on_disk_rows > 0 || self.ids.read().is_empty())
+            {
                 // Schema-only change (add/drop/rename column) on V4 mmap-only.
-                // Base data is NOT in memory — must NOT call save_v4() which would
-                // rewrite with empty data and lose everything.
+                // Base data is NOT in memory — must NOT call save_v4() which
+                // would rewrite with empty data and lose everything. Empty
+                // tables (no on-disk rows and no in-memory rows) are also
+                // schema-only: the only change is the footer schema.
                 // Instead, update just the footer schema on disk.
                 if self.has_pending_deltas() {
                     self.save_delta_store()?;
@@ -4242,14 +4247,21 @@ impl OnDemandStorage {
         super::engine::engine().invalidate(&self.path);
         crate::storage::epoch::bump(&self.path);
 
-        // Atomic write: write to .tmp file, then rename over the original.
-        // If crash occurs mid-write, only the .tmp file is corrupted; original is intact.
+        // Fresh tables have no pre-existing data, so the file is written
+        // directly; updates keep the atomic tmp+rename so a crash never
+        // corrupts an existing table.
+        let is_fresh_create = !self.path.exists();
         let tmp_path = self.path.with_extension("apex.tmp");
+        let write_path = if is_fresh_create {
+            self.path.clone()
+        } else {
+            tmp_path.clone()
+        };
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&tmp_path)?;
+            .open(&write_path)?;
         // On Windows, larger write buffers reduce syscall overhead significantly.
         #[cfg(windows)]
         let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, file);
@@ -4659,37 +4671,39 @@ impl OnDemandStorage {
             writer_inner.sync_all()?;
         }
 
-        // Phase 3: Atomic rename .tmp → .apex
-        // POSIX rename is atomic; on crash the original file remains intact.
-        // On Windows, retry on transient failures from antivirus / Search Indexer / cloud sync
-        // that may briefly hold a sharing lock on the destination file.
         drop(header);
         drop(writer);
-        #[cfg(windows)]
-        {
-            let mut last_err = None;
-            for attempt in 0u64..5 {
-                match std::fs::rename(&tmp_path, &self.path) {
-                    Ok(()) => {
-                        last_err = None;
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                        if attempt < 4 {
-                            std::thread::sleep(std::time::Duration::from_millis(
-                                10 * (attempt + 1),
-                            ));
+        if !is_fresh_create {
+            // Phase 3: Atomic rename .tmp → .apex
+            // POSIX rename is atomic; on crash the original file remains intact.
+            // On Windows, retry on transient failures from antivirus / Search Indexer / cloud sync
+            // that may briefly hold a sharing lock on the destination file.
+            #[cfg(windows)]
+            {
+                let mut last_err = None;
+                for attempt in 0u64..5 {
+                    match std::fs::rename(&tmp_path, &self.path) {
+                        Ok(()) => {
+                            last_err = None;
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                            if attempt < 4 {
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    10 * (attempt + 1),
+                                ));
+                            }
                         }
                     }
                 }
+                if let Some(e) = last_err {
+                    return Err(e);
+                }
             }
-            if let Some(e) = last_err {
-                return Err(e);
-            }
+            #[cfg(not(windows))]
+            std::fs::rename(&tmp_path, &self.path)?;
         }
-        #[cfg(not(windows))]
-        std::fs::rename(&tmp_path, &self.path)?;
 
         // Write column stats sidecar for O(1) aggregation fast path
         self.write_col_stats_sidecar(&schema_clone, &active_columns);
@@ -4740,6 +4754,91 @@ impl OnDemandStorage {
             }
         }
 
+        Ok(())
+    }
+
+    /// Write the initial V4 file for a freshly created table in one shot.
+    ///
+    /// The byte layout is identical to what `save_v4` produces for an empty
+    /// table (256-byte header + one empty row group + footer + trailer), but
+    /// avoids the BufWriter/seek/reopen pipeline that dominates small-file
+    /// DDL latency. In-memory state is updated so the returned storage stays
+    /// fully usable (tests and CTAS/ALTER reuse it).
+    pub(crate) fn save_initial_file(&self) -> io::Result<()> {
+        let schema = self.schema.read().clone();
+        let col_count = schema.column_count() as u32;
+
+        let mut header = self.header.read().clone();
+        header.version = FORMAT_VERSION_V4;
+        header.row_count = 0;
+        header.column_count = col_count;
+        header.row_group_count = 1;
+        header.schema_offset = 0;
+        header.column_index_offset = 0;
+        header.id_column_offset = 0;
+
+        // One empty row group: magic + 0 rows + col_count + min/max + flags.
+        let rg_offset = HEADER_SIZE as u64;
+        let mut body = Vec::with_capacity(32);
+        body.extend_from_slice(MAGIC_ROW_GROUP);
+        body.extend_from_slice(&0u32.to_le_bytes());
+        body.extend_from_slice(&col_count.to_le_bytes());
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&0u64.to_le_bytes());
+        body.extend_from_slice(&[RG_COMPRESS_NONE, 1, RG_IDS_PLAIN, 0]);
+
+        let footer_offset = rg_offset + body.len() as u64;
+        header.footer_offset = footer_offset;
+        let footer = V4Footer {
+            schema,
+            row_groups: vec![RowGroupMeta {
+                offset: rg_offset,
+                data_size: body.len() as u64,
+                row_count: 0,
+                min_id: 0,
+                max_id: 0,
+                deletion_count: 0,
+            }],
+            zone_maps: Vec::new(),
+            col_offsets: Vec::new(),
+        };
+        let footer_bytes = footer.to_bytes();
+
+        let mut file_bytes =
+            Vec::with_capacity(HEADER_SIZE + body.len() + footer_bytes.len() + 16);
+        file_bytes.extend_from_slice(&header.to_bytes());
+        file_bytes.extend_from_slice(&body);
+        file_bytes.extend_from_slice(&footer_bytes);
+        file_bytes.extend_from_slice(&(footer_bytes.len() as u64).to_le_bytes());
+        file_bytes.extend_from_slice(b"APXFOOT\0");
+        std::fs::write(&self.path, &file_bytes)?;
+
+        // Mirror the save_v4 in-memory state so the storage stays usable.
+        *self.header.write() = header;
+        self.cached_footer_offset
+            .store(footer_offset, Ordering::Release);
+        *self.column_index.write() = Vec::new();
+        *self.ids.write() = Vec::new();
+        *self.columns.write() = Vec::new();
+        *self.nulls.write() = Vec::new();
+        *self.deleted.write() = Vec::new();
+        *self.id_to_idx.write() = None;
+        self.mmap_cache.write().invalidate();
+        self.invalidate_page_cache();
+        self.active_count.store(0, Ordering::SeqCst);
+        self.persisted_row_count.store(0, Ordering::SeqCst);
+        self.v4_base_loaded.store(true, Ordering::SeqCst);
+        self.next_id
+            .store(crate::storage::FIRST_ROW_ID, Ordering::SeqCst);
+
+        let file = open_for_sequential_read(&self.path)?;
+        *self.file.write() = Some(file);
+        if self.durability == super::DurabilityLevel::Fast {
+            self.mark_main_sync_pending();
+        } else {
+            self.sync_main_file_data()?;
+            self.clear_main_sync_pending();
+        }
         Ok(())
     }
 

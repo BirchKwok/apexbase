@@ -1074,6 +1074,54 @@ class SQLiteBench:
         self.conn.execute("DELETE FROM bench WHERE age = 99")
         self.conn.commit()
 
+    TABLE_OPS_NAME = "bench_table_ops"
+
+    def bench_table_create_setup(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+        self.conn.commit()
+
+    def bench_table_create(self):
+        self.conn.execute("CREATE TABLE bench_table_ops (k INTEGER)")
+        self.conn.commit()
+
+    def bench_table_drop_setup(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+        self.conn.execute("CREATE TABLE bench_table_ops (k INTEGER)")
+        self.conn.commit()
+
+    def bench_table_drop(self):
+        self.conn.execute("DROP TABLE bench_table_ops")
+        self.conn.commit()
+
+    def bench_table_create_drop_cycle(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+        self.conn.execute("CREATE TABLE bench_table_ops (k INTEGER)")
+        self.conn.execute("DROP TABLE bench_table_ops")
+        self.conn.commit()
+
+    def bench_list_tables_setup(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+        for i in range(10):
+            self.conn.execute(f"DROP TABLE IF EXISTS bench_table_ops_{i}")
+        for i in range(10):
+            self.conn.execute(f"CREATE TABLE bench_table_ops_{i} (k INTEGER)")
+        self.conn.commit()
+
+    def bench_list_tables(self):
+        return self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name LIKE 'bench_table_ops%' ORDER BY name"
+        ).fetchall()
+
+    def bench_alter_table_add_column_setup(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+        self.conn.execute("CREATE TABLE bench_table_ops (k INTEGER)")
+        self.conn.commit()
+
+    def bench_alter_table_add_column(self):
+        self.conn.execute("ALTER TABLE bench_table_ops ADD COLUMN c INTEGER")
+        self.conn.commit()
+
     def bench_window_row_number(self):
         return self._query_all(
             "SELECT name, city, score, "
@@ -1629,6 +1677,47 @@ class DuckDBBench:
     def bench_delete_1k_only(self):
         self.conn.execute("DELETE FROM bench WHERE age = 99")
 
+    TABLE_OPS_NAME = "bench_table_ops"
+
+    def bench_table_create_setup(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+
+    def bench_table_create(self):
+        self.conn.execute("CREATE TABLE bench_table_ops (k BIGINT)")
+
+    def bench_table_drop_setup(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+        self.conn.execute("CREATE TABLE bench_table_ops (k BIGINT)")
+
+    def bench_table_drop(self):
+        self.conn.execute("DROP TABLE bench_table_ops")
+
+    def bench_table_create_drop_cycle(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+        self.conn.execute("CREATE TABLE bench_table_ops (k BIGINT)")
+        self.conn.execute("DROP TABLE bench_table_ops")
+
+    def bench_list_tables_setup(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+        for i in range(10):
+            self.conn.execute(f"DROP TABLE IF EXISTS bench_table_ops_{i}")
+        for i in range(10):
+            self.conn.execute(f"CREATE TABLE bench_table_ops_{i} (k BIGINT)")
+
+    def bench_list_tables(self):
+        return self.conn.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema = 'main' "
+            "AND table_name LIKE 'bench_table_ops%' ORDER BY table_name"
+        ).fetchall()
+
+    def bench_alter_table_add_column_setup(self):
+        self.conn.execute("DROP TABLE IF EXISTS bench_table_ops")
+        self.conn.execute("CREATE TABLE bench_table_ops (k BIGINT)")
+
+    def bench_alter_table_add_column(self):
+        self.conn.execute("ALTER TABLE bench_table_ops ADD COLUMN c BIGINT")
+
     def bench_window_row_number(self):
         return self._query_all(
             "SELECT name, city, score, "
@@ -1723,6 +1812,7 @@ class ApexBaseBench:
         self._next_id = 1
         self._txn_counter = 0
         self._txn_backlog_ready = False
+        self._batch_update_queries = None
 
     def _query_all(self, sql):
         return self.client.execute(sql, show_internal_id=True).to_dict()
@@ -2017,6 +2107,14 @@ class ApexBaseBench:
             f"UPDATE default SET score = 77.0 WHERE _id = {point_lookup_id}"
         )
 
+    def bench_oltp_batch_update_by_id(self):
+        if self._batch_update_queries is None:
+            self._batch_update_queries = [
+                f"UPDATE default SET score = {70.0 + (i % 17):.1f} WHERE _id = {i + 1}"
+                for i in range(10_000)
+            ]
+        return self.client.execute_batch(self._batch_update_queries)
+
     def bench_oltp_update_missing_id(self):
         missing_id = self.n + 100_000_000
         return self.client.execute(
@@ -2287,6 +2385,63 @@ class ApexBaseBench:
     def bench_delete_1k_only(self):
         self.client.execute("DELETE FROM default WHERE age = 99")
 
+    TABLE_OPS_NAME = "bench_table_ops"
+
+    def _drop_table_ops(self, name=None):
+        name = name or self.TABLE_OPS_NAME
+        try:
+            self.client.drop_table(name)
+        except Exception:
+            pass
+
+    def _restore_default_table(self):
+        try:
+            self.client.use_table("default")
+        except Exception:
+            pass
+
+    def bench_table_create_setup(self):
+        self._restore_default_table()
+        self._drop_table_ops()
+
+    def bench_table_create(self):
+        self.client.create_table(self.TABLE_OPS_NAME, {"k": "int64"})
+
+    def bench_table_drop_setup(self):
+        self._restore_default_table()
+        self._drop_table_ops()
+        self.client.create_table(self.TABLE_OPS_NAME, {"k": "int64"})
+
+    def bench_table_drop(self):
+        self.client.drop_table(self.TABLE_OPS_NAME)
+
+    def bench_table_create_drop_cycle(self):
+        self._drop_table_ops()
+        self.client.create_table(self.TABLE_OPS_NAME, {"k": "int64"})
+        self.client.drop_table(self.TABLE_OPS_NAME)
+        self._restore_default_table()
+
+    def bench_list_tables_setup(self):
+        self._restore_default_table()
+        self._drop_table_ops()
+        for i in range(10):
+            self._drop_table_ops(f"{self.TABLE_OPS_NAME}_{i}")
+        for i in range(10):
+            self.client.create_table(f"{self.TABLE_OPS_NAME}_{i}", {"k": "int64"})
+
+    def bench_list_tables(self):
+        return self.client.list_tables()
+
+    def bench_alter_table_add_column_setup(self):
+        self._restore_default_table()
+        self._drop_table_ops()
+        self.client.create_table(self.TABLE_OPS_NAME, {"k": "int64"})
+
+    def bench_alter_table_add_column(self):
+        self.client.execute(
+            f"ALTER TABLE {self.TABLE_OPS_NAME} ADD COLUMN c INT64"
+        )
+
     def bench_window_row_number(self):
         return self._query_all(
             "SELECT name, city, score, "
@@ -2460,6 +2615,7 @@ BENCHMARKS = [
     ("Insert+Read own row",              "bench_oltp_insert_read_own_row", False, False, True, None),
     ("Insert+COUNT visible",             "bench_oltp_insert_count_visible", False, False, True, None),
     ("UPDATE by ID",                     "bench_oltp_update_by_id", False, False, True, None),
+    ("Batch UPDATE by ID (10K)",         "bench_oltp_batch_update_by_id", True, False, False, None),
     ("UPDATE missing ID",                "bench_oltp_update_missing_id", False, False, True, None),
     ("UPDATE+Read by ID",                "bench_oltp_update_read_by_id", False, False, True, None),
     ("Replace row by ID",                "bench_oltp_replace_by_id", False, False, True, None),
@@ -2467,6 +2623,13 @@ BENCHMARKS = [
     ("DELETE missing ID",                "bench_oltp_delete_missing_id", False, False, True, None),
     ("FTS Index Build (name,city,category)", "bench_fts_build",         True,  False, False, None),
     ("FTS Search ('Electronics')",           "bench_fts_search",        False, False, False, None),
+    # --- Table operations (DDL-level) run last: they mutate the catalog and
+    # must not perturb read-only OLAP/OLTP metrics.
+    ("Table CREATE (1 col)",                 "bench_table_create",          False, False, False, "bench_table_create_setup"),
+    ("Table DROP",                           "bench_table_drop",            False, False, False, "bench_table_drop_setup"),
+    ("Table CREATE+DROP cycle",              "bench_table_create_drop_cycle", False, False, False, "bench_table_create_setup"),
+    ("List tables (10)",                     "bench_list_tables",           False, False, False, "bench_list_tables_setup"),
+    ("ALTER TABLE ADD COLUMN",               "bench_alter_table_add_column", False, False, False, "bench_alter_table_add_column_setup"),
 ]
 
 OLAP_BENCHMARK_NAMES = [
@@ -2549,6 +2712,11 @@ OLTP_FAIR_BENCHMARK_NAMES = [
     "DELETE 1K (pure delete; setup rows)",
     "FTS Index Build (name,city,category)",
     "FTS Search ('Electronics')",
+    "Table CREATE (1 col)",
+    "Table DROP",
+    "Table CREATE+DROP cycle",
+    "List tables (10)",
+    "ALTER TABLE ADD COLUMN",
 ]
 
 FILE_BACKED_METHODS = {
@@ -2679,6 +2847,16 @@ FAIR_WORKLOAD_GROUPS = [
         "Search",
         [
             "FTS Search ('Electronics')",
+        ],
+    ),
+    (
+        "Table Ops",
+        [
+            "Table CREATE (1 col)",
+            "Table DROP",
+            "Table CREATE+DROP cycle",
+            "List tables (10)",
+            "ALTER TABLE ADD COLUMN",
         ],
     ),
 ]

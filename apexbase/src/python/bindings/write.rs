@@ -1305,91 +1305,12 @@ impl ApexStorageImpl {
 
         let (table_path, table_name) = self.get_current_table_info()?;
         let _epoch_write = crate::storage::epoch::logical_write(&table_path);
-        let backend_cache_key = Self::backend_cache_key(&table_path, &table_name);
-        let cache_key = format!("{}\0{}", backend_cache_key, column);
+        let Some((backend, col_type)) =
+            self.numeric_update_target(&table_path, &table_name, &column)
+        else {
+            return Ok(None);
+        };
         let replace_cache_key = Self::replace_row_cache_key(&table_path, &table_name, id as u64);
-
-        let backend_opt: Option<Arc<TableStorageBackend>> = self
-            .cached_backends
-            .get(&backend_cache_key)
-            .map(|v| Arc::clone(&v))
-            .or_else(|| {
-                crate::Database::cached_backend(&table_path).ok().map(|b| {
-                    self.cached_backends
-                        .insert(backend_cache_key.clone(), Arc::clone(&b));
-                    b
-                })
-            })
-            .or_else(|| crate::Database::open_backend(&table_path, DurabilityLevel::Fast).ok());
-
-        let Some(backend) = backend_opt else {
-            return Ok(None);
-        };
-        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
-            return Ok(None);
-        }
-
-        let table_epoch = crate::storage::epoch::current(&table_path);
-        let cached_col_type = self
-            .update_by_id_numeric_cache
-            .get(&cache_key)
-            .and_then(|entry| (entry.value().1 == table_epoch).then_some(entry.value().0));
-        if cached_col_type.is_none() {
-            self.update_by_id_numeric_cache.remove(&cache_key);
-        }
-        let col_type = if let Some(col_type) = cached_col_type {
-            col_type
-        } else {
-            let base_dir = table_path
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .to_path_buf();
-            if let Ok(index_mgr) = crate::storage::index::IndexManager::load(&table_name, &base_dir)
-            {
-                if index_mgr
-                    .list_indexes()
-                    .iter()
-                    .any(|meta| meta.effective_columns().iter().any(|c| *c == column))
-                {
-                    return Ok(None);
-                }
-            }
-
-            if backend.storage.has_constraints() {
-                return Ok(None);
-            }
-
-            let Some((_, col_type)) = backend
-                .storage
-                .get_schema()
-                .into_iter()
-                .find(|(name, _)| name == &column)
-            else {
-                return Ok(None);
-            };
-
-            let is_numeric = matches!(
-                col_type,
-                crate::storage::on_demand::ColumnType::Float64
-                    | crate::storage::on_demand::ColumnType::Float32
-                    | crate::storage::on_demand::ColumnType::Int64
-                    | crate::storage::on_demand::ColumnType::Int32
-                    | crate::storage::on_demand::ColumnType::Int16
-                    | crate::storage::on_demand::ColumnType::Int8
-                    | crate::storage::on_demand::ColumnType::UInt8
-                    | crate::storage::on_demand::ColumnType::UInt16
-                    | crate::storage::on_demand::ColumnType::UInt32
-                    | crate::storage::on_demand::ColumnType::UInt64
-                    | crate::storage::on_demand::ColumnType::Timestamp
-                    | crate::storage::on_demand::ColumnType::Date
-            );
-            if !is_numeric {
-                return Ok(None);
-            }
-            self.update_by_id_numeric_cache
-                .insert(cache_key, (col_type, table_epoch));
-            col_type
-        };
 
         let bytes = match col_type {
             crate::storage::on_demand::ColumnType::Float64
@@ -1420,6 +1341,137 @@ impl ApexStorageImpl {
             Ok(None) => Ok(None),
             Err(e) => Err(PyIOError::new_err(e.to_string())),
         }
+    }
+
+    /// Batch numeric update for many `_id` rows in a single pass.
+    ///
+    /// Uses the in-place mmap writer when the row group layout allows it, and
+    /// otherwise records all rows in the DeltaStore with one persistence call,
+    /// avoiding the per-statement SQL executor cost for bulk backfills.
+    ///
+    /// Returns `None` when the fast path cannot serve the batch as a whole
+    /// (for example constraints, indexes, or a non-numeric column); callers
+    /// must then fall back to per-statement execution. Otherwise returns one
+    /// entry per input id: `Some(affected)` when handled, or `None` for an
+    /// individual row that needs the general UPDATE path.
+    fn update_numeric_by_id_batch(
+        &self,
+        ids: Vec<i64>,
+        column: String,
+        values: Vec<f64>,
+    ) -> PyResult<Option<Vec<Option<i64>>>> {
+        if ids.len() != values.len() {
+            return Err(PyValueError::new_err(
+                "ids and values must have the same length",
+            ));
+        }
+        if ids.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        if column == "_id" || ids.iter().any(|&id| id < 0) {
+            return Ok(None);
+        }
+
+        let (table_path, table_name) = self.get_current_table_info()?;
+        let _epoch_write = crate::storage::epoch::logical_write(&table_path);
+        let Some((backend, col_type)) =
+            self.numeric_update_backend_and_type(&table_path, &table_name, &column)
+        else {
+            return Ok(None);
+        };
+
+        let mut affected = Vec::with_capacity(ids.len());
+        let mut delta_values: Vec<(u64, &str, crate::data::Value)> = Vec::new();
+        let mut delta_value_idxs: Vec<usize> = Vec::new();
+        let mut any_written = false;
+        let has_pending = backend.has_pending_deltas()
+            || backend.pending_v4_in_memory_rows() > 0;
+        for (idx, (&id, &value)) in ids.iter().zip(values.iter()).enumerate() {
+            let bytes = match col_type {
+                crate::storage::on_demand::ColumnType::Float64
+                | crate::storage::on_demand::ColumnType::Float32 => value.to_le_bytes(),
+                crate::storage::on_demand::ColumnType::Int64
+                | crate::storage::on_demand::ColumnType::Int32
+                | crate::storage::on_demand::ColumnType::Int16
+                | crate::storage::on_demand::ColumnType::Int8
+                | crate::storage::on_demand::ColumnType::UInt8
+                | crate::storage::on_demand::ColumnType::UInt16
+                | crate::storage::on_demand::ColumnType::UInt32
+                | crate::storage::on_demand::ColumnType::UInt64
+                | crate::storage::on_demand::ColumnType::Timestamp
+                | crate::storage::on_demand::ColumnType::Date => (value as i64).to_le_bytes(),
+                _ => return Ok(None),
+            };
+            let mut handled_inplace = false;
+            if !has_pending {
+                match backend.update_by_id_inplace(id as u64, &column, &bytes) {
+                    Ok(Some((n, physically_written))) => {
+                        if physically_written {
+                            any_written = true;
+                            self.replace_exact_row_cache.remove(
+                                &Self::replace_row_cache_key(&table_path, &table_name, id as u64),
+                            );
+                        }
+                        affected.push(Some(n));
+                        handled_inplace = true;
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Err(PyIOError::new_err(e.to_string())),
+                }
+            }
+            if handled_inplace {
+                continue;
+            }
+
+            // Fall back to DeltaStore for this row (compressed row groups or an
+            // existing delta overlay). The whole batch is persisted once below.
+            let row_id = id as u64;
+            if has_pending {
+                let delta = backend.storage.delta_store();
+                if delta.is_deleted(row_id) {
+                    affected.push(Some(0));
+                    continue;
+                }
+            }
+            let exists = match backend.row_id_active_rcix(row_id)? {
+                Some(exists) => exists,
+                None => {
+                    affected.push(None);
+                    continue;
+                }
+            };
+            if !exists {
+                affected.push(Some(0));
+                continue;
+            }
+            let value = match col_type {
+                crate::storage::on_demand::ColumnType::Float64
+                | crate::storage::on_demand::ColumnType::Float32 => crate::data::Value::Float64(value),
+                _ => crate::data::Value::Int64(value as i64),
+            };
+            delta_values.push((row_id, column.as_str(), value));
+            delta_value_idxs.push(idx);
+            affected.push(Some(1));
+        }
+
+        if !delta_values.is_empty() {
+            backend.delta_batch_update_rows(&delta_values);
+            backend.save_delta_store()?;
+            for &idx in &delta_value_idxs {
+                let id = ids[idx];
+                self.replace_exact_row_cache.remove(
+                    &Self::replace_row_cache_key(&table_path, &table_name, id as u64),
+                );
+                any_written = true;
+            }
+        }
+
+        if any_written {
+            crate::Database::invalidate(&table_path);
+            crate::Database::invalidate_query_cache(&table_path);
+            crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+        }
+        Ok(Some(affected))
     }
 
     fn replace(&self, py: Python<'_>, id: i64, data: &Bound<'_, PyDict>) -> PyResult<bool> {
@@ -2030,5 +2082,111 @@ impl ApexStorageImpl {
             }
         }
         Ok(0)
+    }
+}
+
+/// Rust-only helpers shared by the numeric `_id` update fast paths.
+impl ApexStorageImpl {
+    /// Resolve the backend, numeric column type, and fast-path guards for a
+    /// numeric `_id` update target. Pending DeltaStore rows are allowed; the
+    /// callers decide whether in-place or DeltaStore writes are appropriate.
+    fn numeric_update_backend_and_type(
+        &self,
+        table_path: &Path,
+        table_name: &str,
+        column: &str,
+    ) -> Option<(Arc<TableStorageBackend>, crate::storage::on_demand::ColumnType)> {
+        let backend_cache_key = Self::backend_cache_key(table_path, table_name);
+        let cache_key = format!("{}\0{}", backend_cache_key, column);
+
+        let backend_opt: Option<Arc<TableStorageBackend>> = self
+            .cached_backends
+            .get(&backend_cache_key)
+            .map(|v| Arc::clone(&v))
+            .or_else(|| {
+                crate::Database::cached_backend(table_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(backend_cache_key.clone(), Arc::clone(&b));
+                    b
+                })
+            })
+            .or_else(|| crate::Database::open_backend(table_path, DurabilityLevel::Fast).ok());
+        let backend = backend_opt?;
+
+        let table_epoch = crate::storage::epoch::current(table_path);
+        let cached_col_type = self
+            .update_by_id_numeric_cache
+            .get(&cache_key)
+            .and_then(|entry| (entry.value().1 == table_epoch).then_some(entry.value().0));
+        if cached_col_type.is_none() {
+            self.update_by_id_numeric_cache.remove(&cache_key);
+        }
+        let col_type = if let Some(col_type) = cached_col_type {
+            col_type
+        } else {
+            let base_dir = table_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf();
+            if let Ok(index_mgr) = crate::storage::index::IndexManager::load(table_name, &base_dir)
+            {
+                if index_mgr
+                    .list_indexes()
+                    .iter()
+                    .any(|meta| meta.effective_columns().iter().any(|c| *c == column))
+                {
+                    return None;
+                }
+            }
+            if backend.storage.has_constraints() {
+                return None;
+            }
+            let Some((_, col_type)) = backend
+                .storage
+                .get_schema()
+                .into_iter()
+                .find(|(name, _)| name == column)
+            else {
+                return None;
+            };
+            let is_numeric = matches!(
+                col_type,
+                crate::storage::on_demand::ColumnType::Float64
+                    | crate::storage::on_demand::ColumnType::Float32
+                    | crate::storage::on_demand::ColumnType::Int64
+                    | crate::storage::on_demand::ColumnType::Int32
+                    | crate::storage::on_demand::ColumnType::Int16
+                    | crate::storage::on_demand::ColumnType::Int8
+                    | crate::storage::on_demand::ColumnType::UInt8
+                    | crate::storage::on_demand::ColumnType::UInt16
+                    | crate::storage::on_demand::ColumnType::UInt32
+                    | crate::storage::on_demand::ColumnType::UInt64
+                    | crate::storage::on_demand::ColumnType::Timestamp
+                    | crate::storage::on_demand::ColumnType::Date
+            );
+            if !is_numeric {
+                return None;
+            }
+            self.update_by_id_numeric_cache
+                .insert(cache_key, (col_type, table_epoch));
+            col_type
+        };
+        Some((backend, col_type))
+    }
+
+    /// Resolve the backend and numeric column type for the in-place mmap fast
+    /// path, which is only safe when no DeltaStore overlay is pending.
+    fn numeric_update_target(
+        &self,
+        table_path: &Path,
+        table_name: &str,
+        column: &str,
+    ) -> Option<(Arc<TableStorageBackend>, crate::storage::on_demand::ColumnType)> {
+        let (backend, col_type) =
+            self.numeric_update_backend_and_type(table_path, table_name, column)?;
+        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+            return None;
+        }
+        Some((backend, col_type))
     }
 }

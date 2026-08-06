@@ -35,177 +35,15 @@ impl ApexStorageImpl {
                 .unwrap_or_else(|| base_dir.join(format!("{}.apex", table_name)))
         };
 
-        // ── ULTRA-FAST PATH: _id point lookup via cached_backends (warm) ──
-        // Uses per-instance DashMap — zero PathBuf hashing, bypasses STORAGE_CACHE.
-        if let QuerySignature::PointLookup { id, ref table } = &sig {
-            let (target_table, target_path) =
-                self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
-            let maybe_backend = self
-                .cached_backends
-                .get(&target_table)
-                .map(|v| Arc::clone(&v));
-            if let Some(backend) = maybe_backend {
-                if backend.has_pending_deltas()
-                    || backend.has_delta()
-                    || backend.active_row_count() != backend.row_count()
-                {
-                    // Fall back to the Arrow executor path below so DeltaMerger overlays updates.
-                } else {
-                    let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
-                    if let Ok(Some(vals)) = rcix_result {
-                        let out = PyDict::new_bound(py);
-                        let columns_dict = PyDict::new_bound(py);
-                        for (col_name, val) in &vals {
-                            let pyval = value_to_py(py, val)?;
-                            columns_dict
-                                .set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
-                        }
-                        out.set_item("columns_dict", columns_dict)?;
-                        out.set_item("rows_affected", 0i64)?;
-                        return Ok(out.into());
-                    }
-                }
-            }
-            if let Ok(backend) = crate::Database::cached_backend(&target_path) {
-                self.cached_backends
-                    .insert(target_table.clone(), Arc::clone(&backend));
-                if !backend.has_pending_deltas()
-                    && !backend.has_delta()
-                    && backend.active_row_count() == backend.row_count()
-                {
-                    let rcix_result = py.allow_threads(|| backend.storage.retrieve_rcix(*id));
-                    if let Ok(Some(vals)) = rcix_result {
-                        let out = PyDict::new_bound(py);
-                        let columns_dict = PyDict::new_bound(py);
-                        for (col_name, val) in &vals {
-                            let pyval = value_to_py(py, val)?;
-                            columns_dict
-                                .set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
-                        }
-                        out.set_item("columns_dict", columns_dict)?;
-                        out.set_item("rows_affected", 0i64)?;
-                        return Ok(out.into());
-                    }
-                }
-                // Fallback: Arrow batch path
-                if let Ok(Some(batch)) = backend.read_row_by_id_to_arrow(*id) {
-                    if batch.num_rows() > 0 {
-                        let out = PyDict::new_bound(py);
-                        let columns_dict = PyDict::new_bound(py);
-                        let schema = batch.schema();
-                        for col_idx in 0..batch.num_columns() {
-                            let col_name = schema.field(col_idx).name();
-                            let arr = batch.column(col_idx);
-                            let vals_1row: Vec<_> = (0..batch.num_rows())
-                                .map(|r| value_to_py(py, &arrow_value_at(arr, r)))
-                                .collect::<PyResult<_>>()?;
-                            columns_dict.set_item(col_name, PyList::new_bound(py, vals_1row))?;
-                        }
-                        out.set_item("columns_dict", columns_dict)?;
-                        out.set_item("rows_affected", 0i64)?;
-                        return Ok(out.into());
-                    }
-                }
-            }
-        }
-
-        // ── ULTRA-FAST PATH: projected _id point lookup ──
-        // Keep OLTP-style `SELECT col1, col2 ... WHERE _id = N` on the same
-        // direct rcix path as SELECT *, avoiding an intermediate Arrow batch.
-        if let QuerySignature::ProjectedPointLookup {
-            id,
-            ref table,
-            columns,
-        } = &sig
+        // ── PRIMARY-KEY READ FAST PATHS ──
+        // Point (`WHERE _id = N`) and batch (`WHERE _id IN (...)`) lookups run
+        // directly on the mmap column reader in a single call. These paths hold
+        // the GIL (the reads are microseconds) and never parse the SQL again:
+        // the signature came from `classify()` above.
+        if let Some(result) =
+            self.try_pk_read(py, &sig, &table_name, &table_path, &base_dir, false)?
         {
-            let (target_table, target_path) =
-                self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
-            let maybe_backend = self
-                .cached_backends
-                .get(&target_table)
-                .map(|v| Arc::clone(&v))
-                .or_else(|| {
-                    crate::Database::cached_backend(&target_path).ok().map(|b| {
-                        self.cached_backends
-                            .insert(target_table.clone(), Arc::clone(&b));
-                        b
-                    })
-                });
-
-            if let Some(backend) = maybe_backend {
-                if !backend.has_pending_deltas()
-                    && !backend.has_delta()
-                    && backend.active_row_count() == backend.row_count()
-                {
-                    let projected_cols: Vec<&str> = columns.iter().map(String::as_str).collect();
-                    let rcix_result = py.allow_threads(|| {
-                        backend
-                            .storage
-                            .retrieve_rcix_projected(*id, &projected_cols)
-                    });
-                    let vals_result = match rcix_result {
-                        Ok(Some(vals)) => Some(vals),
-                        _ => py
-                            .allow_threads(|| backend.storage.read_row_by_id_values(*id))
-                            .ok()
-                            .flatten(),
-                    };
-                    if let Some(vals) = vals_result {
-                        let out = PyDict::new_bound(py);
-                        if let Some(columns_dict) =
-                            projected_values_to_columns_dict(py, &vals, columns)?
-                        {
-                            out.set_item("columns_dict", columns_dict)?;
-                            out.set_item("rows_affected", 0i64)?;
-                            return Ok(out.into());
-                        }
-                    }
-                }
-            }
-        }
-
-        // ── FAST PATH: SELECT * ... WHERE _id IN (...) ──
-        if let QuerySignature::IdBatchLookup { ids, ref table } = &sig {
-            let (target_table, target_path) =
-                self.resolve_signature_table(table.as_deref(), &table_name, &table_path, &base_dir);
-            let maybe_backend = self
-                .cached_backends
-                .get(&target_table)
-                .map(|v| Arc::clone(&v))
-                .or_else(|| {
-                    crate::Database::cached_backend(&target_path).ok().map(|b| {
-                        self.cached_backends
-                            .insert(target_table.clone(), Arc::clone(&b));
-                        b
-                    })
-                });
-
-            if let Some(backend) = maybe_backend {
-                let sorted_ids = sort_and_dedupe_ids(ids);
-                let batch_result =
-                    py.allow_threads(|| backend.read_rows_by_ids_to_arrow(&sorted_ids));
-                if let Ok(batch) = batch_result {
-                    let batch = if batch.num_rows() > 0 {
-                        batch
-                    } else if let Ok(empty) = backend.read_columns_to_arrow(None, 0, Some(0)) {
-                        empty
-                    } else {
-                        batch
-                    };
-                    let out = PyDict::new_bound(py);
-                    let columns_dict = PyDict::new_bound(py);
-                    let schema = batch.schema();
-                    for col_idx in 0..batch.num_columns() {
-                        let col_name = schema.field(col_idx).name();
-                        let arr = batch.column(col_idx);
-                        let col_list = arrow_col_to_pylist(py, arr)?;
-                        columns_dict.set_item(col_name, col_list)?;
-                    }
-                    out.set_item("columns_dict", columns_dict)?;
-                    out.set_item("rows_affected", 0i64)?;
-                    return Ok(out.into());
-                }
-            }
+            return Ok(result);
         }
 
         // ── FAST PATH: SELECT ... WHERE string_col = 'value' LIMIT N [OFFSET M] ──
@@ -1224,6 +1062,16 @@ impl ApexStorageImpl {
             let tbl_path = self.current_base_dir().join(format!("{}.apex", name));
             self.table_paths.write().insert(name.clone(), tbl_path);
             *self.current_table.write() = name.clone();
+        } else if let QuerySignature::Ddl {
+            kind: crate::query::query_signature::DdlKind::DropTable { ref name },
+        } = &sig
+        {
+            // The executor already removed the registry entry and file; clear
+            // the client-side cache so a stale path cannot resurrect the table.
+            self.table_paths.write().remove(name);
+            if *self.current_table.read() == *name {
+                *self.current_table.write() = String::new();
+            }
         }
 
         Ok(out.into())
@@ -1306,8 +1154,14 @@ impl ApexStorageImpl {
         }
 
         // Table not in cache - check if it exists on disk (lazy discovery)
-        let table_path = self.current_base_dir().join(format!("{}.apex", name));
-        if py.allow_threads(|| table_path.exists()) {
+        let base_dir = self.current_base_dir();
+        let table_path = base_dir.join(format!("{}.apex", name));
+        let found = py.allow_threads(|| {
+            let path = crate::storage::table_catalog::resolve(&base_dir, name)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            Ok::<bool, PyErr>(path.is_some() && table_path.exists())
+        })?;
+        if found {
             // Add to cache
             self.table_paths
                 .write()
@@ -1330,39 +1184,59 @@ impl ApexStorageImpl {
         name: &str,
         schema: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
-        {
-            let mut paths = self.table_paths.write();
-            if paths.contains_key(name) {
-                // Verify the file actually exists on disk (table_paths may be stale after SQL DROP TABLE)
-                let existing_path = self.current_base_dir().join(format!("{}.apex", name));
-                if py.allow_threads(|| existing_path.exists()) {
-                    return Err(PyValueError::new_err(format!(
-                        "Table already exists: {}",
-                        name
-                    )));
-                }
-                // Stale entry: remove it and proceed with creation
-                paths.remove(name);
-            }
-        }
-
-        let table_path = self.current_base_dir().join(format!("{}.apex", name));
         let schema_cols = if let Some(schema_dict) = schema {
             Some(Self::parse_schema_dict(schema_dict)?)
         } else {
             None
         };
 
+        let base_dir = self.current_base_dir();
+        let table_path = base_dir.join(format!("{}.apex", name));
         py.allow_threads(|| {
-            if let Some(schema_cols) = schema_cols.as_ref() {
+            // The per-database table registry is authoritative: it prevents a
+            // fresh process from silently rebuilding a table that another
+            // client created, and the registry lock closes the cross-process
+            // create race (two clients cannot both pass the existence check).
+            let registry_lock = crate::storage::table_catalog::lock(&base_dir)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let registry = registry_lock
+                .snapshot()
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            if registry.contains_key(name) || table_path.exists() {
+                return Err(PyValueError::new_err(format!(
+                    "Table already exists: {}",
+                    name
+                )));
+            }
+
+            let result = if let Some(schema_cols) = schema_cols.as_ref() {
                 crate::Database::create_table_with_schema(&table_path, self.durability, schema_cols)
-                    .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))
             } else {
                 crate::Database::create_table(&table_path, self.durability)
-                    .map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))
+            };
+            match result {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(PyValueError::new_err(format!(
+                        "Table already exists: {}",
+                        name
+                    )));
+                }
+                Err(e) => {
+                    return Err(PyIOError::new_err(format!(
+                        "Failed to create table: {}",
+                        e
+                    )));
+                }
             }
+            registry_lock
+                .insert(name)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            Ok(())
         })?;
 
+        // Remove any stale cache entry before inserting the fresh one.
+        self.table_paths.write().remove(name);
         self.table_paths
             .write()
             .insert(name.to_string(), table_path);
@@ -1375,16 +1249,19 @@ impl ApexStorageImpl {
         // Invalidate cached backend first (releases file lock)
         self.invalidate_backend(name);
 
-        let path = self
-            .table_paths
-            .write()
-            .remove(name)
-            .ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", name)))?;
-
-        py.allow_threads(|| {
+        let base_dir = self.current_base_dir();
+        let path = py.allow_threads(|| {
+            let registry_lock = crate::storage::table_catalog::lock(&base_dir)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let path = registry_lock
+                .remove(name)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let path = path.ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", name)))?;
             fs::remove_file(&path)
-                .map_err(|e| PyIOError::new_err(format!("Failed to delete table file: {}", e)))
+                .map_err(|e| PyIOError::new_err(format!("Failed to delete table file: {}", e)))?;
+            Ok::<PathBuf, PyErr>(path)
         })?;
+        self.table_paths.write().remove(name);
 
         if *self.current_table.read() == name {
             *self.current_table.write() = String::new();
@@ -1459,28 +1336,17 @@ impl ApexStorageImpl {
         Ok(())
     }
 
-    fn list_tables(&self, py: Python<'_>) -> Vec<String> {
-        // Scan directory for .apex files to ensure we catch tables created via SQL
+    fn list_tables(&self, py: Python<'_>) -> PyResult<Vec<String>> {
+        // The per-database registry is authoritative; legacy databases without
+        // metadata are backfilled from `.apex` files by the catalog module.
         let base_dir = self.current_base_dir();
         py.allow_threads(|| {
-            let mut tables = Vec::new();
-            if let Ok(entries) = fs::read_dir(&base_dir) {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension()
-                        .and_then(|e| e.to_str())
-                        .map(|s| s == "apex")
-                        .unwrap_or(false)
-                    {
-                        if let Some(stem) = p.file_stem().and_then(|s| s.to_str()) {
-                            tables.push(stem.to_string());
-                        }
-                    }
-                }
-            }
-            tables.sort();
-            tables.dedup();
-            tables
+            crate::storage::table_catalog::list(&base_dir)
+                .map(|mut tables| {
+                    tables.sort();
+                    tables
+                })
+                .map_err(|e| PyIOError::new_err(e.to_string()))
         })
     }
 
@@ -1593,4 +1459,179 @@ impl ApexStorageImpl {
 
         Ok(result)
     }
+}
+
+impl ApexStorageImpl {
+    /// Combined primary-key read fast path.
+    ///
+    /// Classifies the SQL (cached in the core), resolves the cached backend,
+    /// and returns the projected rows as a `columns_dict` — all in one call
+    /// with no Python-side parsing. Returns `None` for every other signature
+    /// or when pending/delta state requires the general executor.
+    fn try_pk_read(
+        &self,
+        py: Python<'_>,
+        sig: &crate::query::query_signature::QuerySignature,
+        table_name: &str,
+        table_path: &std::path::Path,
+        base_dir: &std::path::Path,
+        row_result: bool,
+    ) -> PyResult<Option<PyObject>> {
+        use crate::query::query_signature::QuerySignature;
+
+        let (pk_ids, pk_id, pk_table, pk_columns) = match sig {
+            QuerySignature::PointLookup { id, table } => {
+                (vec![*id], Some(*id), table.as_deref(), None)
+            }
+            QuerySignature::ProjectedPointLookup {
+                id,
+                table,
+                columns,
+            } => (
+                vec![*id],
+                Some(*id),
+                table.as_deref(),
+                Some(columns.as_slice()),
+            ),
+            QuerySignature::IdBatchLookup { ids, table } => {
+                (ids.clone(), None, table.as_deref(), None)
+            }
+            QuerySignature::ProjectedIdBatchLookup {
+                ids,
+                table,
+                columns,
+            } => (
+                ids.clone(),
+                None,
+                table.as_deref(),
+                Some(columns.as_slice()),
+            ),
+            _ => return Ok(None),
+        };
+        if pk_ids.is_empty() {
+            return Ok(None);
+        }
+
+        let (target_table, target_path) = self.resolve_signature_table(
+            pk_table,
+            table_name,
+            table_path,
+            base_dir,
+        );
+        let maybe_backend = self
+            .cached_backends
+            .get(&target_table)
+            .map(|v| Arc::clone(&v))
+            .or_else(|| {
+                crate::Database::cached_backend(&target_path).ok().map(|b| {
+                    self.cached_backends
+                        .insert(target_table.clone(), Arc::clone(&b));
+                    b
+                })
+            });
+
+        let Some(backend) = maybe_backend else {
+            return Ok(None);
+        };
+        // The on-disk delta file is loaded into the in-memory DeltaStore when
+        // the backend is opened, so two cheap guards are sufficient: no
+        // pending delta overlay and no unflushed in-memory rows. File-stat
+        // based guards are deliberately avoided on this hot path.
+        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+            return Ok(None);
+        }
+
+        if let Some(id) = pk_id {
+            // Single-row point reads use the lean RCIX reader.
+            if let Some(columns) = pk_columns {
+                let projected_cols: Vec<&str> = columns.iter().map(String::as_str).collect();
+                if let Ok(Some(vals)) = backend.storage.retrieve_rcix_projected(id, &projected_cols)
+                {
+                    let out = PyDict::new_bound(py);
+                    if row_result {
+                        if let Some(row) = projected_values_to_row_dict(py, &vals, columns)? {
+                            out.set_item("row", row)?;
+                        } else {
+                            return Ok(None);
+                        }
+                    } else if let Some(columns_dict) =
+                        projected_values_to_columns_dict(py, &vals, columns)?
+                    {
+                        out.set_item("columns_dict", columns_dict)?;
+                    } else {
+                        return Ok(None);
+                    }
+                    out.set_item("rows_affected", 0i64)?;
+                    return Ok(Some(out.into()));
+                }
+            } else if let Ok(Some(vals)) = backend.storage.retrieve_rcix(id) {
+                let out = PyDict::new_bound(py);
+                if row_result {
+                    let row = PyDict::new_bound(py);
+                    for (col_name, val) in &vals {
+                        row.set_item(col_name.as_str(), value_to_py(py, val)?)?;
+                    }
+                    out.set_item("row", row)?;
+                } else {
+                    let columns_dict = PyDict::new_bound(py);
+                    for (col_name, val) in &vals {
+                        let pyval = value_to_py(py, val)?;
+                        columns_dict
+                            .set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
+                    }
+                    out.set_item("columns_dict", columns_dict)?;
+                }
+                out.set_item("rows_affected", 0i64)?;
+                return Ok(Some(out.into()));
+            }
+            return Ok(None);
+        }
+
+        // Multi-row `_id IN (...)` reads use the batch reader.
+        let sorted_ids = sort_and_dedupe_ids(&pk_ids);
+        let batch_result = if let Some(columns) = pk_columns {
+            backend
+                .storage
+                .retrieve_many_mmap_columns_projected(&sorted_ids, columns)
+        } else {
+            backend.storage.retrieve_many_mmap_columns(&sorted_ids)
+        };
+        if let Ok(Some(batch_cols)) = batch_result {
+            if batch_cols.row_count == sorted_ids.len() {
+                if let Some(columns_dict) =
+                    mmap_batch_columns_to_pydict(py, batch_cols, pk_columns)?
+                {
+                    let out = PyDict::new_bound(py);
+                    out.set_item("columns_dict", columns_dict)?;
+                    out.set_item("rows_affected", 0i64)?;
+                    return Ok(Some(out.into()));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+}
+
+#[pymethods]
+impl ApexStorageImpl {
+    /// One FFI call that classifies and direct-reads primary-key lookups.
+    /// Returns `None` when the general executor must handle the statement.
+    #[pyo3(name = "execute_pk")]
+    fn execute_pk(&self, py: Python<'_>, sql: &str) -> PyResult<Option<PyObject>> {
+        let sig = crate::query::query_signature::classify(sql);
+        let table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
+        let table_path = if table_name.is_empty() {
+            base_dir.clone()
+        } else {
+            self.table_paths
+                .read()
+                .get(&table_name)
+                .cloned()
+                .unwrap_or_else(|| base_dir.join(format!("{}.apex", table_name)))
+        };
+        self.try_pk_read(py, &sig, &table_name, &table_path, &base_dir, true)
+    }
+
 }

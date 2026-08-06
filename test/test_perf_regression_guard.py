@@ -176,10 +176,10 @@ def test_canary_manifest_references_real_benchmark_methods():
         ROOT / "benchmarks" / "bench_perf_canary.py",
     )
 
-    methods = {method for _, method, _ in canary.CANARY_SPECS}
+    methods = {spec[1] for spec in canary.CANARY_SPECS}
     available = set(dir(canary.full_bench.ApexBaseBench))
     assert methods <= available
-    assert len(canary.CANARY_SPECS) == len({name for name, _, _ in canary.CANARY_SPECS})
+    assert len(canary.CANARY_SPECS) == len({spec[0] for spec in canary.CANARY_SPECS})
 
 
 def test_full_benchmark_json_keeps_microsecond_precision(capsys):
