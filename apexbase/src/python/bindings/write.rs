@@ -1793,6 +1793,12 @@ impl ApexStorageImpl {
         py.allow_threads(|| {
             let storage = if table_path.exists() {
                 OnDemandStorage::open_with_durability(&table_path, self.durability)
+            } else if crate::storage::table_catalog::file_exists_or_registered(&table_path)? {
+                let backend = crate::storage::table_catalog::materialize_table_backend(
+                    &table_path,
+                    self.durability,
+                )?;
+                Ok(backend.storage)
             } else {
                 OnDemandStorage::create_with_durability(&table_path, self.durability)
             }
@@ -1833,6 +1839,15 @@ impl ApexStorageImpl {
         self.update_by_id_cell_cache.clear();
         self.replace_exact_row_cache.clear();
         self.flush_prewarm_tables.clear();
+
+        // Release the table catalog mapping(s) for this database so Windows
+        // can rewrite or delete `.apex_tables` after the client closes
+        // (OS error 1224 otherwise). The default database lives at root_dir;
+        // a named database lives at base_dir.
+        crate::storage::table_catalog::release(&self.root_dir);
+        if self.root_dir != base_dir {
+            crate::storage::table_catalog::release(&base_dir);
+        }
 
         // Clean up temp tables
         let _ = fs::remove_dir_all(&self.temp_dir);

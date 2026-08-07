@@ -1184,7 +1184,10 @@ def test_f16_memory_savings(tmp_path):
         return sum(
             os.path.getsize(p / f)
             for f in os.listdir(p)
-            if os.path.isfile(p / f)
+            # Count only the table data file: per-database metadata
+            # (.apex_tables, .apex_schemas, lock) is layout detail, not
+            # vector-data footprint.
+            if os.path.isfile(p / f) and f.endswith(".apex")
         )
 
     f32_size = dir_size(tmp_path / "f32")

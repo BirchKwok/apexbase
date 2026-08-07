@@ -3659,20 +3659,7 @@ impl OnDemandStorage {
         // For V4, schema is updated via footer; data stays on disk (mmap)
         self.load_all_columns_into_memory()?;
 
-        let col_type = match dtype {
-            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
-                ColumnType::Int64
-            }
-            DataType::Float64 | DataType::Float32 => ColumnType::Float64,
-            DataType::String => ColumnType::String,
-            DataType::Bool => ColumnType::Bool,
-            DataType::Binary => ColumnType::Binary,
-            DataType::Blob => ColumnType::Blob,
-            DataType::Timestamp => ColumnType::Timestamp,
-            DataType::Date => ColumnType::Date,
-            DataType::Float16Vector => ColumnType::Float16List,
-            _ => ColumnType::String,
-        };
+        let col_type = ColumnType::from_data_type(dtype);
 
         let mut schema = self.schema.write();
         let mut columns = self.columns.write();

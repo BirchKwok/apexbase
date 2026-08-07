@@ -67,13 +67,13 @@ impl ApexExecutor {
         table: &str,
     ) -> io::Result<ApexResult> {
         let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
-        if !table_path.exists() {
+        if !crate::storage::table_catalog::file_exists_or_registered(&table_path)? {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Table '{}' does not exist", table),
             ));
         }
-        let backend = TableStorageBackend::open(&table_path)?;
+        let backend = crate::Database::read_backend(&table_path)?;
         let schema_entries = backend.get_schema();
         let names: Vec<String> = schema_entries
             .iter()
@@ -159,7 +159,8 @@ impl ApexExecutor {
     }
 
     /// Execute CREATE TABLE statement
-    /// High-performance: O(1) - just creates file header
+    /// High-performance: O(1) - records the full schema in the catalog and
+    /// defers the `.apex` file write until the first real access.
     fn execute_create_table(
         table_path: &Path,
         table: &str,
@@ -172,7 +173,7 @@ impl ApexExecutor {
         }
 
         // The per-database table registry is authoritative for table names.
-        // Holding the registry lock across the existence check, file creation
+        // Holding the registry lock across the existence check, schema write
         // and registration makes CREATE TABLE race-safe between processes.
         let table_name = crate::storage::table_catalog::bare_name(table);
         let base_dir = table_path.parent().unwrap_or(table_path);
@@ -191,83 +192,77 @@ impl ApexExecutor {
         }
         let epoch_write = crate::storage::epoch::logical_write(table_path);
 
-        // Create empty storage file with schema
-        TableStorageBackend::create(&table_path)?;
-        let storage = TableStorageBackend::open_for_write(&table_path)?;
-
-        // Add columns to schema (if provided)
+        // Build the full schema (columns + constraints) once; it is persisted
+        // in the catalog sidecar and used to materialize the file lazily.
+        use crate::query::sql_parser::{ColumnConstraintKind, DefaultValueFunction};
+        use crate::storage::on_demand::{ColumnConstraints, DefaultValue};
+        let mut schema = crate::storage::OnDemandSchema::new();
         for col_def in columns {
-            storage.add_column(&col_def.name, col_def.data_type.clone())?;
-        }
-
-        // Set constraints on the underlying schema
-        {
-            use crate::query::sql_parser::{ColumnConstraintKind, DefaultValueFunction};
-            use crate::storage::on_demand::ColumnConstraints;
-            for col_def in columns {
-                if !col_def.constraints.is_empty() {
-                    let default_val = col_def.constraints.iter().find_map(|c| {
-                        use crate::storage::on_demand::DefaultValue;
-                        match c {
-                            ColumnConstraintKind::Default(v) => Some(match v {
-                                Value::Int64(n) => DefaultValue::Int64(*n),
-                                Value::Float64(f) => DefaultValue::Float64(*f),
-                                Value::String(s) => DefaultValue::String(s.clone()),
-                                Value::Bool(b) => DefaultValue::Bool(*b),
-                                Value::Date(d) => DefaultValue::Date(*d),
-                                Value::Timestamp(t) => DefaultValue::Timestamp(*t),
-                                _ => DefaultValue::Null,
-                            }),
-                            ColumnConstraintKind::DefaultFunction(func) => Some(match func {
-                                DefaultValueFunction::CurrentDate => DefaultValue::CurrentDate,
-                                DefaultValueFunction::CurrentTimestamp => {
-                                    DefaultValue::CurrentTimestamp
-                                }
-                                DefaultValueFunction::UnixTimestamp => DefaultValue::UnixTimestamp,
-                            }),
-                            _ => None,
-                        }
-                    });
-                    let check_sql = col_def.constraints.iter().find_map(|c| {
-                        if let ColumnConstraintKind::Check(sql) = c {
-                            Some(sql.clone())
-                        } else {
-                            None
-                        }
-                    });
-                    let fk = col_def.constraints.iter().find_map(|c| {
-                        if let ColumnConstraintKind::ForeignKey {
-                            ref_table,
-                            ref_column,
-                        } = c
-                        {
-                            Some((ref_table.clone(), ref_column.clone()))
-                        } else {
-                            None
-                        }
-                    });
-                    storage.storage.set_column_constraints(
-                        &col_def.name,
-                        ColumnConstraints {
-                            not_null: col_def.constraints.contains(&ColumnConstraintKind::NotNull),
-                            primary_key: col_def
-                                .constraints
-                                .contains(&ColumnConstraintKind::PrimaryKey),
-                            unique: col_def.constraints.contains(&ColumnConstraintKind::Unique),
-                            default_value: default_val,
-                            check_expr_sql: check_sql,
-                            foreign_key: fk,
-                            autoincrement: col_def
-                                .constraints
-                                .contains(&ColumnConstraintKind::Autoincrement),
-                        },
-                    );
-                }
+            if schema.get_index(&col_def.name).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Column '{}' already exists", col_def.name),
+                ));
             }
+            let idx = schema.add_column(
+                &col_def.name,
+                crate::storage::ColumnType::from_data_type(col_def.data_type.clone()),
+            );
+            let default_val = col_def.constraints.iter().find_map(|c| match c {
+                ColumnConstraintKind::Default(v) => Some(match v {
+                    Value::Int64(n) => DefaultValue::Int64(*n),
+                    Value::Float64(f) => DefaultValue::Float64(*f),
+                    Value::String(s) => DefaultValue::String(s.clone()),
+                    Value::Bool(b) => DefaultValue::Bool(*b),
+                    Value::Date(d) => DefaultValue::Date(*d),
+                    Value::Timestamp(t) => DefaultValue::Timestamp(*t),
+                    _ => DefaultValue::Null,
+                }),
+                ColumnConstraintKind::DefaultFunction(func) => Some(match func {
+                    DefaultValueFunction::CurrentDate => DefaultValue::CurrentDate,
+                    DefaultValueFunction::CurrentTimestamp => DefaultValue::CurrentTimestamp,
+                    DefaultValueFunction::UnixTimestamp => DefaultValue::UnixTimestamp,
+                }),
+                _ => None,
+            });
+            let check_sql = col_def.constraints.iter().find_map(|c| {
+                if let ColumnConstraintKind::Check(sql) = c {
+                    Some(sql.clone())
+                } else {
+                    None
+                }
+            });
+            let fk = col_def.constraints.iter().find_map(|c| {
+                if let ColumnConstraintKind::ForeignKey {
+                    ref_table,
+                    ref_column,
+                } = c
+                {
+                    Some((ref_table.clone(), ref_column.clone()))
+                } else {
+                    None
+                }
+            });
+            schema.constraints[idx] = ColumnConstraints {
+                not_null: col_def.constraints.contains(&ColumnConstraintKind::NotNull),
+                primary_key: col_def
+                    .constraints
+                    .contains(&ColumnConstraintKind::PrimaryKey),
+                unique: col_def.constraints.contains(&ColumnConstraintKind::Unique),
+                default_value: default_val,
+                check_expr_sql: check_sql,
+                foreign_key: fk,
+                autoincrement: col_def
+                    .constraints
+                    .contains(&ColumnConstraintKind::Autoincrement),
+            };
         }
 
-        storage.save()?;
         registry_lock.insert(table_name)?;
+        if let Err(e) = registry_lock.set_schema(table_name, &schema.to_bytes()) {
+            let _ = registry_lock.remove(table_name);
+            return Err(e);
+        }
         epoch_write.commit();
 
         Ok(ApexResult::Scalar(0))
@@ -302,6 +297,7 @@ impl ApexExecutor {
 
         if listed {
             registry_lock.remove(table_name)?;
+            registry_lock.remove_schema(table_name)?;
         }
 
         if table_path.exists() {
@@ -338,12 +334,44 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         use crate::query::sql_parser::AlterTableOp;
 
-        if !table_path.exists() {
+        if !crate::storage::table_catalog::file_exists_or_registered(table_path)? {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Table '{}' does not exist", table),
             ));
         }
+
+        // A registered table whose file has not been materialized yet only
+        // needs its catalog schema record updated for ADD COLUMN; the `.apex`
+        // file (with the final schema) is created on first real access.
+        if !table_path.exists() {
+            if matches!(operation, AlterTableOp::AddColumn { .. }) {
+                let table_name = crate::storage::table_catalog::bare_name(table);
+                let base_dir = table_path.parent().unwrap_or(table_path);
+                let registry_lock = crate::storage::table_catalog::lock(base_dir)?;
+                let bytes = crate::storage::table_catalog::schema_bytes(base_dir, table_name)?
+                    .unwrap_or_else(|| crate::storage::OnDemandSchema::new().to_bytes());
+                let mut schema = crate::storage::OnDemandSchema::from_bytes(&bytes)?;
+                if let AlterTableOp::AddColumn { name, data_type } = operation {
+                    if schema.get_index(name).is_some() {
+                        return Err(io::Error::new(
+                            io::ErrorKind::AlreadyExists,
+                            format!("Column '{}' already exists", name),
+                        ));
+                    }
+                    schema.add_column(name, crate::storage::ColumnType::from_data_type(*data_type));
+                }
+                registry_lock.set_schema(table_name, &schema.to_bytes())?;
+                return Ok(ApexResult::Scalar(0));
+            }
+            // Other schema changes on a lazy table materialize the file first
+            // and then run the normal rewrite path.
+            crate::storage::table_catalog::materialize_table_backend(
+                table_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+        }
+
         let epoch_write = crate::storage::epoch::logical_write(table_path);
 
         // Invalidate all caches before write (executor + StorageEngine)
@@ -395,6 +423,11 @@ impl ApexExecutor {
     /// High-performance: recreates empty file
     fn execute_truncate(storage_path: &Path) -> io::Result<ApexResult> {
         if !storage_path.exists() {
+            if crate::storage::table_catalog::file_exists_or_registered(storage_path)? {
+                // Registered lazy table with no materialized file: nothing to
+                // truncate; the catalog schema record is preserved.
+                return Ok(ApexResult::Scalar(0));
+            }
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 "Table does not exist",
@@ -1997,6 +2030,10 @@ impl ApexExecutor {
         let target_names = if let Some(cols) = columns {
             cols.to_vec()
         } else {
+            crate::storage::table_catalog::ensure_table_file(
+                target_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
             TableStorageBackend::open(target_path)?
                 .get_schema()
                 .into_iter()

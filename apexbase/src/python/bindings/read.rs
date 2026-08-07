@@ -109,9 +109,13 @@ impl ApexStorageImpl {
                 return Ok(temp_path);
             }
         }
-        // Try base_dir
+        // Try base_dir; registered lazy tables count even before their file is
+        // materialized (empty row count).
         let p = base_dir.join(format!("{}.apex", clean));
-        if p.exists() {
+        let registered = crate::storage::table_catalog::resolve(&base_dir, &clean)
+            .map(|path| path.is_some())
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        if p.exists() || registered {
             let mut paths = self.table_paths.write();
             paths.insert(clean.to_string(), p.clone());
             return Ok(p);

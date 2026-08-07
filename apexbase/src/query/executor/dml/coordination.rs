@@ -382,9 +382,18 @@ impl ApexExecutor {
         storage_path: &Path,
         rows: &[std::collections::HashMap<String, Value>],
     ) -> io::Result<Option<i64>> {
-        if rows.is_empty() || !storage_path.exists() {
+        if rows.is_empty() {
             return Ok(Some(0));
         }
+        if !storage_path.exists()
+            && !crate::storage::table_catalog::file_exists_or_registered(storage_path)?
+        {
+            return Ok(Some(0));
+        }
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
 
         let storage = TableStorageBackend::open_for_insert(storage_path)?;
         if storage.storage.has_constraints() {
@@ -493,6 +502,10 @@ impl ApexExecutor {
             return Ok(None);
         }
 
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
         let storage = TableStorageBackend::open_for_insert(storage_path)?;
         if storage.storage.has_constraints() {
             return Ok(None);
@@ -613,6 +626,10 @@ impl ApexExecutor {
                 let base_root = if let Some(base_id) = cached_base_id {
                     base_id
                 } else {
+                    crate::storage::table_catalog::ensure_table_file(
+                        &table_path,
+                        crate::storage::DurabilityLevel::Fast,
+                    )?;
                     let opened = TableStorageBackend::open_for_insert(&table_path)?;
                     let base_id = opened.next_id_value().max(crate::storage::FIRST_ROW_ID);
                     storage = Some(opened);
@@ -628,6 +645,10 @@ impl ApexExecutor {
                         let col_names: Vec<String> = if let Some(cols) = &columns {
                             cols.clone()
                         } else {
+                            crate::storage::table_catalog::ensure_table_file(
+                                &table_path,
+                                crate::storage::DurabilityLevel::Fast,
+                            )?;
                             let opened = match storage.take() {
                                 Some(opened) => opened,
                                 None => TableStorageBackend::open_for_insert(&table_path)?,
@@ -670,6 +691,10 @@ impl ApexExecutor {
                 where_clause,
             } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                crate::storage::table_catalog::ensure_table_file(
+                    &table_path,
+                    crate::storage::DurabilityLevel::Fast,
+                )?;
                 let storage = TableStorageBackend::open_for_insert(&table_path)?;
                 let mut buffered = 0i64;
 
@@ -740,6 +765,10 @@ impl ApexExecutor {
                 where_clause,
             } => {
                 let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+                crate::storage::table_catalog::ensure_table_file(
+                    &table_path,
+                    crate::storage::DurabilityLevel::Fast,
+                )?;
                 let storage = TableStorageBackend::open_for_insert(&table_path)?;
 
                 if let Some(where_expr) = &where_clause {
@@ -1073,7 +1102,7 @@ impl ApexExecutor {
         };
 
         let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
-        if !table_path.exists() {
+        if !crate::storage::table_catalog::file_exists_or_registered(&table_path)? {
             return Err(err_not_found(format!("Table '{}' does not exist", table)));
         }
 
@@ -1092,7 +1121,13 @@ impl ApexExecutor {
             )));
         }
 
-        // Determine column data type from table schema (use first column's type)
+        // Determine column data type from table schema (use first column's
+        // type). A registered lazy table is materialized with its catalog
+        // schema before the index build reads it.
+        crate::storage::table_catalog::ensure_table_file(
+            &table_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
         let storage = TableStorageBackend::open(&table_path)?;
         let schema = storage.get_schema();
         let first_col = &columns[0];
@@ -1791,12 +1826,10 @@ impl ApexExecutor {
 
     #[inline]
     pub(in crate::query::executor) fn execute_analyze(storage_path: &Path, table_name: &str) -> io::Result<ApexResult> {
-        if !storage_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Table '{}' does not exist", table_name),
-            ));
-        }
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
         let storage = TableStorageBackend::open(storage_path)?;
         let batch = storage.read_columns_to_arrow(None, 0, None)?;
         let schema = batch.schema();

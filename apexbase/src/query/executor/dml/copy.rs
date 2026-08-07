@@ -6,12 +6,10 @@ impl ApexExecutor {
         table_name: &str,
         file_path: &str,
     ) -> io::Result<ApexResult> {
-        if !storage_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Table '{}' does not exist", table_name),
-            ));
-        }
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
         let storage = TableStorageBackend::open(storage_path)?;
         let batch = storage.read_columns_to_arrow(None, 0, None)?;
         let schema = batch.schema();
@@ -52,12 +50,10 @@ impl ApexExecutor {
         if format.eq_ignore_ascii_case("PARQUET") {
             return Self::execute_copy_to_parquet(storage_path, table_name, file_path);
         }
-        if !storage_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Table '{}' does not exist", table_name),
-            ));
-        }
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
 
         let storage = TableStorageBackend::open(storage_path)?;
         let batch = storage.read_columns_to_arrow(None, 0, None)?;
@@ -179,27 +175,35 @@ impl ApexExecutor {
                 values.push(row);
             }
 
-            // Ensure table exists — create if not
+            // Ensure table exists — a registered lazy table is materialized
+            // with its catalog schema; an unregistered target is created.
             if !storage_path.exists() {
-                let mut col_defs = Vec::new();
-                for field in schema.fields() {
-                    let type_str = match field.data_type() {
-                        arrow::datatypes::DataType::Int64 => "INTEGER",
-                        arrow::datatypes::DataType::Float64 => "REAL",
-                        arrow::datatypes::DataType::Boolean => "BOOLEAN",
-                        arrow::datatypes::DataType::UInt64 => "INTEGER",
-                        _ => "TEXT",
-                    };
-                    col_defs.push(format!("{} {}", field.name(), type_str));
+                if crate::storage::table_catalog::file_exists_or_registered(storage_path)? {
+                    crate::storage::table_catalog::materialize_table_backend(
+                        storage_path,
+                        crate::storage::DurabilityLevel::Fast,
+                    )?;
+                } else {
+                    let mut col_defs = Vec::new();
+                    for field in schema.fields() {
+                        let type_str = match field.data_type() {
+                            arrow::datatypes::DataType::Int64 => "INTEGER",
+                            arrow::datatypes::DataType::Float64 => "REAL",
+                            arrow::datatypes::DataType::Boolean => "BOOLEAN",
+                            arrow::datatypes::DataType::UInt64 => "INTEGER",
+                            _ => "TEXT",
+                        };
+                        col_defs.push(format!("{} {}", field.name(), type_str));
+                    }
+                    let create_sql = format!("CREATE TABLE {} ({})", table_name, col_defs.join(", "));
+                    let create_stmt = SqlParser::parse(&create_sql).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!("Failed to parse CREATE TABLE: {}", e),
+                        )
+                    })?;
+                    Self::execute_parsed_multi(create_stmt, base_dir, default_table_path)?;
                 }
-                let create_sql = format!("CREATE TABLE {} ({})", table_name, col_defs.join(", "));
-                let create_stmt = SqlParser::parse(&create_sql).map_err(|e| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("Failed to parse CREATE TABLE: {}", e),
-                    )
-                })?;
-                Self::execute_parsed_multi(create_stmt, base_dir, default_table_path)?;
             }
 
             Self::execute_insert(storage_path, Some(&col_names), &values)?;

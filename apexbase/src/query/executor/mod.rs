@@ -893,13 +893,32 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         }
     }
 
-    // Open the file once — gives us both existence check and metadata without a separate stat()
-    let file = std::fs::File::open(path).map_err(|error| {
-        io::Error::new(
-            error.kind(),
-            format!("failed to open table '{}': {}", path.display(), error),
-        )
-    })?;
+    // Open the file once — gives us both existence check and metadata without a separate stat().
+    // A registered lazy table without a file is materialized (with its catalog
+    // schema) so empty-table queries keep working without a per-CREATE write.
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            if crate::storage::table_catalog::file_exists_or_registered(path)? {
+                crate::storage::table_catalog::materialize_table_backend(
+                    path,
+                    crate::storage::DurabilityLevel::Fast,
+                )?;
+                std::fs::File::open(path)?
+            } else {
+                return Err(io::Error::new(
+                    error.kind(),
+                    format!("failed to open table '{}': {}", path.display(), error),
+                ));
+            }
+        }
+        Err(error) => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("failed to open table '{}': {}", path.display(), error),
+            ));
+        }
+    };
     let metadata = file.metadata()?;
     let file_len = metadata.len();
     let modified = metadata

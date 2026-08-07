@@ -59,6 +59,28 @@ impl ColumnType {
         }
     }
 
+    /// Map an SQL-facing `DataType` to the on-disk column type.
+    ///
+    /// Kept in one place so schema evolution through the storage engine and
+    /// through the lazy table-catalog schema path cannot drift.
+    pub fn from_data_type(dtype: crate::data::DataType) -> Self {
+        use crate::data::DataType;
+        match dtype {
+            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+                ColumnType::Int64
+            }
+            DataType::Float64 | DataType::Float32 => ColumnType::Float64,
+            DataType::String => ColumnType::String,
+            DataType::Bool => ColumnType::Bool,
+            DataType::Binary => ColumnType::Binary,
+            DataType::Blob => ColumnType::Blob,
+            DataType::Timestamp => ColumnType::Timestamp,
+            DataType::Date => ColumnType::Date,
+            DataType::Float16Vector => ColumnType::Float16List,
+            _ => ColumnType::String,
+        }
+    }
+
     /// Fixed size in bytes (0 for variable-length types)
     pub fn fixed_size(&self) -> usize {
         match self {

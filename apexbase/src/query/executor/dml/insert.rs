@@ -147,12 +147,10 @@ impl ApexExecutor {
                 .collect());
         }
 
-        if !storage_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Table does not exist",
-            ));
-        }
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
 
         let storage = TableStorageBackend::open_for_write(storage_path)?;
         let col_names: Vec<String> = if let Some(cols) = columns {
@@ -244,12 +242,10 @@ impl ApexExecutor {
     pub(in crate::query::executor) fn resolve_default_values_insert_for_path(
         storage_path: &Path,
     ) -> io::Result<(Vec<String>, Vec<Vec<Value>>)> {
-        if !storage_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Table does not exist",
-            ));
-        }
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
 
         let storage = TableStorageBackend::open_for_write(storage_path)?;
         let schema = storage.get_schema();
@@ -305,12 +301,10 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         use std::collections::HashMap;
 
-        if !storage_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Table does not exist",
-            ));
-        }
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
         let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         // Invalidate cache before write
@@ -732,7 +726,7 @@ impl ApexExecutor {
 
                     // Open referenced table
                     let ref_path = base_dir.join(format!("{}.apex", ref_table));
-                    if !ref_path.exists() {
+                    if !crate::storage::table_catalog::file_exists_or_registered(&ref_path)? {
                         return Err(io::Error::new(
                             io::ErrorKind::NotFound,
                             format!(
@@ -741,6 +735,10 @@ impl ApexExecutor {
                             ),
                         ));
                     }
+                    crate::storage::table_catalog::ensure_table_file(
+                        &ref_path,
+                        crate::storage::DurabilityLevel::Fast,
+                    )?;
                     let ref_storage = TableStorageBackend::open(&ref_path)?;
                     let ref_batch =
                         ref_storage.read_columns_to_arrow(Some(&[ref_column.as_str()]), 0, None)?;
@@ -841,12 +839,10 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         use std::collections::HashMap;
 
-        if !storage_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Table does not exist",
-            ));
-        }
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
         let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         invalidate_storage_cache(storage_path);

@@ -880,6 +880,9 @@ impl ApexStorageImpl {
             );
 
         let sql = sql.to_string();
+        // File-replacing DDL must not run while a per-client cached backend
+        // still maps the table file (Windows OS error 1224).
+        self.release_backends_for_file_replacing_sql(&sql);
         // Return enum to avoid per-cell arrow_value_at inside allow_threads
         enum ExecOut {
             Scalar(String, i64), // key, value — for txn commands
@@ -1159,7 +1162,7 @@ impl ApexStorageImpl {
         let found = py.allow_threads(|| {
             let path = crate::storage::table_catalog::resolve(&base_dir, name)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            Ok::<bool, PyErr>(path.is_some() && table_path.exists())
+            Ok::<bool, PyErr>(path.is_some())
         })?;
         if found {
             // Add to cache
@@ -1209,29 +1212,39 @@ impl ApexStorageImpl {
                 )));
             }
 
+            // Lazy materialization: CREATE records the name (and schema) in the
+            // catalog without paying a per-table file write. The `.apex` file
+            // is created on first real access with the recorded schema.
             let result = if let Some(schema_cols) = schema_cols.as_ref() {
-                crate::Database::create_table_with_schema(&table_path, self.durability, schema_cols)
+                let mut schema = crate::storage::OnDemandSchema::new();
+                for (name, col_type) in schema_cols {
+                    schema.add_column(name, *col_type);
+                }
+                registry_lock.insert(name)?;
+                registry_lock
+                    .set_schema(name, &schema.to_bytes())
+                    .map_err(|e| {
+                        let _ = registry_lock.remove(name);
+                        e
+                    })
             } else {
-                crate::Database::create_table(&table_path, self.durability)
+                registry_lock.insert(name)
             };
             match result {
                 Ok(()) => {}
-                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                    return Err(PyValueError::new_err(format!(
-                        "Table already exists: {}",
-                        name
-                    )));
-                }
                 Err(e) => {
+                    if e.kind() == std::io::ErrorKind::AlreadyExists {
+                        return Err(PyValueError::new_err(format!(
+                            "Table already exists: {}",
+                            name
+                        )));
+                    }
                     return Err(PyIOError::new_err(format!(
                         "Failed to create table: {}",
                         e
                     )));
                 }
             }
-            registry_lock
-                .insert(name)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
             Ok(())
         })?;
 
@@ -1257,8 +1270,13 @@ impl ApexStorageImpl {
                 .remove(name)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             let path = path.ok_or_else(|| PyValueError::new_err(format!("Table not found: {}", name)))?;
-            fs::remove_file(&path)
-                .map_err(|e| PyIOError::new_err(format!("Failed to delete table file: {}", e)))?;
+            registry_lock
+                .remove_schema(name)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            if path.exists() {
+                fs::remove_file(&path)
+                    .map_err(|e| PyIOError::new_err(format!("Failed to delete table file: {}", e)))?;
+            }
             Ok::<PathBuf, PyErr>(path)
         })?;
         self.table_paths.write().remove(name);

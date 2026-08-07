@@ -5,12 +5,10 @@ impl ApexExecutor {
         storage_path: &Path,
         where_clause: Option<&SqlExpr>,
     ) -> io::Result<ApexResult> {
-        if !storage_path.exists() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "Table does not exist",
-            ));
-        }
+        crate::storage::table_catalog::ensure_table_file(
+            storage_path,
+            crate::storage::DurabilityLevel::Fast,
+        )?;
         let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         // Collect indexed column names for this table (for index maintenance)

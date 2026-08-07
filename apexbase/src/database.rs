@@ -197,7 +197,8 @@ impl Database {
         table_path: &Path,
         durability: DurabilityLevel,
     ) -> io::Result<Arc<TableStorageBackend>> {
-        TableStorageBackend::create_with_durability(table_path, durability).map(Arc::new)
+        crate::storage::table_catalog::materialize_table_backend(table_path, durability)
+            .map(Arc::new)
     }
 
     #[inline]

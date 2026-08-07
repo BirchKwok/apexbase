@@ -20,6 +20,10 @@ impl ApexStorageImpl {
         let table_path = self
             .get_current_table_path()
             .unwrap_or_else(|_| base_dir.clone());
+        // File-replacing DDL (TRUNCATE / DROP / ALTER / INSERT OVERWRITE) must
+        // run with no per-client backend still mapping the table file, or
+        // Windows rejects the file rewrite with OS error 1224.
+        self.release_backends_for_file_replacing_sql(&sql);
         // Execute query in Rust thread pool
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
             let result = crate::Session::new(&base_dir, &table_path)
@@ -207,6 +211,9 @@ impl ApexStorageImpl {
 
         let sql = sql.to_string();
         let current_txn = *self.current_txn_id.read();
+        // Same Windows-safe release as _execute_arrow_ffi: cached per-client
+        // backends would keep the table file mapped during TRUNCATE/DROP/ALTER.
+        self.release_backends_for_file_replacing_sql(&sql);
 
         let (batch, new_txn_id) = if is_multi {
             py.allow_threads(|| -> PyResult<(RecordBatch, Option<u64>)> {

@@ -157,6 +157,147 @@ def test_tampered_registry_is_rejected(tmp_path):
         reader.close()
 
 
+def test_create_table_defers_file_until_first_access(tmp_path):
+    db = str(tmp_path / "lazy")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.create_table("t", {"k": "int64"})
+        table_file = tmp_path / "lazy" / "t.apex"
+        # CREATE is metadata-only: no per-table file until first real access.
+        assert not table_file.exists()
+        assert client.list_tables() == ["t"]
+        client.use_table("t")
+        assert client.count_rows() == 0
+        client.store({"k": 1})
+        assert table_file.exists()
+        assert client.count_rows() == 1
+    finally:
+        client.close()
+
+
+def test_lazy_schema_survives_reopen_and_typed_write(tmp_path):
+    db = str(tmp_path / "lazy_schema")
+    writer = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        writer.create_table("t", {"k": "int64"})
+    finally:
+        writer.close()
+    assert not (tmp_path / "lazy_schema" / "t.apex").exists()
+
+    reader = ApexClient(dirpath=db)
+    try:
+        reader.use_table("t")
+        reader.store({"k": 42})
+        assert reader.count_rows("t") == 1
+        rows = reader.execute("SELECT * FROM t")
+        assert rows[0]["k"] == 42
+    finally:
+        reader.close()
+
+
+def test_lazy_table_sql_select_describe_alter_truncate(tmp_path):
+    db = str(tmp_path / "lazy_sql")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.create_table("t", {"k": "int64"})
+        table_file = tmp_path / "lazy_sql" / "t.apex"
+        # ALTER/TRUNCATE on a not-yet-materialized table are schema-only.
+        client.execute("ALTER TABLE t ADD COLUMN c INT64")
+        client.execute("TRUNCATE TABLE t")
+        assert not table_file.exists()
+        # First read materializes the file with the full schema.
+        assert len(client.execute("SELECT * FROM t")) == 0
+        desc = client.execute("DESCRIBE t")
+        assert any(row["column_name"] == "k" for row in desc)
+        assert any(row["column_name"] == "c" for row in desc)
+        assert table_file.exists()
+        client.store({"k": 1, "c": 2})
+        assert client.count_rows("t") == 1
+    finally:
+        client.close()
+
+
+def test_lazy_table_drop_without_materialization(tmp_path):
+    db = str(tmp_path / "lazy_drop")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.create_table("t", {"k": "int64"})
+        assert not (tmp_path / "lazy_drop" / "t.apex").exists()
+        client.drop_table("t")
+        assert client.list_tables() == []
+        # Recreate after drop works and the schema sidecar is clean.
+        client.create_table("t", {"k": "int64"})
+        client.store({"k": 1})
+        assert client.count_rows("t") == 1
+    finally:
+        client.close()
+
+
+def test_sql_create_table_defers_file_and_preserves_constraints(tmp_path):
+    db = str(tmp_path / "lazy_sql_constraints")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.execute(
+            "CREATE TABLE t (k INT NOT NULL DEFAULT 7, s TEXT "
+            "CHECK (LENGTH(s) > 0))"
+        )
+        table_file = tmp_path / "lazy_sql_constraints" / "t.apex"
+        assert not table_file.exists()
+
+        # DEFAULT fills the omitted column on first (materializing) write.
+        client.execute("INSERT INTO t (s) VALUES ('ok')")
+        assert table_file.exists()
+        rows = client.execute("SELECT k, s FROM t")
+        assert list(rows) == [{"k": 7, "s": "ok"}]
+
+        with pytest.raises(Exception):
+            client.execute("INSERT INTO t (s) VALUES ('')")
+        with pytest.raises(Exception):
+            client.execute("INSERT INTO t (k, s) VALUES (NULL, 'x')")
+    finally:
+        client.close()
+
+    # Constraints survive reopen because they were persisted in the schema
+    # sidecar and then materialized into the file footer.
+    reader = ApexClient(dirpath=db)
+    try:
+        reader.use_table("t")
+        with pytest.raises(Exception):
+            reader.execute("INSERT INTO t (s) VALUES ('')")
+        reader.execute("INSERT INTO t (s) VALUES ('after-reopen')")
+        rows = reader.execute("SELECT k, s FROM t ORDER BY s")
+        assert list(rows) == [
+            {"k": 7, "s": "after-reopen"},
+            {"k": 7, "s": "ok"},
+        ]
+    finally:
+        reader.close()
+
+
+def test_sql_create_table_autoincrement_and_foreign_key(tmp_path):
+    db = str(tmp_path / "lazy_sql_fk")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.execute("CREATE TABLE parent (id INT PRIMARY KEY)")
+        client.execute(
+            "CREATE TABLE child (id INT PRIMARY KEY AUTOINCREMENT, "
+            "pid INT REFERENCES parent(id))"
+        )
+        # Both tables are lazy until the first write materializes them.
+        assert not (tmp_path / "lazy_sql_fk" / "parent.apex").exists()
+        assert not (tmp_path / "lazy_sql_fk" / "child.apex").exists()
+
+        client.execute("INSERT INTO parent (id) VALUES (1)")
+        client.execute("INSERT INTO child (pid) VALUES (1)")
+        rows = client.execute("SELECT id, pid FROM child")
+        assert list(rows) == [{"id": 1, "pid": 1}]
+
+        with pytest.raises(Exception):
+            client.execute("INSERT INTO child (pid) VALUES (999)")
+    finally:
+        client.close()
+
+
 def _race_create(db: str, name: str, queue):
     client = ApexClient(dirpath=db)
     try:

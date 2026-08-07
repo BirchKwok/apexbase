@@ -250,7 +250,12 @@ impl StorageEngine {
         let backend = if table_path.exists() {
             TableStorageBackend::open_for_write_with_durability(table_path, durability)?
         } else {
-            TableStorageBackend::create_with_durability(table_path, durability)?
+            // Lazy table: materialize with the schema recorded in the table
+            // catalog when CREATE deferred the per-table file write.
+            crate::storage::table_catalog::materialize_table_backend(
+                table_path,
+                durability,
+            )?
         };
 
         let backend = Arc::new(backend);
@@ -314,8 +319,23 @@ impl StorageEngine {
             }
         }
 
-        // Open fresh backend (read-only mode)
-        let backend = Arc::new(TableStorageBackend::open(table_path)?);
+        // Open fresh backend (read-only mode). A registered table whose file
+        // was not yet materialized is created empty (with its catalog schema);
+        // unregistered paths keep failing with NotFound instead of creating
+        // stray files.
+        let backend = if table_path.exists() {
+            Arc::new(TableStorageBackend::open(table_path)?)
+        } else if crate::storage::table_catalog::file_exists_or_registered(table_path)? {
+            Arc::new(crate::storage::table_catalog::materialize_table_backend(
+                table_path,
+                DurabilityLevel::Fast,
+            )?)
+        } else {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("table '{}' does not exist", table_path.display()),
+            ));
+        };
         let new_modified = Self::get_modified_time(table_path);
 
         // Cache it

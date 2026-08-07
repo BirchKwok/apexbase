@@ -862,7 +862,7 @@ impl ApexStorageImpl {
         let registered = crate::storage::table_catalog::resolve(&base_dir, &table_name)
             .map(|path| path.is_some())
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        if registered && p.exists() {
+        if registered {
             self.table_paths
                 .write()
                 .insert(table_name.clone(), p.clone());
@@ -896,7 +896,7 @@ impl ApexStorageImpl {
         let registered = crate::storage::table_catalog::resolve(&base_dir, &table_name)
             .map(|path| path.is_some())
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
-        if registered && p.exists() {
+        if registered {
             self.table_paths
                 .write()
                 .insert(table_name.clone(), p.clone());
@@ -1033,7 +1033,13 @@ impl ApexStorageImpl {
         }
 
         let backend = py
-            .allow_threads(|| crate::Database::open_backend(table_path, self.durability))
+            .allow_threads(|| {
+                if table_path.exists() {
+                    crate::Database::open_backend(table_path, self.durability)
+                } else {
+                    crate::Database::create_backend(table_path, self.durability)
+                }
+            })
             .map_err(|e| PyIOError::new_err(e.to_string()))?;
         self.cached_backends.insert(cache_key, Arc::clone(&backend));
         crate::Database::cache_backend(table_path, Arc::clone(&backend));
@@ -1406,6 +1412,30 @@ impl ApexStorageImpl {
             .map(|writer| writer.table_name == table_name)
             .unwrap_or(false);
         if clear_writer {
+            *self.schema_stable_memtable_writer.write() = None;
+        }
+    }
+
+    /// Release per-client cached backends before a statement replaces or
+    /// removes a table file (TRUNCATE / INSERT OVERWRITE / DROP / ALTER).
+    ///
+    /// These backends hold open file mappings that the SQL executor's own
+    /// cache invalidation cannot see. On Windows, truncating or rewriting a
+    /// file while a user-mapped section is open fails with OS error 1224, so
+    /// the per-client reference must be dropped BEFORE the DDL runs (the
+    /// existing post-write invalidation is too late for file-replacing DDL).
+    fn release_backends_for_file_replacing_sql(&self, sql: &str) {
+        let s = sql.trim_start();
+        let head = s.get(..16).unwrap_or(s).to_ascii_uppercase();
+        let replaces_file = head.starts_with("TRUNCATE")
+            || head.starts_with("INSERT OVERWRITE")
+            || head.starts_with("DROP TABLE")
+            || head.starts_with("ALTER TABLE")
+            || (head.starts_with("BEGIN")
+                && s.to_ascii_uppercase().contains("TRUNCATE"));
+        if replaces_file {
+            self.cached_backends.clear();
+            self.flush_prewarm_tables.clear();
             *self.schema_stable_memtable_writer.write() = None;
         }
     }
