@@ -1,7 +1,7 @@
 site_name: ApexBase
 site_author: Birch Kwok
 site_description: High-performance HTAP embedded database with Rust core and Python API
-site_url: https://birchkwok.github.io/ApexBase/
+site_url: https://birchkwok.github.io/apexbase/
 repo_url: https://github.com/BirchKwok/ApexBase
 repo_name: birchkwok/ApexBase
 edit_uri: edit/main/docs/

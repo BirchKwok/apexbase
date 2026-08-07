@@ -111,22 +111,22 @@ Latest local snapshot (2026-08-07): **ApexBase 1.28.0**, 1M-row tabular dataset,
 | **FTS search** | **5.5x faster** than SQLite in the representative snapshot |
 | **Batch vector TopK cosine** | **6.8x faster** than DuckDB in the representative snapshot |
 
-Benchmarks are workload-sensitive. The default benchmark command tracks this public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/ApexBase/latest/performance/).
+Benchmarks are workload-sensitive. The default benchmark command tracks this public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/apexbase/latest/performance/).
 
 ## Documentation
 
-**Start here:** <https://birchkwok.github.io/ApexBase/>
+**Start here:** <https://birchkwok.github.io/apexbase/>
 
 | Goal | Page |
 | --- | --- |
-| **Get running quickly** | [Installation](https://birchkwok.github.io/ApexBase/latest/installation/) and [Quick Start](https://birchkwok.github.io/ApexBase/latest/QUICK_START/) |
-| **Understand the model** | [Core Concepts](https://birchkwok.github.io/ApexBase/latest/concepts/) |
-| **Use the Python API** | [Python Client Guide](https://birchkwok.github.io/ApexBase/latest/user-guide/python-client/) and [API Reference](https://birchkwok.github.io/ApexBase/latest/API_REFERENCE/) |
-| **Write SQL** | [SQL Guide](https://birchkwok.github.io/ApexBase/latest/user-guide/sql/) |
-| **Import files and DataFrames** | [Data Import](https://birchkwok.github.io/ApexBase/latest/user-guide/data-import/) |
-| **Use database tools or Arrow clients** | [Server Protocols](https://birchkwok.github.io/ApexBase/latest/user-guide/server-protocols/) |
-| **Search text or vectors** | [Full-Text Search](https://birchkwok.github.io/ApexBase/latest/FTS_GUIDE/) and [Float16 Vectors](https://birchkwok.github.io/ApexBase/latest/FLOAT16_VECTOR_GUIDE/) |
-| **Embed from Rust** | [Rust Embedded API](https://birchkwok.github.io/ApexBase/latest/RUST_EMBEDDED_API/) |
+| **Get running quickly** | [Installation](https://birchkwok.github.io/apexbase/latest/installation/) and [Quick Start](https://birchkwok.github.io/apexbase/latest/QUICK_START/) |
+| **Understand the model** | [Core Concepts](https://birchkwok.github.io/apexbase/latest/concepts/) |
+| **Use the Python API** | [Python Client Guide](https://birchkwok.github.io/apexbase/latest/user-guide/python-client/) and [API Reference](https://birchkwok.github.io/apexbase/latest/API_REFERENCE/) |
+| **Write SQL** | [SQL Guide](https://birchkwok.github.io/apexbase/latest/user-guide/sql/) |
+| **Import files and DataFrames** | [Data Import](https://birchkwok.github.io/apexbase/latest/user-guide/data-import/) |
+| **Use database tools or Arrow clients** | [Server Protocols](https://birchkwok.github.io/apexbase/latest/user-guide/server-protocols/) |
+| **Search text or vectors** | [Full-Text Search](https://birchkwok.github.io/apexbase/latest/FTS_GUIDE/) and [Float16 Vectors](https://birchkwok.github.io/apexbase/latest/FLOAT16_VECTOR_GUIDE/) |
+| **Embed from Rust** | [Rust Embedded API](https://birchkwok.github.io/apexbase/latest/RUST_EMBEDDED_API/) |
 
 ## Interfaces
 

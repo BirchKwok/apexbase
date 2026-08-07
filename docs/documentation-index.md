@@ -49,6 +49,6 @@ GitHub Pages deployment is handled by `.github/workflows/docs.yml`.
 - Pull requests run `python -m mkdocs build --strict`.
 - Manual `workflow_dispatch` runs deploy the current package version with the `latest` alias.
 - `v*` tags deploy the tag version and keep historical documentation available.
-- The site URL is configured as `https://birchkwok.github.io/ApexBase/`.
+- The site URL is configured as `https://birchkwok.github.io/apexbase/`.
 
 In GitHub repository settings, use **Pages -> Build and deployment -> Source -> Deploy from a branch**, with branch **`gh-pages`** and folder **`/(root)`**.
