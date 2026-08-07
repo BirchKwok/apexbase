@@ -46,7 +46,7 @@ match &sig {
 │  - Classifies once → _sig                       │  - Routes to correct Rust method
 │  - Manages Python-side state (_in_txn, _lock)   │  - NO query execution logic
 ├─────────────────────────────────────────────────┤
-│  PyO3 Bindings  (bindings.rs)                   │  Bridge layer
+│  PyO3 Bindings  (python/bindings/)              │  Bridge layer
 │  - classify() once per method entry             │  - execute(): writes, txn, point lookups
 │  - _execute_arrow_ffi(): all reads (zero-copy)  │  - _execute_arrow_ipc(): multi-stmt, fallback
 │  - _execute_like_ffi(): LIKE mmap scan          │  - State: current_txn_id, cached_backends
@@ -113,7 +113,7 @@ match &sig {
 ## 6. Testing Requirements
 
 - **Rust unit tests**: `cargo test --lib query_signature` — all classifier tests must pass
-- **Python integration tests**: `conda run -n dev maturin develop --release && conda run -n dev python -m pytest test/ -x -q`
+- **Python integration tests**: `maturin develop --release && python -m pytest -x -q`
 - **No test deletion**: Never delete or weaken existing tests without explicit direction
 - **Regression tests**: When fixing a bug, add a test that reproduces the original failure
 
@@ -132,10 +132,11 @@ match &sig {
 
 | File | Role |
 |------|------|
-| `src/query/query_signature.rs` | QuerySignature enum + classify() |
-| `src/query/mod.rs` | Module registration + re-exports |
-| `src/query/executor/mod.rs` | Pre-parse dispatch, execute_with_base_dir |
-| `src/query/executor/select.rs` | Post-parse SELECT fast paths (mmap) |
-| `src/query/executor/joins.rs` | resolve_table_path, resolve_point_lookup_table_path |
-| `src/python/bindings.rs` | PyO3 bridge: execute(), _execute_arrow_ffi/ipc/like |
-| `python/apexbase/client.py` | Python client: _execute_impl() classifier + dispatch |
+| `apexbase/src/query/query_signature.rs` | QuerySignature enum + classify() |
+| `apexbase/src/query/mod.rs` | Module registration + re-exports |
+| `apexbase/src/query/executor/mod.rs` | Pre-parse dispatch, execute_with_base_dir |
+| `apexbase/src/query/executor/select.rs` | Post-parse SELECT fast paths (mmap) |
+| `apexbase/src/query/executor/joins.rs` | resolve_table_path, resolve_point_lookup_table_path |
+| `apexbase/src/python/bindings.rs` | PyO3 bridge entry: execute(), _execute_arrow_ffi/ipc/like |
+| `apexbase/src/python/bindings/` | Split bindings: arrow, blob, read, sql, wrapper, write |
+| `apexbase/python/apexbase/client.py` | Python client: _execute_impl() classifier + dispatch |

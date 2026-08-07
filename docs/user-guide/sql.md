@@ -39,6 +39,31 @@ UPDATE users SET age = 31 WHERE name = 'Alice';
 DELETE FROM users WHERE age < 18;
 ```
 
+## Parameter Binding
+
+Pass `params` to `execute()` instead of interpolating strings. Positional `?`
+placeholders consume values from a list/tuple; named `:name`, `@name`, or
+`$name` placeholders read from a dict. A list/tuple value expands to a
+comma-separated list for `IN (?)`.
+
+```python
+# Positional
+client.execute("SELECT * FROM users WHERE age > ?", params=[30])
+
+# Named
+client.execute(
+    "INSERT INTO events (kind, ts) VALUES (:kind, :ts)",
+    params={"kind": "click", "ts": "2026-08-07 12:00:00"},
+)
+
+# IN-list expansion
+client.execute("SELECT * FROM users WHERE city IN (?)", params=[["Beijing", "Shanghai"]])
+```
+
+Binding works for SELECT, DML, DDL, and transaction statements, and keeps the
+TopK vector query on its native FFI fast path. Arity and type mismatches raise
+`ValueError`.
+
 ## Analytical Queries
 
 ```sql

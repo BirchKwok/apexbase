@@ -333,19 +333,77 @@ table = pa.table({"name": ["A", "B"], "age": [20, 30]})
 client.from_pyarrow(table, table_name="users")
 ```
 
+#### store_durable_one
+```python
+store_durable_one(data: dict) -> None
+```
+Persist one schema-stable row immediately when the durable fast path applies.
+Falls back to `store()` plus `flush()` for unsupported cases, so the API
+remains correct when the optimized delta path is unavailable.
+
+**Example:**
+```python
+client.store_durable_one({"name": "Alice", "age": 30})
+```
+
+#### from_lance
+```python
+from_lance(
+    uri,
+    table_name: str = None,
+    columns: Optional[List[str]] = None,
+    filter=None,
+    limit: Optional[int] = None,
+    batch_size: Optional[int] = None,
+    **dataset_options
+) -> ApexClient
+```
+Import a Lance dataset into the current or named ApexBase table. Data is read
+through Lance's Arrow path into ApexBase's columnar write path. `uri` may be a
+Lance dataset URI/path or an object exposing `to_batches`. Extra keyword
+arguments are forwarded to `lance.dataset`. Returns self for chaining.
+
+**Example:**
+```python
+client.from_lance("my_lance_dir", table_name="items")
+```
+
+#### to_lance
+```python
+to_lance(
+    uri,
+    sql: str = None,
+    mode: str = "create",
+    show_internal_id: bool = False,
+    **write_options
+)
+```
+Export the current table or a SQL result to a Lance dataset. When `sql` is
+omitted, exports `SELECT *` from the current table. `mode` is the Lance write
+mode (default `"create"`); `show_internal_id` controls whether `_id` appears
+when exporting a SQL result. Extra keyword arguments are forwarded to the Lance
+writer. Returns the written dataset URI/path.
+
+**Example:**
+```python
+client.to_lance("export_lance_dir")
+client.to_lance("export_lance_dir", sql="SELECT name, age FROM users WHERE age > 18")
+```
+
 ---
 
 ### Data Retrieval
 
 #### execute
 ```python
-execute(sql: str, show_internal_id: bool = None) -> ResultView
+execute(sql: str, show_internal_id: bool = None, params=None) -> ResultView
 ```
 Execute SQL query and return results.
 
 **Parameters:**
 - `sql`: SQL statement (SELECT, INSERT, etc.)
 - `show_internal_id`: If True, include _id column in results
+- `params`: Optional bound parameters. Positional `?` placeholders use a list/tuple; named `:name`, `@name`, or `$name` placeholders use a dict. A list/tuple value expands to a comma-separated list for `IN (?)`.
 
 **Example:**
 ```python
@@ -358,6 +416,55 @@ count = results.scalar()
 
 # With ordering and limits
 results = client.execute("SELECT name, age FROM users ORDER BY age DESC LIMIT 10")
+
+# Parameter binding
+results = client.execute("SELECT * FROM users WHERE age > ?", params=[25])
+results = client.execute(
+    "SELECT * FROM users WHERE city = :city AND age >= :min_age",
+    params={"city": "Beijing", "min_age": 18},
+)
+results = client.execute(
+    "SELECT * FROM users WHERE city IN (?)", params=[["Beijing", "Shanghai"]]
+)
+```
+
+Parameter binding works for SELECT, DML, DDL, and transaction statements. The
+bound TopK vector query keeps its native FFI fast path.
+
+#### execute_batch
+```python
+execute_batch(queries: List[str]) -> List[ResultView]
+```
+Execute a SQL script in list order with read-after-write visibility. Consecutive
+simple `UPDATE ... SET <numeric column> = <literal> WHERE _id = N` statements
+against the same table and column are coalesced into one native batch write;
+all other statements run sequentially.
+
+**Example:**
+```python
+results = client.execute_batch([
+    "INSERT INTO users (name, age) VALUES ('Alice', 30)",
+    "INSERT INTO users (name, age) VALUES ('Bob', 25)",
+    "UPDATE users SET age = 31 WHERE _id = 1",
+])
+```
+
+#### execute_batch_parallel
+```python
+execute_batch_parallel(queries: List[str]) -> List[ResultView]
+```
+Execute independent read-only SQL statements concurrently. Statements that may
+mutate state are rejected, so callers cannot accidentally depend on
+nondeterministic write ordering. Use `execute_batch` for ordered scripts that
+must preserve statement order.
+
+**Example:**
+```python
+results = client.execute_batch_parallel([
+    "SELECT city, COUNT(*) FROM users GROUP BY city",
+    "SELECT AVG(age) FROM users",
+    "SELECT * FROM events ORDER BY ts DESC LIMIT 100",
+])
 ```
 
 #### query
@@ -480,17 +587,23 @@ updated = client.batch_replace({
 
 #### delete
 ```python
-delete(ids: Union[int, List[int]]) -> bool
+delete(id: Optional[Union[int, List[int]]] = None, where: Optional[str] = None) -> Union[bool, int]
 ```
-Delete record(s) by _id.
+Delete record(s) by `_id` or by a `WHERE` expression. Deleting by `id` returns a
+bool indicating success; deleting by `where` returns the number of deleted rows.
+At least one argument is required (safety protection against accidental full
+deletes).
 
 **Example:**
 ```python
 # Single delete
-client.delete(5)
+client.delete(id=5)
 
 # Batch delete
-client.delete([1, 2, 3])
+client.delete(id=[1, 2, 3])
+
+# Conditional delete
+client.delete(where="age < 18")
 ```
 
 ---
@@ -784,6 +897,48 @@ stats = client.get_fts_stats()
 print(stats)  # {'fts_enabled': True, 'doc_count': 1000, 'term_count': 5000}
 ```
 
+#### set_fts_fuzzy_config
+```python
+set_fts_fuzzy_config(
+    threshold: float = 0.7,
+    max_distance: int = 2,
+    max_candidates: int = 20,
+    table_name: str = None
+) -> None
+```
+Configure fuzzy matching parameters for the table's FTS engine. `threshold` is
+the similarity threshold in `[0, 1]`, `max_distance` is the maximum edit
+distance, and `max_candidates` limits the fuzzy candidate terms.
+
+**Example:**
+```python
+client.set_fts_fuzzy_config(threshold=0.75, max_distance=1)
+```
+
+#### compact_fts_index
+```python
+compact_fts_index(table_name: str = None) -> None
+```
+Compact the FTS index for a table, merging pending WAL updates into the
+snapshot.
+
+**Example:**
+```python
+client.compact_fts_index()
+```
+
+#### warmup_fts_terms
+```python
+warmup_fts_terms(terms: List[str], table_name: str = None) -> int
+```
+Warm FTS caches for the given terms. Returns the number of terms warmed, or `0`
+if FTS is not initialized.
+
+**Example:**
+```python
+warmed = client.warmup_fts_terms(["python", "database", "rust"])
+```
+
 #### disable_fts
 ```python
 disable_fts(table_name: str = None) -> ApexClient
@@ -843,6 +998,83 @@ Get current auto-flush configuration.
 ```python
 rows, bytes = client.get_auto_flush()
 ```
+
+#### set_compression
+```python
+set_compression(compression: str) -> bool
+```
+Set compression type for the current table. Only effective on empty tables
+(`row_count == 0`); ignored if the table already contains data. The setting
+persists across restarts. Valid values are `"none"`, `"lz4"`, and `"zstd"`.
+Returns `True` if applied, `False` for a non-empty no-op.
+
+**Example:**
+```python
+client.set_compression("zstd")
+```
+
+#### get_compression
+```python
+get_compression() -> str
+```
+Get the current compression type for the current table (`"none"`, `"lz4"`, or
+`"zstd"`).
+
+**Example:**
+```python
+compression = client.get_compression()
+```
+
+#### begin_buffered_writes
+```python
+begin_buffered_writes(flush_rows: int = 0) -> None
+```
+Enable explicit client-local buffered single-row writes. Rows become
+durable/visible after `flush_buffered_writes()`, `flush()`, or `close()`.
+Trades immediate visibility for lower per-row Python overhead in OLTP-style
+append bursts. `flush_rows` auto-flushes after that many buffered rows
+(`0` disables).
+
+**Example:**
+```python
+client.begin_buffered_writes(flush_rows=1000)
+```
+
+#### end_buffered_writes
+```python
+end_buffered_writes(flush: bool = True) -> None
+```
+Disable buffered writes. With `flush=True` (default), pending rows are flushed
+first; with `flush=False` they are discarded.
+
+#### flush_buffered_writes
+```python
+flush_buffered_writes() -> int
+```
+Flush pending buffered single-row writes. Returns the number of rows flushed.
+
+**Example:**
+```python
+flushed = client.flush_buffered_writes()
+```
+
+#### buffered_write_count
+```python
+buffered_write_count() -> int
+```
+Return the number of pending client-local buffered rows.
+
+#### optimize
+```python
+optimize() -> None
+```
+Best-effort optimization hook; currently flushes pending writes.
+
+#### flush_cache
+```python
+flush_cache() -> None
+```
+Alias for `flush()` (legacy name).
 
 #### estimate_memory_bytes
 ```python
@@ -1039,6 +1271,37 @@ SELECT `group`, COUNT(*) FROM t GROUP BY `group` HAVING COUNT(*) > 5
 ```
 
 > **Tip:** Quoting is only needed when the column name is a reserved keyword. Regular column names like `name`, `age`, `city` do not need quoting.
+
+### Parameter Binding
+
+Pass `params` to `execute()` to bind values instead of interpolating strings.
+Positional `?` placeholders consume values from a list/tuple; named
+`:name`, `@name`, or `$name` placeholders read from a dict. A list/tuple value
+expands to a comma-separated list for `IN (?)`.
+
+```python
+# Positional
+client.execute("SELECT * FROM users WHERE age > ? AND city = ?", params=[30, "Beijing"])
+
+# Named
+client.execute(
+    "INSERT INTO events (kind, ts) VALUES (:kind, :ts)",
+    params={"kind": "click", "ts": "2026-08-07 12:00:00"},
+)
+
+# IN-list expansion
+client.execute("SELECT * FROM users WHERE city IN (?)", params=[["Beijing", "Shanghai"]])
+
+# Bound TopK vector query (keeps the native FFI fast path)
+client.execute(
+    "SELECT explode_rename(topk_distance(embedding, ?, 10, 'cosine'), '_id', 'dist') FROM items",
+    params=[query_vector],
+)
+```
+
+Arity and type mismatches raise `ValueError` instead of silently producing a
+wrong query. Placeholders inside string/identifier literals and comments are
+not substituted.
 
 ### SELECT
 ```sql

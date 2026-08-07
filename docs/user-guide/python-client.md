@@ -107,6 +107,28 @@ rows = client.retrieve_many([1, 2, 3])
 all_rows = client.retrieve_all()
 ```
 
+## Batch Execution
+
+Run ordered SQL scripts with `execute_batch()` (read-after-write visibility;
+consecutive numeric `UPDATE ... WHERE _id = N` statements coalesce into one
+native batch write), or run independent read-only queries concurrently with
+`execute_batch_parallel()`:
+
+```python
+results = client.execute_batch([
+    "INSERT INTO users (name, age) VALUES ('Alice', 30)",
+    "UPDATE users SET age = 31 WHERE _id = 1",
+])
+
+stats = client.execute_batch_parallel([
+    "SELECT city, COUNT(*) FROM users GROUP BY city",
+    "SELECT AVG(age) FROM users",
+])
+```
+
+`execute_batch_parallel` accepts only `SELECT` / `WITH` / `EXPLAIN` statements
+and returns one `ResultView` per input query.
+
 ## Working With Results
 
 ```python
@@ -132,7 +154,7 @@ client.batch_replace({
     3: {"name": "Charlie", "age": 36},
 })
 
-client.delete(where_clause="age < 18")
+client.delete(where="age < 18")
 ```
 
 SQL DML is also supported:

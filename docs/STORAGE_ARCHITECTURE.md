@@ -272,6 +272,33 @@ Delta files are compacted into the base file when:
 
 Compaction loads all data in-memory, merges delta, and saves as V4.
 
+## Table Catalog (`.apex_tables`)
+
+Since v1.28.0, each database directory owns a memory-mapped binary table
+registry, `.apex_tables`, that is the authoritative source of table names
+across processes. It replaces the earlier behavior where `create_table` on an
+existing table could silently rebuild it: a fresh process calling
+`create_table` on an existing table now raises `Table already exists`.
+
+- **Layout**: 32-byte header with magic `APXTBL02` and format version 2,
+  followed by fixed-size slots (name length + 128-byte name + CRC32), default
+  capacity 1024.
+- **Concurrency**: all mutations run under an exclusive advisory lock
+  (`.apex_tables.lock`) and update the mapped region in place, so CREATE/DROP
+  no longer pay a full file rewrite per DDL.
+- **Integrity**: each slot carries its own CRC32, so accidental corruption or
+  manual edits are detected and rejected.
+- **Readers**: take an optimistic generation snapshot, verify CRCs, and retry
+  if the generation changed. A snapshot cache keyed by generation plus file
+  mtime guards against external rewrites.
+- **Migration**: legacy databases without a catalog, or with the earlier
+  one-shot binary/JSON formats, are backfilled/migrated on first access.
+
+Lazy schema information is kept in a second memory-mapped registry,
+`.apex_schemas` (magic `APXSCM01`, version 1, 256 KiB region), used by the
+on-demand storage layer to avoid parsing full `.apex` headers for schema-only
+reads.
+
 ## Adding New Operations
 
 When adding a new storage operation:
@@ -299,8 +326,9 @@ When adding a new storage operation:
 Run all tests to verify storage operations:
 
 ```bash
-conda run -n dev maturin develop --release
-conda run -n dev pytest test/ --tb=short -q
+maturin develop --release
+pytest
 ```
 
-Expected: **663 passed**
+All Python and Rust tests must pass; see `ENGINEERING_GUIDELINES.md` for the
+full validation sequence.

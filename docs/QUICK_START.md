@@ -133,7 +133,7 @@ print(results.to_pandas())
 client.close()
 ```
 
-**Supported DDL Statements:**
+**Supported DDL / DML Statements:**
 - `CREATE TABLE [IF NOT EXISTS] table_name`
 - `ALTER TABLE ... ADD COLUMN column_name TYPE`
 - `INSERT INTO ... VALUES ...`
