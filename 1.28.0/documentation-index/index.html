@@ -1540,7 +1540,7 @@
 <p>GitHub Pages deployment is handled by <code>.github/workflows/docs.yml</code>.</p>
 <ul>
 <li>Pull requests run <code>python -m mkdocs build --strict</code>.</li>
-<li>Pushes to <code>main</code> deploy the current package version with the <code>latest</code> alias.</li>
+<li>Manual <code>workflow_dispatch</code> runs deploy the current package version with the <code>latest</code> alias.</li>
 <li><code>v*</code> tags deploy the tag version and keep historical documentation available.</li>
 <li>The site URL is configured as <code>https://birchkwok.github.io/ApexBase/</code>.</li>
 </ul>

@@ -1060,10 +1060,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#representative-vector-gaps" class="md-nav__link">
+  <a href="#table-ops-new-in-v1280" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Representative Vector Gaps
+        Table Ops (new in v1.28.0)
       
     </span>
   </a>
@@ -1071,10 +1071,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#throughput-snapshot" class="md-nav__link">
+  <a href="#representative-vector-gaps" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Throughput Snapshot
+        Representative Vector Gaps
       
     </span>
   </a>
@@ -1128,6 +1128,17 @@
         
       </ul>
     </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#olap-throughput-qs" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OLAP Throughput (Q/s)
+      
+    </span>
+  </a>
   
 </li>
       
@@ -1522,13 +1533,14 @@
 <p>This page tracks the latest verified local benchmark snapshot rather than an old best-case run. Benchmarks are meant to be reproducible, not magical; always rerun them on your own workload and hardware.</p>
 <h2 id="latest-verified-snapshot">Latest Verified Snapshot<a class="headerlink" href="#latest-verified-snapshot" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>System</strong>: macOS 26.5.2, Apple arm (10 cores), 32 GB RAM</li>
-<li><strong>Stack</strong>: Python 3.12.2, ApexBase 1.23.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Snapshot date / commit</strong>: 2026-08-07, <code>08af3b2</code> on <code>main</code></li>
+<li><strong>System</strong>: macOS 26.6, Apple arm (10 cores), 32 GB RAM</li>
+<li><strong>Stack</strong>: Python 3.12.2, ApexBase 1.28.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1</li>
 <li><strong>Dataset</strong>: 1,000,000 rows x 5 columns (<code>name</code>, <code>age</code>, <code>score</code>, <code>city</code>, <code>category</code>)</li>
 <li><strong>Vector dataset</strong>: 1,000,000 vectors x dim=128, <code>k=10</code>, batch size 10 queries</li>
 <li><strong>Method</strong>: 2 warmup iterations + 5 timed iterations</li>
-<li><strong>Layout</strong>: the default benchmark entrypoint tracks the README public scoreboard, including six competitive vector metrics; Apex-only vector metrics and other extended diagnostics live in <code>benchmarks/bench_vs_sqlite_duckdb_extended.py</code>.</li>
-<li><strong>Fairness rule</strong>: only the default fair OLAP/OLTP cross-engine tables count toward the <code>72/72</code> win/loss summary. Vector similarity uses a separate dataset and its own ApexBase-vs-DuckDB scoreboard.</li>
+<li><strong>Layout</strong>: the default benchmark entrypoint tracks the README public scoreboard: 77 fair cross-engine tabular metrics (45 OLAP + 32 OLTP, including the five table-operation metrics added in v1.28.0) plus six competitive vector metrics. Apex-only vector metrics and other extended diagnostics live in <code>benchmarks/bench_vs_sqlite_duckdb_extended.py</code>.</li>
+<li><strong>Fairness rule</strong>: only the default fair OLAP/OLTP cross-engine tables count toward the win/loss summary. Vector similarity uses a separate dataset and its own ApexBase-vs-DuckDB scoreboard.</li>
 </ul>
 <h2 id="scoreboard">Scoreboard<a class="headerlink" href="#scoreboard" title="Permanent link">&para;</a></h2>
 <table>
@@ -1544,10 +1556,10 @@
 <tbody>
 <tr>
 <td>Default fair (OLAP + OLTP)</td>
-<td style="text-align: right;">72</td>
-<td style="text-align: right;">72</td>
+<td style="text-align: right;">77</td>
+<td style="text-align: right;">75</td>
 <td style="text-align: right;">0</td>
-<td style="text-align: right;">0</td>
+<td style="text-align: right;">2</td>
 </tr>
 <tr>
 <td>OLAP fair</td>
@@ -1558,10 +1570,10 @@
 </tr>
 <tr>
 <td>OLTP fair</td>
-<td style="text-align: right;">27</td>
-<td style="text-align: right;">27</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">30</td>
 <td style="text-align: right;">0</td>
-<td style="text-align: right;">0</td>
+<td style="text-align: right;">2</td>
 </tr>
 <tr>
 <td>Vector similarity (ApexBase vs DuckDB)</td>
@@ -1572,7 +1584,12 @@
 </tr>
 </tbody>
 </table>
-<p>Stock SQLite is not ranked in the vector table because the built-in <code>sqlite3</code> used here has no native vector distance/top-k functions in this harness.</p>
+<p>Total verified: <strong>83 metrics</strong> (77 tabular + 6 vector). The two slower tabular
+metrics are <code>Table DROP</code> and <code>Table CREATE+DROP cycle</code> against SQLite's
+empty-table operations; ApexBase remains faster than DuckDB on both (see
+<a href="#table-ops-new-in-v1280">Table Ops</a>).</p>
+<p>Stock SQLite is not ranked in the vector table because the built-in <code>sqlite3</code>
+used here has no native vector distance/top-k functions in this harness.</p>
 <h2 id="representative-olap-gaps">Representative OLAP Gaps<a class="headerlink" href="#representative-olap-gaps" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1587,38 +1604,38 @@
 <tbody>
 <tr>
 <td>COUNT(*)</td>
-<td style="text-align: right;">0.072 ms</td>
-<td style="text-align: right;">7.94 ms</td>
-<td style="text-align: right;">0.493 ms</td>
-<td>6.8x faster vs DuckDB</td>
+<td style="text-align: right;">0.087 ms</td>
+<td style="text-align: right;">7.83 ms</td>
+<td style="text-align: right;">0.528 ms</td>
+<td>6.1x faster vs DuckDB</td>
 </tr>
 <tr>
 <td>SELECT * LIMIT 100 (warm cache)</td>
-<td style="text-align: right;">0.075 ms</td>
-<td style="text-align: right;">0.124 ms</td>
-<td style="text-align: right;">0.244 ms</td>
+<td style="text-align: right;">0.071 ms</td>
+<td style="text-align: right;">0.120 ms</td>
+<td style="text-align: right;">0.235 ms</td>
 <td>1.7x faster vs SQLite</td>
 </tr>
 <tr>
 <td>Filtered LIMIT 100 (age&gt;30)</td>
-<td style="text-align: right;">0.014 ms</td>
-<td style="text-align: right;">0.127 ms</td>
-<td style="text-align: right;">0.298 ms</td>
-<td>9.1x faster vs SQLite</td>
+<td style="text-align: right;">0.016 ms</td>
+<td style="text-align: right;">0.122 ms</td>
+<td style="text-align: right;">0.415 ms</td>
+<td>7.6x faster vs SQLite</td>
 </tr>
 <tr>
 <td>GROUP BY city (10 groups)</td>
-<td style="text-align: right;">1.51 ms</td>
-<td style="text-align: right;">357.54 ms</td>
-<td style="text-align: right;">3.89 ms</td>
-<td>2.6x faster vs DuckDB</td>
+<td style="text-align: right;">1.52 ms</td>
+<td style="text-align: right;">355.31 ms</td>
+<td style="text-align: right;">2.92 ms</td>
+<td>1.9x faster vs DuckDB</td>
 </tr>
 <tr>
 <td>Temp Table (CSV) Query (filter+agg)</td>
-<td style="text-align: right;">0.538 ms</td>
+<td style="text-align: right;">0.429 ms</td>
 <td style="text-align: right;">N/A</td>
-<td style="text-align: right;">0.797 ms</td>
-<td>1.5x faster vs DuckDB</td>
+<td style="text-align: right;">0.668 ms</td>
+<td>1.6x faster vs DuckDB</td>
 </tr>
 </tbody>
 </table>
@@ -1636,38 +1653,92 @@
 <tbody>
 <tr>
 <td>Bulk Insert (N rows; default fair)</td>
-<td style="text-align: right;">225.05 ms</td>
-<td style="text-align: right;">1.02 s</td>
-<td style="text-align: right;">211.09 s</td>
+<td style="text-align: right;">225.19 ms</td>
+<td style="text-align: right;">1.01 s</td>
+<td style="text-align: right;">178.57 s</td>
 <td>4.5x faster vs SQLite</td>
 </tr>
 <tr>
 <td>Point Lookup (SQL by ID)</td>
-<td style="text-align: right;">0.039 ms</td>
-<td style="text-align: right;">0.055 ms</td>
-<td style="text-align: right;">4.00 ms</td>
-<td>1.4x faster vs SQLite</td>
+<td style="text-align: right;">2.92 us</td>
+<td style="text-align: right;">4.38 us</td>
+<td style="text-align: right;">3.09 ms</td>
+<td>1.5x faster vs SQLite</td>
 </tr>
 <tr>
 <td>Retrieve Many (SQL, 100 IDs)</td>
-<td style="text-align: right;">0.168 ms</td>
-<td style="text-align: right;">0.279 ms</td>
-<td style="text-align: right;">5.70 ms</td>
-<td>1.7x faster vs SQLite</td>
+<td style="text-align: right;">0.195 ms</td>
+<td style="text-align: right;">0.435 ms</td>
+<td style="text-align: right;">5.49 ms</td>
+<td>2.2x faster vs SQLite</td>
 </tr>
 <tr>
 <td>FTS Index Build (name,city,category)</td>
-<td style="text-align: right;">1.38 ms</td>
-<td style="text-align: right;">1.54 s</td>
-<td style="text-align: right;">1.35 s</td>
-<td>978x faster vs DuckDB</td>
+<td style="text-align: right;">1.50 ms</td>
+<td style="text-align: right;">1.51 s</td>
+<td style="text-align: right;">1.32 s</td>
+<td>880x faster vs DuckDB</td>
 </tr>
 <tr>
 <td>FTS Search ('Electronics')</td>
-<td style="text-align: right;">5.45 ms</td>
-<td style="text-align: right;">29.91 ms</td>
-<td style="text-align: right;">24.34 ms</td>
-<td>4.5x faster vs DuckDB</td>
+<td style="text-align: right;">5.38 ms</td>
+<td style="text-align: right;">29.49 ms</td>
+<td style="text-align: right;">23.06 ms</td>
+<td>4.3x faster vs DuckDB</td>
+</tr>
+</tbody>
+</table>
+<h2 id="table-ops-new-in-v1280">Table Ops (new in v1.28.0)<a class="headerlink" href="#table-ops-new-in-v1280" title="Permanent link">&para;</a></h2>
+<p>v1.28.0 added five cross-engine table-operation metrics to the fair OLTP
+scoreboard: <code>Table CREATE (1 col)</code>, <code>Table DROP</code>, <code>Table CREATE+DROP cycle</code>,
+<code>List tables (10)</code>, and <code>ALTER TABLE ADD COLUMN</code>. ApexBase wins 3 of 5; the two
+losses are against SQLite's minimal empty-table DDL path, while ApexBase stays
+ahead of DuckDB on every one of them.</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+<th>Gap</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Table CREATE (1 col)</td>
+<td style="text-align: right;">0.012 ms</td>
+<td style="text-align: right;">0.037 ms</td>
+<td style="text-align: right;">0.139 ms</td>
+<td>3.1x faster vs SQLite</td>
+</tr>
+<tr>
+<td>Table DROP</td>
+<td style="text-align: right;">0.049 ms</td>
+<td style="text-align: right;">0.030 ms</td>
+<td style="text-align: right;">0.142 ms</td>
+<td>1.6x slower vs SQLite; 2.9x faster vs DuckDB</td>
+</tr>
+<tr>
+<td>Table CREATE+DROP cycle</td>
+<td style="text-align: right;">0.107 ms</td>
+<td style="text-align: right;">0.069 ms</td>
+<td style="text-align: right;">0.346 ms</td>
+<td>1.5x slower vs SQLite; 3.2x faster vs DuckDB</td>
+</tr>
+<tr>
+<td>List tables (10)</td>
+<td style="text-align: right;">5.96 us</td>
+<td style="text-align: right;">0.031 ms</td>
+<td style="text-align: right;">2.71 ms</td>
+<td>5.2x faster vs SQLite</td>
+</tr>
+<tr>
+<td>ALTER TABLE ADD COLUMN</td>
+<td style="text-align: right;">0.057 ms</td>
+<td style="text-align: right;">0.074 ms</td>
+<td style="text-align: right;">0.128 ms</td>
+<td>1.3x faster vs SQLite</td>
 </tr>
 </tbody>
 </table>
@@ -1680,79 +1751,56 @@
 <th>Metric</th>
 <th style="text-align: right;">ApexBase</th>
 <th style="text-align: right;">DuckDB</th>
-<th>Gap to DuckDB</th>
+<th style="text-align: right;">Gap to DuckDB</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>TopK L2</td>
-<td style="text-align: right;">3.58 ms</td>
-<td style="text-align: right;">26.46 ms</td>
-<td>7.4x faster</td>
+<td style="text-align: right;">7.73 ms</td>
+<td style="text-align: right;">32.50 ms</td>
+<td style="text-align: right;">4.2x faster</td>
 </tr>
 <tr>
 <td>TopK Cosine</td>
-<td style="text-align: right;">3.80 ms</td>
-<td style="text-align: right;">31.89 ms</td>
-<td>8.4x faster</td>
+<td style="text-align: right;">7.87 ms</td>
+<td style="text-align: right;">43.32 ms</td>
+<td style="text-align: right;">5.5x faster</td>
 </tr>
 <tr>
 <td>TopK Dot</td>
-<td style="text-align: right;">3.48 ms</td>
-<td style="text-align: right;">26.37 ms</td>
-<td>7.6x faster</td>
+<td style="text-align: right;">7.61 ms</td>
+<td style="text-align: right;">30.39 ms</td>
+<td style="text-align: right;">4.0x faster</td>
 </tr>
 <tr>
 <td>Batch TopK L2 (10 queries)</td>
-<td style="text-align: right;">23.18 ms</td>
-<td style="text-align: right;">266.92 ms</td>
-<td>11.5x faster</td>
+<td style="text-align: right;">59.37 ms</td>
+<td style="text-align: right;">357.23 ms</td>
+<td style="text-align: right;">6.0x faster</td>
 </tr>
 <tr>
 <td>Batch TopK Cosine (10 queries)</td>
-<td style="text-align: right;">23.24 ms</td>
-<td style="text-align: right;">322.07 ms</td>
-<td>13.9x faster</td>
+<td style="text-align: right;">70.25 ms</td>
+<td style="text-align: right;">480.35 ms</td>
+<td style="text-align: right;">6.8x faster</td>
 </tr>
 <tr>
 <td>Batch TopK Dot (10 queries)</td>
-<td style="text-align: right;">21.12 ms</td>
-<td style="text-align: right;">268.44 ms</td>
-<td>12.7x faster</td>
-</tr>
-</tbody>
-</table>
-<h2 id="throughput-snapshot">Throughput Snapshot<a class="headerlink" href="#throughput-snapshot" title="Permanent link">&para;</a></h2>
-<p>Q/s uses a mixed analytical profile: <code>COUNT(*)</code>, two <code>GROUP BY</code> scans, and <code>Filtered LIMIT 100</code>, all materialized to Python rows.</p>
-<table>
-<thead>
-<tr>
-<th>Throughput metric</th>
-<th style="text-align: right;">ApexBase</th>
-<th style="text-align: right;">SQLite</th>
-<th style="text-align: right;">DuckDB</th>
-<th>Gap to best other</th>
-</tr>
-</thead>
-<tbody>
-<tr>
-<td>OLAP Q/s (single thread)</td>
-<td style="text-align: right;">123,700.3</td>
-<td style="text-align: right;">34.8</td>
-<td style="text-align: right;">942.2</td>
-<td>131.3x higher vs DuckDB</td>
-</tr>
-<tr>
-<td>OLAP Q/s (4 threads)</td>
-<td style="text-align: right;">125,196.3</td>
-<td style="text-align: right;">126.6</td>
-<td style="text-align: right;">2,776.8</td>
-<td>45.1x higher vs DuckDB</td>
+<td style="text-align: right;">59.35 ms</td>
+<td style="text-align: right;">475.29 ms</td>
+<td style="text-align: right;">8.0x faster</td>
 </tr>
 </tbody>
 </table>
 <h2 id="hot-path-latency-snapshot">Hot-Path Latency Snapshot<a class="headerlink" href="#hot-path-latency-snapshot" title="Permanent link">&para;</a></h2>
-<p>These tables are not part of the <code>38/38</code> fair scoreboard. They answer a different question: how fast is the already-loaded hot path, and what happens when durability or transaction semantics are made explicit?</p>
+<p>The tables below come from the extended diagnostics profile
+(<code>benchmarks/bench_vs_sqlite_duckdb_extended.py</code>) and are not part of the fair
+scoreboard. They answer a different question: how fast is the already-loaded
+hot path, and what happens when durability or transaction semantics are made
+explicit?</p>
+<p>Snapshot: 200,000 rows, 2 warmup iterations + 3 timed iterations, median
+per-call hot-path latency, recorded 2026-08-07.</p>
 <h3 id="default-microbenchmarks">Default Microbenchmarks<a class="headerlink" href="#default-microbenchmarks" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
@@ -1767,45 +1815,45 @@
 <tbody>
 <tr>
 <td>COUNT(*) (direct API)</td>
-<td style="text-align: right;">7.43 us</td>
-<td style="text-align: right;">1.243 ms</td>
-<td style="text-align: right;">0.132 ms</td>
-<td>17.8x faster vs DuckDB</td>
+<td style="text-align: right;">4.0 us</td>
+<td style="text-align: right;">1.259 ms</td>
+<td style="text-align: right;">0.145 ms</td>
+<td>36x faster vs DuckDB</td>
 </tr>
 <tr>
 <td>Point lookup (projected SQL)</td>
-<td style="text-align: right;">2.12 us</td>
-<td style="text-align: right;">2.99 us</td>
-<td style="text-align: right;">1.722 ms</td>
-<td>1.4x faster vs SQLite</td>
+<td style="text-align: right;">3.0 us</td>
+<td style="text-align: right;">3.0 us</td>
+<td style="text-align: right;">1.691 ms</td>
+<td>tied with SQLite</td>
 </tr>
 <tr>
 <td>Retrieve 100 IDs (projected SQL)</td>
-<td style="text-align: right;">0.041 ms</td>
-<td style="text-align: right;">0.099 ms</td>
-<td style="text-align: right;">3.438 ms</td>
-<td>2.4x faster vs SQLite</td>
+<td style="text-align: right;">0.034 ms</td>
+<td style="text-align: right;">0.112 ms</td>
+<td style="text-align: right;">4.532 ms</td>
+<td>3.3x faster vs SQLite</td>
 </tr>
 <tr>
 <td>Insert 1 row (default fair)</td>
-<td style="text-align: right;">0.010 ms</td>
-<td style="text-align: right;">0.014 ms</td>
-<td style="text-align: right;">0.297 ms</td>
-<td>1.4x faster vs SQLite</td>
+<td style="text-align: right;">0.012 ms</td>
+<td style="text-align: right;">0.015 ms</td>
+<td style="text-align: right;">0.275 ms</td>
+<td>1.3x faster vs SQLite</td>
 </tr>
 <tr>
 <td>UPDATE by ID</td>
-<td style="text-align: right;">1.13 us</td>
-<td style="text-align: right;">4.23 us</td>
-<td style="text-align: right;">0.483 ms</td>
-<td>3.7x faster vs SQLite</td>
+<td style="text-align: right;">3.0 us</td>
+<td style="text-align: right;">5.0 us</td>
+<td style="text-align: right;">0.491 ms</td>
+<td>1.7x faster vs SQLite</td>
 </tr>
 <tr>
 <td>DELETE missing ID</td>
-<td style="text-align: right;">2.72 us</td>
-<td style="text-align: right;">3.81 us</td>
-<td style="text-align: right;">1.160 ms</td>
-<td>1.4x faster vs SQLite</td>
+<td style="text-align: right;">0.4 us</td>
+<td style="text-align: right;">4.0 us</td>
+<td style="text-align: right;">0.385 ms</td>
+<td>10x faster vs SQLite</td>
 </tr>
 </tbody>
 </table>
@@ -1823,17 +1871,17 @@
 <tbody>
 <tr>
 <td>Insert 1 row (durable fair)</td>
-<td style="text-align: right;">0.101 ms</td>
-<td style="text-align: right;">0.126 ms</td>
-<td style="text-align: right;">31.106 ms</td>
-<td>1.2x faster vs SQLite</td>
+<td style="text-align: right;">0.167 ms</td>
+<td style="text-align: right;">0.121 ms</td>
+<td style="text-align: right;">33.185 ms</td>
+<td>1.4x slower vs SQLite; 199x faster vs DuckDB</td>
 </tr>
 <tr>
 <td>UPDATE by ID (durable fair)</td>
-<td style="text-align: right;">2.02 us</td>
-<td style="text-align: right;">6.53 us</td>
-<td style="text-align: right;">4.469 ms</td>
-<td>3.2x faster vs SQLite</td>
+<td style="text-align: right;">4.0 us</td>
+<td style="text-align: right;">7.0 us</td>
+<td style="text-align: right;">4.479 ms</td>
+<td>1.8x faster vs SQLite</td>
 </tr>
 </tbody>
 </table>
@@ -1851,41 +1899,76 @@
 <tbody>
 <tr>
 <td>TXN empty (BEGIN+COMMIT; durable sync)</td>
-<td style="text-align: right;">3.29 us</td>
-<td style="text-align: right;">4.08 us</td>
-<td style="text-align: right;">0.148 ms</td>
-<td>1.2x faster vs SQLite</td>
+<td style="text-align: right;">2.0 us</td>
+<td style="text-align: right;">5.0 us</td>
+<td style="text-align: right;">0.177 ms</td>
+<td>2.5x faster vs SQLite</td>
 </tr>
 <tr>
 <td>TXN read COUNT(*) (COMMIT; durable sync)</td>
-<td style="text-align: right;">0.018 ms</td>
-<td style="text-align: right;">1.295 ms</td>
-<td style="text-align: right;">0.294 ms</td>
-<td>16.3x faster vs DuckDB</td>
+<td style="text-align: right;">0.023 ms</td>
+<td style="text-align: right;">1.345 ms</td>
+<td style="text-align: right;">0.320 ms</td>
+<td>13.9x faster vs DuckDB</td>
 </tr>
 <tr>
 <td>TXN backlog string miss (COMMIT; 1500 preseed; durable sync)</td>
-<td style="text-align: right;">0.051 ms</td>
-<td style="text-align: right;">8.011 ms</td>
-<td style="text-align: right;">0.404 ms</td>
-<td>7.9x faster vs DuckDB</td>
+<td style="text-align: right;">0.063 ms</td>
+<td style="text-align: right;">9.088 ms</td>
+<td style="text-align: right;">0.412 ms</td>
+<td>6.5x faster vs DuckDB</td>
 </tr>
 <tr>
 <td>TXN backlog COUNT(*) (COMMIT; 1500 preseed; durable sync)</td>
-<td style="text-align: right;">0.030 ms</td>
-<td style="text-align: right;">3.793 ms</td>
-<td style="text-align: right;">0.305 ms</td>
-<td>10.2x faster vs DuckDB</td>
+<td style="text-align: right;">0.024 ms</td>
+<td style="text-align: right;">1.459 ms</td>
+<td style="text-align: right;">0.312 ms</td>
+<td>13.0x faster vs DuckDB</td>
 </tr>
 <tr>
 <td>TXN backlog INSERT+read-own-name (COMMIT; 1500 preseed; durable sync)</td>
-<td style="text-align: right;">0.262 ms</td>
-<td style="text-align: right;">8.073 ms</td>
-<td style="text-align: right;">33.522 ms</td>
-<td>30.8x faster vs SQLite</td>
+<td style="text-align: right;">0.374 ms</td>
+<td style="text-align: right;">9.929 ms</td>
+<td style="text-align: right;">36.439 ms</td>
+<td>26.5x faster vs SQLite</td>
 </tr>
 </tbody>
 </table>
+<h2 id="olap-throughput-qs">OLAP Throughput (Q/s)<a class="headerlink" href="#olap-throughput-qs" title="Permanent link">&para;</a></h2>
+<p>The Q/s harness (mixed read profile: <code>COUNT(*)</code>, two <code>GROUP BY</code> scans, and a
+filtered <code>LIMIT 100</code>, materialized to Python rows) currently fails on the
+v1.28.0 build with <code>RuntimeError: Projected column 'city' does not exist</code>. The
+failure is reproducible in the full extended benchmark flow at 200,000 and
+50,000 rows: after a second <code>ApexClient</code> instance runs in the same process
+(the materialization section), the first client's <code>GROUP BY</code> projection loses
+its columns. SQLite and DuckDB Q/s values are unaffected:</p>
+<table>
+<thead>
+<tr>
+<th>Engine</th>
+<th style="text-align: right;">Single thread Q/s</th>
+<th style="text-align: right;">4 threads Q/s</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>SQLite</td>
+<td style="text-align: right;">33.3</td>
+<td style="text-align: right;">114.9</td>
+</tr>
+<tr>
+<td>DuckDB</td>
+<td style="text-align: right;">883.0</td>
+<td style="text-align: right;">2,461.6</td>
+</tr>
+</tbody>
+</table>
+<p>Until the projection bug is fixed, ApexBase Q/s cannot be reported from this
+harness. The earlier published throughput snapshot (ApexBase ~123,700 Q/s
+single-threaded) belongs to a previous release and should not be read as
+current. This is tracked in the performance benchmark scripts; see
+<code>benchmarks/bench_vs_sqlite_duckdb.py</code> (<code>run_qps_benchmark</code>) and the regression
+test added with the fix.</p>
 <h2 id="oltp-write-visibility">OLTP Write Visibility<a class="headerlink" href="#oltp-write-visibility" title="Permanent link">&para;</a></h2>
 <p>ApexBase exposes two fast single-row append paths, and the benchmark keeps them out of the fair scoreboard because their visibility rules are Apex-specific:</p>
 <ul>
@@ -1898,7 +1981,7 @@
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>python<span class="w"> </span>benchmarks/bench_vs_sqlite_duckdb.py
 </span></code></pre></div>
 <p>Add <code>--skip-vector</code> if you want a tabular-only rerun without the separate vector module.
-Run <code>python benchmarks/bench_vs_sqlite_duckdb_extended.py --rows 200000 --warmup 2 --iterations 3</code> for the file-format, materialization, Q/s, microbenchmark, durable, transaction, buffered/memtable, and full vector diagnostics.</p>
+Run <code>python benchmarks/bench_vs_sqlite_duckdb_extended.py --rows 200000 --warmup 2 --iterations 3</code> for the file-format, materialization, Q/s, microbenchmark, durable, transaction, buffered/memtable, and full vector diagnostics. Add <code>--output path.json</code> to keep a machine-readable report of any run.</p>
 <h3 id="out-of-core-file-comparison">Out-of-core file comparison<a class="headerlink" href="#out-of-core-file-comparison" title="Permanent link">&para;</a></h3>
 <p>Use the focused harness to compare ApexBase and DuckDB against the exact same
 generated CSV or Parquet source:</p>

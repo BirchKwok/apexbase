@@ -1470,6 +1470,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#table-catalog-apex_tables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Table Catalog (.apex_tables)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#adding-new-operations" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2059,6 +2070,31 @@ each self-contained with IDs, deletion vector, and per-column data.</p>
 - Delta rows &gt; 100,000 (<code>DELTA_COMPACT_ROWS</code>)
 - On read (transparent to caller)</p>
 <p>Compaction loads all data in-memory, merges delta, and saves as V4.</p>
+<h2 id="table-catalog-apex_tables">Table Catalog (<code>.apex_tables</code>)<a class="headerlink" href="#table-catalog-apex_tables" title="Permanent link">&para;</a></h2>
+<p>Since v1.28.0, each database directory owns a memory-mapped binary table
+registry, <code>.apex_tables</code>, that is the authoritative source of table names
+across processes. It replaces the earlier behavior where <code>create_table</code> on an
+existing table could silently rebuild it: a fresh process calling
+<code>create_table</code> on an existing table now raises <code>Table already exists</code>.</p>
+<ul>
+<li><strong>Layout</strong>: 32-byte header with magic <code>APXTBL02</code> and format version 2,
+  followed by fixed-size slots (name length + 128-byte name + CRC32), default
+  capacity 1024.</li>
+<li><strong>Concurrency</strong>: all mutations run under an exclusive advisory lock
+  (<code>.apex_tables.lock</code>) and update the mapped region in place, so CREATE/DROP
+  no longer pay a full file rewrite per DDL.</li>
+<li><strong>Integrity</strong>: each slot carries its own CRC32, so accidental corruption or
+  manual edits are detected and rejected.</li>
+<li><strong>Readers</strong>: take an optimistic generation snapshot, verify CRCs, and retry
+  if the generation changed. A snapshot cache keyed by generation plus file
+  mtime guards against external rewrites.</li>
+<li><strong>Migration</strong>: legacy databases without a catalog, or with the earlier
+  one-shot binary/JSON formats, are backfilled/migrated on first access.</li>
+</ul>
+<p>Lazy schema information is kept in a second memory-mapped registry,
+<code>.apex_schemas</code> (magic <code>APXSCM01</code>, version 1, 256 KiB region), used by the
+on-demand storage layer to avoid parsing full <code>.apex</code> headers for schema-only
+reads.</p>
 <h2 id="adding-new-operations">Adding New Operations<a class="headerlink" href="#adding-new-operations" title="Permanent link">&para;</a></h2>
 <p>When adding a new storage operation:</p>
 <ol>
@@ -2091,10 +2127,11 @@ each self-contained with IDs, deletion vector, and per-column data.</p>
 </ol>
 <h2 id="testing">Testing<a class="headerlink" href="#testing" title="Permanent link">&para;</a></h2>
 <p>Run all tests to verify storage operations:</p>
-<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>conda<span class="w"> </span>run<span class="w"> </span>-n<span class="w"> </span>dev<span class="w"> </span>maturin<span class="w"> </span>develop<span class="w"> </span>--release
-</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>conda<span class="w"> </span>run<span class="w"> </span>-n<span class="w"> </span>dev<span class="w"> </span>pytest<span class="w"> </span>test/<span class="w"> </span>--tb<span class="o">=</span>short<span class="w"> </span>-q
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a>maturin<span class="w"> </span>develop<span class="w"> </span>--release
+</span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>pytest
 </span></code></pre></div>
-<p>Expected: <strong>663 passed</strong></p>
+<p>All Python and Rust tests must pass; see <code>ENGINEERING_GUIDELINES.md</code> for the
+full validation sequence.</p>
 
 
 
