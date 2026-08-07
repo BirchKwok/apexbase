@@ -2406,6 +2406,9 @@ class ApexBaseBench:
 
     def bench_table_create(self):
         self.client.create_table(self.TABLE_OPS_NAME, {"k": "int64"})
+        # DDL changes the current table; restore the dataset table so later
+        # read-only sections (e.g. the OLAP Q/s harness) keep querying it.
+        self._restore_default_table()
 
     def bench_table_drop_setup(self):
         self._restore_default_table()
@@ -2414,6 +2417,7 @@ class ApexBaseBench:
 
     def bench_table_drop(self):
         self.client.drop_table(self.TABLE_OPS_NAME)
+        self._restore_default_table()
 
     def bench_table_create_drop_cycle(self):
         self._drop_table_ops()
@@ -2430,7 +2434,9 @@ class ApexBaseBench:
             self.client.create_table(f"{self.TABLE_OPS_NAME}_{i}", {"k": "int64"})
 
     def bench_list_tables(self):
-        return self.client.list_tables()
+        result = self.client.list_tables()
+        self._restore_default_table()
+        return result
 
     def bench_alter_table_add_column_setup(self):
         self._restore_default_table()
@@ -2441,6 +2447,7 @@ class ApexBaseBench:
         self.client.execute(
             f"ALTER TABLE {self.TABLE_OPS_NAME} ADD COLUMN c INT64"
         )
+        self._restore_default_table()
 
     def bench_window_row_number(self):
         return self._query_all(
@@ -4448,6 +4455,17 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
             existing_engines: dict of {name: bench} to reuse, avoids re-inserting data
         """
         results = {}
+        if existing_engines is not None:
+            # The main benchmark run leaves the Apex dataset table in a
+            # delta-heavy state: the calibrated single-row DML microbenchmarks
+            # accumulate thousands of pending writes and update tombstones,
+            # which makes the read-only scan paths 100-1000x slower than a
+            # steady-state table. Recreate every engine on a fresh loaded copy
+            # (same mechanism as the OLTP microbenchmark sections) so the Q/s
+            # profile measures steady-state read throughput.
+            reload_loaded_state([
+                (name, bench) for name, bench in existing_engines.items()
+            ])
         print("\n--- OLAP Throughput (mixed read profile) ---")
         print("  Metric options: COUNT + two GROUP BY scans + filtered LIMIT 100; materialized Python rows.")
 
@@ -4455,7 +4473,17 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
         qps_engines = []
         if existing_engines is not None:
             if HAS_APEXBASE and "ApexBase" in existing_engines:
-                qps_engines.append(("ApexBase", existing_engines["ApexBase"], QPS_QUERIES_APEX))
+                apex_bench = existing_engines["ApexBase"]
+                # The Q/s harness queries `FROM default`, which resolves to the
+                # currently selected table. Earlier sections (table ops) may
+                # leave another table selected, so pin the dataset table before
+                # pre-warming.
+                if getattr(apex_bench, "client", None) is not None:
+                    try:
+                        apex_bench.client.use_table("default")
+                    except Exception:
+                        pass
+                qps_engines.append(("ApexBase", apex_bench, QPS_QUERIES_APEX))
             if "SQLite" in existing_engines:
                 qps_engines.append(("SQLite", existing_engines["SQLite"], QPS_QUERIES_SQLITE))
             if HAS_DUCKDB and "DuckDB" in existing_engines:

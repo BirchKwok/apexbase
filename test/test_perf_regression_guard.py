@@ -291,3 +291,94 @@ def test_cold_microbenchmark_calibrates_repeats_without_timing_setup(
     assert elapsed_ms == pytest.approx(0.000001)
     assert len(setup_calls) == 9
     assert len(bench_calls) == 9
+
+
+def test_table_ops_metrics_leave_qps_dataset_table_selected(benchmark, tmp_path):
+    """Table-operation metrics must restore the dataset table afterwards.
+
+    The extended benchmark runs the OLAP Q/s harness after the table-ops
+    metrics. Its ``SELECT ... FROM default`` queries resolve to the currently
+    selected table, so when the last table-ops metric left ``bench_table_ops``
+    selected, the Q/s GROUP BY query failed with "Projected column 'city' does
+    not exist". Each table-ops metric must leave ``default`` selected again.
+    """
+    pytest.importorskip("apexbase")
+
+    data = benchmark.generate_data(2000)
+    bench = benchmark.ApexBaseBench(str(tmp_path), data)
+    bench.setup()
+    bench.bench_insert()
+    assert bench.client.current_table == "default"
+
+    table_ops = [
+        ("bench_table_create", "bench_table_create_setup"),
+        ("bench_table_drop", "bench_table_drop_setup"),
+        ("bench_table_create_drop_cycle", "bench_table_create_setup"),
+        ("bench_list_tables", "bench_list_tables_setup"),
+        ("bench_alter_table_add_column", "bench_alter_table_add_column_setup"),
+    ]
+    for method_name, setup_name in table_ops:
+        benchmark.run_bench_with_setup(
+            getattr(bench, setup_name),
+            getattr(bench, method_name),
+            warmup=1,
+            iterations=1,
+        )
+        assert bench.client.current_table == "default", method_name
+
+    # Regression for the Q/s failure: `FROM default` must target the dataset
+    # table after the full table-ops sequence.
+    result = bench.execute_materialized_query(
+        "SELECT city, COUNT(*) FROM default GROUP BY city"
+    )
+    assert len(result) > 0
+    assert {"city", "COUNT(*)"} <= set(result[0].keys())
+    bench.client.close()
+
+
+def test_qps_read_profile_measures_clean_loaded_table(benchmark, tmp_path):
+    """The Q/s harness must not measure the post-DML delta-heavy state.
+
+    The calibrated single-row DML microbenchmarks leave the Apex dataset table
+    with thousands of pending writes and update tombstones, slowing the
+    read-only scan queries used by the Q/s profile by orders of magnitude.
+    ``reload_loaded_state`` (which the harness calls before pre-warming) must
+    restore the steady-state read path.
+    """
+    pytest.importorskip("apexbase")
+    import time
+
+    data = benchmark.generate_data(2000)
+    bench = benchmark.ApexBaseBench(str(tmp_path), data)
+    bench.setup()
+    bench.bench_insert()
+
+    query = "SELECT * FROM default WHERE age > 30 LIMIT 100"
+
+    def median_ms():
+        bench.execute_materialized_query(query)
+        samples = []
+        for _ in range(20):
+            start = time.perf_counter()
+            bench.execute_materialized_query(query)
+            samples.append((time.perf_counter() - start) * 1000)
+        samples.sort()
+        return samples[len(samples) // 2]
+
+    baseline_ms = median_ms()
+
+    # Reproduce the DML contamination from the OLTP microbenchmark section.
+    benchmark.run_bench_nogc_median(bench.bench_oltp_insert_one, warmup=1, iterations=1)
+    benchmark.run_bench_nogc_median(bench.bench_oltp_insert_read_own_row, warmup=1, iterations=1)
+    benchmark.run_bench_nogc_median(bench.bench_oltp_insert_count_visible, warmup=1, iterations=1)
+    benchmark.run_bench_nogc_median(bench.bench_oltp_update_by_id, warmup=1, iterations=1)
+    poisoned_ms = median_ms()
+
+    # The contaminated scan is orders of magnitude slower than the baseline.
+    assert poisoned_ms > max(10 * baseline_ms, 0.5)
+
+    # Recreating the engine on a fresh loaded copy restores the fast read path.
+    benchmark.reload_loaded_state([("ApexBase", bench)])
+    recovered_ms = median_ms()
+    assert recovered_ms < max(5 * baseline_ms, 0.5)
+    bench.client.close()

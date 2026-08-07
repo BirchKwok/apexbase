@@ -122,25 +122,26 @@ per-call hot-path latency, recorded 2026-08-07.
 
 ## OLAP Throughput (Q/s)
 
-The Q/s harness (mixed read profile: `COUNT(*)`, two `GROUP BY` scans, and a
-filtered `LIMIT 100`, materialized to Python rows) currently fails on the
-v1.28.0 build with `RuntimeError: Projected column 'city' does not exist`. The
-failure is reproducible in the full extended benchmark flow at 200,000 and
-50,000 rows: after a second `ApexClient` instance runs in the same process
-(the materialization section), the first client's `GROUP BY` projection loses
-its columns. SQLite and DuckDB Q/s values are unaffected:
+The Q/s harness runs a mixed analytical read profile (`COUNT(*)`, two `GROUP BY`
+scans, and a filtered `LIMIT 100`, materialized to Python rows) on a freshly
+loaded copy of the dataset table (200,000 rows, 2026-08-07, extended profile).
 
 | Engine | Single thread Q/s | 4 threads Q/s |
 | --- | ---: | ---: |
-| SQLite | 33.3 | 114.9 |
-| DuckDB | 883.0 | 2,461.6 |
+| ApexBase | 9,216.3 | 15,068.8 |
+| SQLite | 34.8 | 124.5 |
+| DuckDB | 878.4 | 2,633.6 |
 
-Until the projection bug is fixed, ApexBase Q/s cannot be reported from this
-harness. The earlier published throughput snapshot (ApexBase ~123,700 Q/s
-single-threaded) belongs to a previous release and should not be read as
-current. This is tracked in the performance benchmark scripts; see
-`benchmarks/bench_vs_sqlite_duckdb.py` (`run_qps_benchmark`) and the regression
-test added with the fix.
+Measurement notes:
+
+- The harness re-creates each engine on a clean loaded table before sampling
+  (the same mechanism the OLTP microbenchmark sections use), so the profile
+  measures steady-state read throughput rather than a table left in a
+  delta-heavy state by the calibrated single-row DML microbenchmarks.
+- The earlier published throughput snapshot (ApexBase ~123,700 Q/s
+  single-threaded) came from a harness that created fresh engines but never
+  loaded the dataset, so it measured empty-table query overhead and is not
+  comparable to the current real-data numbers.
 
 ## OLTP Write Visibility
 
