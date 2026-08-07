@@ -1501,5 +1501,46 @@ class TestStorageEdgeCases:
             client.close()
 
 
+def test_recreate_after_delete_does_not_corrupt_new_table():
+    """Regression: deferred DELETE state must not leak into a recreated table.
+
+    On Unix, DELETE defers tombstone writes to a process-global pending map
+    keyed by the table path. Recreating the database at the same path
+    (drop_if_exists) and storing rows used to apply the stale pending state to
+    the fresh table file, failing with "Corrupt Apex file: header/footer row
+    counts differ".
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        client = ApexClient(tmp_dir)
+        client.create_table("default")
+        client.store({
+            "name": [f"del_{i}" for i in range(1000)],
+            "age": [99] * 1000,
+            "score": [99.0] * 1000,
+            "city": ["Beijing"] * 1000,
+            "category": ["Books"] * 1000,
+        })
+        client.execute("DELETE FROM default WHERE age = 99")
+        client.flush()
+        client.close()
+
+        # Same path, fresh storage (drop_if_exists) — the deferred delete state
+        # belongs to the old file and must not be applied to the new one.
+        with ApexClient.create_clean(tmp_dir) as fresh:
+            fresh.create_table("default")
+            fresh.store({
+                "name": [f"row_{i}" for i in range(500)],
+                "age": [30] * 500,
+                "score": [1.0] * 500,
+                "city": ["Shanghai"] * 500,
+                "category": ["Books"] * 500,
+            })
+            assert fresh.execute("SELECT COUNT(*) FROM default").scalar() == 500
+            grouped = fresh.execute(
+                "SELECT city, COUNT(*) AS cnt FROM default GROUP BY city"
+            ).to_dict()
+            assert grouped[0]["cnt"] == 500
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

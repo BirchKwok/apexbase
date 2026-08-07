@@ -20,6 +20,12 @@ CONFIG_KEYS = (
     "skip_vector",
 )
 SYSTEM_KEYS = ("platform", "machine", "processor", "cpu_count", "python")
+THROUGHPUT_METRIC_HINTS = ("Q/s",)
+
+
+def is_throughput_metric(name):
+    """Return True when a larger value is better (e.g. queries per second)."""
+    return any(hint in name for hint in THROUGHPUT_METRIC_HINTS)
 
 
 class ReportError(ValueError):
@@ -129,15 +135,24 @@ def compare_metric_sets(
     for name in selected:
         before = baseline_metrics[name]
         after = current_metrics[name]
-        tolerance = max(before * relative_threshold, absolute_threshold_ms)
-        delta = after - before
+        if is_throughput_metric(name):
+            # Queries per second: a drop beyond the relative tolerance is a
+            # regression. The millisecond absolute tolerance is a timer-noise
+            # guard for microsecond latencies and does not apply to Q/s.
+            tolerance = before * relative_threshold
+            delta = after - before
+            regressed = delta < -tolerance
+        else:
+            tolerance = max(before * relative_threshold, absolute_threshold_ms)
+            delta = after - before
+            regressed = delta > tolerance
         comparisons.append({
             "query": name,
             "baseline_ms": before,
             "current_ms": after,
             "delta_ms": delta,
             "limit_ms": before + tolerance,
-            "regressed": delta > tolerance,
+            "regressed": regressed,
         })
     return comparisons
 
@@ -191,7 +206,7 @@ def main(argv=None):
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
-    print(f"{'Metric':<38} {'Baseline':>12} {'Current':>12} {'Change':>10} {'Status':>10}")
+    print(f"{'Metric':<38} {'Baseline':>14} {'Current':>14} {'Change':>10} {'Status':>10}")
     print("-" * 88)
     regressions = []
     for row in rows:
@@ -199,7 +214,11 @@ def main(argv=None):
         after = row["current_ms"]
         change = ((after / before) - 1.0) * 100.0 if before > 0 else 0.0
         status = "REGRESSED" if row["regressed"] else "ok"
-        print(f"{row['query']:<38} {before:>10.6f}ms {after:>10.6f}ms {change:>+9.2f}% {status:>10}")
+        unit = "Q/s" if is_throughput_metric(row["query"]) else "ms"
+        print(
+            f"{row['query']:<38} {before:>12.3f} {unit:<3} {after:>12.3f} {unit:<3} "
+            f"{change:>+9.2f}% {status:>10}"
+        )
         if row["regressed"]:
             regressions.append(row)
 

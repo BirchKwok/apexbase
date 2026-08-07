@@ -84,6 +84,35 @@ def test_absolute_tolerance_protects_microbenchmarks_from_noise(guard):
     assert rows[0]["regressed"] is False
 
 
+def test_qps_metrics_use_higher_is_better_semantics(guard):
+    base = _report({"Q/s (single thread)": 10000.0, "scan": 10.0})
+
+    dropped = guard.compare_reports(
+        base,
+        _report({"Q/s (single thread)": 8000.0, "scan": 10.0}),
+        relative_threshold=0.15,
+    )
+    by_name = {row["query"]: row for row in dropped}
+    assert by_name["Q/s (single thread)"]["regressed"] is True
+    assert by_name["scan"]["regressed"] is False
+
+    improved = guard.compare_reports(
+        base,
+        _report({"Q/s (single thread)": 12000.0, "scan": 10.0}),
+        relative_threshold=0.15,
+    )
+    by_name = {row["query"]: row for row in improved}
+    assert by_name["Q/s (single thread)"]["regressed"] is False
+
+    within_noise = guard.compare_reports(
+        base,
+        _report({"Q/s (single thread)": 9000.0, "scan": 10.0}),
+        relative_threshold=0.15,
+    )
+    by_name = {row["query"]: row for row in within_noise}
+    assert by_name["Q/s (single thread)"]["regressed"] is False
+
+
 def test_missing_metric_is_an_error(guard):
     with pytest.raises(guard.ReportError, match="missing metrics"):
         guard.compare_reports(
@@ -382,3 +411,26 @@ def test_qps_read_profile_measures_clean_loaded_table(benchmark, tmp_path):
     recovered_ms = median_ms()
     assert recovered_ms < max(5 * baseline_ms, 0.5)
     bench.client.close()
+
+
+def test_canary_with_qps_does_not_corrupt_recreated_table(benchmark):
+    """The canary's Q/s reset must not corrupt a table recreated in-place.
+
+    After the canary's DELETE microbenchmark, the Q/s section recreates the
+    engine on a fresh loaded copy at the same path. Deferred delete state from
+    the old file used to be applied to the new file, failing with "Corrupt Apex
+    file: header/footer row counts differ" and aborting the canary.
+    """
+    pytest.importorskip("apexbase")
+
+    canary = _load(
+        "bench_perf_canary",
+        ROOT / "benchmarks" / "bench_perf_canary.py",
+    )
+    results = canary.run_canary(rows=2000, warmup=1, iterations=1)
+    qps = [row for row in results if row["category"] == "ApexBase Q/s"]
+    assert len(qps) == 2
+    assert all(row["ApexBase"] > 0 for row in qps)
+    assert {"Q/s (single thread)", "Q/s (4 threads)"} == {
+        row["query"] for row in qps
+    }

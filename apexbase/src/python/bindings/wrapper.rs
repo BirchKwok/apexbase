@@ -1496,6 +1496,7 @@ impl ApexStorageImpl {
             crate::Database::invalidate_dir(&root_dir);
             crate::Database::unregister_fts_manager(&root_dir);
             let _ = crate::storage::table_catalog::clear(&root_dir);
+            crate::storage::on_demand::clear_pending_deletes_for_dir(&root_dir);
 
             // Remove all .apex files in the directory
             if let Ok(entries) = fs::read_dir(&root_dir) {

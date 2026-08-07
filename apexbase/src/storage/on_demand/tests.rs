@@ -1,6 +1,79 @@
 use super::*;
 use tempfile::tempdir;
 
+fn insert_pending_delete(
+    path: &std::path::Path,
+    dev_id: u64,
+    ino_id: u64,
+    footer_offset: u64,
+    footer: &[u8],
+) {
+    let mut buf = Vec::with_capacity(24 + 12 + footer.len());
+    buf.extend_from_slice(b"APXP");
+    buf.extend_from_slice(&dev_id.to_le_bytes());
+    buf.extend_from_slice(&ino_id.to_le_bytes());
+    buf.extend_from_slice(&0u32.to_le_bytes()); // zero row-group rewrites
+    buf.extend_from_slice(&footer_offset.to_le_bytes());
+    buf.extend_from_slice(&(footer.len() as u32).to_le_bytes());
+    buf.extend_from_slice(footer);
+    global_pending_deletes()
+        .write()
+        .unwrap()
+        .as_mut()
+        .map(|m| m.insert(path.to_path_buf(), buf));
+}
+
+#[test]
+fn apply_pending_deletes_discards_state_for_recreated_file() {
+    let dir = tempdir().unwrap();
+    let table_path = dir.path().join("recreated.apex");
+    std::fs::write(&table_path, vec![0u8; 100]).unwrap();
+
+    // Deferred state recorded for a different file incarnation (identity does
+    // not match the current file); applying it would corrupt the fresh file.
+    let footer = vec![0u8; 64];
+    insert_pending_delete(&table_path, 0, 0, 4096, &footer);
+    assert!(
+        global_pending_deletes()
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains_key(&table_path)
+    );
+
+    apply_pending_deletes(&table_path).unwrap();
+
+    assert!(
+        !global_pending_deletes()
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains_key(&table_path)
+    );
+    // The fresh file must be untouched.
+    assert_eq!(std::fs::metadata(&table_path).unwrap().len(), 100);
+    assert_eq!(std::fs::read(&table_path).unwrap(), vec![0u8; 100]);
+}
+
+#[test]
+fn clear_pending_deletes_for_dir_removes_only_matching_entries() {
+    let dir = tempdir().unwrap();
+    let outside_dir = tempdir().unwrap();
+    let inside = dir.path().join("inside.apex");
+    let outside = outside_dir.path().join("outside.apex");
+    insert_pending_delete(&inside, 1, 1, 100, &[0u8; 32]);
+    insert_pending_delete(&outside, 1, 1, 100, &[0u8; 32]);
+
+    clear_pending_deletes_for_dir(dir.path());
+
+    let pending = global_pending_deletes().read().unwrap();
+    let map = pending.as_ref().unwrap();
+    assert!(!map.contains_key(&inside));
+    assert!(map.contains_key(&outside));
+}
+
 #[test]
 fn delta_row_count_cache_survives_unrelated_table_epoch() {
     use std::io::Write;

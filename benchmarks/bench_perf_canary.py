@@ -56,7 +56,7 @@ def _run_metric(bench, method_name, mode, warmup, iterations, setup_method=None)
     return full_bench.run_bench(method, warmup, iterations)
 
 
-def run_canary(rows, warmup, iterations):
+def run_canary(rows, warmup, iterations, qps_only=False):
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -68,20 +68,43 @@ def run_canary(rows, warmup, iterations):
     results = []
     try:
         bench.setup()
-        for spec in CANARY_SPECS:
-            name, method_name, mode = spec[0], spec[1], spec[2]
-            setup_method = spec[3] if len(spec) > 3 else None
-            if method_name == "bench_topk_join_canary":
-                bench.setup_topk_join_canary()
-            elapsed_ms = _run_metric(
-                bench, method_name, mode, warmup, iterations, setup_method
-            )
+        if not qps_only:
+            for spec in CANARY_SPECS:
+                name, method_name, mode = spec[0], spec[1], spec[2]
+                setup_method = spec[3] if len(spec) > 3 else None
+                if method_name == "bench_topk_join_canary":
+                    bench.setup_topk_join_canary()
+                elapsed_ms = _run_metric(
+                    bench, method_name, mode, warmup, iterations, setup_method
+                )
+                results.append({
+                    "category": "ApexBase canary",
+                    "query": name,
+                    "ApexBase": round(elapsed_ms, 6),
+                })
+                print(f"{name:<34} {elapsed_ms:>12.6f} ms")
+
+        # OLAP Q/s read profile (ApexBase-only). The harness recreates the
+        # engine on a clean loaded copy, so the measurement is independent of
+        # the delta-heavy state left by the DML canary metrics.
+        qps = full_bench.run_qps_benchmark(
+            tmpdir,
+            data,
+            n_threads=4,
+            min_duration=1.0,
+            min_iterations=50,
+            existing_engines={"ApexBase": bench},
+        )
+        for label, key in (
+            ("Q/s (single thread)", "ApexBase_single"),
+            ("Q/s (4 threads)", "ApexBase_concurrent_4"),
+        ):
             results.append({
-                "category": "ApexBase canary",
-                "query": name,
-                "ApexBase": round(elapsed_ms, 6),
+                "category": "ApexBase Q/s",
+                "query": label,
+                "ApexBase": round(qps.get(key, 0.0), 3),
             })
-            print(f"{name:<34} {elapsed_ms:>12.6f} ms")
+            print(f"{label:<34} {qps.get(key, 0.0):>12.3f} Q/s")
         return results
     finally:
         bench.close()
@@ -94,11 +117,18 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=7)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--qps-only",
+        action="store_true",
+        help="Run only the OLAP Q/s read profile instead of the full canary",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
 
-    results = run_canary(args.rows, args.warmup, args.iterations)
+    results = run_canary(
+        args.rows, args.warmup, args.iterations, qps_only=args.qps_only
+    )
     report = {
         **full_bench.get_report_metadata("apexbase-canary"),
         "config": {

@@ -64,8 +64,8 @@ def one_wheel(directory):
     return wheels[0]
 
 
-def benchmark_arguments(mode, rows, warmup, iterations, output):
-    if mode == "canary":
+def benchmark_arguments(mode, rows, warmup, iterations, output, qps_only=False):
+    if mode == "canary" or qps_only:
         script = ROOT / "benchmarks" / "bench_perf_canary.py"
         defaults = (200_000, 2, 7)
     else:
@@ -76,13 +76,16 @@ def benchmark_arguments(mode, rows, warmup, iterations, output):
         defaults[1] if warmup is None else warmup,
         defaults[2] if iterations is None else iterations,
     )
-    return (
+    command = [
         script,
         "--rows", str(resolved[0]),
         "--warmup", str(resolved[1]),
         "--iterations", str(resolved[2]),
         "--output", output,
-    )
+    ]
+    if qps_only:
+        command.insert(1, "--qps-only")
+    return tuple(command)
 
 
 def comparison_arguments(python, reports, args):
@@ -199,60 +202,95 @@ def main(argv=None):
                 print(f"\nWaiting {args.settle_seconds:g}s for build load to settle...", flush=True)
                 time.sleep(args.settle_seconds)
 
-            counts = {"base": 0, "current": 0}
-            reports = {"base": [], "current": []}
+            def make_collect(prefix, counts, reports, command_builder):
+                def collect(sample_order):
+                    for side in sample_order:
+                        counts[side] += 1
+                        report = output_dir / f"{prefix}-{side}-{counts[side]}.json"
+                        reports[side].append(report)
+                        run((python, "-m", "pip", "install", "--force-reinstall", "--no-deps", wheels[side]))
+                        env = os.environ.copy()
+                        if side == "base":
+                            env.update({
+                                "APEXBASE_BENCHMARK_COMMIT": base_commit,
+                                "APEXBASE_BENCHMARK_BRANCH": args.base_ref,
+                                "APEXBASE_BENCHMARK_DIRTY": "0",
+                            })
+                        else:
+                            env.update({
+                                "APEXBASE_BENCHMARK_COMMIT": current_commit,
+                                "APEXBASE_BENCHMARK_BRANCH": current_branch,
+                                "APEXBASE_BENCHMARK_DIRTY": "1" if dirty else "0",
+                            })
+                        command = (python, *command_builder(side, str(report)))
+                        run(command, env=env)
+                return collect
 
-            def collect(sample_order):
-                for side in sample_order:
-                    counts[side] += 1
-                    report = output_dir / f"perf-{side}-{counts[side]}.json"
-                    reports[side].append(report)
-                    run((python, "-m", "pip", "install", "--force-reinstall", "--no-deps", wheels[side]))
-                    env = os.environ.copy()
-                    if side == "base":
-                        env.update({
-                            "APEXBASE_BENCHMARK_COMMIT": base_commit,
-                            "APEXBASE_BENCHMARK_BRANCH": args.base_ref,
-                            "APEXBASE_BENCHMARK_DIRTY": "0",
-                        })
-                    else:
-                        env.update({
-                            "APEXBASE_BENCHMARK_COMMIT": current_commit,
-                            "APEXBASE_BENCHMARK_BRANCH": current_branch,
-                            "APEXBASE_BENCHMARK_DIRTY": "1" if dirty else "0",
-                        })
-                    command = (python, *benchmark_arguments(
-                        args.mode, args.rows, args.warmup, args.iterations, str(report)
-                    ))
-                    run(command, env=env)
-
-            collect(SAMPLE_ORDER)
-            completed = run(
-                comparison_arguments(python, reports, args), capture=True, check=False
-            )
-            if completed.returncode == 1:
-                initial_output = completed.stdout + completed.stderr
-                (output_dir / "comparison-initial.txt").write_text(
-                    initial_output, encoding="utf-8"
-                )
-                print(f"\n{initial_output}", end="")
-                print(
-                    "Initial three-sample comparison failed; collecting two "
-                    "additional samples per side for confirmation.",
-                    flush=True,
-                )
-                collect(CONFIRMATION_SAMPLE_ORDER)
+            def run_comparison(collect, reports, stem):
                 completed = run(
                     comparison_arguments(python, reports, args),
                     capture=True,
                     check=False,
                 )
-            comparison = output_dir / "comparison.txt"
-            comparison_output = completed.stdout + completed.stderr
-            comparison.write_text(comparison_output, encoding="utf-8")
-            print(f"\n{comparison_output}", end="")
+                if completed.returncode == 1:
+                    initial_output = completed.stdout + completed.stderr
+                    (output_dir / f"{stem}-initial.txt").write_text(
+                        initial_output, encoding="utf-8"
+                    )
+                    print(f"\n{initial_output}", end="")
+                    print(
+                        "Initial three-sample comparison failed; collecting two "
+                        "additional samples per side for confirmation.",
+                        flush=True,
+                    )
+                    collect(CONFIRMATION_SAMPLE_ORDER)
+                    completed = run(
+                        comparison_arguments(python, reports, args),
+                        capture=True,
+                        check=False,
+                    )
+                comparison = output_dir / f"{stem}.txt"
+                comparison_output = completed.stdout + completed.stderr
+                comparison.write_text(comparison_output, encoding="utf-8")
+                print(f"\n{comparison_output}", end="")
+                return completed.returncode
+
+            counts = {"base": 0, "current": 0}
+            reports = {"base": [], "current": []}
+            collect = make_collect(
+                "perf",
+                counts,
+                reports,
+                lambda side, report: benchmark_arguments(
+                    args.mode, args.rows, args.warmup, args.iterations, report
+                ),
+            )
+            collect(SAMPLE_ORDER)
+            comparison_status = run_comparison(collect, reports, "comparison")
+
+            # The full gate also covers the OLAP Q/s read profile
+            # (ApexBase-only, canary scale) as a separate base/current
+            # comparison, so a Q/s regression fails the gate even when the
+            # public tabular/vector metrics pass.
+            qps_status = 0
+            if args.mode == "full":
+                qps_counts = {"base": 0, "current": 0}
+                qps_reports = {"base": [], "current": []}
+                collect_qps = make_collect(
+                    "qps",
+                    qps_counts,
+                    qps_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, qps_only=True
+                    ),
+                )
+                collect_qps(SAMPLE_ORDER)
+                qps_status = run_comparison(
+                    collect_qps, qps_reports, "qps-comparison"
+                )
+                comparison_status = max(comparison_status, qps_status)
+
             print(f"Reports and comparison saved in {output_dir}")
-            comparison_status = completed.returncode
         finally:
             for worktree in reversed(worktrees):
                 run(("git", "worktree", "remove", "--force", worktree), check=False)

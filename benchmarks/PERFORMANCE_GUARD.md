@@ -18,8 +18,21 @@ python benchmarks/bench_perf_canary.py \
 ```
 
 The canary covers bulk insert, point reads, limited and full scans, filtering,
-grouping, ordering, aggregation, small writes, updates, and physical deletion.
-It uses the same benchmark implementations as the public scoreboard.
+grouping, ordering, aggregation, small writes, updates, physical deletion, and
+the OLAP Q/s read profile (single-thread and 4-thread, measured on a clean
+loaded copy of the dataset table). It uses the same benchmark implementations
+as the public scoreboard.
+
+Run only the Q/s read profile with `--qps-only`:
+
+```bash
+python benchmarks/bench_perf_canary.py \
+  --rows 200000 \
+  --warmup 2 \
+  --iterations 7 \
+  --qps-only \
+  --output /tmp/apexbase-qps.json
+```
 
 ## Compare two reports
 
@@ -70,7 +83,7 @@ ApexBase. It must provide `maturin` and the benchmark dependencies from
 packages. Use a quiet machine, connect AC power, close CPU-heavy applications,
 and keep the same power and thermal settings for both revisions.
 
-For the 15-metric development canary:
+For the development canary (which includes the two Q/s metrics):
 
 ```bash
 python benchmarks/run_local_perf_guard.py --base-ref origin/main
@@ -80,7 +93,8 @@ The current side is built from the current workspace, including local source
 changes. `--base-ref` may be any local Git commit, branch, or tag. Fetch the
 remote first if `origin/main` must reflect its latest state.
 
-For the complete 78-metric suite:
+For the complete suite — the public tabular/vector scoreboard **plus** a
+separate base/current Q/s comparison (ApexBase-only, canary scale):
 
 ```bash
 python benchmarks/run_local_perf_guard.py \
@@ -89,8 +103,10 @@ python benchmarks/run_local_perf_guard.py \
 ```
 
 The full mode is intentionally expensive: it performs six complete benchmark
-runs in addition to two release builds. The canary is the normal edit-time
-check; use full mode for final performance acceptance.
+runs of the public scoreboard and six Q/s runs in addition to two release
+builds. The canary is the normal edit-time check; use full mode for final
+performance acceptance. A Q/s regression fails the full gate even when every
+public tabular/vector metric passes.
 
 By default, reports are written under
 `local-perf-results/<timestamp>/`. A custom directory must not already exist:

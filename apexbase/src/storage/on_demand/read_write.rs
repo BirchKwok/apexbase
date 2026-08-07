@@ -26,10 +26,29 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
         None => return Ok(()),
     };
     // Parse pending format: "APXP"[rg_count:u32][(rg_i:u32, offset:u64, len:u32, del_bytes)...][footer_off:u64][footer_len:u32][footer_bytes...]
-    if buf.len() < 8 || &buf[0..4] != b"APXP" {
+    if buf.len() < 24 || &buf[0..4] != b"APXP" {
         return Ok(());
     }
-    let mut pos = 4;
+    let dev_id = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+    let ino_id = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+    // The deferred delete state belongs to one specific file incarnation. If the
+    // file was deleted and recreated at the same path (drop_if_exists, external
+    // temp-dir cleanup), the recorded offsets and footer no longer describe the
+    // current file; applying them would corrupt the fresh file with stale
+    // deletion vectors. Discard the stale entry instead.
+    use std::os::unix::fs::MetadataExt;
+    let matches_identity = std::fs::metadata(path)
+        .map(|m| m.dev() == dev_id && m.ino() == ino_id)
+        .unwrap_or(false);
+    if !matches_identity {
+        global_pending_deletes()
+            .write()
+            .unwrap()
+            .as_mut()
+            .map(|m| m.remove(path));
+        return Ok(());
+    }
+    let mut pos = 20;
     let rg_count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     let mut rg_writes: Vec<(usize, u64, Vec<u8>)> = Vec::new();
@@ -59,6 +78,7 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
     if pos + footer_len > buf.len() {
         return Ok(());
     }
+
     let footer_bytes = &buf[pos..pos + footer_len];
     // Write deletion vectors, footer, and active row count to disk.
     let mut file = std::fs::OpenOptions::new()
@@ -93,6 +113,19 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
         .as_mut()
         .map(|m| m.remove(path));
     Ok(())
+}
+
+/// Drop deferred-delete state for every table under *dir*.
+///
+/// Called when a database directory is wiped and recreated (drop_if_exists):
+/// the pending state was recorded for the old files and must not be applied to
+/// fresh files created at the same paths.
+pub fn clear_pending_deletes_for_dir(dir: &std::path::Path) {
+    global_pending_deletes()
+        .write()
+        .unwrap()
+        .as_mut()
+        .map(|m| m.retain(|path, _| !path.starts_with(dir)));
 }
 
 impl OnDemandStorage {
@@ -5717,8 +5750,18 @@ impl OnDemandStorage {
 
             // Serialize pending state to global map (no file I/O)
             let footer_bytes = footer_mut.to_bytes();
-            let mut buf = Vec::with_capacity(8 + rg_writes.len() * 20 + 12 + footer_bytes.len());
+            let mut buf = Vec::with_capacity(24 + rg_writes.len() * 20 + 12 + footer_bytes.len());
             buf.extend_from_slice(b"APXP");
+            // Record the file identity so the deferred state is only applied to
+            // the same file incarnation. A table recreated at the same path
+            // (drop_if_exists, external temp-dir cleanup) must not receive the
+            // old deletion vectors.
+            use std::os::unix::fs::MetadataExt;
+            let meta = std::fs::metadata(&self.path)
+                .map(|m| (m.dev(), m.ino()))
+                .unwrap_or((0, 0));
+            buf.extend_from_slice(&meta.0.to_le_bytes());
+            buf.extend_from_slice(&meta.1.to_le_bytes());
             buf.extend_from_slice(&(rg_writes.len() as u32).to_le_bytes());
             for (rg_i, wr) in &rg_writes {
                 let del_vec_len = (footer_mut.row_groups[*rg_i].row_count as usize + 7) / 8;

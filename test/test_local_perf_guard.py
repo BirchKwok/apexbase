@@ -81,6 +81,23 @@ def test_local_guard_accepts_explicit_benchmark_sizes(local_guard):
     assert (command[2], command[4], command[6]) == ("1234", "4", "9")
 
 
+def test_local_guard_qps_only_uses_canary_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json", qps_only=True
+    )
+
+    assert Path(command[0]).name == "bench_perf_canary.py"
+    assert "--qps-only" in command
+    assert command[-2:] == ("--output", "report.json")
+
+
+def test_local_guard_full_mode_keeps_public_benchmark(local_guard):
+    command = local_guard.benchmark_arguments("full", None, None, None, "report.json")
+
+    assert Path(command[0]).name == "bench_vs_sqlite_duckdb.py"
+    assert "--qps-only" not in command
+
+
 @pytest.mark.parametrize(
     "arguments",
     (
