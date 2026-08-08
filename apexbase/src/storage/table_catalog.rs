@@ -717,9 +717,11 @@ impl Drop for CatalogLock {
 /// rewrite or truncate a file while a user-mapped section is open (OS error
 /// 1224 / ERROR_USER_MAPPED_FILE), so the mapping must be dropped before a
 /// test or another process tampers with / deletes `.apex_tables`. The next
-/// access remaps the file; `REGISTRY_CACHE` (validated by generation + mtime)
-/// keeps reads O(1).
+/// access remaps the file. Drop the snapshot cache as well: Windows can report
+/// the same coarse mtime for a same-size rewrite, so generation + mtime alone
+/// cannot distinguish the replacement from the previously mapped file.
 pub fn release(base_dir: &Path) {
+    REGISTRY_CACHE.remove(base_dir);
     CATALOGS.remove(base_dir);
     SCHEMAS.remove(base_dir);
 }
