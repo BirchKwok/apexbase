@@ -32,7 +32,7 @@ match &sig {
 
 ### What is FORBIDDEN
 
-- **No inline SQL pattern matching** in `bindings.rs`, `executor/mod.rs`, or `client.py` outside of the classifier
+- **No inline SQL pattern matching** in `python/bindings/`, `executor/mod.rs`, or `client.py` outside of the classifier
 - **No duplicate `sql.to_uppercase()`** — each entry point does ONE classify/uppercase pass
 - **No new fast paths** added directly in bindings or client — add a new `QuerySignature` variant first, then wire it through the 3 layers
 
@@ -85,8 +85,8 @@ match &sig {
 
 ### Fast Path Preservation
 
-- **cached_backends DashMap** (bindings.rs): Per-instance cache keyed by table name string. Avoids global `STORAGE_CACHE` PathBuf hashing. Populated on first point lookup, reused on subsequent calls.
-- **pread_rcix** (bindings.rs): Direct columnar read for `SELECT * LIMIT N`. Returns `columns_dict` format consumed by `ResultView(lazy_pydict=...)`.
+- **cached_backends DashMap** (python/bindings/read.rs): Per-instance cache keyed by table name string. Avoids global `STORAGE_CACHE` PathBuf hashing. Populated on first point lookup, reused on subsequent calls.
+- **pread_rcix** (to_arrow_batch_pread_rcix in storage/on_demand/read_write.rs, invoked from python/bindings/sql.rs): Direct columnar read for `SELECT * LIMIT N`. Returns `columns_dict` format consumed by `ResultView(lazy_pydict=...)`.
 - **Arrow FFI** (zero-copy): Primary read path for all queries ≥500 rows. No serialization overhead.
 - **Arrow IPC** (fallback): Used for multi-statement and when FFI fails.
 
@@ -94,7 +94,7 @@ match &sig {
 
 - **NEVER add query result caching** (e.g., caching PyObject results by SQL string). All optimizations must be genuine algorithmic improvements.
 - **NEVER add `sql.to_uppercase()` calls** outside the classifier. Each layer does ONE uppercase pass.
-- **NEVER add new `if sql_upper.starts_with(...)` checks** in bindings.rs or client.py. Add a QuerySignature variant instead.
+- **NEVER add new `if sql_upper.starts_with(...)` checks** in python/bindings/ or client.py. Add a QuerySignature variant instead.
 
 ---
 
@@ -137,6 +137,11 @@ match &sig {
 | `apexbase/src/query/executor/mod.rs` | Pre-parse dispatch, execute_with_base_dir |
 | `apexbase/src/query/executor/select.rs` | Post-parse SELECT fast paths (mmap) |
 | `apexbase/src/query/executor/joins.rs` | resolve_table_path, resolve_point_lookup_table_path |
-| `apexbase/src/python/bindings.rs` | PyO3 bridge entry: execute(), _execute_arrow_ffi/ipc/like |
-| `apexbase/src/python/bindings/` | Split bindings: arrow, blob, read, sql, wrapper, write |
+| `apexbase/src/python/bindings/wrapper.rs` | PyO3 bridge entry: `ApexStorageImpl`, locks, cached_backends, FTS coordination |
+| `apexbase/src/python/bindings/read.rs` | Read paths: fast_row_count, retrieve/retrieve_projected, cached_backends lookup |
+| `apexbase/src/python/bindings/write.rs` | Write paths: store/store_columnar, DML, schema ops, invalidate_backend |
+| `apexbase/src/python/bindings/sql.rs` | SQL entry points: execute(), txn state |
+| `apexbase/src/python/bindings/arrow.rs` | Arrow FFI/IPC/LIKE read paths: _execute_arrow_ffi/ipc/like |
+| `apexbase/src/python/bindings/blob.rs` | Blob column bindings |
+| `apexbase/src/python/bindings.rs` | Thin re-export of `ApexStorageImpl` (keep it thin) |
 | `apexbase/python/apexbase/client.py` | Python client: _execute_impl() classifier + dispatch |

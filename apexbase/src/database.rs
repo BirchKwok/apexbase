@@ -388,6 +388,18 @@ impl Database {
         )
     }
 
+    /// Write pre-built columnar data (borrowed-buffer path used by the Python
+    /// binding). See `StorageEngine::write_typed_columns`.
+    #[inline]
+    pub fn write_typed_columns(
+        table_path: &Path,
+        columns: HashMap<String, crate::storage::on_demand::ColumnData>,
+        null_positions: HashMap<String, Vec<bool>>,
+        durability: DurabilityLevel,
+    ) -> io::Result<Vec<u64>> {
+        engine().write_typed_columns(table_path, columns, null_positions, durability)
+    }
+
     #[inline]
     pub fn execute(sql: &str, base_dir: &Path, table_path: &Path) -> io::Result<ApexResult> {
         ApexExecutor::execute_with_base_dir(sql, base_dir, table_path)

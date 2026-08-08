@@ -1,6 +1,7 @@
 //! PyO3 binding methods split by domain.
 
 use super::*;
+use crate::storage::ColumnData;
 
 #[pymethods]
 impl ApexStorageImpl {
@@ -726,13 +727,11 @@ impl ApexStorageImpl {
             return Ok(Vec::new());
         }
 
-        // Separate columns by type with NULL tracking
-        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
-        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
-        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
-        let mut binary_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        let mut fixedlist_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
-        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+        // Build ColumnData directly from the Python buffers. Strings and bytes
+        // are borrowed (&str / &[u8]) and copied once into the column data
+        // buffer — no per-element String/Vec allocation, no typed intermediate
+        // layer (see StorageEngine::write_typed_columns).
+        let mut columns_map: HashMap<String, ColumnData> = HashMap::new();
         let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
 
         for (key, value) in columns.iter() {
@@ -782,7 +781,7 @@ impl ApexStorageImpl {
                         col_type = Some("int");
                     } else if item.extract::<f64>().is_ok() {
                         col_type = Some("float");
-                    } else if item.extract::<String>().is_ok() {
+                    } else if item.extract::<&str>().is_ok() {
                         col_type = Some("string");
                     }
                     break;
@@ -802,7 +801,7 @@ impl ApexStorageImpl {
                             item.extract::<i64>().unwrap_or(0)
                         });
                     }
-                    int_columns.insert(col_name.clone(), vals);
+                    columns_map.insert(col_name.clone(), ColumnData::Int64(vals));
                     null_positions.insert(col_name, nulls);
                 }
                 Some("float") => {
@@ -817,7 +816,7 @@ impl ApexStorageImpl {
                             item.extract::<f64>().unwrap_or(0.0)
                         });
                     }
-                    float_columns.insert(col_name.clone(), vals);
+                    columns_map.insert(col_name.clone(), ColumnData::Float64(vals));
                     null_positions.insert(col_name, nulls);
                 }
                 Some("bool") => {
@@ -832,65 +831,94 @@ impl ApexStorageImpl {
                             item.extract::<bool>().unwrap_or(false)
                         });
                     }
-                    bool_columns.insert(col_name.clone(), vals);
+                    let byte_count = (vals.len() + 7) / 8;
+                    let mut packed = vec![0u8; byte_count];
+                    for (i, &v) in vals.iter().enumerate() {
+                        if v {
+                            packed[i / 8] |= 1 << (i % 8);
+                        }
+                    }
+                    columns_map.insert(
+                        col_name.clone(),
+                        ColumnData::Bool {
+                            data: packed,
+                            len: vals.len(),
+                        },
+                    );
                     null_positions.insert(col_name, nulls);
                 }
                 Some("bytes") => {
-                    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(col_len);
+                    let mut offsets = Vec::with_capacity(col_len + 1);
+                    let mut data = Vec::new();
                     let mut nulls = Vec::with_capacity(col_len);
+                    offsets.push(0u64);
                     for item in list.iter() {
                         let is_null = item.is_none();
                         nulls.push(is_null);
                         if is_null {
-                            vals.push(Vec::new());
+                            offsets.push(data.len() as u64);
                         } else if let Ok(b) = item.downcast::<pyo3::types::PyBytes>() {
-                            vals.push(b.as_bytes().to_vec());
+                            data.extend_from_slice(b.as_bytes());
+                            offsets.push(data.len() as u64);
                         } else if let Ok(s) = item.extract::<Vec<u8>>() {
-                            vals.push(s);
+                            data.extend_from_slice(&s);
+                            offsets.push(data.len() as u64);
                         } else {
-                            vals.push(Vec::new());
+                            offsets.push(data.len() as u64);
                         }
                     }
-                    binary_columns_map.insert(col_name.clone(), vals);
+                    columns_map.insert(
+                        col_name.clone(),
+                        ColumnData::Binary { offsets, data },
+                    );
                     null_positions.insert(col_name, nulls);
                 }
                 Some("fixedlist") => {
-                    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(col_len);
+                    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(col_len);
                     let mut nulls = Vec::with_capacity(col_len);
                     for item in list.iter() {
                         let is_null = item.is_none();
                         nulls.push(is_null);
                         if is_null {
-                            vals.push(Vec::new());
+                            rows.push(Vec::new());
                         } else if let Ok(bytes) = item
                             .call_method0("flatten")
                             .and_then(|flat| flat.call_method1("astype", ("float32",)))
                             .and_then(|f32arr| f32arr.call_method0("tobytes"))
                             .and_then(|b| b.extract::<Vec<u8>>())
                         {
-                            vals.push(bytes);
+                            rows.push(bytes);
                         } else if let Ok(seq) = item.downcast::<pyo3::types::PyList>() {
                             let mut bytes = Vec::with_capacity(seq.len() * 4);
                             for elem in seq.iter() {
                                 let f = elem.extract::<f32>().unwrap_or(0.0);
                                 bytes.extend_from_slice(&f.to_le_bytes());
                             }
-                            vals.push(bytes);
+                            rows.push(bytes);
                         } else {
-                            vals.push(Vec::new());
+                            rows.push(Vec::new());
                         }
                     }
-                    fixedlist_columns_map.insert(col_name.clone(), vals);
+                    let dim = rows
+                        .iter()
+                        .find(|b| !b.is_empty())
+                        .map(|b| b.len() / 4)
+                        .unwrap_or(0) as u32;
+                    let mut data: Vec<u8> = Vec::with_capacity(col_len * dim as usize * 4);
+                    for b in &rows {
+                        data.extend_from_slice(b);
+                    }
+                    columns_map.insert(col_name.clone(), ColumnData::FixedList { data, dim });
                     null_positions.insert(col_name, nulls);
                 }
                 Some("float16_vector") => {
-                    let mut vals: Vec<Vec<u8>> = Vec::with_capacity(col_len);
+                    let mut rows: Vec<Vec<u8>> = Vec::with_capacity(col_len);
                     let mut nulls = Vec::with_capacity(col_len);
                     for item in list.iter() {
                         let is_null = item.is_none();
                         nulls.push(is_null);
                         if is_null {
-                            vals.push(Vec::new());
+                            rows.push(Vec::new());
                         } else if let Ok(f32_bytes) = item
                             .call_method0("flatten")
                             .and_then(|flat| flat.call_method1("astype", ("float32",)))
@@ -904,27 +932,45 @@ impl ApexStorageImpl {
                                     crate::storage::on_demand::f32_to_f16(f).to_le_bytes()
                                 })
                                 .collect();
-                            vals.push(f16_bytes);
+                            rows.push(f16_bytes);
                         } else {
-                            vals.push(Vec::new());
+                            rows.push(Vec::new());
                         }
                     }
-                    fixedlist_columns_map.insert(col_name.clone(), vals);
+                    let dim = rows
+                        .iter()
+                        .find(|b| !b.is_empty())
+                        .map(|b| b.len() / 2)
+                        .unwrap_or(0) as u32;
+                    let mut data: Vec<u8> = Vec::with_capacity(col_len * dim as usize * 2);
+                    for b in &rows {
+                        data.extend_from_slice(b);
+                    }
+                    columns_map.insert(col_name.clone(), ColumnData::Float16List { data, dim });
                     null_positions.insert(col_name, nulls);
                 }
                 Some("string") | None => {
-                    let mut vals = Vec::with_capacity(col_len);
+                    let mut offsets = Vec::with_capacity(col_len + 1);
+                    let mut data = Vec::new();
                     let mut nulls = Vec::with_capacity(col_len);
+                    offsets.push(0u64);
                     for item in list.iter() {
                         let is_null = item.is_none();
                         nulls.push(is_null);
-                        vals.push(if is_null {
-                            String::new()
+                        if is_null {
+                            offsets.push(data.len() as u64);
+                        } else if let Ok(s) = item.extract::<&str>() {
+                            // Borrowed Python str buffer — single copy into `data`.
+                            data.extend_from_slice(s.as_bytes());
+                            offsets.push(data.len() as u64);
                         } else {
-                            item.extract::<String>().unwrap_or_default()
-                        });
+                            offsets.push(data.len() as u64);
+                        }
                     }
-                    string_columns.insert(col_name.clone(), vals);
+                    columns_map.insert(
+                        col_name.clone(),
+                        ColumnData::String { offsets, data },
+                    );
                     null_positions.insert(col_name, nulls);
                 }
                 _ => {}
@@ -939,8 +985,21 @@ impl ApexStorageImpl {
         let durability = self.durability;
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
-        // Save a copy of string_columns for FTS indexing (before insert_typed consumes it)
-        let string_columns_for_fts = string_columns.clone();
+        // FTS indexing needs the original string columns after the write. Keep
+        // a copy only when FTS is enabled — the common case avoids cloning the
+        // whole batch.
+        let string_columns_for_fts: Option<HashMap<String, ColumnData>> =
+            if self.fts_manager.read().is_some() {
+                let mut m = HashMap::new();
+                for (name, col) in columns_map.iter() {
+                    if matches!(col, ColumnData::String { .. }) {
+                        m.insert(name.clone(), col.clone());
+                    }
+                }
+                Some(m)
+            } else {
+                None
+            };
 
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
             // Skip file lock for 'fast' durability
@@ -951,14 +1010,9 @@ impl ApexStorageImpl {
                 )
             };
 
-            let result = crate::Database::write_typed(
+            let result = crate::Database::write_typed_columns(
                 &table_path,
-                int_columns,
-                float_columns,
-                string_columns,
-                binary_columns_map,
-                fixedlist_columns_map,
-                bool_columns,
+                columns_map,
                 null_positions,
                 durability,
             )
@@ -981,7 +1035,7 @@ impl ApexStorageImpl {
         crate::Database::invalidate(&table_path);
 
         // Index in FTS if enabled - OPTIMIZED: Use add_documents_arrow_str (🥈 zero-copy &str path)
-        {
+        if let Some(string_columns_for_fts) = &string_columns_for_fts {
             let mgr = self.fts_manager.read();
             if mgr.is_some() {
                 let table_name = self.current_table.read().clone();
@@ -1007,7 +1061,25 @@ impl ApexStorageImpl {
                                 .filter_map(|f| {
                                     string_columns_for_fts
                                         .get(f)
-                                        .map(|v| (f.clone(), v.clone()))
+                                        .map(|col| {
+                                            let vals = match col {
+                                                ColumnData::String { offsets, data } => {
+                                                    let mut vals =
+                                                        Vec::with_capacity(offsets.len() - 1);
+                                                    for i in 0..offsets.len().saturating_sub(1) {
+                                                        let start = offsets[i] as usize;
+                                                        let end = offsets[i + 1] as usize;
+                                                        vals.push(String::from_utf8_lossy(
+                                                            &data[start..end],
+                                                        )
+                                                        .to_string());
+                                                    }
+                                                    vals
+                                                }
+                                                _ => Vec::new(),
+                                            };
+                                            (f.clone(), vals)
+                                        })
                                 })
                                 .collect();
 

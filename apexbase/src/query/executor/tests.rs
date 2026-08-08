@@ -689,6 +689,7 @@ fn test_olap_full_scan() {
     assert!(batch.column_by_name("dept").is_some());
 }
 
+
 #[test]
 fn test_olap_count_star() {
     let dir = tempdir().unwrap();

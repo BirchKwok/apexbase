@@ -841,16 +841,10 @@ impl OnDemandStorage {
                                 )) as ArrayRef,
                             )
                         } else {
-                            let mut offsets_i32: Vec<i32> =
-                                Vec::with_capacity(row_count + 1);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    offsets[..row_count + 1].as_ptr() as *const i32,
-                                    offsets_i32.as_mut_ptr(),
-                                    row_count + 1,
-                                );
-                                offsets_i32.set_len(row_count + 1);
-                            }
+                            let offsets_i32: Vec<i32> = offsets[..row_count + 1]
+                                .iter()
+                                .map(|&o| o as i32)
+                                .collect();
                             let offset_buf = unsafe {
                                 arrow::buffer::OffsetBuffer::new_unchecked(ScalarBuffer::from(
                                     offsets_i32,
@@ -1240,6 +1234,10 @@ impl OnDemandStorage {
             if rg_rows == 0 {
                 continue;
             }
+            // Track which requested columns actually have data in this RG, so
+            // schema-evolution columns (footer-only ADD COLUMN) can be padded
+            // with all-NULL values below.
+            let mut rg_filled: Vec<bool> = vec![false; col_indices.len()];
 
             let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
             if rg_end > mmap_ref.len() {
@@ -1301,7 +1299,17 @@ impl OnDemandStorage {
                         col_data
                     };
                     col_accumulators[out_pos].append(&col_data);
+                    rg_filled[out_pos] = true;
                 }
+                Self::pad_missing_rg_columns(
+                    schema,
+                    col_indices,
+                    &rg_filled,
+                    rg_rows,
+                    null_bitmap_len,
+                    &mut col_accumulators,
+                    &mut col_null_bitmaps,
+                );
                 continue; // Skip sequential path
             }
 
@@ -1345,6 +1353,7 @@ impl OnDemandStorage {
                         col_data
                     };
                     col_accumulators[out_pos].append(&col_data);
+                    rg_filled[out_pos] = true;
                 } else {
                     let consumed = if encoding_version >= 1 {
                         skip_column_encoded(&body[pos..], col_type)?
@@ -1354,9 +1363,45 @@ impl OnDemandStorage {
                     pos += consumed;
                 }
             }
+            Self::pad_missing_rg_columns(
+                schema,
+                col_indices,
+                &rg_filled,
+                rg_rows,
+                null_bitmap_len,
+                &mut col_accumulators,
+                &mut col_null_bitmaps,
+            );
         }
 
         Ok((col_accumulators, all_del_bytes, col_null_bitmaps))
+    }
+
+    /// Append all-NULL default values for requested columns that have no data
+    /// in the current Row Group (footer-only ALTER TABLE ADD COLUMN).
+    fn pad_missing_rg_columns(
+        schema: &OnDemandSchema,
+        col_indices: &[usize],
+        rg_filled: &[bool],
+        rg_rows: usize,
+        null_bitmap_len: usize,
+        col_accumulators: &mut [ColumnData],
+        col_null_bitmaps: &mut [Vec<u8>],
+    ) {
+        for (out_pos, filled) in rg_filled.iter().enumerate() {
+            if !filled {
+                let col_idx = col_indices[out_pos];
+                let ct = schema.columns[col_idx].1;
+                col_accumulators[out_pos].append(&Self::create_default_column(ct, rg_rows));
+                // Only the first rg_rows bits are valid; leave trailing bits
+                // clear so later Row Groups' rows are not marked NULL.
+                let mut pad = vec![0u8; null_bitmap_len];
+                for i in 0..rg_rows {
+                    pad[i / 8] |= 1 << (i % 8);
+                }
+                col_null_bitmaps[out_pos].extend_from_slice(&pad);
+            }
+        }
     }
 
     pub(super) fn zone_map_prune_rgs(
@@ -1721,7 +1766,7 @@ impl OnDemandStorage {
 
         if start_row >= total_count {
             return Ok(ColumnData::String {
-                offsets: vec![0],
+                offsets: vec![0u64],
                 data: Vec::new(),
             });
         }
@@ -1731,18 +1776,20 @@ impl OnDemandStorage {
         // OPTIMIZATION: Read offsets directly into u32 Vec using bulk read
         let offset_start = 8 + start_row * 4; // skip count header
         let offset_count = actual_count + 1;
-        let mut offsets: Vec<u32> = vec![0u32; offset_count];
+        let mut disk_offsets: Vec<u32> = vec![0u32; offset_count];
         // SAFETY: u32 slice can be safely viewed as bytes for reading
         let offset_bytes = unsafe {
-            std::slice::from_raw_parts_mut(offsets.as_mut_ptr() as *mut u8, offset_count * 4)
+            std::slice::from_raw_parts_mut(disk_offsets.as_mut_ptr() as *mut u8, offset_count * 4)
         };
         mmap_cache.read_at(file, offset_bytes, index.data_offset + offset_start as u64)?;
 
         // Handle endianness on big-endian systems
         #[cfg(target_endian = "big")]
-        for off in &mut offsets {
+        for off in &mut disk_offsets {
             *off = u32::from_le(*off);
         }
+
+        let mut offsets: Vec<u64> = disk_offsets.iter().map(|&o| o as u64).collect();
 
         // Calculate data range
         let data_start = offsets[0];
@@ -1817,16 +1864,20 @@ impl OnDemandStorage {
 
         // OPTIMIZATION: Read dict_offsets directly into Vec<u32>
         let dict_offsets_offset = base_offset + 16 + (total_rows * 4) as u64;
-        let mut dict_offsets: Vec<u32> = vec![0u32; dict_size];
+        let mut disk_dict_offsets: Vec<u32> = vec![0u32; dict_size];
         let dict_offsets_bytes = unsafe {
-            std::slice::from_raw_parts_mut(dict_offsets.as_mut_ptr() as *mut u8, dict_size * 4)
+            std::slice::from_raw_parts_mut(
+                disk_dict_offsets.as_mut_ptr() as *mut u8,
+                dict_size * 4,
+            )
         };
         mmap_cache.read_at(file, dict_offsets_bytes, dict_offsets_offset)?;
 
         #[cfg(target_endian = "big")]
-        for off in &mut dict_offsets {
+        for off in &mut disk_dict_offsets {
             *off = u32::from_le(*off);
         }
+        let dict_offsets: Vec<u64> = disk_dict_offsets.iter().map(|&o| o as u64).collect();
 
         // Read dict_data_len and dict_data
         let dict_data_len_offset = dict_offsets_offset + (dict_size * 4) as u64;
@@ -1950,16 +2001,20 @@ impl OnDemandStorage {
 
         // OPTIMIZATION: Read dict_offsets directly into Vec<u32>
         let dict_offsets_offset = base_offset + 16 + (total_rows * 4) as u64;
-        let mut dict_offsets: Vec<u32> = vec![0u32; dict_size];
+        let mut disk_dict_offsets: Vec<u32> = vec![0u32; dict_size];
         let dict_offsets_bytes = unsafe {
-            std::slice::from_raw_parts_mut(dict_offsets.as_mut_ptr() as *mut u8, dict_size * 4)
+            std::slice::from_raw_parts_mut(
+                disk_dict_offsets.as_mut_ptr() as *mut u8,
+                dict_size * 4,
+            )
         };
         mmap_cache.read_at(file, dict_offsets_bytes, dict_offsets_offset)?;
 
         #[cfg(target_endian = "big")]
-        for off in &mut dict_offsets {
+        for off in &mut disk_dict_offsets {
             *off = u32::from_le(*off);
         }
+        let dict_offsets: Vec<u64> = disk_dict_offsets.iter().map(|&o| o as u64).collect();
 
         // Read dict_data_len and dict_data
         let dict_data_len_offset = dict_offsets_offset + (dict_size * 4) as u64;
@@ -2069,7 +2124,7 @@ impl OnDemandStorage {
         let data_base = index.data_offset + 8 + (total_count + 1) as u64 * 4 + 8;
 
         // Read data for each requested row and build result
-        let mut result_offsets = vec![0u32];
+        let mut result_offsets = vec![0u64];
         let mut result_data = Vec::new();
 
         for &idx in row_indices {
@@ -2083,10 +2138,10 @@ impl OnDemandStorage {
                     mmap_cache.read_at(file, &mut chunk, data_base + start as u64)?;
                     result_data.extend_from_slice(&chunk);
                 }
-                result_offsets.push(result_data.len() as u32);
+                result_offsets.push(result_data.len() as u64);
             } else {
                 // Out of bounds - push empty
-                result_offsets.push(result_data.len() as u32);
+                result_offsets.push(result_data.len() as u64);
             }
         }
 
@@ -2520,6 +2575,22 @@ impl OnDemandStorage {
         // Pre-compute column offsets for each RG (from RCIX or by scanning).
         // Then process each column independently in parallel via rayon.
         let needed_col_indices: Vec<usize> = (0..col_count).filter(|&ci| col_needed[ci]).collect();
+        // Schema evolution (footer-only ADD COLUMN): Row Groups predating a
+        // requested column lack its data. Fall back to the padded full-read +
+        // take path (scan_columns_mmap_with_nulls) instead of producing
+        // short/misaligned columns.
+        for (rg_i, local_pairs) in rg_local_indices.iter().enumerate() {
+            if local_pairs.is_empty() {
+                continue;
+            }
+            if rg_i >= footer.col_offsets.len()
+                || needed_col_indices
+                    .iter()
+                    .any(|&ci| ci >= footer.col_offsets[rg_i].len())
+            {
+                return Ok(None);
+            }
+        }
         let mut par_col_offsets: Vec<Option<Vec<u32>>> = Vec::new(); // per-RG col offsets
         let mut par_eligible = needed_col_indices.len() >= 2
             && n_out >= 500
@@ -2933,8 +3004,13 @@ impl OnDemandStorage {
             // Assemble RecordBatch from parallel results
             let mut fields: Vec<Field> = Vec::with_capacity(col_count + 1);
             let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_count + 1);
-            fields.push(Field::new("_id", ArrowDataType::Int64, false));
-            arrays.push(Arc::new(Int64Array::from(out_ids)));
+            let include_id = col_refs
+                .map(|refs| refs.iter().any(|r| r.eq_ignore_ascii_case("_id")))
+                .unwrap_or(true);
+            if include_id {
+                fields.push(Field::new("_id", ArrowDataType::Int64, false));
+                arrays.push(Arc::new(Int64Array::from(out_ids)));
+            }
             for (_, field, arr) in col_arrays {
                 fields.push(field);
                 arrays.push(arr);
@@ -3464,8 +3540,13 @@ impl OnDemandStorage {
         let mut fields: Vec<Field> = Vec::with_capacity(col_count + 1);
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(col_count + 1);
 
-        fields.push(Field::new("_id", ArrowDataType::Int64, false));
-        arrays.push(Arc::new(Int64Array::from(out_ids)));
+        let include_id = col_refs
+            .map(|refs| refs.iter().any(|r| r.eq_ignore_ascii_case("_id")))
+            .unwrap_or(true);
+        if include_id {
+            fields.push(Field::new("_id", ArrowDataType::Int64, false));
+            arrays.push(Arc::new(Int64Array::from(out_ids)));
+        }
 
         for (ci, buf) in col_bufs.into_iter().enumerate() {
             if !col_needed[ci] {
@@ -3650,7 +3731,7 @@ impl OnDemandStorage {
             if local_pairs.is_empty() {
                 continue;
             }
-            if rg_i >= footer.col_offsets.len() || footer.col_offsets[rg_i].len() < col_count {
+            if rg_i >= footer.col_offsets.len() {
                 return Ok(None);
             }
         }
@@ -3754,6 +3835,12 @@ impl OnDemandStorage {
 
             for ci in 0..col_count {
                 if !col_needed[ci] {
+                    continue;
+                }
+                // Schema evolution (footer-only ADD COLUMN): RGs predating the
+                // new column have no data — the output buffer already holds
+                // all-NULL values, so skip and leave them NULL.
+                if ci >= rcix.len() {
                     continue;
                 }
                 let ct = schema.columns[ci].1;

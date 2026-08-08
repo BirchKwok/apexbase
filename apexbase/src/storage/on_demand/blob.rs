@@ -88,7 +88,7 @@ fn decode_blob_descriptor(bytes: &[u8]) -> Option<BlobDescriptor> {
 }
 
 fn blob_descriptor_bounds<'a>(
-    offsets: &[u32],
+    offsets: &[u64],
     data: &'a [u8],
     row_idx: usize,
 ) -> Option<&'a [u8]> {
@@ -767,7 +767,7 @@ impl OnDemandStorage {
 
     pub fn materialize_blob_column(
         &self,
-        offsets: &[u32],
+        offsets: &[u64],
         data: &[u8],
         null_bitmap: &[bool],
         row_count: usize,

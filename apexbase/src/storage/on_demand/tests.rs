@@ -209,6 +209,183 @@ fn test_create_and_open() {
 }
 
 #[test]
+fn streaming_compact_merges_delta_and_deltastore_bounded_memory() {
+    use crate::data::Value;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("stream_compact.apex");
+
+    // Base table: 5 rows, persisted as compressed V4 Row Groups.
+    let base_ids;
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        storage.set_compression(CompressionType::Zstd).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("age".to_string(), vec![25i64, 30, 35, 40, 45]);
+        let mut string_cols = HashMap::new();
+        string_cols.insert(
+            "name".to_string(),
+            vec![
+                "Alice".to_string(),
+                "Bob".to_string(),
+                "Charlie".to_string(),
+                "David".to_string(),
+                "Eve".to_string(),
+            ],
+        );
+        base_ids = storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        assert_eq!(base_ids.len(), 5);
+        storage.save().unwrap();
+    }
+
+    // Reopen mmap-only, append two delta rows, then update/delete via DeltaStore.
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert!(!storage.v4_base_loaded.load(Ordering::SeqCst));
+
+    let delta_rows = vec![
+        {
+            let mut m = HashMap::new();
+            m.insert("age".to_string(), Value::Int64(50));
+            m.insert("name".to_string(), Value::String("Frank".to_string()));
+            m
+        },
+        {
+            let mut m = HashMap::new();
+            m.insert("age".to_string(), Value::Int64(55));
+            m.insert("name".to_string(), Value::String("Grace".to_string()));
+            m
+        },
+    ];
+    let delta_ids = storage.insert_value_rows_to_delta(&delta_rows).unwrap();
+    assert_eq!(delta_ids.len(), 2);
+
+    // Update one base row and one delta row; delete one base row.
+    storage
+        .delta_store
+        .write()
+        .update_cell(base_ids[0], "age", Value::Int64(99));
+    storage
+        .delta_store
+        .write()
+        .update_cell(delta_ids[0], "age", Value::Int64(51));
+    storage.delta_store.write().delete_row(base_ids[2]);
+    storage.save_delta_store().unwrap();
+
+    storage.compact_streaming_v4().unwrap();
+
+    // Delta artifacts are gone and the instance is back in mmap-only mode.
+    assert!(!OnDemandStorage::delta_path(&path).exists());
+    assert!(!std::path::Path::new(&format!("{}.deltastore", path.display())).exists());
+    assert!(!storage.v4_base_loaded.load(Ordering::SeqCst));
+    assert_eq!(storage.active_row_count(), 6);
+
+    // Reopen and verify merged data: one deleted row dropped, updates baked in.
+    drop(storage);
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.row_count(), 6);
+    let result = reopened
+        .read_columns(Some(&["age", "name"]), 0, None)
+        .unwrap();
+    match &result["age"] {
+        ColumnData::Int64(vals) => assert_eq!(vals, &[99, 30, 40, 45, 51, 55]),
+        other => panic!("unexpected age column: {other:?}"),
+    }
+    match &result["name"] {
+        ColumnData::String { offsets, data } => {
+            let names: Vec<String> = (0..offsets.len() - 1)
+                .map(|i| {
+                    String::from_utf8_lossy(&data[offsets[i] as usize..offsets[i + 1] as usize])
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(names, ["Alice", "Bob", "David", "Eve", "Frank", "Grace"]);
+        }
+        other => panic!("unexpected name column: {other:?}"),
+    }
+}
+
+#[test]
+fn append_chunks_large_batch_into_multiple_row_groups() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("chunked_append.apex");
+
+    // Seed a single-row V4 base.
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("id".to_string(), vec![1i64]);
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    // Reopen mmap-only, then append a batch larger than one Row Group.
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let mut int_cols = HashMap::new();
+    int_cols.insert(
+        "id".to_string(),
+        (2..=DEFAULT_ROW_GROUP_SIZE as i64 + 1001).collect(),
+    );
+    let ids = storage
+        .insert_typed(
+            int_cols,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    assert_eq!(ids.len(), DEFAULT_ROW_GROUP_SIZE as usize + 1000);
+    storage.save().unwrap();
+
+    // The append must be split into multiple Row Groups, not one giant RG.
+    let footer = storage.get_or_load_footer().unwrap().unwrap();
+    assert!(
+        footer.row_groups.len() >= 3,
+        "expected at least 3 Row Groups after chunked append, got {}",
+        footer.row_groups.len()
+    );
+    let max_rg = footer
+        .row_groups
+        .iter()
+        .map(|rg| rg.row_count)
+        .max()
+        .unwrap_or(0);
+    assert!(
+        max_rg <= DEFAULT_ROW_GROUP_SIZE,
+        "Row Group larger than target size: {max_rg}"
+    );
+
+    drop(storage);
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.row_count(), DEFAULT_ROW_GROUP_SIZE as u64 + 1001);
+    let result = reopened.read_columns(Some(&["id"]), 0, None).unwrap();
+    match &result["id"] {
+        ColumnData::Int64(vals) => {
+            assert_eq!(vals.len(), DEFAULT_ROW_GROUP_SIZE as usize + 1001);
+            assert_eq!(vals[0], 1);
+            assert_eq!(*vals.last().unwrap(), DEFAULT_ROW_GROUP_SIZE as i64 + 1001);
+        }
+        other => panic!("unexpected id column: {other:?}"),
+    }
+}
+
+#[test]
 fn persisted_string_null_detection_does_not_confuse_values_with_bitmap() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("string_null_detection.apex");
@@ -1251,4 +1428,390 @@ fn test_blob_storage_modes_roundtrip() {
 fn large_arrow_offset_boundary_uses_64_bit_offsets() {
     assert!(!super::requires_large_arrow_offsets(i32::MAX as usize));
     assert!(super::requires_large_arrow_offsets(i32::MAX as usize + 1));
+}
+
+#[test]
+fn footer_only_add_column_does_not_load_base_and_synthesizes_nulls() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("footer_add_col.apex");
+
+    // Seed a V4 base with two columns.
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("id".to_string(), vec![1i64, 2, 3]);
+        let mut string_cols = HashMap::new();
+        string_cols.insert(
+            "name".to_string(),
+            vec![
+                "Alice".to_string(),
+                "Bob".to_string(),
+                "Carol".to_string(),
+            ],
+        );
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    // Reopen mmap-only: add_column must not load the base into memory.
+    let storage = OnDemandStorage::open(&path).unwrap();
+    storage
+        .add_column_with_padding("extra", crate::data::DataType::Int64)
+        .unwrap();
+    assert!(!storage.v4_base_loaded.load(Ordering::SeqCst));
+    storage.update_v4_footer_schema().unwrap();
+
+    // Existing rows read back with the new column all-NULL.
+    let result = storage
+        .read_columns(Some(&["id", "extra"]), 0, None)
+        .unwrap();
+    assert_eq!(result["id"].len(), 3);
+    assert_eq!(result["extra"].len(), 3);
+    assert!(storage.column_has_nulls("extra"));
+
+    // Append new rows that include the new column: old rows stay NULL,
+    // new rows carry real values.
+    let mut int_cols = HashMap::new();
+    int_cols.insert("id".to_string(), vec![4i64, 5]);
+    int_cols.insert("extra".to_string(), vec![40i64, 50]);
+    let mut string_cols = HashMap::new();
+    string_cols.insert(
+        "name".to_string(),
+        vec!["Dave".to_string(), "Erin".to_string()],
+    );
+    storage
+        .insert_typed(
+            int_cols,
+            HashMap::new(),
+            string_cols,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save().unwrap();
+    assert_eq!(storage.row_count(), 5);
+
+    // Streaming compact keeps the semantics (old rows NULL, new rows valued).
+    storage.compact_streaming_v4().unwrap();
+    drop(storage);
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.row_count(), 5);
+    assert!(reopened.column_has_nulls("extra"));
+    let result = reopened
+        .read_columns(Some(&["id", "extra"]), 0, None)
+        .unwrap();
+    match &result["extra"] {
+        ColumnData::Int64(vals) => {
+            assert_eq!(vals, &[0, 0, 0, 40, 50]);
+        }
+        other => panic!("unexpected extra column: {other:?}"),
+    }
+}
+
+#[test]
+fn streaming_drop_column_rewrites_without_loading_base() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("stream_drop_col.apex");
+
+    // Seed V4 base: name, age, city, active.
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("age".to_string(), vec![25i64, 30]);
+        int_cols.insert("active".to_string(), vec![1i64, 0]);
+        let mut string_cols = HashMap::new();
+        string_cols.insert(
+            "name".to_string(),
+            vec!["Alice".to_string(), "Bob".to_string()],
+        );
+        string_cols.insert(
+            "city".to_string(),
+            vec!["NYC".to_string(), "LA".to_string()],
+        );
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    // Reopen mmap-only; drop the middle column (city).
+    let storage = OnDemandStorage::open(&path).unwrap();
+    storage.drop_column("city").unwrap();
+    assert!(!storage.v4_base_loaded.load(Ordering::SeqCst));
+    storage.rewrite_v4_drop_columns().unwrap();
+    drop(storage);
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.row_count(), 2);
+    let col_names = reopened.column_names();
+    let names = col_names
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>();
+    let mut sorted = names.clone();
+    sorted.sort_unstable();
+    assert_eq!(sorted, ["_id", "active", "age", "name"]);
+    let result = reopened
+        .read_columns(Some(&["name", "age", "active"]), 0, None)
+        .unwrap();
+    match &result["name"] {
+        ColumnData::String { offsets, data } => {
+            let vals: Vec<String> = (0..offsets.len() - 1)
+                .map(|i| {
+                    String::from_utf8_lossy(&data[offsets[i] as usize..offsets[i + 1] as usize])
+                        .to_string()
+                })
+                .collect();
+            assert_eq!(vals, ["Alice", "Bob"]);
+        }
+        other => panic!("unexpected name column: {other:?}"),
+    }
+    match &result["age"] {
+        ColumnData::Int64(vals) => assert_eq!(vals, &[25, 30]),
+        other => panic!("unexpected age column: {other:?}"),
+    }
+    match &result["active"] {
+        ColumnData::Int64(vals) => assert_eq!(vals, &[1, 0]),
+        other => panic!("unexpected active column: {other:?}"),
+    }
+}
+
+#[test]
+fn compressed_delete_uses_streaming_rewrite_not_full_load() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("compressed_delete.apex");
+
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        storage.set_compression(CompressionType::Zstd).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert(
+            "id".to_string(),
+            (1..=200).collect::<Vec<i64>>(),
+        );
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert!(!storage.v4_base_loaded.load(Ordering::SeqCst));
+    assert!(storage.delete(50));
+    storage.save_delete_only().unwrap();
+    assert!(!storage.v4_base_loaded.load(Ordering::SeqCst));
+    assert_eq!(storage.row_count(), 199);
+    drop(storage);
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.row_count(), 199);
+    let result = reopened.read_columns(Some(&["id"]), 0, None).unwrap();
+    match &result["id"] {
+        ColumnData::Int64(vals) => {
+            assert_eq!(vals.len(), 199);
+            assert_eq!(vals[0], 1);
+            assert_eq!(vals[48], 49);
+            assert_eq!(vals[49], 51);
+            assert_eq!(*vals.last().unwrap(), 200);
+        }
+        other => panic!("unexpected id column: {other:?}"),
+    }
+}
+
+#[test]
+fn uncompressed_inplace_delete_keeps_raw_row_order() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("inplace_delete.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("id".to_string(), (1..=200).collect::<Vec<i64>>());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert!(storage.delete(50));
+    storage.save_delete_only().unwrap();
+    assert_eq!(storage.active_row_count(), 199);
+    drop(storage);
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.active_row_count(), 199);
+    // raw column scan still contains all 200 physical rows (deleted row is
+    // tombstoned, not removed) — verify via to_arrow_batch instead.
+    let batch = reopened.to_arrow_batch(None, false).unwrap();
+    assert_eq!(batch.num_rows(), 199);
+}
+
+#[test]
+fn streaming_compact_scales_across_many_row_groups() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("many_rgs.apex");
+    let n = 200_000usize;
+
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("id".to_string(), (1..=n as i64).collect());
+        int_cols.insert(
+            "score".to_string(),
+            (0..n as i64).map(|i| i % 1000).collect(),
+        );
+        let mut string_cols = HashMap::new();
+        string_cols.insert(
+            "label".to_string(),
+            (0..n).map(|i| format!("row_{}", i % 97)).collect(),
+        );
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    // Reopen mmap-only, append delta rows, apply updates + deletes, then
+    // streaming-compact. Memory stays bounded by a Row Group + delta payloads.
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let delta_rows: Vec<HashMap<String, crate::data::Value>> = (0..500)
+        .map(|i| {
+            let mut m = HashMap::new();
+            m.insert("id".to_string(), crate::data::Value::Int64((n + 1 + i) as i64));
+            m.insert("score".to_string(), crate::data::Value::Int64(i as i64));
+            m.insert(
+                "label".to_string(),
+                crate::data::Value::String(format!("delta_{i}")),
+            );
+            m
+        })
+        .collect();
+    let delta_ids = storage.insert_value_rows_to_delta(&delta_rows).unwrap();
+    assert_eq!(delta_ids.len(), 500);
+    storage
+        .delta_store
+        .write()
+        .update_cell(10, "score", crate::data::Value::Int64(999_999));
+    storage
+        .delta_store
+        .write()
+        .update_cell(delta_ids[0], "score", crate::data::Value::Int64(888_888));
+    storage.delta_store.write().delete_row(20);
+    storage.save_delta_store().unwrap();
+
+    storage.compact_streaming_v4().unwrap();
+    assert!(!OnDemandStorage::delta_path(&path).exists());
+    assert!(!storage.v4_base_loaded.load(Ordering::SeqCst));
+    assert_eq!(storage.active_row_count(), n as u64 + 499);
+    drop(storage);
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.active_row_count(), n as u64 + 499);
+    let result = reopened
+        .read_columns(Some(&["id", "score"]), 0, None)
+        .unwrap();
+    match &result["score"] {
+        ColumnData::Int64(vals) => {
+            assert_eq!(vals.len(), n + 499);
+            assert_eq!(vals[9], 999_999, "base row 10 updated");
+            assert_eq!(vals[19], 20, "row 20 deleted -> next kept row id 21 has score 20");
+            assert_eq!(vals[n - 1], 888_888, "delta row 0 updated");
+            assert_eq!(vals[n - 1 + 499], 499);
+        }
+        other => panic!("unexpected score column: {other:?}"),
+    }
+}
+
+#[test]
+fn dict_encoded_string_column_roundtrips_via_arrow() {
+    use arrow::array::Array;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dict_arrow.apex");
+    let n = 5000usize;
+    let cities = [
+        "Beijing",
+        "Shanghai",
+        "Shenzhen",
+        "Guangzhou",
+        "Hangzhou",
+        "Chengdu",
+        "Wuhan",
+        "Nanjing",
+        "Tianjin",
+        "Xian",
+    ];
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut string_cols = HashMap::new();
+        string_cols.insert(
+            "city".to_string(),
+            (0..n).map(|i| cities[i % 10].to_string()).collect(),
+        );
+        storage
+            .insert_typed(
+                HashMap::new(),
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let batch = storage.to_arrow_batch_dict(Some(&["city"]), false).unwrap();
+    assert_eq!(batch.num_rows(), n);
+    let col = batch.column_by_name("city").unwrap();
+    let mut uniq = std::collections::HashSet::new();
+    if let Some(arr) = col.as_any().downcast_ref::<arrow::array::StringArray>() {
+        for i in 0..arr.len() {
+            uniq.insert(arr.value(i).to_string());
+        }
+    } else if let Some(arr) = col.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+        for i in 0..arr.len() {
+            uniq.insert(arr.value(i).to_string());
+        }
+    } else {
+        let casted = arrow::compute::cast(col, &arrow::datatypes::DataType::Utf8).unwrap();
+        let arr = casted
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        for i in 0..arr.len() {
+            uniq.insert(arr.value(i).to_string());
+        }
+    }
+    assert_eq!(uniq.len(), 10, "distinct cities = {uniq:?}");
 }

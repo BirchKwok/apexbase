@@ -310,7 +310,7 @@ impl OnDemandStorage {
                         // Only when dict_encode_strings=true (GROUP BY queries)
                         let try_dict = dict_encode_strings
                             && row_count >= 100
-                            && offsets[row_count] <= i32::MAX as u32;
+                            && offsets[row_count] <= i32::MAX as u64;
                         if try_dict {
                             // Sample first 1000 rows to estimate cardinality
                             let sample_size = row_count.min(1000);
@@ -382,15 +382,8 @@ impl OnDemandStorage {
                                     )) as ArrayRef,
                                 )
                             } else {
-                            let mut offsets_i32: Vec<i32> = Vec::with_capacity(row_count + 1);
-                            unsafe {
-                                std::ptr::copy_nonoverlapping(
-                                    offsets[..row_count + 1].as_ptr() as *const i32,
-                                    offsets_i32.as_mut_ptr(),
-                                    row_count + 1,
-                                );
-                                offsets_i32.set_len(row_count + 1);
-                            }
+                            let offsets_i32: Vec<i32> =
+                                offsets[..row_count + 1].iter().map(|&o| o as i32).collect();
                             let offset_buf = unsafe { arrow::buffer::OffsetBuffer::new_unchecked(ScalarBuffer::from(offsets_i32)) };
                             let data_buf = Buffer::from_slice_ref(&data[..data_end]);
                             // SAFETY: data written by our storage engine is valid UTF-8

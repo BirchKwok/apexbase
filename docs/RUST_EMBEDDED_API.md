@@ -863,7 +863,7 @@ The example at `examples/embedded.rs` demonstrates all 16 steps:
 
 - **Point lookups** (`retrieve`) — O(log n) via V4 RCIX index, ~24 µs warm.
 - **Batch reads** (`retrieve_many`) — single footer lock + one mmap slice per row-group via V4 mmap fast-path.
-- **Bulk insert** (`insert_batch`) — routes through `engine.write()`, auto-selects delta append or full V4 rewrite based on schema.
+- **Bulk insert** (`insert_batch`) — routes through `Database::write` (StorageEngine smart routing): V4 tables append a new Row Group via the insert backend; legacy non-V4 tables use delta appends when the schema matches exactly.
 - **Arrow insert** (`insert_arrow`) — bypasses `HashMap` construction; preferred for Arrow-native pipelines.
 - **SQL queries** — same Arrow-native JIT engine as the Python API: Cranelift JIT, vectorized SIMD filters, zone-map pruning, mmap on-demand scans.
 - **Count** (`count()`) — O(1) for V4 tables — reads only the footer metadata.

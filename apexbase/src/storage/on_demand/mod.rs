@@ -656,14 +656,15 @@ impl<'a> StringDictView<'a> {
         } else {
             indices.extend((0..self.row_count).map(|row| self.index(row).unwrap()));
         }
-        let mut dict_offsets = vec![0u32; self.dict_size];
+        let mut disk_dict_offsets = vec![0u32; self.dict_size];
         unsafe {
             std::ptr::copy_nonoverlapping(
                 self.dict_offsets.as_ptr(),
-                dict_offsets.as_mut_ptr() as *mut u8,
+                disk_dict_offsets.as_mut_ptr() as *mut u8,
                 self.dict_offsets.len(),
             );
         }
+        let dict_offsets: Vec<u64> = disk_dict_offsets.iter().map(|&o| o as u64).collect();
         ColumnData::StringDict {
             indices,
             dict_offsets,
@@ -1316,10 +1317,11 @@ fn write_column_encoded<W: Write>(
                 }
                 writer.write_all(&compact)?;
             }
+            let disk_offsets: Vec<u32> = dict_offsets.iter().map(|&o| o as u32).collect();
             let offsets = unsafe {
                 std::slice::from_raw_parts(
-                    dict_offsets.as_ptr() as *const u8,
-                    dict_offsets.len() * 4,
+                    disk_offsets.as_ptr() as *const u8,
+                    disk_offsets.len() * 4,
                 )
             };
             writer.write_all(offsets)?;
@@ -1481,14 +1483,15 @@ fn read_column_encoded_partial(
                 return Err(err_data("partial String: offsets truncated"));
             }
             // Read only first actual+1 offsets
-            let mut offsets = vec![0u32; actual + 1];
+            let mut disk_offsets = vec![0u32; actual + 1];
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data_bytes[8..].as_ptr(),
-                    offsets.as_mut_ptr() as *mut u8,
+                    disk_offsets.as_mut_ptr() as *mut u8,
                     (actual + 1) * 4,
                 );
             }
+            let mut offsets: Vec<u64> = disk_offsets.iter().map(|&o| o as u64).collect();
             let data_len_off = 8 + all_offsets_len;
             if data_len_off + 8 > data_bytes.len() {
                 return Err(err_data("partial String: data_len truncated"));
@@ -1502,8 +1505,9 @@ fn read_column_encoded_partial(
             let data = data_bytes[data_start + base..data_start + end].to_vec();
             // Adjust offsets to be zero-based
             if base > 0 {
+                let base_u64 = base as u64;
                 for o in offsets.iter_mut() {
-                    *o -= base as u32;
+                    *o -= base_u64;
                 }
             }
             Ok((ColumnData::String { offsets, data }, total_consumed))
@@ -1534,14 +1538,15 @@ fn read_column_encoded_partial(
             if dict_off_start + dict_offsets_len > data_bytes.len() {
                 return Err(err_data("partial StringDict: dict_offsets truncated"));
             }
-            let mut dict_offsets = vec![0u32; dict_size];
+            let mut disk_dict_offsets = vec![0u32; dict_size];
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     data_bytes[dict_off_start..].as_ptr(),
-                    dict_offsets.as_mut_ptr() as *mut u8,
+                    disk_dict_offsets.as_mut_ptr() as *mut u8,
                     dict_offsets_len,
                 );
             }
+            let dict_offsets: Vec<u64> = disk_dict_offsets.iter().map(|&o| o as u64).collect();
             let dict_data_len_off = dict_off_start + dict_offsets_len;
             if dict_data_len_off + 8 > data_bytes.len() {
                 return Err(err_data("partial StringDict: dict_data_len truncated"));

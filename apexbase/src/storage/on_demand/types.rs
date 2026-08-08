@@ -297,11 +297,11 @@ pub enum ColumnData {
     Int64(Vec<i64>),
     Float64(Vec<f64>),
     String {
-        offsets: Vec<u32>,  // Offset into data
+        offsets: Vec<u64>,  // Offset into data
         data: Vec<u8>,      // UTF-8 bytes
     },
     Binary {
-        offsets: Vec<u32>,  // Offset into data
+        offsets: Vec<u64>,  // Offset into data
         data: Vec<u8>,      // Raw bytes
     },
     /// Dictionary-encoded string column (DuckDB-style optimization)
@@ -315,7 +315,7 @@ pub enum ColumnData {
     /// - Faster comparisons (integer vs string)
     StringDict {
         indices: Vec<u32>,      // Per-row dictionary index (0 = NULL)
-        dict_offsets: Vec<u32>, // Offsets into dict_data
+        dict_offsets: Vec<u64>, // Offsets into dict_data
         dict_data: Vec<u8>,     // Unique string bytes
     },
     /// Fixed-size list of f32 — contiguous raw bytes, no offset array.
@@ -335,6 +335,20 @@ pub enum ColumnData {
 // ─────────────────────────────────────────────────────────────────────────────
 // f16 ↔ f32 conversion utilities (software, no external crate)
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// Convert in-memory u64 offsets to the disk format's u32 offsets.
+///
+/// The on-disk V4 format stores 4-byte offsets per value. Per-Row-Group blocks
+/// are bounded well below 4 GiB, so the conversion is lossless in practice; the
+/// in-memory u64 representation exists so large columns never silently truncate.
+#[inline]
+fn offsets_to_u32(offsets: &[u64]) -> Vec<u32> {
+    let mut out = Vec::with_capacity(offsets.len());
+    for &o in offsets {
+        out.push(o as u32);
+    }
+    out
+}
 
 /// Encode f32 as IEEE 754 half-precision bits (u16 LE).
 #[inline]
@@ -427,16 +441,16 @@ impl ColumnData {
             }
             ColumnType::Float32 | ColumnType::Float64 => ColumnData::Float64(Vec::new()),
             ColumnType::String => ColumnData::String {
-                offsets: vec![0],
+                offsets: vec![0u64],
                 data: Vec::new(),
             },
             ColumnType::Binary | ColumnType::Blob => ColumnData::Binary {
-                offsets: vec![0],
+                offsets: vec![0u64],
                 data: Vec::new(),
             },
             ColumnType::StringDict => ColumnData::StringDict {
                 indices: Vec::new(),
-                dict_offsets: vec![0],
+                dict_offsets: vec![0u64],
                 dict_data: Vec::new(),
             },
             ColumnType::FixedList => ColumnData::FixedList { data: Vec::new(), dim: 0 },
@@ -511,7 +525,7 @@ impl ColumnData {
     pub fn push_string(&mut self, value: &str) {
         if let ColumnData::String { offsets, data } = self {
             data.extend_from_slice(value.as_bytes());
-            offsets.push(data.len() as u32);
+            offsets.push(data.len() as u64);
         }
     }
 
@@ -519,7 +533,7 @@ impl ColumnData {
     pub fn push_bytes(&mut self, value: &[u8]) {
         if let ColumnData::Binary { offsets, data } = self {
             data.extend_from_slice(value);
-            offsets.push(data.len() as u32);
+            offsets.push(data.len() as u64);
         }
     }
 
@@ -546,7 +560,7 @@ impl ColumnData {
             
             for s in values {
                 data.extend_from_slice(s.as_bytes());
-                offsets.push(data.len() as u32);
+                offsets.push(data.len() as u64);
             }
         }
     }
@@ -561,7 +575,7 @@ impl ColumnData {
             
             for b in values {
                 data.extend_from_slice(b);
-                offsets.push(data.len() as u32);
+                offsets.push(data.len() as u64);
             }
         }
     }
@@ -629,11 +643,16 @@ impl ColumnData {
             ColumnData::String { offsets, data } | ColumnData::Binary { offsets, data } => {
                 // OPTIMIZATION: Pre-allocate and use bulk memcpy for offsets
                 let count = offsets.len().saturating_sub(1);
-                let mut buf = Vec::with_capacity(8 + offsets.len() * 4 + 8 + data.len());
+                let disk_offsets = offsets_to_u32(offsets);
+                let mut buf = Vec::with_capacity(8 + disk_offsets.len() * 4 + 8 + data.len());
                 buf.extend_from_slice(&(count as u64).to_le_bytes());
-                // Bulk copy offsets (u32 array)
+                // Disk format keeps u32 offsets (per-RG blocks stay < 4 GiB);
+                // the u64 in-memory representation is converted here.
                 let offset_bytes = unsafe {
-                    std::slice::from_raw_parts(offsets.as_ptr() as *const u8, offsets.len() * 4)
+                    std::slice::from_raw_parts(
+                        disk_offsets.as_ptr() as *const u8,
+                        disk_offsets.len() * 4,
+                    )
                 };
                 buf.extend_from_slice(offset_bytes);
                 buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
@@ -643,11 +662,12 @@ impl ColumnData {
             ColumnData::StringDict { indices, dict_offsets, dict_data } => {
                 // Format: [row_count][dict_size][indices...][dict_offsets...][dict_data_len][dict_data]
                 // OPTIMIZATION: Pre-allocate and use bulk memcpy
+                let disk_dict_offsets = offsets_to_u32(dict_offsets);
                 let mut buf = Vec::with_capacity(
-                    16 + indices.len() * 4 + dict_offsets.len() * 4 + 8 + dict_data.len()
+                    16 + indices.len() * 4 + disk_dict_offsets.len() * 4 + 8 + dict_data.len()
                 );
                 buf.extend_from_slice(&(indices.len() as u64).to_le_bytes());
-                buf.extend_from_slice(&(dict_offsets.len() as u64).to_le_bytes());
+                buf.extend_from_slice(&(disk_dict_offsets.len() as u64).to_le_bytes());
                 // Bulk copy indices (u32 array)
                 let indices_bytes = unsafe {
                     std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4)
@@ -655,7 +675,10 @@ impl ColumnData {
                 buf.extend_from_slice(indices_bytes);
                 // Bulk copy dict_offsets (u32 array)
                 let offsets_bytes = unsafe {
-                    std::slice::from_raw_parts(dict_offsets.as_ptr() as *const u8, dict_offsets.len() * 4)
+                    std::slice::from_raw_parts(
+                        disk_dict_offsets.as_ptr() as *const u8,
+                        disk_dict_offsets.len() * 4,
+                    )
                 };
                 buf.extend_from_slice(offsets_bytes);
                 buf.extend_from_slice(&(dict_data.len() as u64).to_le_bytes());
@@ -746,23 +769,31 @@ impl ColumnData {
             }
             ColumnData::String { offsets, data } | ColumnData::Binary { offsets, data } => {
                 let count = offsets.len().saturating_sub(1);
+                let disk_offsets = offsets_to_u32(offsets);
                 writer.write_all(&(count as u64).to_le_bytes())?;
                 let offset_bytes = unsafe {
-                    std::slice::from_raw_parts(offsets.as_ptr() as *const u8, offsets.len() * 4)
+                    std::slice::from_raw_parts(
+                        disk_offsets.as_ptr() as *const u8,
+                        disk_offsets.len() * 4,
+                    )
                 };
                 writer.write_all(offset_bytes)?;
                 writer.write_all(&(data.len() as u64).to_le_bytes())?;
                 writer.write_all(data)?;
             }
             ColumnData::StringDict { indices, dict_offsets, dict_data } => {
+                let disk_dict_offsets = offsets_to_u32(dict_offsets);
                 writer.write_all(&(indices.len() as u64).to_le_bytes())?;
-                writer.write_all(&(dict_offsets.len() as u64).to_le_bytes())?;
+                writer.write_all(&(disk_dict_offsets.len() as u64).to_le_bytes())?;
                 let indices_bytes = unsafe {
                     std::slice::from_raw_parts(indices.as_ptr() as *const u8, indices.len() * 4)
                 };
                 writer.write_all(indices_bytes)?;
                 let offsets_bytes = unsafe {
-                    std::slice::from_raw_parts(dict_offsets.as_ptr() as *const u8, dict_offsets.len() * 4)
+                    std::slice::from_raw_parts(
+                        disk_dict_offsets.as_ptr() as *const u8,
+                        disk_dict_offsets.len() * 4,
+                    )
                 };
                 writer.write_all(offsets_bytes)?;
                 writer.write_all(&(dict_data.len() as u64).to_le_bytes())?;
@@ -849,13 +880,16 @@ impl ColumnData {
                 if pos + offsets_len > bytes.len() {
                     return Err(err_data("String offsets truncated"));
                 }
-                let mut offsets = vec![0u32; count + 1];
+                let mut disk_offsets = vec![0u32; count + 1];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        bytes[pos..].as_ptr(), offsets.as_mut_ptr() as *mut u8, offsets_len,
+                        bytes[pos..].as_ptr(),
+                        disk_offsets.as_mut_ptr() as *mut u8,
+                        offsets_len,
                     );
                 }
                 pos += offsets_len;
+                let offsets: Vec<u64> = disk_offsets.iter().map(|&o| o as u64).collect();
                 let data_len = read_u64!() as usize;
                 if pos + data_len > bytes.len() {
                     return Err(err_data("String data truncated"));
@@ -870,13 +904,16 @@ impl ColumnData {
                 if pos + offsets_len > bytes.len() {
                     return Err(err_data("Binary offsets truncated"));
                 }
-                let mut offsets = vec![0u32; count + 1];
+                let mut disk_offsets = vec![0u32; count + 1];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        bytes[pos..].as_ptr(), offsets.as_mut_ptr() as *mut u8, offsets_len,
+                        bytes[pos..].as_ptr(),
+                        disk_offsets.as_mut_ptr() as *mut u8,
+                        offsets_len,
                     );
                 }
                 pos += offsets_len;
+                let offsets: Vec<u64> = disk_offsets.iter().map(|&o| o as u64).collect();
                 let data_len = read_u64!() as usize;
                 if pos + data_len > bytes.len() {
                     return Err(err_data("Binary data truncated"));
@@ -903,13 +940,19 @@ impl ColumnData {
                 if pos + dict_offsets_len > bytes.len() {
                     return Err(err_data("StringDict dict_offsets truncated"));
                 }
-                let mut dict_offsets = vec![0u32; dict_size];
+                let mut disk_dict_offsets = vec![0u32; dict_size];
                 unsafe {
                     std::ptr::copy_nonoverlapping(
-                        bytes[pos..].as_ptr(), dict_offsets.as_mut_ptr() as *mut u8, dict_offsets_len,
+                        bytes[pos..].as_ptr(),
+                        disk_dict_offsets.as_mut_ptr() as *mut u8,
+                        dict_offsets_len,
                     );
                 }
                 pos += dict_offsets_len;
+                let dict_offsets: Vec<u64> = disk_dict_offsets
+                    .iter()
+                    .map(|&o| o as u64)
+                    .collect();
                 let dict_data_len = read_u64!() as usize;
                 if pos + dict_data_len > bytes.len() {
                     return Err(err_data("StringDict dict_data truncated"));
@@ -1139,19 +1182,19 @@ impl ColumnData {
                 let row_count = offsets.len() - 1;
                 let mut new_offsets = Vec::with_capacity(row_count + 1);
                 let mut new_data = Vec::new();
-                new_offsets.push(0u32);
+                new_offsets.push(0u64);
                 for i in 0..row_count {
                     let byte_idx = i / 8;
                     let bit_idx = i % 8;
                     let is_null = byte_idx < null_bitmap.len()
                         && (null_bitmap[byte_idx] >> bit_idx) & 1 != 0;
                     if is_null {
-                        new_offsets.push(new_data.len() as u32);
+                        new_offsets.push(new_data.len() as u64);
                     } else {
                         let s = offsets[i] as usize;
                         let e = offsets[i + 1] as usize;
                         new_data.extend_from_slice(&data[s..e]);
-                        new_offsets.push(new_data.len() as u32);
+                        new_offsets.push(new_data.len() as u64);
                     }
                 }
                 *offsets = new_offsets;
@@ -1189,19 +1232,19 @@ impl ColumnData {
                 let row_count = offsets.len() - 1;
                 let mut new_offsets = Vec::with_capacity(row_count + 1);
                 let mut new_data = Vec::new();
-                new_offsets.push(0u32);
+                new_offsets.push(0u64);
                 for i in 0..row_count {
                     let byte_idx = i / 8;
                     let bit_idx = i % 8;
                     let is_null = byte_idx < null_bitmap.len()
                         && (null_bitmap[byte_idx] >> bit_idx) & 1 != 0;
                     if is_null {
-                        new_offsets.push(new_data.len() as u32);
+                        new_offsets.push(new_data.len() as u64);
                     } else {
                         let s = offsets[i] as usize;
                         let e = offsets[i + 1] as usize;
                         new_data.extend_from_slice(&data[s..e]);
-                        new_offsets.push(new_data.len() as u32);
+                        new_offsets.push(new_data.len() as u64);
                     }
                 }
                 *offsets = new_offsets;
@@ -1269,7 +1312,7 @@ impl ColumnData {
             }
             ColumnData::String { offsets, data } | ColumnData::Binary { offsets, data } => {
                 let mut new_offsets = Vec::with_capacity(indices.len() + 1);
-                new_offsets.push(0u32);
+                new_offsets.push(0u64);
                 // Estimate average string length for pre-allocation
                 let avg_len = if offsets.len() > 1 {
                     data.len() / (offsets.len() - 1)
@@ -1280,7 +1323,7 @@ impl ColumnData {
                         let start = offsets[idx] as usize;
                         let end = offsets[idx + 1] as usize;
                         new_data.extend_from_slice(&data[start..end]);
-                        new_offsets.push(new_data.len() as u32);
+                        new_offsets.push(new_data.len() as u64);
                     }
                 }
                 if matches!(self, ColumnData::String { .. }) {
@@ -1351,7 +1394,7 @@ impl ColumnData {
             if row_count == 0 {
                 return Some(ColumnData::StringDict {
                     indices: Vec::new(),
-                    dict_offsets: vec![0],
+                    dict_offsets: vec![0u64],
                     dict_data: Vec::new(),
                 });
             }
@@ -1361,7 +1404,7 @@ impl ColumnData {
             let mut dict_map: AHashMap<&[u8], u32> =
                 AHashMap::with_capacity(expected_unique);
             let mut dict_offsets_new = Vec::with_capacity(expected_unique + 1);
-            dict_offsets_new.push(0u32);
+            dict_offsets_new.push(0u64);
             let mut dict_data_new = Vec::new();
             let mut row_indices = Vec::with_capacity(row_count);
             let mut next_dict_idx = 1u32; // 0 reserved for NULL
@@ -1375,7 +1418,7 @@ impl ColumnData {
                     let idx = next_dict_idx;
                     next_dict_idx += 1;
                     dict_data_new.extend_from_slice(str_bytes);
-                    dict_offsets_new.push(dict_data_new.len() as u32);
+                    dict_offsets_new.push(dict_data_new.len() as u64);
                     idx
                 });
                 row_indices.push(dict_idx);
@@ -1397,18 +1440,18 @@ impl ColumnData {
         if let ColumnData::StringDict { indices, dict_offsets, dict_data } = self {
             let mut offsets = Vec::with_capacity(indices.len() + 1);
             let mut data = Vec::new();
-            offsets.push(0u32);
+            offsets.push(0u64);
             
             for &idx in &indices {
                 if idx == 0 || (idx as usize) >= dict_offsets.len() {
-                    offsets.push(data.len() as u32);
+                    offsets.push(data.len() as u64);
                 } else {
                     let start = dict_offsets[(idx - 1) as usize] as usize;
                     let end = dict_offsets[idx as usize] as usize;
                     if end <= dict_data.len() && start <= end {
                         data.extend_from_slice(&dict_data[start..end]);
                     }
-                    offsets.push(data.len() as u32);
+                    offsets.push(data.len() as u64);
                 }
             }
             
@@ -1486,13 +1529,13 @@ impl ColumnData {
                 let s = start.min(row_count);
                 let e = end.min(row_count);
                 if e <= s {
-                    return ColumnData::String { offsets: vec![0], data: Vec::new() };
+                    return ColumnData::String { offsets: vec![0u64], data: Vec::new() };
                 }
                 let data_start = offsets[s] as usize;
                 let data_end = offsets[e] as usize;
                 let new_data = data[data_start..data_end.min(data.len())].to_vec();
                 let base = offsets[s];
-                let new_offsets: Vec<u32> = offsets[s..=e].iter().map(|&o| o - base).collect();
+                let new_offsets: Vec<u64> = offsets[s..=e].iter().map(|&o| o - base).collect();
                 ColumnData::String { offsets: new_offsets, data: new_data }
             }
             ColumnData::Binary { offsets, data } => {
@@ -1500,13 +1543,13 @@ impl ColumnData {
                 let s = start.min(row_count);
                 let e = end.min(row_count);
                 if e <= s {
-                    return ColumnData::Binary { offsets: vec![0], data: Vec::new() };
+                    return ColumnData::Binary { offsets: vec![0u64], data: Vec::new() };
                 }
                 let data_start = offsets[s] as usize;
                 let data_end = offsets[e] as usize;
                 let new_data = data[data_start..data_end.min(data.len())].to_vec();
                 let base = offsets[s];
-                let new_offsets: Vec<u32> = offsets[s..=e].iter().map(|&o| o - base).collect();
+                let new_offsets: Vec<u64> = offsets[s..=e].iter().map(|&o| o - base).collect();
                 ColumnData::Binary { offsets: new_offsets, data: new_data }
             }
             ColumnData::StringDict { indices, dict_offsets, dict_data } => {

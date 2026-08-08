@@ -37,6 +37,370 @@ static DELTA_ROW_COUNT_CACHE: once_cell::sync::Lazy<
     RwLock<HashMap<PathBuf, (u64, std::time::SystemTime, usize, u64)>>,
 > = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
+// ============================================================================
+// Streaming V4 rewrite helpers (bounded-memory compaction / rewrites)
+// ============================================================================
+
+/// Parsed contents of a single V4 Row Group (uncompressed, decoded).
+struct ParsedV4RowGroup {
+    ids: Vec<u64>,
+    deleted: Vec<u8>,
+    columns: Vec<ColumnData>,
+    nulls: Vec<Vec<u8>>,
+}
+
+/// Parse one V4 Row Group from its on-disk bytes (32-byte header + body).
+/// Dictionary-encoded string columns are normalized back to plain `String`.
+/// Peak memory per call is O(Row Group size), independent of table size.
+fn parse_v4_row_group(
+    rg_buf: &[u8],
+    rg_meta: &RowGroupMeta,
+    col_count: usize,
+    schema_cols: &[(String, ColumnType)],
+) -> io::Result<ParsedV4RowGroup> {
+    let rg_rows = rg_meta.row_count as usize;
+    if rg_rows == 0 {
+        return Ok(ParsedV4RowGroup {
+            ids: Vec::new(),
+            deleted: Vec::new(),
+            columns: (0..col_count).map(|_| ColumnData::new(ColumnType::Int64)).collect(),
+            nulls: vec![Vec::new(); col_count],
+        });
+    }
+    let compress_flag = if rg_buf.len() >= 32 {
+        rg_buf[28]
+    } else {
+        RG_COMPRESS_NONE
+    };
+    let encoding_version = if rg_buf.len() >= 32 {
+        rg_buf[29]
+    } else {
+        0
+    };
+    let id_encoding = rg_buf.get(30).copied().unwrap_or(RG_IDS_PLAIN);
+
+    let decompressed = decompress_rg_body(compress_flag, &rg_buf[32..])?;
+    let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_buf[32..]);
+    let mut pos = 0usize;
+
+    // IDs (plain array or implicit contiguous range).
+    let id_byte_len = rg_id_section_len(rg_rows, id_encoding);
+    let mut ids = Vec::with_capacity(rg_rows);
+    if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+        ids.extend((0..rg_rows as u64).map(|o| rg_meta.min_id + o));
+    } else {
+        if id_byte_len > body.len() {
+            return Err(err_data("RG ID section truncated"));
+        }
+        ids.resize(rg_rows, 0);
+        unsafe {
+            std::ptr::copy_nonoverlapping(body.as_ptr(), ids.as_mut_ptr() as *mut u8, id_byte_len);
+        }
+    }
+    pos += id_byte_len;
+
+    // Deletion vector.
+    let del_vec_len = (rg_rows + 7) / 8;
+    if pos + del_vec_len > body.len() {
+        return Err(err_data("RG deletion vector truncated"));
+    }
+    let deleted = body[pos..pos + del_vec_len].to_vec();
+    pos += del_vec_len;
+
+    // Columns: null bitmap + column data per schema column.
+    let null_bitmap_len = (rg_rows + 7) / 8;
+    let mut columns = Vec::with_capacity(col_count);
+    let mut nulls = Vec::with_capacity(col_count);
+    for col_idx in 0..col_count {
+        if pos + null_bitmap_len > body.len() {
+            // Schema evolution: this Row Group predates the trailing column(s)
+            // (footer-only ALTER TABLE ADD COLUMN). Pad with all-NULL values.
+            for missing_idx in col_idx..col_count {
+                let ct = schema_cols
+                    .get(missing_idx)
+                    .map(|(_, ct)| *ct)
+                    .unwrap_or(ColumnType::Null);
+                let mem_ct = if matches!(ct, ColumnType::StringDict) {
+                    ColumnType::String
+                } else {
+                    ct
+                };
+                columns.push(ColumnData::new(mem_ct));
+                let mut pad_nulls = vec![0u8; null_bitmap_len];
+                for i in 0..rg_rows {
+                    pad_nulls[i / 8] |= 1 << (i % 8);
+                }
+                nulls.push(pad_nulls);
+            }
+            break;
+        }
+        let col_nulls = body[pos..pos + null_bitmap_len].to_vec();
+        pos += null_bitmap_len;
+        let col_type = schema_cols
+            .get(col_idx)
+            .map(|(_, ct)| *ct)
+            .unwrap_or(ColumnType::Null);
+        let (mut col, consumed) = if encoding_version >= 1 {
+            read_column_encoded(&body[pos..], col_type)?
+        } else {
+            ColumnData::from_bytes_typed(&body[pos..], col_type)?
+        };
+        pos += consumed;
+        if matches!(col, ColumnData::StringDict { .. }) {
+            col = col.decode_string_dict();
+        }
+        columns.push(col);
+        nulls.push(col_nulls);
+    }
+
+    Ok(ParsedV4RowGroup {
+        ids,
+        deleted,
+        columns,
+        nulls,
+    })
+}
+
+/// Push a default (non-null) value for a column that has no source data.
+#[inline]
+fn push_default_value(col: &mut ColumnData) {
+    match col {
+        ColumnData::Int64(v) => v.push(0),
+        ColumnData::Float64(v) => v.push(0.0),
+        ColumnData::String { offsets, .. } => {
+            let last = offsets.last().copied().unwrap_or(0);
+            offsets.push(last);
+        }
+        ColumnData::Binary { offsets, .. } => {
+            let last = offsets.last().copied().unwrap_or(0);
+            offsets.push(last);
+        }
+        ColumnData::Bool { data, len } => {
+            let byte_idx = *len / 8;
+            if byte_idx >= data.len() {
+                data.push(0);
+            }
+            *len += 1;
+        }
+        ColumnData::StringDict { indices, .. } => indices.push(0),
+        ColumnData::FixedList { data, dim } => {
+            if *dim > 0 {
+                data.extend(std::iter::repeat(0u8).take(*dim as usize * 4));
+            }
+        }
+        ColumnData::Float16List { data, dim } => {
+            if *dim > 0 {
+                data.extend(std::iter::repeat(0u8).take(*dim as usize * 2));
+            }
+        }
+    }
+}
+
+/// Push a NULL row value (default value + null bit set by the caller).
+#[inline]
+fn push_null_value(col: &mut ColumnData) {
+    push_default_value(col);
+}
+
+/// Read a single bool from a packed Bool column.
+#[inline]
+fn src_bool_at(col: &ColumnData, row: usize) -> bool {
+    match col {
+        ColumnData::Bool { data, .. } => (data[row / 8] >> (row % 8)) & 1 == 1,
+        _ => false,
+    }
+}
+
+/// Append one row value from a source column into a destination column.
+#[inline]
+fn push_source_value(dst: &mut ColumnData, src: &ColumnData, row: usize, is_null: bool) {
+    if is_null {
+        push_null_value(dst);
+        return;
+    }
+    match (&mut *dst, src) {
+        (ColumnData::Int64(v), ColumnData::Int64(s)) => v.push(s[row]),
+        (ColumnData::Float64(v), ColumnData::Float64(s)) => v.push(s[row]),
+        (
+            ColumnData::String { offsets, data },
+            ColumnData::String {
+                offsets: so,
+                data: sd,
+            },
+        ) => {
+            if row + 1 >= so.len() {
+                push_null_value(dst);
+                return;
+            }
+            let start = so[row] as usize;
+            let end = so[row + 1] as usize;
+            if start <= end && end <= sd.len() {
+                data.extend_from_slice(&sd[start..end]);
+            }
+            offsets.push(data.len() as u64);
+        }
+        (
+            ColumnData::Binary { offsets, data },
+            ColumnData::Binary {
+                offsets: so,
+                data: sd,
+            },
+        ) => {
+            if row + 1 >= so.len() {
+                push_null_value(dst);
+                return;
+            }
+            let start = so[row] as usize;
+            let end = so[row + 1] as usize;
+            if start <= end && end <= sd.len() {
+                data.extend_from_slice(&sd[start..end]);
+            }
+            offsets.push(data.len() as u64);
+        }
+        (ColumnData::Bool { data, len }, s) => {
+            let byte_idx = *len / 8;
+            let bit_idx = *len % 8;
+            if byte_idx >= data.len() {
+                data.push(0);
+            }
+            if src_bool_at(s, row) {
+                data[byte_idx] |= 1 << bit_idx;
+            }
+            *len += 1;
+        }
+        (ColumnData::FixedList { data, dim }, ColumnData::FixedList { data: sd, dim: sdim }) => {
+            if *dim == 0 {
+                *dim = *sdim;
+            }
+            if *dim > 0 {
+                let start = row * (*dim as usize * 4);
+                if start + *dim as usize * 4 <= sd.len() {
+                    data.extend_from_slice(&sd[start..start + *dim as usize * 4]);
+                } else {
+                    push_null_value(dst);
+                }
+            }
+        }
+        (
+            ColumnData::Float16List { data, dim },
+            ColumnData::Float16List { data: sd, dim: sdim },
+        ) => {
+            if *dim == 0 {
+                *dim = *sdim;
+            }
+            if *dim > 0 {
+                let start = row * (*dim as usize * 2);
+                if start + *dim as usize * 2 <= sd.len() {
+                    data.extend_from_slice(&sd[start..start + *dim as usize * 2]);
+                } else {
+                    push_null_value(dst);
+                }
+            }
+        }
+        _ => push_default_value(dst),
+    }
+}
+
+/// Apply a DeltaStore update value to a destination column. Returns `Some(())`
+/// when the value type matches the column type and was applied, `None` when the
+/// update is ignored (same parity as the legacy in-memory compaction path).
+#[inline]
+fn try_push_updated_value(dst: &mut ColumnData, value: &crate::data::Value) -> Option<()> {
+    match (dst, value) {
+        (ColumnData::Int64(v), crate::data::Value::Int64(x)) => {
+            v.push(*x);
+            Some(())
+        }
+        (ColumnData::Float64(v), crate::data::Value::Float64(x)) => {
+            v.push(*x);
+            Some(())
+        }
+        (ColumnData::String { offsets, data }, crate::data::Value::String(s)) => {
+            data.extend_from_slice(s.as_bytes());
+            offsets.push(data.len() as u64);
+            Some(())
+        }
+        (ColumnData::Bool { data, len }, crate::data::Value::Bool(b)) => {
+            let byte_idx = *len / 8;
+            let bit_idx = *len % 8;
+            if byte_idx >= data.len() {
+                data.push(0);
+            }
+            if *b {
+                data[byte_idx] |= 1 << bit_idx;
+            }
+            *len += 1;
+            Some(())
+        }
+        _ => None,
+    }
+}
+
+/// Set or clear the NULL bit for a row in a packed null bitmap.
+#[inline]
+fn set_null_bit(bitmap: &mut Vec<u8>, row: usize, is_null: bool) {
+    let byte_idx = row / 8;
+    let bit_idx = row % 8;
+    if byte_idx >= bitmap.len() {
+        bitmap.resize(byte_idx + 1, 0);
+    }
+    if is_null {
+        bitmap[byte_idx] |= 1 << bit_idx;
+    } else {
+        bitmap[byte_idx] &= !(1 << bit_idx);
+    }
+}
+
+/// Flush the current output Row Group buffer to the streaming writer and reset
+/// the buffer. No-op when the buffer is empty.
+#[allow(clippy::too_many_arguments)]
+fn flush_streamed_out_rg<W: std::io::Write + std::io::Seek>(
+    writer: &mut W,
+    schema_cols: &[(String, ColumnType)],
+    ids: &mut Vec<u64>,
+    columns: &mut Vec<ColumnData>,
+    nulls: &mut Vec<Vec<u8>>,
+    first_rg: &mut bool,
+    actual_col_types: &mut Vec<ColumnType>,
+    rg_metas: &mut Vec<RowGroupMeta>,
+    all_zone_maps: &mut RgZoneMaps,
+    all_rg_col_offsets: &mut Vec<Vec<u32>>,
+    compression: CompressionType,
+    implicit_ids_ok: bool,
+    written_rows: &mut u64,
+) -> io::Result<()> {
+    let n = ids.len();
+    if n == 0 {
+        return Ok(());
+    }
+    OnDemandStorage::write_streamed_v4_row_group(
+        writer,
+        schema_cols,
+        ids,
+        columns,
+        nulls,
+        0,
+        n,
+        *first_rg,
+        actual_col_types,
+        rg_metas,
+        all_zone_maps,
+        all_rg_col_offsets,
+        compression,
+        implicit_ids_ok,
+    )?;
+    *first_rg = false;
+    *written_rows += n as u64;
+    ids.clear();
+    for c in columns.iter_mut() {
+        *c = ColumnData::new(c.column_type());
+    }
+    for nn in nulls.iter_mut() {
+        nn.clear();
+    }
+    Ok(())
+}
+
 /// High-performance on-demand columnar storage
 ///
 /// Key features:
@@ -1520,10 +1884,10 @@ impl OnDemandStorage {
                                             // Rebuild
                                             data.clear();
                                             offsets.clear();
-                                            offsets.push(0);
+                                            offsets.push(0u64);
                                             for st in &strings {
                                                 data.extend_from_slice(st.as_bytes());
-                                                offsets.push(data.len() as u32);
+                                                offsets.push(data.len() as u64);
                                             }
                                         }
                                     }
@@ -1632,10 +1996,10 @@ impl OnDemandStorage {
                                             }
                                             data.clear();
                                             offsets.clear();
-                                            offsets.push(0);
+                                            offsets.push(0u64);
                                             for st in &strings {
                                                 data.extend_from_slice(st.as_bytes());
-                                                offsets.push(data.len() as u32);
+                                                offsets.push(data.len() as u64);
                                             }
                                         }
                                     }
@@ -2739,19 +3103,29 @@ impl OnDemandStorage {
         Ok(true)
     }
 
-    /// Compact: merge delta file into base file
+    /// Compact: merge delta file into base file.
     ///
-    /// MEMORY EFFICIENT: Uses column-streaming merge.
-    /// Processes one column at a time via mmap, never loading all columns simultaneously.
-    /// Peak memory ≈ max(single column) + delta data, instead of ALL columns + delta.
-    ///
-    /// For a 10M-row × 5-column table, this reduces peak memory from ~800MB to ~160MB.
+    /// For mmap-only V4 backends (the production path) this uses
+    /// `compact_streaming_v4`, which merges Row Group by Row Group via mmap so
+    /// peak memory is O(largest Row Group + delta payloads) instead of the whole
+    /// table. The legacy in-memory path is retained for backends that already
+    /// have the base materialized in memory (tests / legacy open_for_write).
     pub fn compact(&self) -> io::Result<()> {
         let delta_path = Self::delta_path(&self.path);
         if !delta_path.exists() {
             return Ok(());
         }
 
+        let header = self.header.read();
+        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        let base_loaded = self.v4_base_loaded.load(Ordering::SeqCst);
+        drop(header);
+
+        if is_v4 && !base_loaded {
+            return self.compact_streaming_v4();
+        }
+
+        // Legacy in-memory path (base already loaded)
         self.load_all_columns_into_memory()?;
         self.merge_delta_file(&delta_path)?;
         self.save()?;
@@ -2764,6 +3138,891 @@ impl OnDemandStorage {
 
         Ok(())
     }
+
+    /// Streaming V4 compaction (bounded memory).
+    ///
+    /// Merges the append-only delta file (`.apex.delta`) and the DeltaStore
+    /// (updates/deletes) into the base V4 file Row Group by Row Group via mmap.
+    /// Base data is never loaded wholesale: peak memory is O(largest Row Group +
+    /// delta payloads), so tables larger than physical memory can be compacted.
+    /// The output is written to `.apex.tmp` and atomically renamed over the
+    /// original, mirroring the `save_v4` atomic-write protocol.
+    pub fn compact_streaming_v4(&self) -> io::Result<()> {
+        self.stream_rewrite_v4(true, false)
+    }
+
+    /// Streaming rewrite that drops rows marked deleted (in-memory `deleted`
+    /// bitmap) plus any pending DeltaStore/delta-file changes. Used by the
+    /// compressed-Row-Group delete path so deletes never require loading the
+    /// whole table into memory.
+    pub fn rewrite_v4_active_rows(&self) -> io::Result<()> {
+        self.stream_rewrite_v4(false, true)
+    }
+
+    /// Shared streaming V4 rewrite engine: merges the append-only delta file
+    /// (when present), DeltaStore updates/deletes, and optionally the
+    /// in-memory deletion bitmap, Row Group by Row Group via mmap.
+    fn stream_rewrite_v4(&self, require_delta: bool, filter_mem_deletes: bool) -> io::Result<()> {
+        let header = self.header.read();
+        if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
+            return Err(err_data("streaming V4 rewrite requires a V4 base file"));
+        }
+        let rg_size_target = (header.row_group_size as usize).max(1024);
+        drop(header);
+
+        let delta_path = Self::delta_path(&self.path);
+        let has_delta = delta_path.exists();
+        if require_delta && !has_delta {
+            return Ok(());
+        }
+        let tmp_path = self.path.with_extension("apex.tmp");
+
+        // Apply any deferred delete state first (idempotent).
+        let _ = apply_pending_deletes(&self.path);
+
+        // Bounded delta payloads: the append-only delta file is capped by
+        // DELTA_COMPACT_SIZE / DELTA_COMPACT_ROWS; the DeltaStore is bounded by
+        // update/delete volume.
+        let delta_data = if has_delta {
+            self.read_delta_data()?
+        } else {
+            None
+        };
+        let (all_updates, delete_bitmap) = {
+            let ds = self.delta_store.read();
+            (ds.all_updates().clone(), ds.delete_bitmap().clone())
+        };
+        let delta_ids: Vec<u64> = delta_data
+            .as_ref()
+            .map(|(ids, _)| ids.clone())
+            .unwrap_or_default();
+        // Footer must be loaded before acquiring mmap_cache.write() below
+        // (get_or_load_footer takes the mmap write lock internally).
+        let footer = self
+            .get_or_load_footer()?
+            .ok_or_else(|| err_data("V4 footer missing"))?;
+        let base_schema = footer.schema.clone();
+        let base_col_count = base_schema.column_count();
+
+        // Merged schema: base footer schema + in-memory schema columns
+        // (footer-only ALTER TABLE ADD COLUMN may not have been persisted yet)
+        // + delta-only columns.
+        let mut schema = base_schema.clone();
+        {
+            let mem_schema = self.schema.read();
+            for (name, ct) in &mem_schema.columns {
+                if schema.get_index(name).is_none() {
+                    schema.add_column(name, *ct);
+                }
+            }
+        }
+        if let Some((_, delta_cols)) = &delta_data {
+            for (name, col) in delta_cols {
+                if schema.get_index(name).is_none() {
+                    schema.add_column(name, col.column_type());
+                }
+            }
+        }
+        let schema_cols: Vec<(String, ColumnType)> = schema.columns.clone();
+        let col_count = schema.column_count();
+
+        // Output RG buffers (one Row Group worth at a time). String columns are
+        // kept as plain String; dict encoding is decided at write time.
+        let mut out_ids: Vec<u64> = Vec::new();
+        let mut out_columns: Vec<ColumnData> = schema_cols
+            .iter()
+            .map(|(_, ct)| {
+                if matches!(ct, ColumnType::StringDict) {
+                    ColumnData::new(ColumnType::String)
+                } else {
+                    ColumnData::new(*ct)
+                }
+            })
+            .collect();
+        let mut out_nulls: Vec<Vec<u8>> = vec![Vec::new(); col_count];
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open"))?;
+        let mut mmap = self.mmap_cache.write();
+
+        let tmp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, tmp_file);
+        writer.write_all(&[0u8; HEADER_SIZE])?;
+
+        let mut rg_metas: Vec<RowGroupMeta> = Vec::new();
+        let mut all_zone_maps: RgZoneMaps = Vec::new();
+        let mut all_rg_col_offsets: Vec<Vec<u32>> = Vec::new();
+        let mut actual_col_types: Vec<ColumnType> = Vec::new();
+        let mut max_id_seen: u64 = 0;
+        let mut written_rows: u64 = 0;
+        let mut first_rg = true;
+        let mut out_row_count: usize = 0;
+        let implicit_ids_ok = self
+            .path
+            .components()
+            .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"));
+        let compression = self.compression();
+
+        macro_rules! flush_out_rg {
+            () => {
+                flush_streamed_out_rg(
+                    &mut writer,
+                    &schema_cols,
+                    &mut out_ids,
+                    &mut out_columns,
+                    &mut out_nulls,
+                    &mut first_rg,
+                    &mut actual_col_types,
+                    &mut rg_metas,
+                    &mut all_zone_maps,
+                    &mut all_rg_col_offsets,
+                    compression,
+                    implicit_ids_ok,
+                    &mut written_rows,
+                )?;
+                out_row_count = out_ids.len();
+            };
+        }
+
+        // Merge base Row Groups one at a time.
+        for rg_meta in &footer.row_groups {
+            if rg_meta.row_count == 0 {
+                continue;
+            }
+            let rg_size = rg_meta.data_size as usize;
+            let mut rg_buf = vec![0u8; rg_size];
+            mmap.read_at(file, &mut rg_buf, rg_meta.offset)?;
+            let parsed =
+                parse_v4_row_group(&rg_buf, rg_meta, base_col_count, &base_schema.columns)?;
+
+            for row in 0..parsed.ids.len() {
+                let id = parsed.ids[row];
+                let mut is_deleted = ((parsed.deleted[row / 8] >> (row % 8)) & 1) == 1
+                    || delete_bitmap.is_deleted(id);
+                if !is_deleted && filter_mem_deletes {
+                    if let Some(map) = self.id_to_idx.read().as_ref() {
+                        if let Some(&idx) = map.get(&id) {
+                            let db = self.deleted.read();
+                            is_deleted = (db[idx / 8] >> (idx % 8)) & 1 == 1;
+                        }
+                    }
+                }
+                if is_deleted {
+                    continue;
+                }
+                if id > max_id_seen {
+                    max_id_seen = id;
+                }
+                let updates = all_updates.get(&id);
+                for col_idx in 0..col_count {
+                    if col_idx < base_col_count {
+                        let is_null =
+                            ((parsed.nulls[col_idx][row / 8] >> (row % 8)) & 1) == 1;
+                        let col_name = &schema_cols[col_idx].0;
+                        let mut applied_update = false;
+                        if let Some(upd) = updates {
+                            if let Some(rec) = upd.get(col_name) {
+                                if try_push_updated_value(&mut out_columns[col_idx], &rec.new_value)
+                                    .is_some()
+                                {
+                                    set_null_bit(&mut out_nulls[col_idx], out_row_count, false);
+                                    applied_update = true;
+                                }
+                            }
+                        }
+                        if !applied_update {
+                            push_source_value(
+                                &mut out_columns[col_idx],
+                                &parsed.columns[col_idx],
+                                row,
+                                is_null,
+                            );
+                            if is_null {
+                                set_null_bit(&mut out_nulls[col_idx], out_row_count, true);
+                            }
+                        }
+                    } else {
+                        // Column added after these rows were written: pad with default.
+                        push_default_value(&mut out_columns[col_idx]);
+                    }
+                }
+                out_ids.push(id);
+                out_row_count += 1;
+                if out_row_count >= rg_size_target {
+                    flush_out_rg!();
+                }
+            }
+        }
+        flush_out_rg!();
+
+        // Merge appended delta rows (fresh IDs that do not collide with base).
+        if has_delta {
+        if let Some((delta_ids_all, delta_cols)) = &delta_data {
+            for (delta_row, &id) in delta_ids_all.iter().enumerate() {
+                if delete_bitmap.is_deleted(id) {
+                    continue;
+                }
+                if id > max_id_seen {
+                    max_id_seen = id;
+                }
+                let updates = all_updates.get(&id);
+                for col_idx in 0..col_count {
+                    let (name, _) = &schema_cols[col_idx];
+                    let src_col = delta_cols.get(name);
+                    let mut applied_update = false;
+                    if let Some(upd) = updates {
+                        if let Some(rec) = upd.get(name) {
+                            if try_push_updated_value(&mut out_columns[col_idx], &rec.new_value)
+                                .is_some()
+                            {
+                                set_null_bit(&mut out_nulls[col_idx], out_row_count, false);
+                                applied_update = true;
+                            }
+                        }
+                    }
+                    if !applied_update {
+                        match src_col {
+                            Some(col) if delta_row < col.len() => {
+                                push_source_value(
+                                    &mut out_columns[col_idx],
+                                    col,
+                                    delta_row,
+                                    false,
+                                );
+                            }
+                            _ => push_default_value(&mut out_columns[col_idx]),
+                        }
+                    }
+                }
+                out_ids.push(id);
+                out_row_count += 1;
+                if out_row_count >= rg_size_target {
+                    flush_out_rg!();
+                }
+            }
+        }
+        }
+        flush_out_rg!();
+
+        // Release the source mmap before touching mmap_cache again (invalidation
+        // below would otherwise deadlock on the write lock).
+        drop(mmap);
+        drop(file_guard);
+
+        // Empty output: write a single bootstrap Row Group (mirrors save_v4).
+        if rg_metas.is_empty() {
+            Self::write_streamed_v4_row_group(
+                &mut writer,
+                &schema_cols,
+                &[],
+                &[],
+                &[],
+                0,
+                0,
+                true,
+                &mut actual_col_types,
+                &mut rg_metas,
+                &mut all_zone_maps,
+                &mut all_rg_col_offsets,
+                compression,
+                implicit_ids_ok,
+            )?;
+        }
+
+        // Build the modified schema with actual types (StringDict if dict-encoded).
+        let modified_schema = if !actual_col_types.is_empty() {
+            let mut ms = OnDemandSchema::new();
+            for (col_idx, (name, _)) in schema_cols.iter().enumerate() {
+                ms.add_column(name, actual_col_types[col_idx]);
+            }
+            ms.constraints = schema.constraints.clone();
+            ms
+        } else {
+            schema.clone()
+        };
+
+        // Write footer + trailer, then fix the header.
+        let footer_offset = writer.stream_position()?;
+        let final_footer = V4Footer {
+            schema: modified_schema,
+            row_groups: rg_metas.clone(),
+            zone_maps: all_zone_maps,
+            col_offsets: all_rg_col_offsets,
+        };
+        writer.write_all(&final_footer.to_bytes())?;
+        writer.flush()?;
+        {
+            let mut header = self.header.write();
+            header.version = FORMAT_VERSION_V4;
+            header.row_count = written_rows;
+            header.column_count = col_count as u32;
+            header.footer_offset = footer_offset;
+            header.row_group_count = rg_metas.len() as u32;
+            header.schema_offset = 0;
+            header.column_index_offset = 0;
+            header.id_column_offset = 0;
+        }
+        self.cached_footer_offset
+            .store(footer_offset, Ordering::Release);
+        let header = self.header.read();
+        let writer_inner = writer.get_mut();
+        writer_inner.seek(std::io::SeekFrom::Start(0))?;
+        writer_inner.write_all(&header.to_bytes())?;
+        writer_inner.flush()?;
+        if self.durability != super::DurabilityLevel::Fast {
+            writer_inner.sync_all()?;
+        }
+        drop(header);
+        drop(writer);
+
+        // Atomic tmp + rename (crash leaves the original file intact).
+        #[cfg(windows)]
+        {
+            let mut last_err = None;
+            for attempt in 0u64..5 {
+                match std::fs::rename(&tmp_path, &self.path) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt < 4 {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                10 * (attempt + 1),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(e);
+            }
+        }
+        #[cfg(not(windows))]
+        std::fs::rename(&tmp_path, &self.path)?;
+
+        // Drop delta artifacts; deltas are now baked into the base file.
+        *self.delta_file.write() = None;
+        if has_delta {
+            let _ = std::fs::remove_file(&delta_path);
+            let _ = std::fs::remove_file(Self::delta_meta_path(&delta_path));
+            DELTA_NUMERIC_RANGE_CACHE.write().remove(&delta_path);
+            DELTA_ROW_COUNT_CACHE.write().remove(&delta_path);
+            DELTA_STRING_INDEX_CACHE.write().remove(&delta_path);
+        }
+        self.delete_col_stats_sidecar()?;
+        self.clear_delta_store()?;
+
+        // Restore mmap-only in-memory state (empty write buffer, updated counts).
+        *self.column_index.write() = Vec::new();
+        *self.ids.write() = Vec::new();
+        *self.columns.write() = schema_cols
+            .iter()
+            .map(|(_, ct)| {
+                if matches!(ct, ColumnType::StringDict) {
+                    ColumnData::new(ColumnType::String)
+                } else {
+                    ColumnData::new(*ct)
+                }
+            })
+            .collect();
+        *self.nulls.write() = vec![Vec::new(); col_count];
+        *self.deleted.write() = Vec::new();
+        *self.id_to_idx.write() = None;
+        self.mmap_cache.write().invalidate();
+        self.invalidate_page_cache();
+        self.active_count.store(written_rows, Ordering::SeqCst);
+        self.persisted_row_count
+            .store(written_rows, Ordering::SeqCst);
+        self.v4_base_loaded.store(false, Ordering::SeqCst);
+        let candidate = max_id_seen.saturating_add(1);
+        let current = self.next_id.load(Ordering::SeqCst);
+        if candidate > current {
+            self.next_id.store(candidate, Ordering::SeqCst);
+        }
+        *self.v4_footer.write() = Some(final_footer);
+
+        let file = open_for_sequential_read(&self.path)?;
+        *self.file.write() = Some(file);
+
+        if self.durability == super::DurabilityLevel::Fast {
+            self.mark_main_sync_pending();
+        } else {
+            self.sync_main_file_data()?;
+            self.clear_main_sync_pending();
+        }
+
+        Ok(())
+    }
+
+    /// Serialize one Row Group (from in-memory columns) into a fresh V4 writer.
+    /// Mirrors the `save_v4` per-RG serialization: dict encoding on the first
+    /// RG, per-RG zone maps, RCIX offsets, optional body compression, and the
+    /// 32-byte RG header. Shared by the streaming compaction path.
+    #[allow(clippy::too_many_arguments)]
+    fn write_streamed_v4_row_group<W: std::io::Write + std::io::Seek>(
+        writer: &mut W,
+        schema_cols: &[(String, ColumnType)],
+        ids: &[u64],
+        columns: &[ColumnData],
+        nulls: &[Vec<u8>],
+        chunk_start: usize,
+        chunk_end: usize,
+        is_first_rg: bool,
+        actual_col_types: &mut Vec<ColumnType>,
+        rg_metas: &mut Vec<RowGroupMeta>,
+        all_zone_maps: &mut RgZoneMaps,
+        all_rg_col_offsets: &mut Vec<Vec<u32>>,
+        compression: CompressionType,
+        implicit_ids_ok: bool,
+    ) -> io::Result<()> {
+        let chunk_rows = chunk_end - chunk_start;
+        let col_count = schema_cols.len();
+        let rg_offset = writer.stream_position()?;
+
+        if chunk_rows == 0 {
+            // Empty bootstrap Row Group (empty table).
+            writer.write_all(MAGIC_ROW_GROUP)?;
+            writer.write_all(&0u32.to_le_bytes())?;
+            writer.write_all(&(col_count as u32).to_le_bytes())?;
+            writer.write_all(&0u64.to_le_bytes())?;
+            writer.write_all(&0u64.to_le_bytes())?;
+            writer.write_all(&[RG_COMPRESS_NONE, 1, RG_IDS_PLAIN, 0])?;
+            let rg_end = writer.stream_position()?;
+            rg_metas.push(RowGroupMeta {
+                offset: rg_offset,
+                data_size: rg_end - rg_offset,
+                row_count: 0,
+                min_id: 0,
+                max_id: 0,
+                deletion_count: 0,
+            });
+            return Ok(());
+        }
+
+        let chunk_ids = &ids[chunk_start..chunk_end];
+        let min_id = chunk_ids.iter().copied().min().unwrap_or(0);
+        let max_id = chunk_ids.iter().copied().max().unwrap_or(0);
+        let id_encoding = if implicit_ids_ok && ids_are_contiguous(chunk_ids) {
+            RG_IDS_IMPLICIT_CONTIGUOUS
+        } else {
+            RG_IDS_PLAIN
+        };
+        let id_section_len = rg_id_section_len(chunk_rows, id_encoding);
+        let null_bitmap_len = (chunk_rows + 7) / 8;
+        let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + chunk_rows * col_count);
+        {
+            let mut bw = std::io::Cursor::new(&mut body_buf);
+            if id_encoding == RG_IDS_PLAIN {
+                let id_bytes = unsafe {
+                    std::slice::from_raw_parts(
+                        chunk_ids.as_ptr() as *const u8,
+                        chunk_ids.len() * 8,
+                    )
+                };
+                bw.write_all(id_bytes)?;
+            }
+            // Fresh compaction output has no deleted rows.
+            bw.write_all(&vec![0u8; null_bitmap_len])?;
+            let mut rg_col_offsets: Vec<u32> = Vec::with_capacity(col_count);
+            for col_idx in 0..col_count {
+                let chunk_col = columns[col_idx].slice_range(chunk_start, chunk_end);
+                let dict_encoded = if is_first_rg {
+                    Self::dict_encode_if_smaller(&chunk_col)
+                } else if matches!(actual_col_types.get(col_idx), Some(ColumnType::StringDict)) {
+                    chunk_col.to_dict_encoded()
+                } else {
+                    None
+                };
+                let processed = dict_encoded.as_ref().unwrap_or(&chunk_col);
+                if is_first_rg {
+                    let actual_type = match processed {
+                        ColumnData::StringDict { .. } => ColumnType::StringDict,
+                        _ => schema_cols[col_idx].1,
+                    };
+                    actual_col_types.push(actual_type);
+                }
+                rg_col_offsets.push(bw.position() as u32);
+                let chunk_nulls =
+                    Self::slice_null_bitmap(&nulls[col_idx], chunk_start, chunk_end);
+                bw.write_all(&chunk_nulls)?;
+                write_column_encoded(processed, schema_cols[col_idx].1, &mut bw)?;
+            }
+            all_rg_col_offsets.push(rg_col_offsets);
+        }
+
+        let (compress_flag, disk_body) = compress_rg_body(body_buf, compression);
+        writer.write_all(MAGIC_ROW_GROUP)?;
+        writer.write_all(&(chunk_rows as u32).to_le_bytes())?;
+        writer.write_all(&(col_count as u32).to_le_bytes())?;
+        writer.write_all(&min_id.to_le_bytes())?;
+        writer.write_all(&max_id.to_le_bytes())?;
+        writer.write_all(&[compress_flag, 1, id_encoding, 0])?;
+        writer.write_all(&disk_body)?;
+
+        // Per-RG zone maps (numeric min/max; string byte-length min/max).
+        let mut rg_zmaps: Vec<RgColumnZoneMap> = Vec::new();
+        for col_idx in 0..col_count {
+            match &columns[col_idx] {
+                ColumnData::Int64(data) => {
+                    let slice = &data[chunk_start..chunk_end];
+                    if !slice.is_empty() {
+                        let (mut mn, mut mx) = (i64::MAX, i64::MIN);
+                        for &v in slice {
+                            mn = mn.min(v);
+                            mx = mx.max(v);
+                        }
+                        rg_zmaps.push(RgColumnZoneMap {
+                            col_idx: col_idx as u16,
+                            min_bits: mn,
+                            max_bits: mx,
+                            has_nulls: false,
+                            is_float: false,
+                        });
+                    }
+                }
+                ColumnData::Float64(data) => {
+                    let slice = &data[chunk_start..chunk_end];
+                    if !slice.is_empty() {
+                        let (mut mn, mut mx) = (f64::INFINITY, f64::NEG_INFINITY);
+                        for &v in slice {
+                            if v < mn {
+                                mn = v;
+                            }
+                            if v > mx {
+                                mx = v;
+                            }
+                        }
+                        rg_zmaps.push(RgColumnZoneMap {
+                            col_idx: col_idx as u16,
+                            min_bits: mn.to_bits() as i64,
+                            max_bits: mx.to_bits() as i64,
+                            has_nulls: false,
+                            is_float: true,
+                        });
+                    }
+                }
+                ColumnData::String { offsets, .. } => {
+                    let end_idx = chunk_end.min(offsets.len().saturating_sub(1));
+                    if end_idx > chunk_start {
+                        let (mut mn, mut mx) = (u64::MAX, 0u64);
+                        for i in chunk_start..end_idx {
+                            let len = offsets[i + 1].saturating_sub(offsets[i]);
+                            if len < mn {
+                                mn = len;
+                            }
+                            if len > mx {
+                                mx = len;
+                            }
+                        }
+                        if mn <= mx {
+                            rg_zmaps.push(RgColumnZoneMap {
+                                col_idx: col_idx as u16,
+                                min_bits: mn as i64,
+                                max_bits: mx as i64,
+                                has_nulls: false,
+                                is_float: false,
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        all_zone_maps.push(rg_zmaps);
+
+        let rg_end = writer.stream_position()?;
+        rg_metas.push(RowGroupMeta {
+            offset: rg_offset,
+            data_size: rg_end - rg_offset,
+            row_count: chunk_rows as u32,
+            min_id,
+            max_id,
+            deletion_count: 0,
+        });
+        Ok(())
+    }
+
+    /// Streaming physical rewrite that drops columns from the V4 base file
+    /// without loading the table into memory.
+    ///
+    /// `drop_column` is a logical schema change; because RG column layout is
+    /// positional, dropped columns must be physically removed from every Row
+    /// Group. This rewrites RG-by-RG via mmap (peak memory O(RG size)) and
+    /// atomically replaces the file, then updates the footer schema from the
+    /// current in-memory schema (which `drop_column` already updated).
+    pub fn rewrite_v4_drop_columns(&self) -> io::Result<()> {
+        let header = self.header.read();
+        if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
+            return Err(err_data("rewrite_v4_drop_columns requires a V4 base file"));
+        }
+        let rg_size_target = (header.row_group_size as usize).max(1024);
+        drop(header);
+
+        let tmp_path = self.path.with_extension("apex.tmp");
+        let footer = self
+            .get_or_load_footer()?
+            .ok_or_else(|| err_data("V4 footer missing"))?;
+        let old_schema = footer.schema.clone();
+        let old_col_count = old_schema.column_count();
+
+        // New schema: current in-memory schema (already had the column removed).
+        let new_schema = self.schema.read().clone();
+        if new_schema.column_count() >= old_col_count {
+            return Ok(());
+        }
+        // Map old column index -> kept output index (old order, minus dropped).
+        let mut kept_cols: Vec<usize> = Vec::new();
+        for (i, (name, _)) in old_schema.columns.iter().enumerate() {
+            if new_schema.get_index(name).is_some() {
+                kept_cols.push(i);
+            }
+        }
+        let new_col_count = new_schema.column_count();
+        let new_schema_cols: Vec<(String, ColumnType)> = new_schema.columns.clone();
+
+        let mut out_ids: Vec<u64> = Vec::new();
+        let mut out_columns: Vec<ColumnData> = new_schema_cols
+            .iter()
+            .map(|(_, ct)| {
+                if matches!(ct, ColumnType::StringDict) {
+                    ColumnData::new(ColumnType::String)
+                } else {
+                    ColumnData::new(*ct)
+                }
+            })
+            .collect();
+        let mut out_nulls: Vec<Vec<u8>> = vec![Vec::new(); new_col_count];
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open"))?;
+        let mut mmap = self.mmap_cache.write();
+
+        let tmp_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&tmp_path)?;
+        let mut writer = std::io::BufWriter::with_capacity(256 * 1024, tmp_file);
+        writer.write_all(&[0u8; HEADER_SIZE])?;
+
+        let mut rg_metas: Vec<RowGroupMeta> = Vec::new();
+        let mut all_zone_maps: RgZoneMaps = Vec::new();
+        let mut all_rg_col_offsets: Vec<Vec<u32>> = Vec::new();
+        let mut actual_col_types: Vec<ColumnType> = Vec::new();
+        let mut max_id_seen: u64 = 0;
+        let mut written_rows: u64 = 0;
+        let mut first_rg = true;
+        let mut out_row_count: usize = 0;
+        let implicit_ids_ok = self
+            .path
+            .components()
+            .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"));
+        let compression = self.compression();
+
+        macro_rules! flush_out_rg {
+            () => {
+                flush_streamed_out_rg(
+                    &mut writer,
+                    &new_schema_cols,
+                    &mut out_ids,
+                    &mut out_columns,
+                    &mut out_nulls,
+                    &mut first_rg,
+                    &mut actual_col_types,
+                    &mut rg_metas,
+                    &mut all_zone_maps,
+                    &mut all_rg_col_offsets,
+                    compression,
+                    implicit_ids_ok,
+                    &mut written_rows,
+                )?;
+                out_row_count = out_ids.len();
+            };
+        }
+
+        for rg_meta in &footer.row_groups {
+            if rg_meta.row_count == 0 {
+                continue;
+            }
+            let rg_size = rg_meta.data_size as usize;
+            let mut rg_buf = vec![0u8; rg_size];
+            mmap.read_at(file, &mut rg_buf, rg_meta.offset)?;
+            let parsed = parse_v4_row_group(&rg_buf, rg_meta, old_col_count, &old_schema.columns)?;
+
+            for row in 0..parsed.ids.len() {
+                let id = parsed.ids[row];
+                if ((parsed.deleted[row / 8] >> (row % 8)) & 1) == 1 {
+                    continue;
+                }
+                if id > max_id_seen {
+                    max_id_seen = id;
+                }
+                for (out_idx, &src_idx) in kept_cols.iter().enumerate() {
+                    let is_null =
+                        ((parsed.nulls[src_idx][row / 8] >> (row % 8)) & 1) == 1;
+                    push_source_value(
+                        &mut out_columns[out_idx],
+                        &parsed.columns[src_idx],
+                        row,
+                        is_null,
+                    );
+                    if is_null {
+                        set_null_bit(&mut out_nulls[out_idx], out_row_count, true);
+                    }
+                }
+                out_ids.push(id);
+                out_row_count += 1;
+                if out_row_count >= rg_size_target {
+                    flush_out_rg!();
+                }
+            }
+        }
+        flush_out_rg!();
+
+        drop(mmap);
+        drop(file_guard);
+
+        if rg_metas.is_empty() {
+            Self::write_streamed_v4_row_group(
+                &mut writer,
+                &new_schema_cols,
+                &[],
+                &[],
+                &[],
+                0,
+                0,
+                true,
+                &mut actual_col_types,
+                &mut rg_metas,
+                &mut all_zone_maps,
+                &mut all_rg_col_offsets,
+                compression,
+                implicit_ids_ok,
+            )?;
+        }
+
+        let modified_schema = if !actual_col_types.is_empty() {
+            let mut ms = OnDemandSchema::new();
+            for (col_idx, (name, _)) in new_schema_cols.iter().enumerate() {
+                ms.add_column(name, actual_col_types[col_idx]);
+            }
+            ms.constraints = new_schema.constraints.clone();
+            ms
+        } else {
+            new_schema.clone()
+        };
+
+        let footer_offset = writer.stream_position()?;
+        let final_footer = V4Footer {
+            schema: modified_schema,
+            row_groups: rg_metas.clone(),
+            zone_maps: all_zone_maps,
+            col_offsets: all_rg_col_offsets,
+        };
+        writer.write_all(&final_footer.to_bytes())?;
+        writer.flush()?;
+        {
+            let mut header = self.header.write();
+            header.version = FORMAT_VERSION_V4;
+            header.row_count = written_rows;
+            header.column_count = new_col_count as u32;
+            header.footer_offset = footer_offset;
+            header.row_group_count = rg_metas.len() as u32;
+            header.schema_offset = 0;
+            header.column_index_offset = 0;
+            header.id_column_offset = 0;
+        }
+        self.cached_footer_offset
+            .store(footer_offset, Ordering::Release);
+        let header = self.header.read();
+        let writer_inner = writer.get_mut();
+        writer_inner.seek(std::io::SeekFrom::Start(0))?;
+        writer_inner.write_all(&header.to_bytes())?;
+        writer_inner.flush()?;
+        if self.durability != super::DurabilityLevel::Fast {
+            writer_inner.sync_all()?;
+        }
+        drop(header);
+        drop(writer);
+
+        #[cfg(windows)]
+        {
+            let mut last_err = None;
+            for attempt in 0u64..5 {
+                match std::fs::rename(&tmp_path, &self.path) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt < 4 {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                10 * (attempt + 1),
+                            ));
+                        }
+                    }
+                }
+            }
+            if let Some(e) = last_err {
+                return Err(e);
+            }
+        }
+        #[cfg(not(windows))]
+        std::fs::rename(&tmp_path, &self.path)?;
+
+        self.delete_col_stats_sidecar()?;
+        *self.column_index.write() = Vec::new();
+        *self.ids.write() = Vec::new();
+        *self.columns.write() = new_schema_cols
+            .iter()
+            .map(|(_, ct)| {
+                if matches!(ct, ColumnType::StringDict) {
+                    ColumnData::new(ColumnType::String)
+                } else {
+                    ColumnData::new(*ct)
+                }
+            })
+            .collect();
+        *self.nulls.write() = vec![Vec::new(); new_col_count];
+        *self.deleted.write() = Vec::new();
+        *self.id_to_idx.write() = None;
+        self.mmap_cache.write().invalidate();
+        self.invalidate_page_cache();
+        self.active_count.store(written_rows, Ordering::SeqCst);
+        self.persisted_row_count
+            .store(written_rows, Ordering::SeqCst);
+        self.v4_base_loaded.store(false, Ordering::SeqCst);
+        let candidate = max_id_seen.saturating_add(1);
+        let current = self.next_id.load(Ordering::SeqCst);
+        if candidate > current {
+            self.next_id.store(candidate, Ordering::SeqCst);
+        }
+        *self.v4_footer.write() = Some(final_footer);
+
+        let file = open_for_sequential_read(&self.path)?;
+        *self.file.write() = Some(file);
+
+        if self.durability == super::DurabilityLevel::Fast {
+            self.mark_main_sync_pending();
+        } else {
+            self.sync_main_file_data()?;
+            self.clear_main_sync_pending();
+        }
+
+        Ok(())
+    }
+
 
     /// Convert an Arrow ArrayRef to ColumnData, preserving nulls.
     fn arrow_array_to_column_data(array: &dyn arrow::array::Array) -> ColumnData {
@@ -2784,14 +4043,14 @@ impl OnDemandStorage {
                 let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
                 let mut offsets = Vec::with_capacity(arr.len() + 1);
                 let mut data = Vec::new();
-                offsets.push(0u32);
+                offsets.push(0u64);
                 for j in 0..arr.len() {
                     if arr.is_null(j) {
-                        offsets.push(data.len() as u32);
+                        offsets.push(data.len() as u64);
                     } else {
                         let s = arr.value(j).as_bytes();
                         data.extend_from_slice(s);
-                        offsets.push(data.len() as u32);
+                        offsets.push(data.len() as u64);
                     }
                 }
                 ColumnData::String { offsets, data }
@@ -2812,13 +4071,13 @@ impl OnDemandStorage {
                 let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
                 let mut offsets = Vec::with_capacity(arr.len() + 1);
                 let mut data = Vec::new();
-                offsets.push(0u32);
+                offsets.push(0u64);
                 for j in 0..arr.len() {
                     if arr.is_null(j) {
-                        offsets.push(data.len() as u32);
+                        offsets.push(data.len() as u64);
                     } else {
                         data.extend_from_slice(arr.value(j));
-                        offsets.push(data.len() as u32);
+                        offsets.push(data.len() as u64);
                     }
                 }
                 ColumnData::Binary { offsets, data }
@@ -2850,11 +4109,11 @@ impl OnDemandStorage {
             | ColumnType::Date => ColumnData::Int64(vec![0i64; count]),
             ColumnType::Float64 | ColumnType::Float32 => ColumnData::Float64(vec![0.0f64; count]),
             ColumnType::String | ColumnType::StringDict => ColumnData::String {
-                offsets: vec![0u32; count + 1],
+                offsets: vec![0u64; count + 1],
                 data: Vec::new(),
             },
             ColumnType::Binary | ColumnType::Blob => ColumnData::Binary {
-                offsets: vec![0u32; count + 1],
+                offsets: vec![0u64; count + 1],
                 data: Vec::new(),
             },
             ColumnType::FixedList => ColumnData::FixedList {

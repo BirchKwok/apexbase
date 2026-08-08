@@ -414,11 +414,11 @@ impl OnDemandStorage {
                                 dict_offsets,
                                 dict_data,
                             } => {
-                                let mut new_offsets = vec![0u32];
+                                let mut new_offsets = vec![0u64];
                                 let mut new_data = Vec::new();
                                 for &dict_idx in indices {
                                     if dict_idx == 0 {
-                                        new_offsets.push(new_data.len() as u32);
+                                        new_offsets.push(new_data.len() as u64);
                                     } else {
                                         let actual_idx = (dict_idx - 1) as usize;
                                         if actual_idx + 1 < dict_offsets.len() {
@@ -426,7 +426,7 @@ impl OnDemandStorage {
                                             let end = dict_offsets[actual_idx + 1] as usize;
                                             new_data.extend_from_slice(&dict_data[start..end]);
                                         }
-                                        new_offsets.push(new_data.len() as u32);
+                                        new_offsets.push(new_data.len() as u64);
                                     }
                                 }
                                 columns[idx] = ColumnData::String {
@@ -609,11 +609,11 @@ impl OnDemandStorage {
                                 dict_offsets,
                                 dict_data,
                             } => {
-                                let mut new_offsets = vec![0u32];
+                                let mut new_offsets = vec![0u64];
                                 let mut new_data = Vec::new();
                                 for &dict_idx in indices {
                                     if dict_idx == 0 {
-                                        new_offsets.push(new_data.len() as u32);
+                                        new_offsets.push(new_data.len() as u64);
                                     } else {
                                         let actual_idx = (dict_idx - 1) as usize;
                                         if actual_idx + 1 < dict_offsets.len() {
@@ -621,7 +621,7 @@ impl OnDemandStorage {
                                             let end = dict_offsets[actual_idx + 1] as usize;
                                             new_data.extend_from_slice(&dict_data[start..end]);
                                         }
-                                        new_offsets.push(new_data.len() as u32);
+                                        new_offsets.push(new_data.len() as u64);
                                     }
                                 }
                                 columns[idx] = ColumnData::String {
@@ -3689,7 +3689,25 @@ impl OnDemandStorage {
     ) -> io::Result<()> {
         use crate::data::DataType;
 
-        // For V4, schema is updated via footer; data stays on disk (mmap)
+        let is_v4 = {
+            let header = self.header.read();
+            header.version == FORMAT_VERSION_V4 && header.footer_offset > 0
+        };
+        let base_loaded = self.v4_base_loaded.load(Ordering::SeqCst);
+
+        // V4 mmap-only: schema-only DDL. The footer schema is updated on the
+        // next save() (update_v4_footer_schema) and read paths synthesize
+        // all-NULL values for rows already on disk — no full load, no padding.
+        if is_v4 && !base_loaded {
+            let col_type = ColumnType::from_data_type(dtype);
+            let mut schema = self.schema.write();
+            schema.add_column(name, col_type);
+            let mut header = self.header.write();
+            header.column_count = schema.column_count() as u32;
+            return Ok(());
+        }
+
+        // Loaded-base / legacy path: materialize and pad in memory.
         self.load_all_columns_into_memory()?;
 
         let col_type = ColumnType::from_data_type(dtype);
@@ -4574,7 +4592,7 @@ impl OnDemandStorage {
                         let end_idx = chunk_end.min(offsets.len().saturating_sub(1));
                         let start_idx = if is_single_rg { 0 } else { chunk_start };
                         if end_idx > start_idx {
-                            let (mut mn, mut mx) = (u32::MAX, 0u32);
+                            let (mut mn, mut mx) = (u64::MAX, 0u64);
                             for i in start_idx..end_idx {
                                 let len = offsets[i + 1].saturating_sub(offsets[i]);
                                 if len < mn {
@@ -4598,7 +4616,7 @@ impl OnDemandStorage {
                     ColumnData::StringDict { dict_offsets, .. } => {
                         // Store min/max dict-entry byte-length for zone-skip
                         if dict_offsets.len() > 1 {
-                            let (mut mn, mut mx) = (u32::MAX, 0u32);
+                            let (mut mn, mut mx) = (u64::MAX, 0u64);
                             for i in 0..dict_offsets.len().saturating_sub(1) {
                                 let len = dict_offsets[i + 1].saturating_sub(dict_offsets[i]);
                                 if len < mn {
@@ -4986,6 +5004,38 @@ impl OnDemandStorage {
             // Parse columns
             let null_bitmap_len = (rg_rows + 7) / 8;
             for col_idx in 0..col_count {
+                if pos + null_bitmap_len > body.len() {
+                    // Schema evolution: this Row Group predates the trailing
+                    // column(s) (footer-only ALTER TABLE ADD COLUMN). Pad the
+                    // remaining columns with all-NULL default values.
+                    for pad_idx in col_idx..col_count {
+                        let pad_type = footer.schema.columns[pad_idx].1;
+                        let pad_col = Self::create_default_column(pad_type, rg_rows);
+                        if pad_idx < all_columns.len() {
+                            all_columns[pad_idx].append(&pad_col);
+                        } else {
+                            all_columns.push(pad_col);
+                        }
+                        let needed_len = (ids_before + rg_rows + 7) / 8;
+                        if pad_idx < all_nulls.len() {
+                            if all_nulls[pad_idx].len() < needed_len {
+                                all_nulls[pad_idx].resize(needed_len, 0);
+                            }
+                            for i in 0..rg_rows {
+                                let fi = ids_before + i;
+                                all_nulls[pad_idx][fi / 8] |= 1 << (fi % 8);
+                            }
+                        } else {
+                            let mut pad_nulls = vec![0u8; needed_len];
+                            for i in 0..rg_rows {
+                                let fi = ids_before + i;
+                                pad_nulls[fi / 8] |= 1 << (fi % 8);
+                            }
+                            all_nulls.push(pad_nulls);
+                        }
+                    }
+                    break;
+                }
                 // Read null bitmap
                 let null_bytes = &body[pos..pos + null_bitmap_len];
 
@@ -5353,10 +5403,11 @@ impl OnDemandStorage {
         };
 
         if has_compression {
-            // Compressed: must load all columns before full rewrite
-            self.load_all_columns_into_memory()?;
+            // Compressed: deletion vectors live inside the compressed body, so
+            // rewrite Row Group by Row Group via mmap (bounded memory) instead
+            // of loading the whole table.
             self.pending_rows.store(0, Ordering::SeqCst);
-            let result = self.save_v4();
+            let result = self.rewrite_v4_active_rows();
             if result.is_ok() {
                 let _ = self.clear_delta_store();
                 self.checkpoint_wal();
@@ -6021,6 +6072,7 @@ impl OnDemandStorage {
             return Err(err_data("write_row_group_to_disk requires V4 format file"));
         }
         let footer_offset = header.footer_offset;
+        let rg_size = (header.row_group_size as usize).max(1024);
         drop(header);
 
         // Read existing footer
@@ -6062,126 +6114,149 @@ impl OnDemandStorage {
         file.seek(SeekFrom::Start(footer_offset))?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
 
-        let rg_rows = new_ids.len();
-        let rg_offset = footer_offset;
-        let min_id = new_ids.iter().copied().min().unwrap_or(0);
-        let max_id = new_ids.iter().copied().max().unwrap_or(0);
-        let id_encoding = if self
-            .path
-            .components()
-            .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"))
-            && ids_are_contiguous(new_ids)
-        {
-            RG_IDS_IMPLICIT_CONTIGUOUS
-        } else {
-            RG_IDS_PLAIN
-        };
-        let id_section_len = rg_id_section_len(rg_rows, id_encoding);
+        // Chunk the batch into Row Groups of `row_group_size` so single large
+        // appends never produce oversized RGs (bounds per-RG memory for later
+        // streaming compaction and keeps zone-map granularity).
+        let mut chunk_start = 0usize;
+        while chunk_start < new_ids.len() || (new_ids.is_empty() && footer.row_groups.is_empty()) {
+            let chunk_end = if new_ids.is_empty() {
+                0
+            } else {
+                (chunk_start + rg_size).min(new_ids.len())
+            };
+            let rg_rows = chunk_end - chunk_start;
+            let rg_offset = writer.stream_position()?;
+            let chunk_ids = &new_ids[chunk_start..chunk_end];
+            let min_id = chunk_ids.iter().copied().min().unwrap_or(0);
+            let max_id = chunk_ids.iter().copied().max().unwrap_or(0);
+            let id_encoding = if self
+                .path
+                .components()
+                .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"))
+                && ids_are_contiguous(chunk_ids)
+            {
+                RG_IDS_IMPLICIT_CONTIGUOUS
+            } else {
+                RG_IDS_PLAIN
+            };
+            let id_section_len = rg_id_section_len(rg_rows, id_encoding);
 
-        // Serialize RG body to buffer (IDs + deletion vector + columns)
-        let null_bitmap_len = (rg_rows + 7) / 8;
-        let (delete_bitmap, deletion_count) = if let Some(start_row) = pending_delete_start {
-            let deleted = self.deleted.read();
-            let mut bitmap = vec![0u8; null_bitmap_len];
-            let mut count = 0u32;
-            for row_idx in 0..rg_rows {
-                let source_row = start_row + row_idx;
-                let source_byte = source_row / 8;
-                let source_bit = source_row % 8;
-                if source_byte < deleted.len()
-                    && (deleted[source_byte] >> source_bit) & 1 == 1
-                {
-                    bitmap[row_idx / 8] |= 1 << (row_idx % 8);
-                    count += 1;
-                }
-            }
-            (bitmap, count)
-        } else {
-            // append_row_group() receives brand-new rows that are not present in
-            // this backend's in-memory deleted bitmap. Reusing old tombstones
-            // here would make new rows invisible and corrupt active row counts.
-            (vec![0u8; null_bitmap_len], 0)
-        };
-        let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + rg_rows * col_count);
-        {
-            let mut body_writer = std::io::Cursor::new(&mut body_buf);
-
-            if id_encoding == RG_IDS_PLAIN {
-                for &id in new_ids {
-                    body_writer.write_all(&id.to_le_bytes())?;
-                }
-            }
-
-            // Deletion vector for rows that were inserted and deleted before flush.
-            body_writer.write_all(&delete_bitmap)?;
-
-            // Columns
-            let mut new_rg_col_offsets: Vec<u32> = Vec::with_capacity(col_count);
-            for col_idx in 0..col_count {
-                // Record body offset of this column's null bitmap for RCIX
-                new_rg_col_offsets.push(body_writer.position() as u32);
-
-                // Null bitmap
-                let col_nulls = new_nulls.get(col_idx).map(|v| v.as_slice()).unwrap_or(&[]);
-                let padded = if col_nulls.len() < null_bitmap_len {
-                    let mut v = vec![0u8; null_bitmap_len];
-                    let copy = col_nulls.len().min(null_bitmap_len);
-                    v[..copy].copy_from_slice(&col_nulls[..copy]);
-                    v
-                } else {
-                    col_nulls[..null_bitmap_len].to_vec()
-                };
-                body_writer.write_all(&padded)?;
-
-                // Column data — dict-encode if footer schema expects StringDict
-                if col_idx < new_columns.len() {
-                    let col = &new_columns[col_idx];
-                    let col_type = if col_idx < footer.schema.columns.len() {
-                        footer.schema.columns[col_idx].1
-                    } else {
-                        ColumnType::Int64
-                    };
-                    if col_type == ColumnType::StringDict
-                        && matches!(col, ColumnData::String { .. })
+            // Serialize RG body to buffer (IDs + deletion vector + columns)
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let (delete_bitmap, deletion_count) = if let Some(start_row) = pending_delete_start {
+                let deleted = self.deleted.read();
+                let mut bitmap = vec![0u8; null_bitmap_len];
+                let mut count = 0u32;
+                for row_idx in 0..rg_rows {
+                    let source_row = start_row + chunk_start + row_idx;
+                    let source_byte = source_row / 8;
+                    let source_bit = source_row % 8;
+                    if source_byte < deleted.len()
+                        && (deleted[source_byte] >> source_bit) & 1 == 1
                     {
-                        if let Some(dict) = col.to_dict_encoded() {
-                            write_column_encoded(&dict, col_type, &mut body_writer)?;
+                        bitmap[row_idx / 8] |= 1 << (row_idx % 8);
+                        count += 1;
+                    }
+                }
+                (bitmap, count)
+            } else {
+                // append_row_group() receives brand-new rows that are not present in
+                // this backend's in-memory deleted bitmap. Reusing old tombstones
+                // here would make new rows invisible and corrupt active row counts.
+                (vec![0u8; null_bitmap_len], 0)
+            };
+            let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + rg_rows * col_count);
+            {
+                let mut body_writer = std::io::Cursor::new(&mut body_buf);
+
+                if id_encoding == RG_IDS_PLAIN {
+                    for &id in chunk_ids {
+                        body_writer.write_all(&id.to_le_bytes())?;
+                    }
+                }
+
+                // Deletion vector for rows that were inserted and deleted before flush.
+                body_writer.write_all(&delete_bitmap)?;
+
+                // Columns
+                let mut new_rg_col_offsets: Vec<u32> = Vec::with_capacity(col_count);
+                for col_idx in 0..col_count {
+                    // Record body offset of this column's null bitmap for RCIX
+                    new_rg_col_offsets.push(body_writer.position() as u32);
+
+                    // Null bitmap (chunk slice)
+                    let col_nulls = new_nulls.get(col_idx).map(|v| v.as_slice()).unwrap_or(&[]);
+                    let chunk_nulls = Self::slice_null_bitmap(col_nulls, chunk_start, chunk_end);
+                    let padded = if chunk_nulls.len() < null_bitmap_len {
+                        let mut v = vec![0u8; null_bitmap_len];
+                        let copy = chunk_nulls.len().min(null_bitmap_len);
+                        v[..copy].copy_from_slice(&chunk_nulls[..copy]);
+                        v
+                    } else {
+                        chunk_nulls
+                    };
+                    body_writer.write_all(&padded)?;
+
+                    // Column data — dict-encode if footer schema expects StringDict
+                    if col_idx < new_columns.len() {
+                        let col_full = &new_columns[col_idx];
+                        let col = if chunk_start == 0 && chunk_end == col_full.len() {
+                            col_full
+                        } else {
+                            &col_full.slice_range(chunk_start, chunk_end)
+                        };
+                        let col_type = if col_idx < footer.schema.columns.len() {
+                            footer.schema.columns[col_idx].1
+                        } else {
+                            ColumnType::Int64
+                        };
+                        if col_type == ColumnType::StringDict
+                            && matches!(col, ColumnData::String { .. })
+                        {
+                            if let Some(dict) = col.to_dict_encoded() {
+                                write_column_encoded(&dict, col_type, &mut body_writer)?;
+                            } else {
+                                write_column_encoded(col, col_type, &mut body_writer)?;
+                            }
                         } else {
                             write_column_encoded(col, col_type, &mut body_writer)?;
                         }
-                    } else {
-                        write_column_encoded(col, col_type, &mut body_writer)?;
                     }
                 }
+                footer.col_offsets.push(new_rg_col_offsets);
             }
-            footer.col_offsets.push(new_rg_col_offsets);
+
+            // Compress body using configured compression algorithm
+            let (compress_flag, disk_body) = compress_rg_body(body_buf, self.compression());
+
+            // Write RG header (32 bytes) — byte 28 = compression flag
+            writer.write_all(MAGIC_ROW_GROUP)?;
+            writer.write_all(&(rg_rows as u32).to_le_bytes())?;
+            writer.write_all(&(col_count as u32).to_le_bytes())?;
+            writer.write_all(&min_id.to_le_bytes())?;
+            writer.write_all(&max_id.to_le_bytes())?;
+            writer.write_all(&[compress_flag, 1, id_encoding, 0])?;
+
+            // RG body (possibly compressed)
+            writer.write_all(&disk_body)?;
+
+            // Update footer with new RG
+            footer.row_groups.push(RowGroupMeta {
+                offset: rg_offset,
+                data_size: writer.stream_position()? - rg_offset,
+                row_count: rg_rows as u32,
+                min_id,
+                max_id,
+                deletion_count,
+            });
+
+            if new_ids.is_empty() {
+                break;
+            }
+            chunk_start = chunk_end;
         }
 
-        // Compress body using configured compression algorithm
-        let (compress_flag, disk_body) = compress_rg_body(body_buf, self.compression());
-
-        // Write RG header (32 bytes) — byte 28 = compression flag
-        writer.write_all(MAGIC_ROW_GROUP)?;
-        writer.write_all(&(rg_rows as u32).to_le_bytes())?;
-        writer.write_all(&(col_count as u32).to_le_bytes())?;
-        writer.write_all(&min_id.to_le_bytes())?;
-        writer.write_all(&max_id.to_le_bytes())?;
-        writer.write_all(&[compress_flag, 1, id_encoding, 0])?;
-
-        // RG body (possibly compressed)
-        writer.write_all(&disk_body)?;
-
         let rg_end = writer.stream_position()?;
-
-        // Update footer with new RG
-        footer.row_groups.push(RowGroupMeta {
-            offset: rg_offset,
-            data_size: rg_end - rg_offset,
-            row_count: rg_rows as u32,
-            min_id,
-            max_id,
-            deletion_count,
-        });
         let active_rows_after: u64 = footer
             .row_groups
             .iter()
@@ -6197,7 +6272,8 @@ impl OnDemandStorage {
         writer.flush()?;
 
         // Fix header
-        let new_persisted = self.persisted_row_count.load(Ordering::SeqCst) + rg_rows as u64;
+        let new_persisted =
+            self.persisted_row_count.load(Ordering::SeqCst) + new_ids.len() as u64;
         let writer_inner = writer.get_mut();
         {
             let mut header = self.header.write();

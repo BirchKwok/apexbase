@@ -4,7 +4,7 @@
 
 ApexBase 值得继续建设轻量查询优化器，但不以实现通用数据库优化器为目标。当前优先完善单表访问路径、统计生命周期和计划可观测性；Join 算法、运行时反馈和计划缓存必须由真实 workload 触发，不能仅为了功能完整而实现。
 
-所有开发必须遵守仓库根目录的 `precondition.md`。其中性能基线、release 构建、完整 pytest、完整 cargo test 和修改后 benchmark 均为合入前置条件。
+所有开发必须遵守仓库根目录的 `AGENTS.md`。其中性能基线、release 构建、完整 pytest、完整 cargo test 和修改后 benchmark 均为合入前置条件。
 
 ## 2. 设计边界
 

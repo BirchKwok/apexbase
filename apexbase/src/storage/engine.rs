@@ -52,6 +52,21 @@ const DELTA_COMPACT_SIZE: u64 = 10 * 1024 * 1024;
 /// Delta row count threshold for auto-compaction
 const DELTA_COMPACT_ROWS: usize = 100_000;
 
+/// Decode a Binary ColumnData (offsets + data) into per-row `Vec<u8>` values.
+fn binary_column_to_values(offsets: &[u64], data: &[u8], row_count: usize) -> Vec<Vec<u8>> {
+    let mut values = Vec::with_capacity(row_count);
+    for i in 0..row_count {
+        let start = offsets.get(i).copied().unwrap_or(0) as usize;
+        let end = offsets.get(i + 1).copied().unwrap_or(data.len() as u64) as usize;
+        values.push(if start <= end && end <= data.len() {
+            data[start..end].to_vec()
+        } else {
+            Vec::new()
+        });
+    }
+    values
+}
+
 // ============================================================================
 // Cache Entry
 // ============================================================================
@@ -785,6 +800,22 @@ impl StorageEngine {
     ) -> io::Result<()> {
         let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
+        if Self::is_v4_file(table_path) {
+            // V4: schema-only DDL on the metadata insert backend. save() updates
+            // the footer schema in place (no data load, no rewrite); reads
+            // synthesize all-NULL values for rows already on disk.
+            let backend = self.get_insert_backend(table_path, durability)?;
+            if Self::has_delta_file(table_path) {
+                // Materialize pending delta rows first so the schema change and
+                // subsequent reads see one coherent column layout.
+                backend.storage.compact()?;
+            }
+            backend.add_column(column_name, dtype)?;
+            backend.save()?;
+            self.invalidate(table_path);
+            epoch_write.commit();
+            return Ok(());
+        }
         let backend = self.get_write_backend(table_path, durability)?;
         backend.add_column(column_name, dtype)?;
         backend.save()?;
@@ -802,6 +833,20 @@ impl StorageEngine {
     ) -> io::Result<()> {
         let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
+        if Self::is_v4_file(table_path) {
+            // V4: logical drop in schema, then a streaming RG-by-RG rewrite
+            // that physically removes the column without loading the table.
+            let backend = self.get_insert_backend(table_path, durability)?;
+            if Self::has_delta_file(table_path) {
+                // Materialize pending delta rows before the physical rewrite.
+                backend.storage.compact()?;
+            }
+            backend.drop_column(column_name)?;
+            backend.storage.rewrite_v4_drop_columns()?;
+            self.invalidate(table_path);
+            epoch_write.commit();
+            return Ok(());
+        }
         let backend = self.get_write_backend(table_path, durability)?;
         backend.drop_column(column_name)?;
         backend.save()?;
@@ -998,15 +1043,15 @@ impl StorageEngine {
                                                 let mut offsets =
                                                     Vec::with_capacity(vals.len() + 1);
                                                 let mut data = Vec::new();
-                                                offsets.push(0u32);
+                                                   offsets.push(0u64);
                                                 for s in vals {
                                                     data.extend_from_slice(s.as_bytes());
-                                                    offsets.push(data.len() as u32);
+                                                    offsets.push(data.len() as u64);
                                                 }
                                                 new_columns
                                                     .push(ColumnData::String { offsets, data });
                                             } else {
-                                                let offsets = vec![0u32; row_count + 1];
+                                                let offsets = vec![0u64; row_count + 1];
                                                 new_columns.push(ColumnData::String {
                                                     offsets,
                                                     data: Vec::new(),
@@ -1038,22 +1083,22 @@ impl StorageEngine {
                                                 let mut offsets =
                                                     Vec::with_capacity(vals.len() + 1);
                                                 let mut data = Vec::new();
-                                                offsets.push(0u32);
+                                                offsets.push(0u64);
                                                 if *col_type == ColumnType::Blob {
                                                     for desc in storage.write_blob_values(vals)? {
                                                         data.extend_from_slice(&desc);
-                                                        offsets.push(data.len() as u32);
+                                                        offsets.push(data.len() as u64);
                                                     }
                                                 } else {
                                                     for b in vals {
                                                         data.extend_from_slice(b);
-                                                        offsets.push(data.len() as u32);
+                                                        offsets.push(data.len() as u64);
                                                     }
                                                 }
                                                 new_columns
                                                     .push(ColumnData::Binary { offsets, data });
                                             } else {
-                                                let offsets = vec![0u32; row_count + 1];
+                                                let offsets = vec![0u64; row_count + 1];
                                                 new_columns.push(ColumnData::Binary {
                                                     offsets,
                                                     data: Vec::new(),
@@ -1195,6 +1240,354 @@ impl StorageEngine {
         }
         Ok(ids)
     }
+
+    /// Write pre-built columnar data (for store_columnar).
+    ///
+    /// Same semantics as `write_typed`, but accepts columns that are already
+    /// materialized as `ColumnData` so the Python binding can build them
+    /// directly from borrowed `&str` / `&[u8]` buffers. This avoids the
+    /// per-element `Vec<String>` / `Vec<Vec<u8>>` intermediate layer and the
+    /// second copy into the Row Group buffers — peak memory for a string-heavy
+    /// batch drops from ~2× the data to ~1×.
+    pub fn write_typed_columns(
+        &self,
+        table_path: &Path,
+        mut columns: HashMap<String, crate::storage::on_demand::ColumnData>,
+        null_positions: HashMap<String, Vec<bool>>,
+        durability: DurabilityLevel,
+    ) -> io::Result<Vec<u64>> {
+        use crate::storage::on_demand::{ColumnData, ColumnType};
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
+
+        let row_count = columns.values().map(|c| c.len()).max().unwrap_or(0);
+        if row_count == 0 {
+            return Ok(Vec::new());
+        }
+
+        // FAST PATH: V4 append for existing tables with matching schema
+        if table_path.exists() {
+            if let Ok(meta) = std::fs::metadata(table_path) {
+                if meta.len() >= 256 {
+                    if let Ok(backend) = self.get_insert_backend(table_path, durability) {
+                        let storage = &backend.storage;
+                        let schema = storage.get_schema();
+                        let header = storage.header_info();
+                        let is_v4 = header.0 > 0;
+
+                        if is_v4 && !schema.is_empty() && storage.row_count() > 0 {
+                            let schema_cols: std::collections::HashSet<String> =
+                                schema.iter().map(|(name, _)| name.clone()).collect();
+                            let data_cols: std::collections::HashSet<String> =
+                                columns.keys().cloned().collect();
+
+                            if schema_cols == data_cols {
+                                // Assemble ColumnData in schema order. A column is
+                                // accepted only when its variant matches the schema
+                                // type (same rule as write_typed's typed buckets);
+                                // otherwise it is padded with the type default.
+                                let mut new_columns: Vec<ColumnData> =
+                                    Vec::with_capacity(schema.len());
+                                let mut new_nulls: Vec<Vec<u8>> =
+                                    Vec::with_capacity(schema.len());
+
+                                let start_id = storage.next_id_value();
+                                let ids: Vec<u64> =
+                                    (start_id..start_id + row_count as u64).collect();
+
+                                for (col_name, col_type) in schema.iter() {
+                                    let null_bitmap =
+                                        if let Some(null_vec) = null_positions.get(col_name) {
+                                            let mut bitmap = vec![0u8; (row_count + 7) / 8];
+                                            for (i, &is_null) in null_vec.iter().enumerate() {
+                                                if is_null {
+                                                    bitmap[i / 8] |= 1 << (i % 8);
+                                                }
+                                            }
+                                            if bitmap.iter().any(|&b| b != 0) {
+                                                bitmap
+                                            } else {
+                                                Vec::new()
+                                            }
+                                        } else {
+                                            Vec::new()
+                                        };
+                                    new_nulls.push(null_bitmap);
+
+                                    let col = columns.remove(col_name);
+                                    match col_type {
+                                        ColumnType::Int64
+                                        | ColumnType::Int32
+                                        | ColumnType::Int16
+                                        | ColumnType::Int8
+                                        | ColumnType::UInt8
+                                        | ColumnType::UInt16
+                                        | ColumnType::UInt32
+                                        | ColumnType::UInt64
+                                        | ColumnType::Timestamp
+                                        | ColumnType::Date => {
+                                            let vals = match col {
+                                                Some(ColumnData::Int64(v)) => v,
+                                                _ => vec![0; row_count],
+                                            };
+                                            new_columns.push(ColumnData::Int64(vals));
+                                        }
+                                        ColumnType::Float64 | ColumnType::Float32 => {
+                                            let vals = match col {
+                                                Some(ColumnData::Float64(v)) => v,
+                                                _ => vec![0.0; row_count],
+                                            };
+                                            new_columns.push(ColumnData::Float64(vals));
+                                        }
+                                        ColumnType::String
+                                        | ColumnType::StringDict
+                                        | ColumnType::Null => match col {
+                                            Some(ColumnData::String { offsets, data }) => {
+                                                new_columns.push(ColumnData::String {
+                                                    offsets,
+                                                    data,
+                                                });
+                                            }
+                                            _ => {
+                                                new_columns.push(ColumnData::String {
+                                                    offsets: vec![0u64; row_count + 1],
+                                                    data: Vec::new(),
+                                                });
+                                            }
+                                        },
+                                        ColumnType::Bool => {
+                                            let packed = match col {
+                                                Some(ColumnData::Bool { data, len }) => {
+                                                    debug_assert_eq!(len, row_count);
+                                                    data
+                                                }
+                                                _ => vec![0u8; (row_count + 7) / 8],
+                                            };
+                                            new_columns.push(ColumnData::Bool {
+                                                data: packed,
+                                                len: row_count,
+                                            });
+                                        }
+                                        ColumnType::Binary | ColumnType::Blob => match col {
+                                            Some(ColumnData::Binary { offsets, data }) => {
+                                                if *col_type == ColumnType::Blob {
+                                                    // Blob schema: values are raw bytes in the
+                                                    // binary column; write sidecar descriptors.
+                                                    let values = binary_column_to_values(
+                                                        &offsets,
+                                                        &data,
+                                                        row_count,
+                                                    );
+                                                    let descriptors =
+                                                        storage.write_blob_values(&values)?;
+                                                    let mut desc_offsets =
+                                                        Vec::with_capacity(descriptors.len() + 1);
+                                                    let mut desc_data = Vec::new();
+                                                    desc_offsets.push(0u64);
+                                                    for d in &descriptors {
+                                                        desc_data.extend_from_slice(d);
+                                                        desc_offsets.push(desc_data.len() as u64);
+                                                    }
+                                                    new_columns.push(ColumnData::Binary {
+                                                        offsets: desc_offsets,
+                                                        data: desc_data,
+                                                    });
+                                                } else {
+                                                    new_columns.push(ColumnData::Binary {
+                                                        offsets,
+                                                        data,
+                                                    });
+                                                }
+                                            }
+                                            _ => {
+                                                new_columns.push(ColumnData::Binary {
+                                                    offsets: vec![0u64; row_count + 1],
+                                                    data: Vec::new(),
+                                                });
+                                            }
+                                        },
+                                        ColumnType::FixedList => {
+                                            let col = match col {
+                                                Some(ColumnData::FixedList { data, dim }) => {
+                                                    ColumnData::FixedList { data, dim }
+                                                }
+                                                _ => ColumnData::FixedList {
+                                                    data: Vec::new(),
+                                                    dim: 0,
+                                                },
+                                            };
+                                            new_columns.push(col);
+                                        }
+                                        ColumnType::Float16List => {
+                                            let col = match col {
+                                                Some(ColumnData::Float16List { data, dim }) => {
+                                                    ColumnData::Float16List { data, dim }
+                                                }
+                                                // FixedList columns carry f32 bytes (the
+                                                // Python binding's numpy path); convert to
+                                                // f16 exactly like write_typed's typed path.
+                                                Some(ColumnData::FixedList { data, dim }) => {
+                                                    let mut f16_data =
+                                                        Vec::with_capacity(data.len() / 2);
+                                                    for chunk in data.chunks_exact(4) {
+                                                        let f = f32::from_le_bytes(
+                                                            chunk.try_into().unwrap(),
+                                                        );
+                                                        f16_data.extend_from_slice(
+                                                            &crate::storage::on_demand::f32_to_f16(
+                                                                f,
+                                                            )
+                                                            .to_le_bytes(),
+                                                        );
+                                                    }
+                                                    ColumnData::Float16List {
+                                                        data: f16_data,
+                                                        dim,
+                                                    }
+                                                }
+                                                _ => ColumnData::Float16List {
+                                                    data: Vec::new(),
+                                                    dim: 0,
+                                                },
+                                            };
+                                            new_columns.push(col);
+                                        }
+                                    }
+                                }
+
+                                match storage.append_row_group(&ids, &new_columns, &new_nulls) {
+                                    Ok(()) => {
+                                        self.invalidate_after_append(table_path);
+                                        epoch_write.commit();
+                                        drop(epoch_write);
+                                        if let Some(entry) =
+                                            self.insert_cache.write().get_mut(table_path)
+                                        {
+                                            entry.epoch =
+                                                crate::storage::epoch::current(table_path);
+                                        }
+                                        return Ok(ids);
+                                    }
+                                    Err(_) => {
+                                        return Err(io::Error::new(
+                                            io::ErrorKind::Other,
+                                            "append_row_group failed",
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // SLOW PATH: convert pre-built columns back to the typed maps and let
+        // write_typed handle new tables / schema evolution / non-V4 files.
+        let mut int_columns: HashMap<String, Vec<i64>> = HashMap::new();
+        let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
+        let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
+        let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut fixedlist_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
+        for (name, col) in columns {
+            match col {
+                ColumnData::Int64(v) => {
+                    int_columns.insert(name, v);
+                }
+                ColumnData::Float64(v) => {
+                    float_columns.insert(name, v);
+                }
+                ColumnData::String { offsets, data } => {
+                    let mut vals = Vec::with_capacity(offsets.len().saturating_sub(1));
+                    for i in 0..offsets.len().saturating_sub(1) {
+                        let start = offsets[i] as usize;
+                        let end = offsets[i + 1] as usize;
+                        vals.push(String::from_utf8_lossy(&data[start..end]).to_string());
+                    }
+                    string_columns.insert(name, vals);
+                }
+                ColumnData::StringDict {
+                    indices,
+                    dict_offsets,
+                    dict_data,
+                } => {
+                    let mut vals = Vec::with_capacity(indices.len());
+                    for &idx in &indices {
+                        if idx == 0 || (idx as usize) >= dict_offsets.len() {
+                            vals.push(String::new());
+                        } else {
+                            let start = dict_offsets[(idx - 1) as usize] as usize;
+                            let end = dict_offsets[idx as usize] as usize;
+                            vals.push(
+                                String::from_utf8_lossy(&dict_data[start..end]).to_string(),
+                            );
+                        }
+                    }
+                    string_columns.insert(name, vals);
+                }
+                ColumnData::Binary { offsets, data } => {
+                    let mut vals = Vec::with_capacity(offsets.len().saturating_sub(1));
+                    for i in 0..offsets.len().saturating_sub(1) {
+                        let start = offsets[i] as usize;
+                        let end = offsets[i + 1] as usize;
+                        vals.push(data[start..end].to_vec());
+                    }
+                    binary_columns.insert(name, vals);
+                }
+                ColumnData::Bool { data, len } => {
+                    let mut vals = Vec::with_capacity(len);
+                    for i in 0..len {
+                        vals.push((data[i / 8] >> (i % 8)) & 1 == 1);
+                    }
+                    bool_columns.insert(name, vals);
+                }
+                ColumnData::FixedList { data, dim } => {
+                    let row_bytes = dim as usize * 4;
+                    let mut vals = Vec::with_capacity(if row_bytes == 0 {
+                        0
+                    } else {
+                        data.len() / row_bytes
+                    });
+                    for chunk in data.chunks(row_bytes.max(1)) {
+                        vals.push(chunk.to_vec());
+                    }
+                    fixedlist_columns.insert(name, vals);
+                }
+                ColumnData::Float16List { data, dim } => {
+                    // Convert f16 bytes back to f32 bytes for the typed path.
+                    let row_bytes = dim as usize * 2;
+                    let mut vals = Vec::with_capacity(if row_bytes == 0 {
+                        0
+                    } else {
+                        data.len() / row_bytes
+                    });
+                    for chunk in data.chunks(row_bytes.max(1)) {
+                        let mut f32_row = Vec::with_capacity(chunk.len() * 2);
+                        for pair in chunk.chunks_exact(2) {
+                            let h = u16::from_le_bytes(pair.try_into().unwrap());
+                            f32_row.extend_from_slice(
+                                &crate::storage::on_demand::f16_to_f32(h).to_le_bytes(),
+                            );
+                        }
+                        vals.push(f32_row);
+                    }
+                    fixedlist_columns.insert(name, vals);
+                }
+            }
+        }
+
+        self.write_typed(
+            table_path,
+            int_columns,
+            float_columns,
+            string_columns,
+            binary_columns,
+            fixedlist_columns,
+            bool_columns,
+            null_positions,
+            durability,
+        )
+    }
 }
 
 // ============================================================================
@@ -1210,6 +1603,137 @@ pub fn engine() -> &'static StorageEngine {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn write_typed_columns_slow_then_fast_path() {
+        use crate::storage::on_demand::{ColumnData, ColumnType};
+
+        let dir = tempdir().unwrap();
+        let table_path = dir.path().join("typed_cols.apex");
+        let engine = engine();
+
+        // First write: new table -> slow path (schema inferred from data).
+        let mut cols: HashMap<String, ColumnData> = HashMap::new();
+        cols.insert(
+            "name".to_string(),
+            ColumnData::String {
+                offsets: vec![0u64, 3, 6],
+                data: b"abcdef".to_vec(),
+            },
+        );
+        cols.insert("score".to_string(), ColumnData::Int64(vec![1, 2]));
+        let ids = engine
+            .write_typed_columns(&table_path, cols, HashMap::new(), DurabilityLevel::Fast)
+            .unwrap();
+        assert_eq!(ids, vec![1, 2]);
+
+        // Second write: V4 append fast path with matching schema.
+        let mut cols2: HashMap<String, ColumnData> = HashMap::new();
+        cols2.insert(
+            "name".to_string(),
+            ColumnData::String {
+                offsets: vec![0u64, 2, 4],
+                data: b"xyzw".to_vec(),
+            },
+        );
+        cols2.insert("score".to_string(), ColumnData::Int64(vec![3, 4]));
+        let ids2 = engine
+            .write_typed_columns(&table_path, cols2, HashMap::new(), DurabilityLevel::Fast)
+            .unwrap();
+        assert_eq!(ids2, vec![3, 4]);
+
+        // Verify both row groups are readable with correct values.
+        let backend = engine.get_read_backend(&table_path).unwrap();
+        assert_eq!(backend.row_count(), 4);
+        let batch = backend
+            .read_columns_to_arrow(Some(&["name", "score"]), 0, None)
+            .unwrap();
+        assert_eq!(batch.num_rows(), 4);
+        use arrow::array::Array;
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "abc");
+        assert_eq!(names.value(1), "def");
+        assert_eq!(names.value(2), "xy");
+        assert_eq!(names.value(3), "zw");
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(scores.values(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn write_typed_columns_converts_fixedlist_to_float16_schema() {
+        use crate::storage::on_demand::{ColumnData, ColumnType};
+
+        let dir = tempdir().unwrap();
+        let table_path = dir.path().join("f16_cols.apex");
+        let engine = engine();
+        engine
+            .create_table_with_schema(
+                &table_path,
+                DurabilityLevel::Fast,
+                &[("vec".to_string(), ColumnType::Float16List)],
+            )
+            .unwrap();
+
+        let f32_row = |a: f32, b: f32, c: f32, d: f32| -> Vec<u8> {
+            let mut out = Vec::with_capacity(16);
+            for v in [a, b, c, d] {
+                out.extend_from_slice(&v.to_le_bytes());
+            }
+            out
+        };
+
+        // First write: empty table -> slow path (FixedList -> typed -> f16).
+        let mut cols: HashMap<String, ColumnData> = HashMap::new();
+        cols.insert(
+            "vec".to_string(),
+            ColumnData::FixedList {
+                data: [
+                    f32_row(1.0, 0.0, 0.0, 0.0),
+                    f32_row(0.0, 1.0, 0.0, 0.0),
+                ]
+                .concat(),
+                dim: 4,
+            },
+        );
+        engine
+            .write_typed_columns(&table_path, cols, HashMap::new(), DurabilityLevel::Fast)
+            .unwrap();
+
+        // Second write: V4 append fast path must convert FixedList -> Float16List.
+        let mut cols2: HashMap<String, ColumnData> = HashMap::new();
+        cols2.insert(
+            "vec".to_string(),
+            ColumnData::FixedList {
+                data: [
+                    f32_row(0.0, 0.0, 1.0, 0.0),
+                    f32_row(0.0, 0.0, 0.0, 1.0),
+                ]
+                .concat(),
+                dim: 4,
+            },
+        );
+        engine
+            .write_typed_columns(&table_path, cols2, HashMap::new(), DurabilityLevel::Fast)
+            .unwrap();
+
+        let backend = engine.get_read_backend(&table_path).unwrap();
+        let batch = backend
+            .read_columns_to_arrow(Some(&["vec"]), 0, None)
+            .unwrap();
+        assert_eq!(batch.num_rows(), 4);
+        let vec_col = batch.column_by_name("vec").unwrap();
+        assert_eq!(vec_col.len(), 4);
+    }
 
     #[test]
     fn test_engine_write_read() {

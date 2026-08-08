@@ -142,7 +142,7 @@ impl ColumnBloomIndex {
     /// Build bloom index from string column data
     pub fn build_from_strings(
         column_name: &str,
-        offsets: &[u32],
+        offsets: &[u64],
         data: &[u8],
         row_group_size: usize,
         false_positive_rate: f64,
@@ -402,7 +402,7 @@ mod tests {
 
     #[test]
     fn test_column_bloom_index() {
-        let offsets = vec![0u32, 5, 11, 17, 23, 29]; // 5 strings
+        let offsets = vec![0u64, 5, 11, 17, 23, 29]; // 5 strings
         let data = b"appleorangebananagrapemeloncoding";
 
         let index = ColumnBloomIndex::build_from_strings(
