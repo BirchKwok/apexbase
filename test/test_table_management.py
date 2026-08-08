@@ -829,6 +829,9 @@ class TestCreateTableWithSchema:
             with tempfile.TemporaryDirectory() as td:
                 c = ApexClient(dirpath=td)
                 c.create_table("t", schema=schema)
+                # CREATE is lazily materialized; keep that one-time filesystem
+                # work outside the store-path comparison on every platform.
+                assert c.count_rows() == 0
                 t0 = time.perf_counter()
                 c.store(data)
                 times_schema.append(time.perf_counter() - t0)
@@ -837,6 +840,7 @@ class TestCreateTableWithSchema:
             with tempfile.TemporaryDirectory() as td:
                 c = ApexClient(dirpath=td)
                 c.create_table("t")
+                assert c.count_rows() == 0
                 t0 = time.perf_counter()
                 c.store(data)
                 times_no_schema.append(time.perf_counter() - t0)
