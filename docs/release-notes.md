@@ -3,6 +3,23 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.29.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.29.0)
+*2026-08-08*
+
+[Compare with v1.28.0](https://github.com/BirchKwok/ApexBase/compare/v1.28.0...v1.29.0)
+
+- Introduce a streaming Row-Group rewrite engine for V4 storage: delta-file compaction, compressed-row-group deletes, and `DROP COLUMN` now merge/rewrite Row Group by Row Group via mmap into a temporary file followed by an atomic rename, so peak memory is O(largest Row Group + delta payloads) instead of the whole table — tables larger than physical memory can be compacted and restructured without OOM
+- Make `ALTER TABLE ADD COLUMN` footer-only on mmap-only V4 tables: only the footer schema is updated, read paths synthesize all-NULL values for rows already on disk, and later compactions materialize the column; `DROP COLUMN` and `ADD COLUMN` materialize any pending delta first
+- Chunk appends by `row_group_size` so a single large batch is split into multiple Row Groups, bounding per-RG buffers and preserving zone-map granularity regardless of batch size
+- Upgrade in-memory `String`/`Binary`/`StringDict` column offsets from u32 to u64, eliminating silent truncation for columns larger than 4 GiB while keeping the on-disk format (u32 offsets per Row Group) unchanged and fully compatible with existing files
+- Build `store()`/`store_columnar()` columns directly from borrowed Python buffers (`&str` / `&[u8]`) through a new `write_typed_columns` path, removing per-element `String`/`Vec` allocation and the typed intermediate copy; FTS string retention now happens only when FTS is enabled
+- Fix `_id` leakage and missing-column padding in mmap read paths (RCIX extraction, indexed row reads, and filtered limit scans) that were exposed by footer-only ADD COLUMN, and align column projection on numeric-range filter fast paths
+- Expand regression coverage with Rust and Python tests for streaming compaction across many row groups, footer-only ADD COLUMN, streaming DROP COLUMN, compressed deletes, append chunking, u64 offsets, and the borrowed-buffer write path, and refresh the storage architecture documentation
+- Update the Rust crate and Python package version metadata to 1.29.0
+
+---
+
+
 ## [v1.28.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.28.0)
 *2026-08-06*
 
