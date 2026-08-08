@@ -13,6 +13,22 @@ fn global_pending_deletes() -> &'static StdRwLock<Option<HashMap<PathBuf, Vec<u8
     &PENDING_DELETES
 }
 
+#[cfg(unix)]
+fn pending_delete_matches_file(path: &std::path::Path, dev_id: u64, ino_id: u64) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(path)
+        .map(|metadata| metadata.dev() == dev_id && metadata.ino() == ino_id)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn pending_delete_matches_file(_: &std::path::Path, _: u64, _: u64) -> bool {
+    // Deferred deletes are only produced by the Unix fast path. Reject any
+    // process-local entry on other platforms instead of applying Unix file IDs.
+    false
+}
+
 /// Apply pending delete state from global map to file on disk.
 /// Called on fresh open so reads see the latest state.
 /// Returns Ok(()) even if no pending state exists.
@@ -36,11 +52,7 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
     // temp-dir cleanup), the recorded offsets and footer no longer describe the
     // current file; applying them would corrupt the fresh file with stale
     // deletion vectors. Discard the stale entry instead.
-    use std::os::unix::fs::MetadataExt;
-    let matches_identity = std::fs::metadata(path)
-        .map(|m| m.dev() == dev_id && m.ino() == ino_id)
-        .unwrap_or(false);
-    if !matches_identity {
+    if !pending_delete_matches_file(path, dev_id, ino_id) {
         global_pending_deletes()
             .write()
             .unwrap()

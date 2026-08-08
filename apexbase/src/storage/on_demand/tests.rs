@@ -23,6 +23,38 @@ fn insert_pending_delete(
         .map(|m| m.insert(path.to_path_buf(), buf));
 }
 
+#[cfg(unix)]
+#[test]
+fn pending_delete_identity_matches_current_file() {
+    use std::os::unix::fs::MetadataExt;
+
+    let dir = tempdir().unwrap();
+    let table_path = dir.path().join("identity.apex");
+    std::fs::write(&table_path, []).unwrap();
+    let metadata = std::fs::metadata(&table_path).unwrap();
+
+    assert!(pending_delete_matches_file(
+        &table_path,
+        metadata.dev(),
+        metadata.ino()
+    ));
+    assert!(!pending_delete_matches_file(
+        &table_path,
+        metadata.dev(),
+        metadata.ino().wrapping_add(1)
+    ));
+}
+
+#[cfg(not(unix))]
+#[test]
+fn pending_delete_identity_is_rejected_without_unix_file_ids() {
+    assert!(!pending_delete_matches_file(
+        std::path::Path::new("unused.apex"),
+        1,
+        1
+    ));
+}
+
 #[test]
 fn apply_pending_deletes_discards_state_for_recreated_file() {
     let dir = tempdir().unwrap();
