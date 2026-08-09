@@ -1677,10 +1677,12 @@
 </span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;CREATE TABLE embeddings (doc_id TEXT, vec FLOAT16_VECTOR)&quot;</span><span class="p">)</span>
 </span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="n">client</span><span class="o">.</span><span class="n">use_table</span><span class="p">(</span><span class="s2">&quot;embeddings&quot;</span><span class="p">)</span>
 </span></code></pre></div>
-<p>Accepted type name aliases (all equivalent):
-- <code>FLOAT16_VECTOR</code> <em>(recommended)</em>
-- <code>FLOAT16VECTOR</code>
-- <code>F16_VECTOR</code></p>
+<p>Accepted type name aliases (all equivalent):</p>
+<ul>
+<li><code>FLOAT16_VECTOR</code> <em>(recommended)</em></li>
+<li><code>FLOAT16VECTOR</code></li>
+<li><code>F16_VECTOR</code></li>
+</ul>
 <hr />
 <h2 id="inserting-vectors">Inserting vectors<a class="headerlink" href="#inserting-vectors" title="Permanent link">&para;</a></h2>
 <h3 id="recommended-batch-store-with-numpy-arrays">Recommended: batch store with numpy arrays<a class="headerlink" href="#recommended-batch-store-with-numpy-arrays" title="Permanent link">&para;</a></h3>
@@ -1808,10 +1810,12 @@
 </span></code></pre></div>
 <hr />
 <h2 id="quantization-error-and-precision">Quantization error and precision<a class="headerlink" href="#quantization-error-and-precision" title="Permanent link">&para;</a></h2>
-<p>Float16 (IEEE 754 binary16) has:
-- 10-bit mantissa → ~3.3 decimal digits of precision
-- Range: ±65504
-- Machine epsilon: ~9.77 × 10⁻⁴</p>
+<p>Float16 (IEEE 754 binary16) has:</p>
+<ul>
+<li>10-bit mantissa → ~3.3 decimal digits of precision</li>
+<li>Range: ±65504</li>
+<li>Machine epsilon: ~9.77 × 10⁻⁴</li>
+</ul>
 <p>For typical embedding ranges (values in [−1, 1]):</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 </span><span id="__span-8-2"><a id="__codelineno-8-2" name="__codelineno-8-2" href="#__codelineno-8-2"></a>

@@ -1748,14 +1748,16 @@
 </span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>                    │         {dir}/fts_config.json        │
 </span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a>                    └─────────────────────────────────────┘
 </span></code></pre></div>
-<p>Key design points:
-- FTS state is stored in a <strong>global Rust registry</strong> keyed by database directory, so PG Wire and Arrow Flight connections share the same FTS engines as Python API calls.
-- <code>MATCH('query')</code> in a <code>WHERE</code> clause is resolved once to an <code>Arc&lt;RoaringTreemap&gt;</code>; Arrow batches test <code>_id</code> membership directly without materializing an <code>IN</code> list.
-- The configuration is persisted in <code>fts_config.json</code> alongside the <code>.apex</code> data files, and is re-loaded automatically on process restart.
-- Postings use 64-bit Roaring bitmaps. Packed per-document token streams provide BM25 term frequency, document length, and phrase positions without duplicating the term dictionary.
-- Updates and deletes are recorded in a checksummed WAL and compacted into an atomically replaced v3 snapshot.
-- With <code>lazy_load=true</code>, the fixed-width term directory and posting blobs remain mmap-backed; posting bitmaps are decoded on first access into a bounded cache.
-- Text is NFKC-normalized and Unicode-lowercased. Unicode word boundaries cover Latin, Cyrillic, Arabic and other spaced scripts; n-grams cover Han, Hiragana, Katakana and Hangul.</p>
+<p>Key design points:</p>
+<ul>
+<li>FTS state is stored in a <strong>global Rust registry</strong> keyed by database directory, so PG Wire and Arrow Flight connections share the same FTS engines as Python API calls.</li>
+<li><code>MATCH('query')</code> in a <code>WHERE</code> clause is resolved once to an <code>Arc&lt;RoaringTreemap&gt;</code>; Arrow batches test <code>_id</code> membership directly without materializing an <code>IN</code> list.</li>
+<li>The configuration is persisted in <code>fts_config.json</code> alongside the <code>.apex</code> data files, and is re-loaded automatically on process restart.</li>
+<li>Postings use 64-bit Roaring bitmaps. Packed per-document token streams provide BM25 term frequency, document length, and phrase positions without duplicating the term dictionary.</li>
+<li>Updates and deletes are recorded in a checksummed WAL and compacted into an atomically replaced v3 snapshot.</li>
+<li>With <code>lazy_load=true</code>, the fixed-width term directory and posting blobs remain mmap-backed; posting bitmaps are decoded on first access into a bounded cache.</li>
+<li>Text is NFKC-normalized and Unicode-lowercased. Unicode word boundaries cover Latin, Cyrillic, Arabic and other spaced scripts; n-grams cover Han, Hiragana, Katakana and Hangul.</li>
+</ul>
 <hr />
 <h2 id="quick-start">Quick Start<a class="headerlink" href="#quick-start" title="Permanent link">&para;</a></h2>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">apexbase</span><span class="w"> </span><span class="kn">import</span> <span class="n">ApexClient</span>
@@ -1794,11 +1796,13 @@
 </span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="w">    </span><span class="p">[(</span><span class="n">col1</span><span class="w"> </span><span class="p">[,</span><span class="w"> </span><span class="n">col2</span><span class="p">,</span><span class="w"> </span><span class="p">...])]</span>
 </span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a><span class="w">    </span><span class="p">[</span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="k">option</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">value</span><span class="w"> </span><span class="p">[,</span><span class="w"> </span><span class="p">...])]</span>
 </span></code></pre></div>
-<p><strong>Effect:</strong>
-- Registers the table in <code>fts_config.json</code> with <code>enabled = true</code>.
-- Creates (or opens) the ApexFTS engine for the table under <code>{dir}/fts_indexes/{table}.afts</code> and replays <code>{table}.afts.wal</code>.
-- <strong>Existing rows are back-filled automatically</strong> — all rows already in the table are indexed immediately. The status message reports the number of rows indexed.
-- New documents stored via <code>store()</code> / <code>INSERT</code> are indexed automatically on every write.</p>
+<p><strong>Effect:</strong></p>
+<ul>
+<li>Registers the table in <code>fts_config.json</code> with <code>enabled = true</code>.</li>
+<li>Creates (or opens) the ApexFTS engine for the table under <code>{dir}/fts_indexes/{table}.afts</code> and replays <code>{table}.afts.wal</code>.</li>
+<li><strong>Existing rows are back-filled automatically</strong> — all rows already in the table are indexed immediately. The status message reports the number of rows indexed.</li>
+<li>New documents stored via <code>store()</code> / <code>INSERT</code> are indexed automatically on every write.</li>
+</ul>
 <p><strong>Column list (optional)</strong></p>
 <p>If omitted, all string columns are indexed. Specify columns to reduce index size and improve precision:</p>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1">-- Index specific columns</span>
@@ -1849,10 +1853,12 @@
 <h3 id="drop-fts-index">DROP FTS INDEX<a class="headerlink" href="#drop-fts-index" title="Permanent link">&para;</a></h3>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="k">DROP</span><span class="w"> </span><span class="n">FTS</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">table_name</span>
 </span></code></pre></div>
-<p><strong>Effect:</strong>
-- Removes the table entry from <code>fts_config.json</code>.
-- Deletes the <code>.afts</code> snapshot and WAL from <code>{dir}/fts_indexes/</code>, together with legacy <code>.nfts</code> files when present.
-- Removes the in-memory engine from the global registry.</p>
+<p><strong>Effect:</strong></p>
+<ul>
+<li>Removes the table entry from <code>fts_config.json</code>.</li>
+<li>Deletes the <code>.afts</code> snapshot and WAL from <code>{dir}/fts_indexes/</code>, together with legacy <code>.nfts</code> files when present.</li>
+<li>Removes the in-memory engine from the global registry.</li>
+</ul>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;DROP FTS INDEX ON articles&quot;</span><span class="p">)</span>
 </span></code></pre></div>
 <hr />
@@ -1860,19 +1866,23 @@
 <p><strong>Disable:</strong>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-8-1"><a id="__codelineno-8-1" name="__codelineno-8-1" href="#__codelineno-8-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="n">FTS</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="n">DISABLE</span>
 </span></code></pre></div></p>
-<p><strong>Effect:</strong>
-- Sets <code>enabled = false</code> in <code>fts_config.json</code>.
-- <strong>Does not</strong> delete index files.
-- While disabled, SQL <code>INSERT</code> / <code>DELETE</code> writes are <strong>not</strong> synced to the FTS index.
-- Useful when temporarily suspending FTS to avoid write overhead during a large bulk load.</p>
+<p><strong>Effect:</strong></p>
+<ul>
+<li>Sets <code>enabled = false</code> in <code>fts_config.json</code>.</li>
+<li><strong>Does not</strong> delete index files.</li>
+<li>While disabled, SQL <code>INSERT</code> / <code>DELETE</code> writes are <strong>not</strong> synced to the FTS index.</li>
+<li>Useful when temporarily suspending FTS to avoid write overhead during a large bulk load.</li>
+</ul>
 <p><strong>Enable:</strong>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-9-1"><a id="__codelineno-9-1" name="__codelineno-9-1" href="#__codelineno-9-1"></a><span class="k">ALTER</span><span class="w"> </span><span class="n">FTS</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="n">ENABLE</span>
 </span></code></pre></div></p>
-<p><strong>Effect:</strong>
-- Sets <code>enabled = true</code> in <code>fts_config.json</code>.
-- <strong>Back-fills all rows</strong> currently in the table into the FTS index (idempotent — re-indexing already-indexed rows is safe).
-- Rows inserted while FTS was disabled are caught up automatically during the enable step.
-- Returns a status message with the number of rows indexed.</p>
+<p><strong>Effect:</strong></p>
+<ul>
+<li>Sets <code>enabled = true</code> in <code>fts_config.json</code>.</li>
+<li><strong>Back-fills all rows</strong> currently in the table into the FTS index (idempotent — re-indexing already-indexed rows is safe).</li>
+<li>Rows inserted while FTS was disabled are caught up automatically during the enable step.</li>
+<li>Returns a status message with the number of rows indexed.</li>
+</ul>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="c1"># Disable while doing a large bulk import</span>
 </span><span id="__span-10-2"><a id="__codelineno-10-2" name="__codelineno-10-2" href="#__codelineno-10-2"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;ALTER FTS INDEX ON articles DISABLE&quot;</span><span class="p">)</span>
 </span><span id="__span-10-3"><a id="__codelineno-10-3" name="__codelineno-10-3" href="#__codelineno-10-3"></a>

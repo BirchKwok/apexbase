@@ -2696,11 +2696,13 @@ The table is the default context — use its name unqualified in SQL.</p>
 </span><span id="__span-24-15"><a id="__codelineno-24-15" name="__codelineno-24-15" href="#__codelineno-24-15"></a>
 </span><span id="__span-24-16"><a id="__codelineno-24-16" name="__codelineno-24-16" href="#__codelineno-24-16"></a><span class="k">for</span><span class="w"> </span><span class="n">h</span><span class="w"> </span><span class="k">in</span><span class="w"> </span><span class="n">handles</span><span class="w"> </span><span class="p">{</span><span class="w"> </span><span class="n">h</span><span class="p">.</span><span class="n">join</span><span class="p">().</span><span class="n">unwrap</span><span class="p">();</span><span class="w"> </span><span class="p">}</span>
 </span></code></pre></div>
-<p><strong>Notes:</strong>
-- <code>ApexDB::clone()</code> and <code>Table::clone()</code> are <code>O(1)</code> — they share the same <code>Arc&lt;DbInner&gt;</code>.
-- Reads (<code>execute</code>, <code>retrieve</code>, <code>retrieve_many</code>, <code>count</code>) are lock-free on V4 mmap-only tables.
-- Writes are serialized per-table via an internal write lock in the storage engine.
-- <code>use_database()</code> modifies shared state; avoid calling it from multiple threads concurrently.</p>
+<p><strong>Notes:</strong></p>
+<ul>
+<li><code>ApexDB::clone()</code> and <code>Table::clone()</code> are <code>O(1)</code> — they share the same <code>Arc&lt;DbInner&gt;</code>.</li>
+<li>Reads (<code>execute</code>, <code>retrieve</code>, <code>retrieve_many</code>, <code>count</code>) are lock-free on V4 mmap-only tables.</li>
+<li>Writes are serialized per-table via an internal write lock in the storage engine.</li>
+<li><code>use_database()</code> modifies shared state; avoid calling it from multiple threads concurrently.</li>
+</ul>
 <hr />
 <h2 id="public-helper-functions">Public Helper Functions<a class="headerlink" href="#public-helper-functions" title="Permanent link">&para;</a></h2>
 <p>Two public functions are exported from <code>apexbase::embedded</code>:</p>
@@ -3005,18 +3007,20 @@ Handles: <code>Int8/16/32/64</code>, <code>UInt8/16/32/64</code>, <code>Float32/
 <h2 id="running-the-example">Running the Example<a class="headerlink" href="#running-the-example" title="Permanent link">&para;</a></h2>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-27-1"><a id="__codelineno-27-1" name="__codelineno-27-1" href="#__codelineno-27-1"></a>cargo<span class="w"> </span>run<span class="w"> </span>--example<span class="w"> </span>embedded<span class="w"> </span>--no-default-features
 </span></code></pre></div>
-<p>The example at <code>examples/embedded.rs</code> demonstrates all 16 steps:
-- Opening a database with the builder
-- Creating a table with predefined schema
-- Inserting individual rows
-- SQL queries (filter, aggregate, GROUP BY)
-- Bulk insert (1 000 rows)
-- Delete and replace by <code>_id</code>
-- <code>retrieve_many</code> (Arrow batch read)
-- Schema introspection (<code>columns()</code>)
-- Add / drop columns
-- Multi-table operations
-- Database-level SQL (<code>db.execute</code>)</p>
+<p>The example at <code>examples/embedded.rs</code> demonstrates all 16 steps:</p>
+<ul>
+<li>Opening a database with the builder</li>
+<li>Creating a table with predefined schema</li>
+<li>Inserting individual rows</li>
+<li>SQL queries (filter, aggregate, GROUP BY)</li>
+<li>Bulk insert (1 000 rows)</li>
+<li>Delete and replace by <code>_id</code></li>
+<li><code>retrieve_many</code> (Arrow batch read)</li>
+<li>Schema introspection (<code>columns()</code>)</li>
+<li>Add / drop columns</li>
+<li>Multi-table operations</li>
+<li>Database-level SQL (<code>db.execute</code>)</li>
+</ul>
 <hr />
 <h2 id="performance-notes">Performance Notes<a class="headerlink" href="#performance-notes" title="Permanent link">&para;</a></h2>
 <ul>

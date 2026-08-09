@@ -1687,15 +1687,19 @@
 </span><span id="__span-5-21"><a id="__codelineno-5-21" name="__codelineno-5-21" href="#__codelineno-5-21"></a>
 </span><span id="__span-5-22"><a id="__codelineno-5-22" name="__codelineno-5-22" href="#__codelineno-5-22"></a><span class="n">client</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
 </span></code></pre></div>
-<p><strong>Supported DDL / DML Statements:</strong>
-- <code>CREATE TABLE [IF NOT EXISTS] table_name</code>
-- <code>ALTER TABLE ... ADD COLUMN column_name TYPE</code>
-- <code>INSERT INTO ... VALUES ...</code>
-- <code>DROP TABLE [IF EXISTS] table_name</code></p>
-<p><strong>Multi-Statement SQL:</strong>
-- Separate statements with semicolons (<code>;</code>)
-- Statements are executed sequentially
-- The result of the last statement is returned</p>
+<p><strong>Supported DDL / DML Statements:</strong></p>
+<ul>
+<li><code>CREATE TABLE [IF NOT EXISTS] table_name</code></li>
+<li><code>ALTER TABLE ... ADD COLUMN column_name TYPE</code></li>
+<li><code>INSERT INTO ... VALUES ...</code></li>
+<li><code>DROP TABLE [IF EXISTS] table_name</code></li>
+</ul>
+<p><strong>Multi-Statement SQL:</strong></p>
+<ul>
+<li>Separate statements with semicolons (<code>;</code>)</li>
+<li>Statements are executed sequentially</li>
+<li>The result of the last statement is returned</li>
+</ul>
 <h2 id="bulk-data-import">Bulk Data Import<a class="headerlink" href="#bulk-data-import" title="Permanent link">&para;</a></h2>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pandas</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pd</span>
 </span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>

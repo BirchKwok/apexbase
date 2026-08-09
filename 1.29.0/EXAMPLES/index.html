@@ -2532,12 +2532,14 @@
 </span><span id="__span-9-33"><a id="__codelineno-9-33" name="__codelineno-9-33" href="#__codelineno-9-33"></a>
 </span><span id="__span-9-34"><a id="__codelineno-9-34" name="__codelineno-9-34" href="#__codelineno-9-34"></a><span class="n">client</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
 </span></code></pre></div>
-<p><strong>Notes on Multi-Statement SQL:</strong>
-- Statements are separated by semicolons (<code>;</code>)
-- Semicolons inside string literals are handled correctly
-- Statements execute sequentially
-- The result of the last statement is returned
-- Useful for schema setup and batch operations</p>
+<p><strong>Notes on Multi-Statement SQL:</strong></p>
+<ul>
+<li>Statements are separated by semicolons (<code>;</code>)</li>
+<li>Semicolons inside string literals are handled correctly</li>
+<li>Statements execute sequentially</li>
+<li>The result of the last statement is returned</li>
+<li>Useful for schema setup and batch operations</li>
+</ul>
 <hr />
 <h2 id="data-import">Data Import<a class="headerlink" href="#data-import" title="Permanent link">&para;</a></h2>
 <h3 id="from-pandas">From Pandas<a class="headerlink" href="#from-pandas" title="Permanent link">&para;</a></h3>

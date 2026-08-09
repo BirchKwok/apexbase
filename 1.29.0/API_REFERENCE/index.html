@@ -3052,14 +3052,16 @@
 </span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>    <span class="n">_auto_manage</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
 </span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a><span class="p">)</span>
 </span></code></pre></div>
-<p><strong>Parameters:</strong>
-- <code>dirpath</code>: Data directory path (default: current directory)
-- <code>batch_size</code>: Batch size for bulk operations
-- <code>drop_if_exists</code>: If True, delete existing data on open
-- <code>enable_cache</code>: Enable query result caching
-- <code>cache_size</code>: Maximum cache entries
-- <code>prefer_arrow_format</code>: Prefer Arrow format for internal transfers
-- <code>durability</code>: Persistence level - 'fast' (async), 'safe' (sync), 'max' (fsync every write)</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>dirpath</code>: Data directory path (default: current directory)</li>
+<li><code>batch_size</code>: Batch size for bulk operations</li>
+<li><code>drop_if_exists</code>: If True, delete existing data on open</li>
+<li><code>enable_cache</code>: Enable query result caching</li>
+<li><code>cache_size</code>: Maximum cache entries</li>
+<li><code>prefer_arrow_format</code>: Prefer Arrow format for internal transfers</li>
+<li><code>durability</code>: Persistence level - 'fast' (async), 'safe' (sync), 'max' (fsync every write)</li>
+</ul>
 <p><strong>Example:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">apexbase</span><span class="w"> </span><span class="kn">import</span> <span class="n">ApexClient</span>
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
@@ -3079,8 +3081,10 @@
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">use_database</span><span class="p">(</span><span class="n">database</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;default&#39;</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ApexClient</span>
 </span></code></pre></div>
 Switch to a named database. Creates the database subdirectory if it does not exist. Resets the current table to <code>None</code>.</p>
-<p><strong>Parameters:</strong>
-- <code>database</code>: Database name. <code>'default'</code> (or <code>''</code>) maps to the root directory.</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>database</code>: Database name. <code>'default'</code> (or <code>''</code>) maps to the root directory.</li>
+</ul>
 <p><strong>Returns:</strong> <code>self</code> (for method chaining)</p>
 <p><strong>Examples:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1"># Switch to analytics database</span>
@@ -3097,9 +3101,11 @@ Switch to a named database. Creates the database subdirectory if it does not exi
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="n">use</span><span class="p">(</span><span class="n">database</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="s1">&#39;default&#39;</span><span class="p">,</span> <span class="n">table</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ApexClient</span>
 </span></code></pre></div>
 Switch to a named database and optionally select or create a table in one call. If <code>table</code> is specified and does not exist it is created automatically.</p>
-<p><strong>Parameters:</strong>
-- <code>database</code>: Database name (default = root-level).
-- <code>table</code>: Table name to select. If <code>None</code>, only the database is switched.</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>database</code>: Database name (default = root-level).</li>
+<li><code>table</code>: Table name to select. If <code>None</code>, only the database is switched.</li>
+</ul>
 <p><strong>Returns:</strong> <code>self</code> (for method chaining)</p>
 <p><strong>Examples:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="c1"># Switch database only</span>
@@ -3164,9 +3170,11 @@ Return the name of the currently active database. Returns <code>'default'</code>
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="n">create_table</span><span class="p">(</span><span class="n">table_name</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">schema</span><span class="p">:</span> <span class="nb">dict</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span>
 </span></code></pre></div>
 Create a new table, optionally with a pre-defined schema.</p>
-<p><strong>Parameters:</strong>
-- <code>table_name</code>: Name of the table to create.
-- <code>schema</code>: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>table_name</code>: Name of the table to create.</li>
+<li><code>schema</code>: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.</li>
+</ul>
 <p><strong>Supported types:</strong> <code>int8</code>, <code>int16</code>, <code>int32</code>, <code>int64</code>, <code>uint8</code>, <code>uint16</code>, <code>uint32</code>, <code>uint64</code>, <code>float32</code>, <code>float64</code>, <code>bool</code>, <code>string</code>, <code>binary</code>, <code>blob</code>, <code>large_binary</code></p>
 <p><strong>Examples:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="c1"># Without schema</span>
@@ -3214,13 +3222,15 @@ Get the name of the currently active table. Returns <code>None</code> if no tabl
 <h4 id="store">store<a class="headerlink" href="#store" title="Permanent link">&para;</a></h4>
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-21-1"><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="n">store</span><span class="p">(</span><span class="n">data</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span>
 </span></code></pre></div>
-Store data in the active table. Requires a table to be selected via <code>create_table()</code> or <code>use_table()</code> first. Accepts multiple formats:
-- Single dict: <code>{"name": "Alice", "age": 30}</code>
-- List of dicts: <code>[{"name": "A"}, {"name": "B"}]</code>
-- Dict of columns: <code>{"name": ["A", "B"], "age": [20, 30]}</code>
-- pandas DataFrame
-- polars DataFrame<br />
-- PyArrow Table</p>
+Store data in the active table. Requires a table to be selected via <code>create_table()</code> or <code>use_table()</code> first. Accepts multiple formats:</p>
+<ul>
+<li>Single dict: <code>{"name": "Alice", "age": 30}</code></li>
+<li>List of dicts: <code>[{"name": "A"}, {"name": "B"}]</code></li>
+<li>Dict of columns: <code>{"name": ["A", "B"], "age": [20, 30]}</code></li>
+<li>pandas DataFrame</li>
+<li>polars DataFrame  </li>
+<li>PyArrow Table</li>
+</ul>
 <p><strong>Examples:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-22-1"><a id="__codelineno-22-1" name="__codelineno-22-1" href="#__codelineno-22-1"></a><span class="c1"># Single record</span>
 </span><span id="__span-22-2"><a id="__codelineno-22-2" name="__codelineno-22-2" href="#__codelineno-22-2"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">({</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="s2">&quot;Alice&quot;</span><span class="p">,</span> <span class="s2">&quot;age&quot;</span><span class="p">:</span> <span class="mi">30</span><span class="p">})</span>
@@ -3241,9 +3251,11 @@ Store data in the active table. Requires a table to be selected via <code>create
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-23-1"><a id="__codelineno-23-1" name="__codelineno-23-1" href="#__codelineno-23-1"></a><span class="n">from_pandas</span><span class="p">(</span><span class="n">df</span><span class="p">:</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span> <span class="n">table_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ApexClient</span>
 </span></code></pre></div>
 Import data from pandas DataFrame. Returns self for chaining.</p>
-<p><strong>Parameters:</strong>
-- <code>df</code>: pandas DataFrame to import
-- <code>table_name</code>: Optional. If provided, auto-creates/selects the table before importing.</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>df</code>: pandas DataFrame to import</li>
+<li><code>table_name</code>: Optional. If provided, auto-creates/selects the table before importing.</li>
+</ul>
 <p><strong>Example:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-24-1"><a id="__codelineno-24-1" name="__codelineno-24-1" href="#__codelineno-24-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pandas</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pd</span>
 </span><span id="__span-24-2"><a id="__codelineno-24-2" name="__codelineno-24-2" href="#__codelineno-24-2"></a><span class="n">df</span> <span class="o">=</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">({</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;A&quot;</span><span class="p">,</span> <span class="s2">&quot;B&quot;</span><span class="p">],</span> <span class="s2">&quot;age&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">20</span><span class="p">,</span> <span class="mi">30</span><span class="p">]})</span>
@@ -3253,9 +3265,11 @@ Import data from pandas DataFrame. Returns self for chaining.</p>
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-25-1"><a id="__codelineno-25-1" name="__codelineno-25-1" href="#__codelineno-25-1"></a><span class="n">from_polars</span><span class="p">(</span><span class="n">df</span><span class="p">:</span> <span class="n">pl</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">,</span> <span class="n">table_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ApexClient</span>
 </span></code></pre></div>
 Import data from polars DataFrame. Returns self for chaining.</p>
-<p><strong>Parameters:</strong>
-- <code>df</code>: polars DataFrame to import
-- <code>table_name</code>: Optional. If provided, auto-creates/selects the table before importing.</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>df</code>: polars DataFrame to import</li>
+<li><code>table_name</code>: Optional. If provided, auto-creates/selects the table before importing.</li>
+</ul>
 <p><strong>Example:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-26-1"><a id="__codelineno-26-1" name="__codelineno-26-1" href="#__codelineno-26-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">polars</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pl</span>
 </span><span id="__span-26-2"><a id="__codelineno-26-2" name="__codelineno-26-2" href="#__codelineno-26-2"></a><span class="n">df</span> <span class="o">=</span> <span class="n">pl</span><span class="o">.</span><span class="n">DataFrame</span><span class="p">({</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;A&quot;</span><span class="p">,</span> <span class="s2">&quot;B&quot;</span><span class="p">],</span> <span class="s2">&quot;age&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">20</span><span class="p">,</span> <span class="mi">30</span><span class="p">]})</span>
@@ -3265,9 +3279,11 @@ Import data from polars DataFrame. Returns self for chaining.</p>
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-27-1"><a id="__codelineno-27-1" name="__codelineno-27-1" href="#__codelineno-27-1"></a><span class="n">from_pyarrow</span><span class="p">(</span><span class="n">table</span><span class="p">:</span> <span class="n">pa</span><span class="o">.</span><span class="n">Table</span><span class="p">,</span> <span class="n">table_name</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ApexClient</span>
 </span></code></pre></div>
 Import data from PyArrow Table. Returns self for chaining.</p>
-<p><strong>Parameters:</strong>
-- <code>table</code>: PyArrow Table to import
-- <code>table_name</code>: Optional. If provided, auto-creates/selects the table before importing.</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>table</code>: PyArrow Table to import</li>
+<li><code>table_name</code>: Optional. If provided, auto-creates/selects the table before importing.</li>
+</ul>
 <p><strong>Example:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-28-1"><a id="__codelineno-28-1" name="__codelineno-28-1" href="#__codelineno-28-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">pyarrow</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">pa</span>
 </span><span id="__span-28-2"><a id="__codelineno-28-2" name="__codelineno-28-2" href="#__codelineno-28-2"></a><span class="n">table</span> <span class="o">=</span> <span class="n">pa</span><span class="o">.</span><span class="n">table</span><span class="p">({</span><span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;A&quot;</span><span class="p">,</span> <span class="s2">&quot;B&quot;</span><span class="p">],</span> <span class="s2">&quot;age&quot;</span><span class="p">:</span> <span class="p">[</span><span class="mi">20</span><span class="p">,</span> <span class="mi">30</span><span class="p">]})</span>
@@ -3324,10 +3340,12 @@ writer. Returns the written dataset URI/path.</p>
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-35-1"><a id="__codelineno-35-1" name="__codelineno-35-1" href="#__codelineno-35-1"></a><span class="n">execute</span><span class="p">(</span><span class="n">sql</span><span class="p">:</span> <span class="nb">str</span><span class="p">,</span> <span class="n">show_internal_id</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ResultView</span>
 </span></code></pre></div>
 Execute SQL query and return results.</p>
-<p><strong>Parameters:</strong>
-- <code>sql</code>: SQL statement (SELECT, INSERT, etc.)
-- <code>show_internal_id</code>: If True, include _id column in results
-- <code>params</code>: Optional bound parameters. Positional <code>?</code> placeholders use a list/tuple; named <code>:name</code>, <code>@name</code>, or <code>$name</code> placeholders use a dict. A list/tuple value expands to a comma-separated list for <code>IN (?)</code>.</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>sql</code>: SQL statement (SELECT, INSERT, etc.)</li>
+<li><code>show_internal_id</code>: If True, include _id column in results</li>
+<li><code>params</code>: Optional bound parameters. Positional <code>?</code> placeholders use a list/tuple; named <code>:name</code>, <code>@name</code>, or <code>$name</code> placeholders use a dict. A list/tuple value expands to a comma-separated list for <code>IN (?)</code>.</li>
+</ul>
 <p><strong>Example:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-36-1"><a id="__codelineno-36-1" name="__codelineno-36-1" href="#__codelineno-36-1"></a><span class="c1"># Basic query (use your table name in FROM clause)</span>
 </span><span id="__span-36-2"><a id="__codelineno-36-2" name="__codelineno-36-2" href="#__codelineno-36-2"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;SELECT * FROM users WHERE age &gt; 25&quot;</span><span class="p">)</span>
@@ -3579,10 +3597,12 @@ List all column names in the current table.</p>
 </table>
 <p><strong><code>CREATE FTS INDEX</code></strong>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-69-1"><a id="__codelineno-69-1" name="__codelineno-69-1" href="#__codelineno-69-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">FTS</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="p">[(</span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">,</span><span class="w"> </span><span class="p">...)]</span><span class="w"> </span><span class="p">[</span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">lazy_load</span><span class="o">=</span><span class="n">bool</span><span class="p">,</span><span class="w"> </span><span class="n">cache_size</span><span class="o">=</span><span class="n">N</span><span class="p">)]</span>
-</span></code></pre></div>
-- <code>(col1, col2)</code> — optional column list; omit to index all string columns
-- <code>lazy_load</code> — mmap the v3 term directory and decode postings on demand (default <code>false</code>)
-- <code>cache_size</code> — maximum decoded postings retained in lazy mode (default <code>10000</code>)</p>
+</span></code></pre></div></p>
+<ul>
+<li><code>(col1, col2)</code> — optional column list; omit to index all string columns</li>
+<li><code>lazy_load</code> — mmap the v3 term directory and decode postings on demand (default <code>false</code>)</li>
+<li><code>cache_size</code> — maximum decoded postings retained in lazy mode (default <code>10000</code>)</li>
+</ul>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-70-1"><a id="__codelineno-70-1" name="__codelineno-70-1" href="#__codelineno-70-1"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;CREATE FTS INDEX ON articles (title, content)&quot;</span><span class="p">)</span>
 </span><span id="__span-70-2"><a id="__codelineno-70-2" name="__codelineno-70-2" href="#__codelineno-70-2"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">&quot;CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)&quot;</span><span class="p">)</span>
 </span></code></pre></div>
@@ -3651,11 +3671,13 @@ Returns a result set with columns: <code>database</code>, <code>table</code>, <c
 </span><span id="__span-79-6"><a id="__codelineno-79-6" name="__codelineno-79-6" href="#__codelineno-79-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ApexClient</span>
 </span></code></pre></div>
 Initialize full-text search for a table.</p>
-<p><strong>Parameters:</strong>
-- <code>table_name</code>: Table to index (default: current table)
-- <code>index_fields</code>: Fields to index (None = all string fields)
-- <code>lazy_load</code>: Load index on first search
-- <code>cache_size</code>: FTS cache size</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>table_name</code>: Table to index (default: current table)</li>
+<li><code>index_fields</code>: Fields to index (None = all string fields)</li>
+<li><code>lazy_load</code>: Load index on first search</li>
+<li><code>cache_size</code>: FTS cache size</li>
+</ul>
 <p><strong>Example:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-80-1"><a id="__codelineno-80-1" name="__codelineno-80-1" href="#__codelineno-80-1"></a><span class="n">client</span><span class="o">.</span><span class="n">init_fts</span><span class="p">(</span><span class="n">index_fields</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;title&quot;</span><span class="p">,</span> <span class="s2">&quot;content&quot;</span><span class="p">])</span>
 </span><span id="__span-80-2"><a id="__codelineno-80-2" name="__codelineno-80-2" href="#__codelineno-80-2"></a><span class="n">client</span><span class="o">.</span><span class="n">init_fts</span><span class="p">(</span><span class="n">index_fields</span><span class="o">=</span><span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">],</span> <span class="n">lazy_load</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
@@ -3868,8 +3890,10 @@ Close the client and release resources.</p>
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-126-1"><a id="__codelineno-126-1" name="__codelineno-126-1" href="#__codelineno-126-1"></a><span class="n">to_pandas</span><span class="p">(</span><span class="n">zero_copy</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">pd</span><span class="o">.</span><span class="n">DataFrame</span>
 </span></code></pre></div>
 Convert to pandas DataFrame.</p>
-<p><strong>Parameters:</strong>
-- <code>zero_copy</code>: Use ArrowDtype for zero-copy (pandas 2.0+)</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>zero_copy</code>: Use ArrowDtype for zero-copy (pandas 2.0+)</li>
+</ul>
 <p><strong>Example:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-127-1"><a id="__codelineno-127-1" name="__codelineno-127-1" href="#__codelineno-127-1"></a><span class="n">df</span> <span class="o">=</span> <span class="n">results</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>
 </span><span id="__span-127-2"><a id="__codelineno-127-2" name="__codelineno-127-2" href="#__codelineno-127-2"></a><span class="n">df</span> <span class="o">=</span> <span class="n">results</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">(</span><span class="n">zero_copy</span><span class="o">=</span><span class="kc">False</span><span class="p">)</span>  <span class="c1"># Traditional NumPy types</span>
@@ -4146,9 +4170,11 @@ not substituted.</p>
 <h3 id="read_json">read_json<a class="headerlink" href="#read_json" title="Permanent link">&para;</a></h3>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-155-1"><a id="__codelineno-155-1" name="__codelineno-155-1" href="#__codelineno-155-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">read_json</span><span class="p">(</span><span class="s1">&#39;path/to/file.json&#39;</span><span class="p">)</span>
 </span></code></pre></div>
-<p>Handles two formats automatically:
-- <strong>NDJSON / JSON Lines</strong> — one JSON object per line (<code>.json</code>, <code>.jsonl</code>, <code>.ndjson</code>)
-- <strong>pandas column-oriented JSON</strong> — output of <code>df.to_json(orient='columns')</code> or <code>orient='split'</code></p>
+<p>Handles two formats automatically:</p>
+<ul>
+<li><strong>NDJSON / JSON Lines</strong> — one JSON object per line (<code>.json</code>, <code>.jsonl</code>, <code>.ndjson</code>)</li>
+<li><strong>pandas column-oriented JSON</strong> — output of <code>df.to_json(orient='columns')</code> or <code>orient='split'</code></li>
+</ul>
 <p>No options — format is detected automatically.</p>
 <p><strong>Examples:</strong></p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-156-1"><a id="__codelineno-156-1" name="__codelineno-156-1" href="#__codelineno-156-1"></a><span class="c1"># Read NDJSON (one JSON object per line)</span>
@@ -4549,13 +4575,15 @@ not substituted.</p>
 </span><span id="__span-174-8"><a id="__codelineno-174-8" name="__codelineno-174-8" href="#__codelineno-174-8"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">ResultView</span>
 </span></code></pre></div>
 <p>Heap-based nearest-neighbour search: O(n log k), significantly faster than <code>ORDER BY distance LIMIT k</code> for large tables.</p>
-<p><strong>Parameters:</strong>
-- <code>col</code>: Name of the vector column to search (FixedList or Binary).
-- <code>query</code>: Query vector — list, tuple, or numpy array of floats.
-- <code>k</code>: Number of nearest neighbours to return (default <code>10</code>).
-- <code>metric</code>: Distance metric (see table below).
-- <code>id_col</code>: Column name for the returned row IDs (default <code>'_id'</code>).
-- <code>dist_col</code>: Column name for the returned distances (default <code>'dist'</code>).</p>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>col</code>: Name of the vector column to search (FixedList or Binary).</li>
+<li><code>query</code>: Query vector — list, tuple, or numpy array of floats.</li>
+<li><code>k</code>: Number of nearest neighbours to return (default <code>10</code>).</li>
+<li><code>metric</code>: Distance metric (see table below).</li>
+<li><code>id_col</code>: Column name for the returned row IDs (default <code>'_id'</code>).</li>
+<li><code>dist_col</code>: Column name for the returned distances (default <code>'dist'</code>).</li>
+</ul>
 <p><strong>Supported metrics:</strong></p>
 <table>
 <thead>
@@ -4639,20 +4667,26 @@ not substituted.</p>
 </span><span id="__span-176-6"><a id="__codelineno-176-6" name="__codelineno-176-6" href="#__codelineno-176-6"></a><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">numpy</span><span class="o">.</span><span class="n">ndarray</span>
 </span></code></pre></div>
 <p>Batch nearest-neighbour search — N query vectors in a single Rust call.</p>
-<p><strong>Why use this instead of calling <code>topk_distance</code> N times:</strong>
-- The mmap float buffer (<code>scan_buf</code>) is populated <strong>once</strong> regardless of N.
-- All N queries run in <strong>parallel</strong> via Rayon (outer parallelism over queries).
-- The <code>_id</code> column is read only once.</p>
-<p><strong>Parameters:</strong>
-- <code>col</code>: Name of the vector column (FixedList or Binary).
-- <code>queries</code>: <code>(N, D)</code> numpy array or array-like of query vectors (float32 or float64). A 1-D array is treated as a single query (N=1).
-- <code>k</code>: Number of nearest neighbours per query (default <code>10</code>).
-- <code>metric</code>: Distance metric — same values accepted as <code>topk_distance</code>.</p>
-<p><strong>Returns:</strong> <code>numpy.ndarray</code> of shape <code>(N, k, 2)</code>, dtype <code>float64</code>.
-- <code>result[i, j, 0]</code> — <code>_id</code> of the j-th nearest neighbour for query i (cast to <code>int64</code> as needed).
-- <code>result[i, j, 1]</code> — corresponding distance.
-- Each row is sorted ascending by distance.
-- Entries padded with <code>(-1, inf)</code> when fewer than k neighbours exist.</p>
+<p><strong>Why use this instead of calling <code>topk_distance</code> N times:</strong></p>
+<ul>
+<li>The mmap float buffer (<code>scan_buf</code>) is populated <strong>once</strong> regardless of N.</li>
+<li>All N queries run in <strong>parallel</strong> via Rayon (outer parallelism over queries).</li>
+<li>The <code>_id</code> column is read only once.</li>
+</ul>
+<p><strong>Parameters:</strong></p>
+<ul>
+<li><code>col</code>: Name of the vector column (FixedList or Binary).</li>
+<li><code>queries</code>: <code>(N, D)</code> numpy array or array-like of query vectors (float32 or float64). A 1-D array is treated as a single query (N=1).</li>
+<li><code>k</code>: Number of nearest neighbours per query (default <code>10</code>).</li>
+<li><code>metric</code>: Distance metric — same values accepted as <code>topk_distance</code>.</li>
+</ul>
+<p><strong>Returns:</strong> <code>numpy.ndarray</code> of shape <code>(N, k, 2)</code>, dtype <code>float64</code>.</p>
+<ul>
+<li><code>result[i, j, 0]</code> — <code>_id</code> of the j-th nearest neighbour for query i (cast to <code>int64</code> as needed).</li>
+<li><code>result[i, j, 1]</code> — corresponding distance.</li>
+<li>Each row is sorted ascending by distance.</li>
+<li>Entries padded with <code>(-1, inf)</code> when fewer than k neighbours exist.</li>
+</ul>
 <p><strong>Example:</strong></p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-177-1"><a id="__codelineno-177-1" name="__codelineno-177-1" href="#__codelineno-177-1"></a><span class="kn">import</span><span class="w"> </span><span class="nn">numpy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">np</span>
 </span><span id="__span-177-2"><a id="__codelineno-177-2" name="__codelineno-177-2" href="#__codelineno-177-2"></a>
@@ -4858,12 +4892,14 @@ not substituted.</p>
 </span><span id="__span-185-20"><a id="__codelineno-185-20" name="__codelineno-185-20" href="#__codelineno-185-20"></a><span class="s2">    SELECT * FROM temp</span>
 </span><span id="__span-185-21"><a id="__codelineno-185-21" name="__codelineno-185-21" href="#__codelineno-185-21"></a><span class="s2">&quot;&quot;&quot;</span><span class="p">)</span>
 </span></code></pre></div>
-<p><strong>Multi-Statement SQL Rules:</strong>
-- Statements are separated by semicolons (<code>;</code>)
-- Semicolons inside string literals are handled correctly
-- Statements execute sequentially in order
-- The result of the last SELECT statement is returned
-- DDL statements (CREATE, ALTER, DROP, INSERT) return empty results</p>
+<p><strong>Multi-Statement SQL Rules:</strong></p>
+<ul>
+<li>Statements are separated by semicolons (<code>;</code>)</li>
+<li>Semicolons inside string literals are handled correctly</li>
+<li>Statements execute sequentially in order</li>
+<li>The result of the last SELECT statement is returned</li>
+<li>DDL statements (CREATE, ALTER, DROP, INSERT) return empty results</li>
+</ul>
 <hr />
 
 

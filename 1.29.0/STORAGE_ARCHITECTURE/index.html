@@ -2069,11 +2069,13 @@ epoch-checked schema cache to avoid file I/O on the fast path:</p>
 </span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">backend</span><span class="p">.</span><span class="n">save</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
 </span></code></pre></div>
 <h3 id="2-lock-ordering">2. Lock Ordering<a class="headerlink" href="#2-lock-ordering" title="Permanent link">&para;</a></h3>
-<p>Always acquire locks in this order to prevent deadlocks:
-1. File lock (<code>acquire_write_lock</code> / <code>acquire_read_lock</code>)
-2. StorageEngine operation
-3. Release file lock
-4. Invalidate local caches</p>
+<p>Always acquire locks in this order to prevent deadlocks:</p>
+<ol>
+<li>File lock (<code>acquire_write_lock</code> / <code>acquire_read_lock</code>)</li>
+<li>StorageEngine operation</li>
+<li>Release file lock</li>
+<li>Invalidate local caches</li>
+</ol>
 <div class="language-rust highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1">// Correct pattern</span>
 </span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">lock_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">Self</span><span class="p">::</span><span class="n">acquire_write_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">table_path</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
 </span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">crate</span><span class="p">::</span><span class="n">Database</span><span class="p">::</span><span class="n">write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">table_path</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">rows</span><span class="p">,</span><span class="w"> </span><span class="n">durability</span><span class="p">);</span>
@@ -2221,10 +2223,12 @@ plus a delete bitmap, serialized with bincode. It is used for:</p>
 <li>legacy non-V4 delta appends.</li>
 </ul>
 <h3 id="compaction">Compaction<a class="headerlink" href="#compaction" title="Permanent link">&para;</a></h3>
-<p>Delta files are compacted into the base file when:
-- Delta size &gt; 10MB (<code>DELTA_COMPACT_SIZE</code>)
-- Delta rows &gt; 100,000 (<code>DELTA_COMPACT_ROWS</code>)
-- Before opening a write backend when a delta exists (<code>open_for_compact</code>)</p>
+<p>Delta files are compacted into the base file when:</p>
+<ul>
+<li>Delta size &gt; 10MB (<code>DELTA_COMPACT_SIZE</code>)</li>
+<li>Delta rows &gt; 100,000 (<code>DELTA_COMPACT_ROWS</code>)</li>
+<li>Before opening a write backend when a delta exists (<code>open_for_compact</code>)</li>
+</ul>
 <p>Compaction merges delta into the V4 base file and clears the delta store.
 For mmap-only V4 backends (the production path) this is a <strong>streaming
 RG-by-RG rewrite</strong> (<code>compact_streaming_v4</code>): each Row Group is parsed from the
