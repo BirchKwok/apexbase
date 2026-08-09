@@ -705,6 +705,7 @@ for h in handles { h.join().unwrap(); }
 ```
 
 **Notes:**
+
 - `ApexDB::clone()` and `Table::clone()` are `O(1)` — they share the same `Arc<DbInner>`.
 - Reads (`execute`, `retrieve`, `retrieve_many`, `count`) are lock-free on V4 mmap-only tables.
 - Writes are serialized per-table via an internal write lock in the storage engine.
@@ -845,6 +846,7 @@ cargo run --example embedded --no-default-features
 ```
 
 The example at `examples/embedded.rs` demonstrates all 16 steps:
+
 - Opening a database with the builder
 - Creating a table with predefined schema
 - Inserting individual rows

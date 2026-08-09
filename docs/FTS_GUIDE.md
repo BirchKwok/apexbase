@@ -53,6 +53,7 @@ ApexBase includes **ApexFTS**, its native Rust full-text storage engine, directl
 ```
 
 Key design points:
+
 - FTS state is stored in a **global Rust registry** keyed by database directory, so PG Wire and Arrow Flight connections share the same FTS engines as Python API calls.
 - `MATCH('query')` in a `WHERE` clause is resolved once to an `Arc<RoaringTreemap>`; Arrow batches test `_id` membership directly without materializing an `IN` list.
 - The configuration is persisted in `fts_config.json` alongside the `.apex` data files, and is re-loaded automatically on process restart.
@@ -109,6 +110,7 @@ CREATE FTS INDEX ON table_name
 ```
 
 **Effect:**
+
 - Registers the table in `fts_config.json` with `enabled = true`.
 - Creates (or opens) the ApexFTS engine for the table under `{dir}/fts_indexes/{table}.afts` and replays `{table}.afts.wal`.
 - **Existing rows are back-filled automatically** — all rows already in the table are indexed immediately. The status message reports the number of rows indexed.
@@ -160,6 +162,7 @@ DROP FTS INDEX ON table_name
 ```
 
 **Effect:**
+
 - Removes the table entry from `fts_config.json`.
 - Deletes the `.afts` snapshot and WAL from `{dir}/fts_indexes/`, together with legacy `.nfts` files when present.
 - Removes the in-memory engine from the global registry.
@@ -178,6 +181,7 @@ ALTER FTS INDEX ON table_name DISABLE
 ```
 
 **Effect:**
+
 - Sets `enabled = false` in `fts_config.json`.
 - **Does not** delete index files.
 - While disabled, SQL `INSERT` / `DELETE` writes are **not** synced to the FTS index.
@@ -189,6 +193,7 @@ ALTER FTS INDEX ON table_name ENABLE
 ```
 
 **Effect:**
+
 - Sets `enabled = true` in `fts_config.json`.
 - **Back-fills all rows** currently in the table into the FTS index (idempotent — re-indexing already-indexed rows is safe).
 - Rows inserted while FTS was disabled are caught up automatically during the enable step.

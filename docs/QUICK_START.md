@@ -134,12 +134,14 @@ client.close()
 ```
 
 **Supported DDL / DML Statements:**
+
 - `CREATE TABLE [IF NOT EXISTS] table_name`
 - `ALTER TABLE ... ADD COLUMN column_name TYPE`
 - `INSERT INTO ... VALUES ...`
 - `DROP TABLE [IF EXISTS] table_name`
 
 **Multi-Statement SQL:**
+
 - Separate statements with semicolons (`;`)
 - Statements are executed sequentially
 - The result of the last statement is returned

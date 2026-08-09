@@ -285,6 +285,7 @@ client.close()
 ```
 
 **Notes on Multi-Statement SQL:**
+
 - Statements are separated by semicolons (`;`)
 - Semicolons inside string literals are handled correctly
 - Statements execute sequentially

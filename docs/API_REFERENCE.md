@@ -34,6 +34,7 @@ ApexClient(
 ```
 
 **Parameters:**
+
 - `dirpath`: Data directory path (default: current directory)
 - `batch_size`: Batch size for bulk operations
 - `drop_if_exists`: If True, delete existing data on open
@@ -69,6 +70,7 @@ use_database(database: str = 'default') -> ApexClient
 Switch to a named database. Creates the database subdirectory if it does not exist. Resets the current table to `None`.
 
 **Parameters:**
+
 - `database`: Database name. `'default'` (or `''`) maps to the root directory.
 
 **Returns:** `self` (for method chaining)
@@ -94,6 +96,7 @@ use(database: str = 'default', table: str = None) -> ApexClient
 Switch to a named database and optionally select or create a table in one call. If `table` is specified and does not exist it is created automatically.
 
 **Parameters:**
+
 - `database`: Database name (default = root-level).
 - `table`: Table name to select. If `None`, only the database is switched.
 
@@ -184,6 +187,7 @@ create_table(table_name: str, schema: dict = None) -> None
 Create a new table, optionally with a pre-defined schema.
 
 **Parameters:**
+
 - `table_name`: Name of the table to create.
 - `schema`: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.
 
@@ -257,6 +261,7 @@ print(client.current_table)  # 'users'
 store(data) -> None
 ```
 Store data in the active table. Requires a table to be selected via `create_table()` or `use_table()` first. Accepts multiple formats:
+
 - Single dict: `{"name": "Alice", "age": 30}`
 - List of dicts: `[{"name": "A"}, {"name": "B"}]`
 - Dict of columns: `{"name": ["A", "B"], "age": [20, 30]}`
@@ -289,6 +294,7 @@ from_pandas(df: pd.DataFrame, table_name: str = None) -> ApexClient
 Import data from pandas DataFrame. Returns self for chaining.
 
 **Parameters:**
+
 - `df`: pandas DataFrame to import
 - `table_name`: Optional. If provided, auto-creates/selects the table before importing.
 
@@ -306,6 +312,7 @@ from_polars(df: pl.DataFrame, table_name: str = None) -> ApexClient
 Import data from polars DataFrame. Returns self for chaining.
 
 **Parameters:**
+
 - `df`: polars DataFrame to import
 - `table_name`: Optional. If provided, auto-creates/selects the table before importing.
 
@@ -323,6 +330,7 @@ from_pyarrow(table: pa.Table, table_name: str = None) -> ApexClient
 Import data from PyArrow Table. Returns self for chaining.
 
 **Parameters:**
+
 - `table`: PyArrow Table to import
 - `table_name`: Optional. If provided, auto-creates/selects the table before importing.
 
@@ -401,6 +409,7 @@ execute(sql: str, show_internal_id: bool = None, params=None) -> ResultView
 Execute SQL query and return results.
 
 **Parameters:**
+
 - `sql`: SQL statement (SELECT, INSERT, etc.)
 - `show_internal_id`: If True, include _id column in results
 - `params`: Optional bound parameters. Positional `?` placeholders use a list/tuple; named `:name`, `@name`, or `$name` placeholders use a dict. A list/tuple value expands to a comma-separated list for `IN (?)`.
@@ -695,6 +704,7 @@ FTS is implemented natively in Rust and available through all interfaces (Python
 ```sql
 CREATE FTS INDEX ON table_name [(col1, col2, ...)] [WITH (lazy_load=bool, cache_size=N)]
 ```
+
 - `(col1, col2)` — optional column list; omit to index all string columns
 - `lazy_load` — mmap the v3 term directory and decode postings on demand (default `false`)
 - `cache_size` — maximum decoded postings retained in lazy mode (default `10000`)
@@ -795,6 +805,7 @@ init_fts(
 Initialize full-text search for a table.
 
 **Parameters:**
+
 - `table_name`: Table to index (default: current table)
 - `index_fields`: Fields to index (None = all string fields)
 - `lazy_load`: Load index on first search
@@ -1114,6 +1125,7 @@ to_pandas(zero_copy: bool = True) -> pd.DataFrame
 Convert to pandas DataFrame.
 
 **Parameters:**
+
 - `zero_copy`: Use ArrowDtype for zero-copy (pandas 2.0+)
 
 **Example:**
@@ -1437,6 +1449,7 @@ SELECT * FROM read_json('path/to/file.json')
 ```
 
 Handles two formats automatically:
+
 - **NDJSON / JSON Lines** — one JSON object per line (`.json`, `.jsonl`, `.ndjson`)
 - **pandas column-oriented JSON** — output of `df.to_json(orient='columns')` or `orient='split'`
 
@@ -1815,6 +1828,7 @@ topk_distance(
 Heap-based nearest-neighbour search: O(n log k), significantly faster than `ORDER BY distance LIMIT k` for large tables.
 
 **Parameters:**
+
 - `col`: Name of the vector column to search (FixedList or Binary).
 - `query`: Query vector — list, tuple, or numpy array of floats.
 - `k`: Number of nearest neighbours to return (default `10`).
@@ -1884,17 +1898,20 @@ batch_topk_distance(
 Batch nearest-neighbour search — N query vectors in a single Rust call.
 
 **Why use this instead of calling `topk_distance` N times:**
+
 - The mmap float buffer (`scan_buf`) is populated **once** regardless of N.
 - All N queries run in **parallel** via Rayon (outer parallelism over queries).
 - The `_id` column is read only once.
 
 **Parameters:**
+
 - `col`: Name of the vector column (FixedList or Binary).
 - `queries`: `(N, D)` numpy array or array-like of query vectors (float32 or float64). A 1-D array is treated as a single query (N=1).
 - `k`: Number of nearest neighbours per query (default `10`).
 - `metric`: Distance metric — same values accepted as `topk_distance`.
 
 **Returns:** `numpy.ndarray` of shape `(N, k, 2)`, dtype `float64`.
+
 - `result[i, j, 0]` — `_id` of the j-th nearest neighbour for query i (cast to `int64` as needed).
 - `result[i, j, 1]` — corresponding distance.
 - Each row is sorted ascending by distance.
@@ -2088,6 +2105,7 @@ results = client.execute("""
 ```
 
 **Multi-Statement SQL Rules:**
+
 - Statements are separated by semicolons (`;`)
 - Semicolons inside string literals are handled correctly
 - Statements execute sequentially in order

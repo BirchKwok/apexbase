@@ -43,6 +43,7 @@ client.use_table("embeddings")
 ```
 
 Accepted type name aliases (all equivalent):
+
 - `FLOAT16_VECTOR` *(recommended)*
 - `FLOAT16VECTOR`
 - `F16_VECTOR`
@@ -189,6 +190,7 @@ CPU query at startup → select kernel → cache decision
 ## Quantization error and precision
 
 Float16 (IEEE 754 binary16) has:
+
 - 10-bit mantissa → ~3.3 decimal digits of precision
 - Range: ±65504
 - Machine epsilon: ~9.77 × 10⁻⁴

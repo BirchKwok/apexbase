@@ -211,6 +211,7 @@ backend.save()?;
 ### 2. Lock Ordering
 
 Always acquire locks in this order to prevent deadlocks:
+
 1. File lock (`acquire_write_lock` / `acquire_read_lock`)
 2. StorageEngine operation
 3. Release file lock
@@ -360,6 +361,7 @@ plus a delete bitmap, serialized with bincode. It is used for:
 ### Compaction
 
 Delta files are compacted into the base file when:
+
 - Delta size > 10MB (`DELTA_COMPACT_SIZE`)
 - Delta rows > 100,000 (`DELTA_COMPACT_ROWS`)
 - Before opening a write backend when a delta exists (`open_for_compact`)
