@@ -828,7 +828,75 @@ impl OnDemandStorage {
                         // OPTIMIZATION: build StringArray directly from u32 offsets + data bytes
                         let row_count = count.min(active_count);
                         let data_end = offsets[row_count] as usize;
-                        if super::requires_large_arrow_offsets(data_end) {
+                        // OPTIMIZATION: dictionary-encode low-cardinality string
+                        // columns directly from the mmap byte ranges.  Downstream
+                        // filters/joins/aggregations then hash the distinct values
+                        // once instead of every row.
+                        if dict_encode_strings
+                            && row_count >= 100
+                            && data_end <= i32::MAX as usize
+                        {
+                            let sample_size = row_count.min(1000);
+                            let mut sample_unique: ahash::AHashSet<&[u8]> =
+                                ahash::AHashSet::with_capacity(100);
+                            let step = if row_count > sample_size {
+                                row_count / sample_size
+                            } else {
+                                1
+                            };
+                            let mut si = 0usize;
+                            while si < row_count && sample_unique.len() < 1000 {
+                                sample_unique
+                                    .insert(&data[offsets[si] as usize..offsets[si + 1] as usize]);
+                                si += step;
+                            }
+                            if sample_unique.len() < 1000 {
+                                use arrow::array::{DictionaryArray, UInt32Array};
+                                use arrow::datatypes::UInt32Type;
+                                let mut dict_map: ahash::AHashMap<&[u8], u32> =
+                                    ahash::AHashMap::with_capacity(sample_unique.len());
+                                let mut dict_strings: Vec<&str> =
+                                    Vec::with_capacity(sample_unique.len());
+                                let mut next_id = 0u32;
+                                let mut keys: Vec<u32> = Vec::with_capacity(row_count);
+                                for i in 0..row_count {
+                                    let bytes = &data[offsets[i] as usize..offsets[i + 1] as usize];
+                                    let id = *dict_map.entry(bytes).or_insert_with(|| {
+                                        let id = next_id;
+                                        next_id += 1;
+                                        dict_strings.push(std::str::from_utf8(bytes).unwrap_or(""));
+                                        id
+                                    });
+                                    keys.push(id);
+                                }
+                                let dict_array = DictionaryArray::<UInt32Type>::try_new(
+                                    UInt32Array::from(keys),
+                                    Arc::new(StringArray::from_iter_values(dict_strings)),
+                                )
+                                .map_err(|e| err_data(e.to_string()))?;
+                                let arr_ref: ArrayRef = Arc::new(dict_array);
+                                (arr_ref.data_type().clone(), arr_ref)
+                            } else {
+                                // High cardinality → zero-copy plain StringArray
+                                // (same construction as the non-dict path).
+                                let offsets_i32: Vec<i32> = offsets[..row_count + 1]
+                                    .iter()
+                                    .map(|&o| o as i32)
+                                    .collect();
+                                let offset_buf = unsafe {
+                                    arrow::buffer::OffsetBuffer::new_unchecked(
+                                        ScalarBuffer::from(offsets_i32),
+                                    )
+                                };
+                                let data_buf = Buffer::from_slice_ref(&data[..data_end]);
+                                (
+                                    ArrowDataType::Utf8,
+                                    Arc::new(unsafe {
+                                        StringArray::new_unchecked(offset_buf, data_buf, None)
+                                    }) as ArrayRef,
+                                )
+                            }
+                        } else if super::requires_large_arrow_offsets(data_end) {
                             let strings = (0..row_count).map(|i| {
                                 let start = offsets[i] as usize;
                                 let end = offsets[i + 1] as usize;

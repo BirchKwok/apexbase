@@ -744,6 +744,56 @@ impl ApexExecutor {
             return Ok(batch.clone());
         }
 
+        // Arrow lexsort with limit: radix-based top-k selection is far faster
+        // than a generic heap comparator for large inputs, and its null
+        // ordering (nulls_first == descending, i.e. nulls last ascending)
+        // matches the manual comparator below.
+        let all_typed = typed_sort_cols.iter().all(|col| {
+            !matches!(col, TypedSortCol::Other(_, _))
+        });
+        if all_typed {
+            use arrow::compute::SortColumn;
+            let sort_columns: Vec<SortColumn> = order_by
+                .iter()
+                .filter_map(|clause| {
+                    let col_name = clause.column.trim_matches('"');
+                    let actual_col = if batch.column_by_name(col_name).is_some() {
+                        col_name
+                    } else if let Some(dot_pos) = col_name.rfind('.') {
+                        let prefix = &col_name[..dot_pos];
+                        if prefix.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                            &col_name[dot_pos + 1..]
+                        } else {
+                            col_name
+                        }
+                    } else {
+                        col_name
+                    };
+                    batch.column_by_name(actual_col).map(|col| SortColumn {
+                        values: col.clone(),
+                        options: Some(SortOptions {
+                            descending: clause.descending,
+                            nulls_first: clause.nulls_first.unwrap_or(clause.descending),
+                        }),
+                    })
+                })
+                .collect();
+            if sort_columns.len() == typed_sort_cols.len() && !sort_columns.is_empty() {
+                let indices = compute::lexsort_to_indices(&sort_columns, Some(k))
+                    .map_err(|e| err_data(e.to_string()))?;
+                let taken: Vec<ArrayRef> = batch
+                    .columns()
+                    .iter()
+                    .map(|col| {
+                        compute::take(col.as_ref(), &indices, None)
+                            .map_err(|e| err_data(e.to_string()))
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                return RecordBatch::try_new(batch.schema(), taken)
+                    .map_err(|e| err_data(e.to_string()));
+            }
+        }
+
         // Fast comparison using pre-downcast columns
         let compare_rows = |a: usize, b: usize| -> Ordering {
             for col in &typed_sort_cols {
@@ -969,7 +1019,7 @@ impl ApexExecutor {
     ) -> io::Result<RecordBatch> {
         // Handle simple SELECT * (only * with no other columns)
         if columns.len() == 1 && matches!(columns[0], SelectColumn::All) {
-            return Ok(batch.clone());
+            return Ok(Self::decode_dict_columns(batch));
         }
 
         let mut fields: Vec<Field> = Vec::new();
@@ -1037,8 +1087,14 @@ impl ApexExecutor {
                         )));
                     };
                     if !added_columns.contains(out_name) {
-                        fields.push(Field::new(out_name, array.data_type().clone(), true));
-                        arrays.push(array.clone());
+                        let keep_dict = crate::query::executor::keep_dict_projection();
+                        let decoded = if keep_dict {
+                            array.clone()
+                        } else {
+                            Self::decode_dict_to_plain(array)
+                        };
+                        fields.push(Field::new(out_name, decoded.data_type().clone(), true));
+                        arrays.push(decoded);
                         added_columns.insert(out_name.to_string());
                     }
                 }
@@ -1057,8 +1113,14 @@ impl ApexExecutor {
                     let array = array.ok_or_else(|| {
                         err_input(format!("Projected column '{}' does not exist", col_name))
                     })?;
-                    fields.push(Field::new(alias, array.data_type().clone(), true));
-                    arrays.push(array.clone());
+                    let keep_dict = crate::query::executor::keep_dict_projection();
+                    let decoded = if keep_dict {
+                        array.clone()
+                    } else {
+                        Self::decode_dict_to_plain(array)
+                    };
+                    fields.push(Field::new(alias, decoded.data_type().clone(), true));
+                    arrays.push(decoded);
                     added_columns.insert(alias.clone());
                 }
                 SelectColumn::Expression { expr, alias } => {
@@ -1084,8 +1146,13 @@ impl ApexExecutor {
                             continue;
                         }
                         if !added_columns.contains(col_name) {
-                            fields.push(field.as_ref().clone());
-                            arrays.push(batch.column(i).clone());
+                            let decoded = Self::decode_dict_to_plain(batch.column(i));
+                            fields.push(Field::new(
+                                col_name,
+                                decoded.data_type().clone(),
+                                field.is_nullable(),
+                            ));
+                            arrays.push(decoded);
                             added_columns.insert(col_name.clone());
                         }
                     }
@@ -1097,8 +1164,13 @@ impl ApexExecutor {
                             continue;
                         }
                         if !added_columns.contains(col_name) {
-                            fields.push(field.as_ref().clone());
-                            arrays.push(batch.column(i).clone());
+                            let decoded = Self::decode_dict_to_plain(batch.column(i));
+                            fields.push(Field::new(
+                                col_name,
+                                decoded.data_type().clone(),
+                                field.is_nullable(),
+                            ));
+                            arrays.push(decoded);
                             added_columns.insert(col_name.clone());
                         }
                     }
@@ -1112,8 +1184,13 @@ impl ApexExecutor {
                             continue;
                         }
                         if !added_columns.contains(col_name) {
-                            fields.push(field.as_ref().clone());
-                            arrays.push(batch.column(i).clone());
+                            let decoded = Self::decode_dict_to_plain(batch.column(i));
+                            fields.push(Field::new(
+                                col_name,
+                                decoded.data_type().clone(),
+                                field.is_nullable(),
+                            ));
+                            arrays.push(decoded);
                             added_columns.insert(col_name.clone());
                         }
                     }
@@ -1140,8 +1217,13 @@ impl ApexExecutor {
                             continue;
                         }
                         if re.is_match(col_name) && !added_columns.contains(col_name) {
-                            fields.push(field.as_ref().clone());
-                            arrays.push(batch.column(i).clone());
+                            let decoded = Self::decode_dict_to_plain(batch.column(i));
+                            fields.push(Field::new(
+                                col_name,
+                                decoded.data_type().clone(),
+                                field.is_nullable(),
+                            ));
+                            arrays.push(decoded);
                             added_columns.insert(col_name.clone());
                         }
                     }
@@ -1157,6 +1239,71 @@ impl ApexExecutor {
 
         let schema = Arc::new(Schema::new(fields));
         RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))
+    }
+
+    /// Convert a dictionary-encoded string column to a plain Utf8 array.
+    /// Projections must return plain arrays because the Python bindings do not
+    /// materialise Arrow DictionaryArrays.
+    pub(in crate::query::executor) fn decode_dict_to_plain(array: &ArrayRef) -> ArrayRef {
+        use arrow::datatypes::UInt32Type;
+        if array
+            .as_any()
+            .downcast_ref::<arrow::array::DictionaryArray<UInt32Type>>()
+            .is_some()
+        {
+            // Manual O(N) decode: index the dictionary by each key instead of
+            // Arrow's cast, which materialises offsets/data for every column
+            // and is measurably slower on large batches.
+            if let Some(dict) = array
+                .as_any()
+                .downcast_ref::<arrow::array::DictionaryArray<UInt32Type>>()
+            {
+                let keys = dict.keys();
+                let values = dict
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .cloned();
+                if let Some(values) = values {
+                    let strings: Vec<Option<&str>> = (0..keys.len())
+                        .map(|i| {
+                            if keys.is_null(i) {
+                                None
+                            } else {
+                                let key = keys.value(i) as usize;
+                                if key < values.len() && !values.is_null(key) {
+                                    Some(values.value(key))
+                                } else {
+                                    None
+                                }
+                            }
+                        })
+                        .collect();
+                    return Arc::new(StringArray::from(strings)) as ArrayRef;
+                }
+            }
+            array.clone()
+        } else {
+            array.clone()
+        }
+    }
+
+    /// Decode every dictionary-encoded column of a batch (used by SELECT *).
+    pub(in crate::query::executor) fn decode_dict_columns(batch: &RecordBatch) -> RecordBatch {
+        let needs_decode = batch.columns().iter().any(|col| {
+            col.as_any()
+                .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>>()
+                .is_some()
+        });
+        if !needs_decode {
+            return batch.clone();
+        }
+        let arrays: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|col| Self::decode_dict_to_plain(col))
+            .collect();
+        RecordBatch::try_new(batch.schema(), arrays).unwrap_or_else(|_| batch.clone())
     }
 
     /// Execute aggregation query

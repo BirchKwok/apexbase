@@ -72,6 +72,14 @@ impl ApexExecutor {
         if let Some(result) =
             Self::try_execute_single_key_streaming_group_by(&batch, effective_stmt, &group_cols)?
         {
+            return Ok(Self::decode_group_by_dict_columns(result));
+        }
+
+        // Single dict-encoded group key + COUNT(CASE WHEN cond THEN 1 END):
+        // count in one direct-indexed pass, avoiding the hash-based group
+        // construction and per-group row-index vectors.
+        if let Some(result) = Self::try_execute_dict_case_count(&batch, effective_stmt, &group_cols)?
+        {
             return Ok(result);
         }
 
@@ -96,6 +104,7 @@ impl ApexExecutor {
             // Fall back to full row-index based aggregation for complex cases
             Self::execute_group_by_with_indices(&batch, effective_stmt, &group_cols)?
         };
+        result = Self::decode_group_by_dict_columns(result);
 
         // Strip the extra HAVING-only aggregate columns we injected above
         if extra_agg_count > 0 {
@@ -116,6 +125,17 @@ impl ApexExecutor {
         }
 
         Ok(result)
+    }
+
+    /// Grouped results may carry dictionary-encoded string columns (the input
+    /// batch is dict-encoded for low-cardinality keys).  Decode them so the
+    /// Python bindings receive plain strings.
+    fn decode_group_by_dict_columns(result: ApexResult) -> ApexResult {
+        if let ApexResult::Data(batch) = result {
+            ApexResult::Data(Self::decode_dict_columns(&batch))
+        } else {
+            result
+        }
     }
 
     pub(in crate::query::executor) fn try_execute_single_key_streaming_group_by(
@@ -1164,10 +1184,15 @@ impl ApexExecutor {
                 .map_err(|e| err_data(e.to_string()))?;
         }
 
-        // Apply ORDER BY if present (resolve aggregate expressions to output column names first)
+        // Apply ORDER BY (resolve aggregate expressions to output column names first),
+        // then LIMIT/OFFSET so grouped queries with ORDER BY LIMIT return bounded rows.
         if !stmt.order_by.is_empty() {
             let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
-            result_batch = Self::apply_order_by(&result_batch, &resolved_ob)?;
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            result_batch = Self::apply_order_by_topk(&result_batch, &resolved_ob, k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result_batch = Self::apply_limit_offset(&result_batch, stmt.limit, stmt.offset)?;
         }
 
         Ok(ApexResult::Data(result_batch))
@@ -1238,10 +1263,121 @@ impl ApexExecutor {
             .unwrap_or_else(|| clean.rsplit('.').next().unwrap_or(clean).to_string())
     }
 
-    pub(in crate::query::executor) fn execute_group_by_string_dict(
+    /// Fast path: a single dictionary-encoded string GROUP BY key with one
+    /// `COUNT(CASE WHEN cond THEN 1 END)` (or `COUNT(IF(cond, 1, 0))`)
+    /// aggregate.  The condition mask is evaluated once and each row is
+    /// counted into its key slot directly — no hash map, no per-group row
+    /// index vectors.
+    pub(in crate::query::executor) fn try_execute_dict_case_count(
         batch: &RecordBatch,
         stmt: &SelectStatement,
-        _str_arr: &StringArray,
+        group_cols: &[String],
+    ) -> io::Result<Option<ApexResult>> {
+        if group_cols.len() != 1 || stmt.distinct {
+            return Ok(None);
+        }
+        let group_col = &group_cols[0];
+        let Some(col) = batch.column_by_name(group_col) else {
+            return Ok(None);
+        };
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+        let Some(dict_arr) = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() else {
+            return Ok(None);
+        };
+        let Some(str_values) = dict_arr.values().as_any().downcast_ref::<StringArray>() else {
+            return Ok(None);
+        };
+
+        // Columns: the group column plus exactly one COUNT(CASE ...) expression.
+        let mut count_alias: Option<String> = None;
+        let mut count_spec: Option<(SqlExpr, bool)> = None;
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(_) | SelectColumn::ColumnAlias { .. } => {}
+                SelectColumn::Expression { expr, alias } => {
+                    if count_spec.is_some() {
+                        return Ok(None);
+                    }
+                    let SqlExpr::Function { name, args } = expr else {
+                        return Ok(None);
+                    };
+                    if !name.eq_ignore_ascii_case("COUNT") || args.len() != 1 {
+                        return Ok(None);
+                    }
+                    let Some(spec) = Self::count_case_condition(&args[0]) else {
+                        return Ok(None);
+                    };
+                    count_spec = Some(spec);
+                    count_alias = alias.clone();
+                }
+                _ => return Ok(None),
+            }
+        }
+        let Some((cond_expr, count_true)) = count_spec else {
+            return Ok(None);
+        };
+        let cond = Self::evaluate_predicate(batch, &cond_expr)?;
+
+        let dict_size = str_values.len() + 1;
+        let mut counts: Vec<i64> = vec![0; dict_size];
+        let keys = dict_arr.keys();
+        for row in 0..batch.num_rows() {
+            let idx = if keys.is_null(row) {
+                0usize
+            } else {
+                keys.value(row) as usize + 1
+            };
+            let hit = if count_true {
+                !cond.is_null(row) && cond.value(row)
+            } else {
+                !cond.is_null(row)
+            };
+            if hit {
+                counts[idx] += 1;
+            }
+        }
+
+        let active_groups: Vec<usize> = (0..dict_size).filter(|&i| counts[i] > 0).collect();
+        let group_col_name = Self::group_output_name(stmt, group_col);
+        let group_values: Vec<Option<&str>> = active_groups
+            .iter()
+            .map(|&i| {
+                if i == 0 {
+                    None
+                } else {
+                    Some(str_values.value(i - 1))
+                }
+            })
+            .collect();
+        let count_name = count_alias.unwrap_or_else(|| "expr".to_string());
+
+        let mut fields = vec![Field::new(&group_col_name, ArrowDataType::Utf8, true)];
+        let mut arrays: Vec<ArrayRef> = vec![Arc::new(StringArray::from(group_values))];
+        fields.push(Field::new(&count_name, ArrowDataType::Int64, false));
+        arrays.push(Arc::new(Int64Array::from(
+            active_groups.iter().map(|&i| counts[i]).collect::<Vec<_>>(),
+        )));
+
+        let schema = Arc::new(Schema::new(fields));
+        let mut result_batch =
+            RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
+
+        if !stmt.order_by.is_empty() {
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            result_batch = Self::apply_order_by_topk(&result_batch, &resolved_ob, k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result_batch = Self::apply_limit_offset(&result_batch, stmt.limit, stmt.offset)?;
+        }
+
+        Ok(Some(ApexResult::Data(result_batch)))
+    }
+
+    pub(in crate::query::executor) fn execute_group_by_string_dict(
+        batch: &RecordBatch,
+        stmt: &SelectStatement,        _str_arr: &StringArray,
         indices: &[u32],
         dict_values: &[&str],
         dict_size: usize,
@@ -1256,6 +1392,8 @@ impl ApexExecutor {
         let mut sums_float: Vec<f64> = vec![0.0; dict_size];
         let mut mins_int: Vec<Option<i64>> = vec![None; dict_size];
         let mut maxs_int: Vec<Option<i64>> = vec![None; dict_size];
+        let mut mins_float: Vec<Option<f64>> = vec![None; dict_size];
+        let mut maxs_float: Vec<Option<f64>> = vec![None; dict_size];
 
         // Find aggregate column
         let mut agg_col_int: Option<&Int64Array> = None;
@@ -1326,8 +1464,12 @@ impl ApexExecutor {
                     let group_idx = unsafe { *indices.get_unchecked(row_idx) as usize };
                     unsafe {
                         *counts.get_unchecked_mut(group_idx) += 1;
-                        *sums_float.get_unchecked_mut(group_idx) +=
-                            *values.get_unchecked(row_idx);
+                        let val = *values.get_unchecked(row_idx);
+                        *sums_float.get_unchecked_mut(group_idx) += val;
+                        let min_slot = mins_float.get_unchecked_mut(group_idx);
+                        *min_slot = Some(min_slot.map_or(val, |m| m.min(val)));
+                        let max_slot = maxs_float.get_unchecked_mut(group_idx);
+                        *max_slot = Some(max_slot.map_or(val, |m| m.max(val)));
                     }
                 }
             } else {
@@ -1335,7 +1477,12 @@ impl ApexExecutor {
                     let group_idx = indices[row_idx] as usize;
                     counts[group_idx] += 1;
                     if !float_arr.is_null(row_idx) {
-                        sums_float[group_idx] += float_arr.value(row_idx);
+                        let val = float_arr.value(row_idx);
+                        sums_float[group_idx] += val;
+                        mins_float[group_idx] =
+                            Some(mins_float[group_idx].map_or(val, |m| m.min(val)));
+                        maxs_float[group_idx] =
+                            Some(maxs_float[group_idx].map_or(val, |m| m.max(val)));
                     }
                 }
             }
@@ -1469,16 +1616,38 @@ impl ApexExecutor {
                         result_arrays.push(Arc::new(Float64Array::from(values)));
                     }
                     AggregateFunc::Min => {
-                        let values: Vec<Option<i64>> =
-                            active_groups.iter().map(|&i| mins_int[i]).collect();
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                        result_arrays.push(Arc::new(Int64Array::from(values)));
+                        if agg_col_int.is_some() {
+                            let values: Vec<Option<i64>> =
+                                active_groups.iter().map(|&i| mins_int[i]).collect();
+                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
+                            result_arrays.push(Arc::new(Int64Array::from(values)));
+                        } else {
+                            let values: Vec<Option<f64>> =
+                                active_groups.iter().map(|&i| mins_float[i]).collect();
+                            result_fields.push(Field::new(
+                                &field_name,
+                                ArrowDataType::Float64,
+                                true,
+                            ));
+                            result_arrays.push(Arc::new(Float64Array::from(values)));
+                        }
                     }
                     AggregateFunc::Max => {
-                        let values: Vec<Option<i64>> =
-                            active_groups.iter().map(|&i| maxs_int[i]).collect();
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                        result_arrays.push(Arc::new(Int64Array::from(values)));
+                        if agg_col_int.is_some() {
+                            let values: Vec<Option<i64>> =
+                                active_groups.iter().map(|&i| maxs_int[i]).collect();
+                            result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
+                            result_arrays.push(Arc::new(Int64Array::from(values)));
+                        } else {
+                            let values: Vec<Option<f64>> =
+                                active_groups.iter().map(|&i| maxs_float[i]).collect();
+                            result_fields.push(Field::new(
+                                &field_name,
+                                ArrowDataType::Float64,
+                                true,
+                            ));
+                            result_arrays.push(Arc::new(Float64Array::from(values)));
+                        }
                     }
                 }
             }
@@ -1495,10 +1664,15 @@ impl ApexExecutor {
                 .map_err(|e| err_data(e.to_string()))?;
         }
 
-        // Apply ORDER BY if present (resolve aggregate expressions to output column names first)
+        // Apply ORDER BY (resolve aggregate expressions to output column names first).
+        // A top-k sort is used when LIMIT is present; LIMIT/OFFSET then applies.
         if !stmt.order_by.is_empty() {
             let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
-            result_batch = Self::apply_order_by(&result_batch, &resolved_ob)?;
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            result_batch = Self::apply_order_by_topk(&result_batch, &resolved_ob, k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result_batch = Self::apply_limit_offset(&result_batch, stmt.limit, stmt.offset)?;
         }
 
         Ok(ApexResult::Data(result_batch))
@@ -1521,6 +1695,8 @@ impl ApexExecutor {
         let mut sums_float: Vec<f64> = vec![0.0; range];
         let mut mins_int: Vec<Option<i64>> = vec![None; range];
         let mut maxs_int: Vec<Option<i64>> = vec![None; range];
+        let mut mins_float: Vec<Option<f64>> = vec![None; range];
+        let mut maxs_float: Vec<Option<f64>> = vec![None; range];
         let mut first_rows: Vec<usize> = vec![usize::MAX; range];
         // Separate state for NULL-key rows
         let mut null_count: i64 = 0;
@@ -1528,6 +1704,8 @@ impl ApexExecutor {
         let mut null_sum_float: f64 = 0.0;
         let mut null_min_int: Option<i64> = None;
         let mut null_max_int: Option<i64> = None;
+        let mut null_min_float: Option<f64> = None;
+        let mut null_max_float: Option<f64> = None;
         let mut null_first_row: usize = usize::MAX;
 
         // Find aggregate column
@@ -1578,7 +1756,10 @@ impl ApexExecutor {
                 }
                 if let Some(float_arr) = agg_col_float {
                     if !float_arr.is_null(row_idx) {
-                        null_sum_float += float_arr.value(row_idx);
+                        let val = float_arr.value(row_idx);
+                        null_sum_float += val;
+                        null_min_float = Some(null_min_float.map_or(val, |m| m.min(val)));
+                        null_max_float = Some(null_max_float.map_or(val, |m| m.max(val)));
                     }
                 }
                 continue;
@@ -1600,7 +1781,12 @@ impl ApexExecutor {
             }
             if let Some(float_arr) = agg_col_float {
                 if !float_arr.is_null(row_idx) {
-                    sums_float[group_val] += float_arr.value(row_idx);
+                    let val = float_arr.value(row_idx);
+                    sums_float[group_val] += val;
+                    mins_float[group_val] =
+                        Some(mins_float[group_val].map_or(val, |m| m.min(val)));
+                    maxs_float[group_val] =
+                        Some(maxs_float[group_val].map_or(val, |m| m.max(val)));
                 }
             }
         }
@@ -1710,22 +1896,46 @@ impl ApexExecutor {
                         result_arrays.push(Arc::new(Float64Array::from(vals)));
                     }
                     AggregateFunc::Min => {
-                        let mut vals: Vec<Option<i64>> =
-                            active_groups.iter().map(|&i| mins_int[i]).collect();
-                        if has_null_group {
-                            vals.push(null_min_int);
+                        if agg_col_int.is_some() {
+                            let mut vals: Vec<Option<i64>> =
+                                active_groups.iter().map(|&i| mins_int[i]).collect();
+                            if has_null_group {
+                                vals.push(null_min_int);
+                            }
+                            result_fields
+                                .push(Field::new(&field_name, ArrowDataType::Int64, true));
+                            result_arrays.push(Arc::new(Int64Array::from(vals)));
+                        } else {
+                            let mut vals: Vec<Option<f64>> =
+                                active_groups.iter().map(|&i| mins_float[i]).collect();
+                            if has_null_group {
+                                vals.push(null_min_float);
+                            }
+                            result_fields
+                                .push(Field::new(&field_name, ArrowDataType::Float64, true));
+                            result_arrays.push(Arc::new(Float64Array::from(vals)));
                         }
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                        result_arrays.push(Arc::new(Int64Array::from(vals)));
                     }
                     AggregateFunc::Max => {
-                        let mut vals: Vec<Option<i64>> =
-                            active_groups.iter().map(|&i| maxs_int[i]).collect();
-                        if has_null_group {
-                            vals.push(null_max_int);
+                        if agg_col_int.is_some() {
+                            let mut vals: Vec<Option<i64>> =
+                                active_groups.iter().map(|&i| maxs_int[i]).collect();
+                            if has_null_group {
+                                vals.push(null_max_int);
+                            }
+                            result_fields
+                                .push(Field::new(&field_name, ArrowDataType::Int64, true));
+                            result_arrays.push(Arc::new(Int64Array::from(vals)));
+                        } else {
+                            let mut vals: Vec<Option<f64>> =
+                                active_groups.iter().map(|&i| maxs_float[i]).collect();
+                            if has_null_group {
+                                vals.push(null_max_float);
+                            }
+                            result_fields
+                                .push(Field::new(&field_name, ArrowDataType::Float64, true));
+                            result_arrays.push(Arc::new(Float64Array::from(vals)));
                         }
-                        result_fields.push(Field::new(&field_name, ArrowDataType::Int64, true));
-                        result_arrays.push(Arc::new(Int64Array::from(vals)));
                     }
                 }
             }
@@ -1741,7 +1951,11 @@ impl ApexExecutor {
         }
         if !stmt.order_by.is_empty() {
             let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
-            result_batch = Self::apply_order_by(&result_batch, &resolved_ob)?;
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            result_batch = Self::apply_order_by_topk(&result_batch, &resolved_ob, k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result_batch = Self::apply_limit_offset(&result_batch, stmt.limit, stmt.offset)?;
         }
         Ok(ApexResult::Data(result_batch))
     }
@@ -1970,7 +2184,7 @@ impl ApexExecutor {
         enum TypedCol<'a> {
             Int64(&'a Int64Array),
             Float64(&'a Float64Array),
-            StringDict(&'a StringArray, Vec<u32>), // (array, dictionary indices per row)
+            StringDict(&'a ArrayRef, Vec<u32>), // (array, dictionary indices per row)
             Bool(&'a BooleanArray),
             Other(&'a ArrayRef),
         }
@@ -2242,28 +2456,26 @@ impl ApexExecutor {
                         let mut sums_float: Vec<f64> = vec![0.0; total_size];
 
                         if let Some(int_arr) = agg_col_int {
-                            // Int64 aggregate
+                            // Int64 aggregate.  NULL group keys (idx 0) form
+                            // their own group: composite = idx1*dict2_size+idx2
+                            // already maps (0, x), (x, 0) and (0, 0) to the
+                            // NULL-group slots, so every row participates.
                             if int_arr.null_count() == 0 {
                                 let values = int_arr.values();
                                 for row_idx in 0..num_rows {
                                     let idx1 = unsafe { *indices1.get_unchecked(row_idx) as usize };
                                     let idx2 = unsafe { *indices2.get_unchecked(row_idx) as usize };
-                                    if idx1 != 0 && idx2 != 0 {
-                                        let composite = idx1 * dict2_size + idx2;
-                                        unsafe {
-                                            *counts.get_unchecked_mut(composite) += 1;
-                                            *sums_int.get_unchecked_mut(composite) +=
-                                                *values.get_unchecked(row_idx);
-                                        }
+                                    let composite = idx1 * dict2_size + idx2;
+                                    unsafe {
+                                        *counts.get_unchecked_mut(composite) += 1;
+                                        *sums_int.get_unchecked_mut(composite) +=
+                                            *values.get_unchecked(row_idx);
                                     }
                                 }
                             } else {
                                 for row_idx in 0..num_rows {
                                     let idx1 = indices1[row_idx] as usize;
                                     let idx2 = indices2[row_idx] as usize;
-                                    if idx1 == 0 || idx2 == 0 {
-                                        continue;
-                                    }
                                     let composite = idx1 * dict2_size + idx2;
                                     counts[composite] += 1;
                                     if !int_arr.is_null(row_idx) {
@@ -2272,28 +2484,23 @@ impl ApexExecutor {
                                 }
                             }
                         } else if let Some(float_arr) = agg_col_float {
-                            // Float64 aggregate
+                            // Float64 aggregate (NULL group keys included)
                             if float_arr.null_count() == 0 {
                                 let values = float_arr.values();
                                 for row_idx in 0..num_rows {
                                     let idx1 = unsafe { *indices1.get_unchecked(row_idx) as usize };
                                     let idx2 = unsafe { *indices2.get_unchecked(row_idx) as usize };
-                                    if idx1 != 0 && idx2 != 0 {
-                                        let composite = idx1 * dict2_size + idx2;
-                                        unsafe {
-                                            *counts.get_unchecked_mut(composite) += 1;
-                                            *sums_float.get_unchecked_mut(composite) +=
-                                                *values.get_unchecked(row_idx);
-                                        }
+                                    let composite = idx1 * dict2_size + idx2;
+                                    unsafe {
+                                        *counts.get_unchecked_mut(composite) += 1;
+                                        *sums_float.get_unchecked_mut(composite) +=
+                                            *values.get_unchecked(row_idx);
                                     }
                                 }
                             } else {
                                 for row_idx in 0..num_rows {
                                     let idx1 = indices1[row_idx] as usize;
                                     let idx2 = indices2[row_idx] as usize;
-                                    if idx1 == 0 || idx2 == 0 {
-                                        continue;
-                                    }
                                     let composite = idx1 * dict2_size + idx2;
                                     counts[composite] += 1;
                                     if !float_arr.is_null(row_idx) {
@@ -2306,19 +2513,17 @@ impl ApexExecutor {
                             for row_idx in 0..num_rows {
                                 let idx1 = unsafe { *indices1.get_unchecked(row_idx) as usize };
                                 let idx2 = unsafe { *indices2.get_unchecked(row_idx) as usize };
-                                if idx1 != 0 && idx2 != 0 {
-                                    let composite = idx1 * dict2_size + idx2;
-                                    unsafe {
-                                        *counts.get_unchecked_mut(composite) += 1;
-                                    }
+                                let composite = idx1 * dict2_size + idx2;
+                                unsafe {
+                                    *counts.get_unchecked_mut(composite) += 1;
                                 }
                             }
                         }
 
-                        // Collect active groups
-                        let mut result_col1: Vec<&str> =
+                        // Collect active groups, emitting NULL for the idx-0 slots.
+                        let mut result_col1: Vec<Option<&str>> =
                             Vec::with_capacity(dict1_size * dict2_size / 10);
-                        let mut result_col2: Vec<&str> =
+                        let mut result_col2: Vec<Option<&str>> =
                             Vec::with_capacity(dict1_size * dict2_size / 10);
                         let mut result_counts: Vec<i64> =
                             Vec::with_capacity(dict1_size * dict2_size / 10);
@@ -2327,12 +2532,20 @@ impl ApexExecutor {
                         let mut result_sums_float: Vec<f64> =
                             Vec::with_capacity(dict1_size * dict2_size / 10);
 
-                        for idx1 in 1..dict1_size {
-                            for idx2 in 1..dict2_size {
+                        for idx1 in 0..dict1_size {
+                            for idx2 in 0..dict2_size {
                                 let composite = idx1 * dict2_size + idx2;
                                 if counts[composite] > 0 {
-                                    result_col1.push(&dict1_values[idx1 - 1]);
-                                    result_col2.push(&dict2_values[idx2 - 1]);
+                                    result_col1.push(if idx1 == 0 {
+                                        None
+                                    } else {
+                                        Some(dict1_values[idx1 - 1].as_str())
+                                    });
+                                    result_col2.push(if idx2 == 0 {
+                                        None
+                                    } else {
+                                        Some(dict2_values[idx2 - 1].as_str())
+                                    });
                                     result_counts.push(counts[composite]);
                                     result_sums_int.push(sums_int[composite]);
                                     result_sums_float.push(sums_float[composite]);
@@ -2347,13 +2560,13 @@ impl ApexExecutor {
                         result_fields.push(Field::new(
                             Self::group_output_name(stmt, &group_cols[0]),
                             ArrowDataType::Utf8,
-                            false,
+                            true,
                         ));
                         result_arrays.push(Arc::new(StringArray::from(result_col1)));
                         result_fields.push(Field::new(
                             Self::group_output_name(stmt, &group_cols[1]),
                             ArrowDataType::Utf8,
-                            false,
+                            true,
                         ));
                         result_arrays.push(Arc::new(StringArray::from(result_col2)));
                         let has_int_agg = agg_col_int.is_some();
@@ -2628,6 +2841,9 @@ impl ApexExecutor {
                         let mut sums_float: Vec<f64> = vec![0.0; total_size];
 
                         if let Some(int_arr) = agg_col_int {
+                            // NULL group keys (idx 0) form their own group;
+                            // composite = str_idx*(int_range+1)+int_idx maps
+                            // every combination including NULL slots.
                             if int_arr.null_count() == 0 {
                                 let values = int_arr.values();
                                 for row_idx in 0..num_rows {
@@ -2635,22 +2851,17 @@ impl ApexExecutor {
                                         unsafe { *str_indices.get_unchecked(row_idx) as usize };
                                     let int_idx =
                                         unsafe { *int_indices.get_unchecked(row_idx) as usize };
-                                    if str_idx != 0 && int_idx != 0 {
-                                        let composite = str_idx * (int_range + 1) + int_idx;
-                                        unsafe {
-                                            *counts.get_unchecked_mut(composite) += 1;
-                                            *sums_int.get_unchecked_mut(composite) +=
-                                                *values.get_unchecked(row_idx);
-                                        }
+                                    let composite = str_idx * (int_range + 1) + int_idx;
+                                    unsafe {
+                                        *counts.get_unchecked_mut(composite) += 1;
+                                        *sums_int.get_unchecked_mut(composite) +=
+                                            *values.get_unchecked(row_idx);
                                     }
                                 }
                             } else {
                                 for row_idx in 0..num_rows {
                                     let str_idx = str_indices[row_idx] as usize;
                                     let int_idx = int_indices[row_idx] as usize;
-                                    if str_idx == 0 || int_idx == 0 {
-                                        continue;
-                                    }
                                     let composite = str_idx * (int_range + 1) + int_idx;
                                     counts[composite] += 1;
                                     if !int_arr.is_null(row_idx) {
@@ -2666,22 +2877,17 @@ impl ApexExecutor {
                                         unsafe { *str_indices.get_unchecked(row_idx) as usize };
                                     let int_idx =
                                         unsafe { *int_indices.get_unchecked(row_idx) as usize };
-                                    if str_idx != 0 && int_idx != 0 {
-                                        let composite = str_idx * (int_range + 1) + int_idx;
-                                        unsafe {
-                                            *counts.get_unchecked_mut(composite) += 1;
-                                            *sums_float.get_unchecked_mut(composite) +=
-                                                *values.get_unchecked(row_idx);
-                                        }
+                                    let composite = str_idx * (int_range + 1) + int_idx;
+                                    unsafe {
+                                        *counts.get_unchecked_mut(composite) += 1;
+                                        *sums_float.get_unchecked_mut(composite) +=
+                                            *values.get_unchecked(row_idx);
                                     }
                                 }
                             } else {
                                 for row_idx in 0..num_rows {
                                     let str_idx = str_indices[row_idx] as usize;
                                     let int_idx = int_indices[row_idx] as usize;
-                                    if str_idx == 0 || int_idx == 0 {
-                                        continue;
-                                    }
                                     let composite = str_idx * (int_range + 1) + int_idx;
                                     counts[composite] += 1;
                                     if !float_arr.is_null(row_idx) {
@@ -2696,28 +2902,34 @@ impl ApexExecutor {
                                     unsafe { *str_indices.get_unchecked(row_idx) as usize };
                                 let int_idx =
                                     unsafe { *int_indices.get_unchecked(row_idx) as usize };
-                                if str_idx != 0 && int_idx != 0 {
-                                    let composite = str_idx * (int_range + 1) + int_idx;
-                                    unsafe {
-                                        *counts.get_unchecked_mut(composite) += 1;
-                                    }
+                                let composite = str_idx * (int_range + 1) + int_idx;
+                                unsafe {
+                                    *counts.get_unchecked_mut(composite) += 1;
                                 }
                             }
                         }
 
-                        // Collect active groups
-                        let mut result_col1: Vec<&str> = Vec::with_capacity(total_size / 10);
-                        let mut result_col2: Vec<i64> = Vec::with_capacity(total_size / 10);
+                        // Collect active groups, emitting NULL for the idx-0 slots.
+                        let mut result_col1: Vec<Option<&str>> = Vec::with_capacity(total_size / 10);
+                        let mut result_col2: Vec<Option<i64>> = Vec::with_capacity(total_size / 10);
                         let mut result_counts: Vec<i64> = Vec::with_capacity(total_size / 10);
                         let mut result_sums_int: Vec<i64> = Vec::with_capacity(total_size / 10);
                         let mut result_sums_float: Vec<f64> = Vec::with_capacity(total_size / 10);
 
-                        for str_idx in 1..str_size {
-                            for int_offset in 1..=int_range {
+                        for str_idx in 0..str_size {
+                            for int_offset in 0..=int_range {
                                 let composite = str_idx * (int_range + 1) + int_offset;
                                 if counts[composite] > 0 {
-                                    result_col1.push(&str_values[str_idx - 1]);
-                                    result_col2.push(int_min + (int_offset - 1) as i64);
+                                    result_col1.push(if str_idx == 0 {
+                                        None
+                                    } else {
+                                        Some(str_values[str_idx - 1].as_str())
+                                    });
+                                    result_col2.push(if int_offset == 0 {
+                                        None
+                                    } else {
+                                        Some(int_min + (int_offset - 1) as i64)
+                                    });
                                     result_counts.push(counts[composite]);
                                     result_sums_int.push(sums_int[composite]);
                                     result_sums_float.push(sums_float[composite]);
@@ -2733,13 +2945,13 @@ impl ApexExecutor {
                         result_fields.push(Field::new(
                             Self::group_output_name(stmt, &group_cols[0]),
                             ArrowDataType::Utf8,
-                            false,
+                            true,
                         ));
                         result_arrays.push(Arc::new(StringArray::from(result_col1)));
                         result_fields.push(Field::new(
                             Self::group_output_name(stmt, &group_cols[1]),
                             ArrowDataType::Int64,
-                            false,
+                            true,
                         ));
                         result_arrays.push(Arc::new(Int64Array::from(result_col2)));
 
@@ -2948,11 +3160,27 @@ impl ApexExecutor {
                                 }
                             })
                             .collect();
-                        TypedCol::StringDict(arr, indices)
+                        TypedCol::StringDict(col, indices)
                     } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
                         TypedCol::Float64(arr)
                     } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
                         TypedCol::Bool(arr)
+                    } else if let Some(arr) = col.as_any().downcast_ref::<
+                        arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>,
+                    >() {
+                        // Dictionary-encoded string: reuse the existing key ids
+                        // (+1 for the NULL slot) instead of building a runtime
+                        // dictionary and per-row string hashing.
+                        let indices: Vec<u32> = (0..num_rows)
+                            .map(|i| {
+                                if arr.keys().is_null(i) {
+                                    0u32
+                                } else {
+                                    arr.keys().value(i) + 1
+                                }
+                            })
+                            .collect();
+                        TypedCol::StringDict(col, indices)
                     } else {
                         TypedCol::Other(col)
                     }
@@ -3404,6 +3632,7 @@ impl ApexExecutor {
             Float64(&'a Float64Array),
             String(&'a StringArray),
             Bool(&'a BooleanArray),
+            StringDict(&'a arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>),
             Other(&'a ArrayRef),
         }
 
@@ -3419,6 +3648,13 @@ impl ApexExecutor {
                         TypedColumn::Float64(arr)
                     } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
                         TypedColumn::Bool(arr)
+                    } else if let Some(arr) = col.as_any().downcast_ref::<
+                        arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>,
+                    >() {
+                        // Dictionary-encoded string: the key id uniquely
+                        // identifies the value, so hashing the id is exact and
+                        // avoids per-row string hashing / dynamic dispatch.
+                        TypedColumn::StringDict(arr)
                     } else {
                         TypedColumn::Other(col)
                     }
@@ -3457,6 +3693,13 @@ impl ApexExecutor {
                             hasher.write_u8(arr.value(row_idx) as u8);
                         } else {
                             hasher.write_u8(2);
+                        }
+                    }
+                    Some(TypedColumn::StringDict(arr)) => {
+                        if !arr.keys().is_null(row_idx) {
+                            hasher.write_u32(arr.keys().value(row_idx));
+                        } else {
+                            hasher.write_u8(0);
                         }
                     }
                     Some(TypedColumn::Other(col)) => {
@@ -3568,10 +3811,14 @@ impl ApexExecutor {
                 .map_err(|e| err_data(e.to_string()))?;
         }
 
-        // Apply ORDER BY if present
+        // Apply ORDER BY (top-k when LIMIT is present), then LIMIT/OFFSET.
         if !stmt.order_by.is_empty() {
             let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
-            result = Self::apply_order_by(&result, &resolved_ob)?;
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            result = Self::apply_order_by_topk(&result, &resolved_ob, k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result = Self::apply_limit_offset(&result, stmt.limit, stmt.offset)?;
         }
 
         Ok(ApexResult::Data(result))
@@ -4050,6 +4297,30 @@ impl ApexExecutor {
         let arg = args
             .first()
             .ok_or_else(|| err_input(format!("{} requires an argument", name)))?;
+        // COUNT(CASE WHEN cond THEN 1 END) / COUNT(IF(cond, 1, 0)): count the
+        // condition mask directly instead of materializing a million-row
+        // CASE result array.
+        if upper == "COUNT" {
+            if let Some((cond_expr, count_true)) = Self::count_case_condition(arg) {
+                let cond = Self::evaluate_predicate(batch, &cond_expr)?;
+                let count_group = |group: &Vec<usize>| {
+                    if count_true {
+                        group
+                            .iter()
+                            .filter(|&&i| !cond.is_null(i) && cond.value(i))
+                            .count() as i64
+                    } else {
+                        group.iter().filter(|&&i| !cond.is_null(i)).count() as i64
+                    }
+                };
+                let counts = if use_parallel {
+                    groups.par_iter().map(count_group).collect::<Vec<_>>()
+                } else {
+                    groups.iter().map(count_group).collect::<Vec<_>>()
+                };
+                return Ok(Arc::new(Int64Array::from(counts)));
+            }
+        }
         let values = Self::evaluate_expr_to_array(batch, arg)?;
         match upper.as_str() {
             "COUNT" => {
@@ -4222,8 +4493,46 @@ impl ApexExecutor {
         }
     }
 
-    pub(in crate::query::executor) fn create_group_batch(
-        batch: &RecordBatch,
+    /// Recognize `CASE WHEN cond THEN <non-null const> [ELSE NULL] END` and
+    /// `IF(cond, <non-null const>, <const>)` shapes used by COUNT(CASE ...).
+    /// Returns (condition, count_true): when true the count is the number of
+    /// TRUE condition rows; when false it is the number of non-NULL condition
+    /// rows (ELSE makes the CASE result non-NULL for FALSE conditions).
+    pub(in crate::query::executor) fn count_case_condition(
+        arg: &SqlExpr,
+    ) -> Option<(SqlExpr, bool)> {
+        fn is_null_literal(expr: &SqlExpr) -> bool {
+            matches!(expr, SqlExpr::Literal(crate::data::Value::Null))
+        }
+        match arg {
+            SqlExpr::Case {
+                when_then,
+                else_expr,
+            } if when_then.len() == 1 => {
+                let (cond, then) = &when_then[0];
+                if is_null_literal(then) {
+                    return None;
+                }
+                match else_expr {
+                    None => Some((cond.clone(), true)),
+                    Some(e) if is_null_literal(e) => Some((cond.clone(), true)),
+                    Some(e) if !is_null_literal(e) => Some((cond.clone(), false)),
+                    _ => None,
+                }
+            }
+            SqlExpr::Function { name, args } if name.eq_ignore_ascii_case("IF") && args.len() == 3 => {
+                // IF(cond, a, b): NULL result only when cond is NULL.
+                if !is_null_literal(&args[1]) {
+                    Some((args[0].clone(), false))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    pub(in crate::query::executor) fn create_group_batch(        batch: &RecordBatch,
         indices: &[usize],
     ) -> io::Result<RecordBatch> {
         let indices_array =
@@ -4423,6 +4732,40 @@ impl ApexExecutor {
                             })
                             .collect::<Vec<_>>(),
                     )),
+                ))
+            }
+            DataType::Dictionary(_, _) => {
+                // Dictionary-encoded string group key: take the first row per
+                // group and decode to a plain Utf8 array.
+                use arrow::array::DictionaryArray;
+                use arrow::datatypes::UInt32Type;
+                let src = array
+                    .as_any()
+                    .downcast_ref::<DictionaryArray<UInt32Type>>()
+                    .ok_or_else(|| err_data("expected dictionary group column"))?;
+                let values = src
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| err_data("dictionary group values must be strings"))?;
+                let strings: Vec<Option<&str>> = first_indices
+                    .iter()
+                    .map(|&i| {
+                        if src.keys().is_null(i) {
+                            None
+                        } else {
+                            let key = src.keys().value(i) as usize;
+                            if key < values.len() && !values.is_null(key) {
+                                Some(values.value(key))
+                            } else {
+                                None
+                            }
+                        }
+                    })
+                    .collect();
+                Ok((
+                    Field::new(output_name, DataType::Utf8, true),
+                    Arc::new(StringArray::from(strings)),
                 ))
             }
             _ => Ok((

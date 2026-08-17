@@ -262,6 +262,22 @@ impl ApexExecutor {
                                 }
                             }
 
+                            // FAST PATH: fused COUNT for NOT BETWEEN AND NOT LIKE
+                            // (single mmap pass over both columns, no Arrow materialization).
+                            if has_aggregation_check
+                                && stmt.where_clause.is_some()
+                                && stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && !backend.has_pending_deltas()
+                                && !backend.has_delta()
+                            {
+                                if let Some(result) =
+                                    Self::try_fast_not_filter_count(&backend, &stmt)?
+                                {
+                                    return Ok(result);
+                                }
+                            }
+
                             // FAST PATH: Filtered aggregation with string equality
                             // SELECT COUNT(*), AVG(col), MAX(col) FROM table WHERE str_col = 'val'
                             if has_aggregation_check
@@ -305,6 +321,16 @@ impl ApexExecutor {
                                 }
                                 if let Some(result) =
                                     Self::try_fast_filtered_numeric_agg(&backend, &stmt)?
+                                {
+                                    return Ok(result);
+                                }
+                                if let Some(result) =
+                                    Self::try_fast_in_subquery_count(&backend, &stmt)?
+                                {
+                                    return Ok(result);
+                                }
+                                if let Some(result) =
+                                    Self::try_fast_dict_scalar_count(&backend, &stmt)?
                                 {
                                     return Ok(result);
                                 }
@@ -631,7 +657,30 @@ impl ApexExecutor {
                                     } else if let Some(result) =
                                         Self::try_fast_numeric_range_filter(&backend, &stmt)?
                                     {
-                                        result
+                                        // The scan consumed the whole WHERE
+                                        // (single comparison/BETWEEN), so the
+                                        // batch is final except for OFFSET.
+                                        let offset = stmt.offset.unwrap_or(0);
+                                        let limited = if offset > 0
+                                            && result.num_rows() > offset
+                                        {
+                                            result.slice(
+                                                offset,
+                                                result.num_rows() - offset,
+                                            )
+                                        } else {
+                                            result
+                                        };
+                                        if !stmt.is_pure_star() {
+                                            let projected =
+                                                Self::apply_projection_with_storage(
+                                                    &limited,
+                                                    &stmt.columns,
+                                                    Some(storage_path),
+                                                )?;
+                                            return Ok(ApexResult::Data(projected));
+                                        }
+                                        return Ok(ApexResult::Data(limited));
                                     // FAST PATH 3: Try combined string + numeric filter for multi-condition
                                     } else if let Some(result) =
                                         Self::try_fast_multi_condition_filter(&backend, &stmt)?
@@ -905,30 +954,62 @@ impl ApexExecutor {
                                 } else if !stmt.group_by.is_empty() {
                                     // GROUP BY with WHERE: use dict-encoded path for faster string aggregation
                                     let col_refs = Self::get_col_refs(&stmt);
-                                    backend.read_columns_to_arrow_dict(
-                                        col_refs
-                                            .as_ref()
-                                            .map(|v| {
-                                                v.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-                                            })
-                                            .as_deref(),
-                                    )?
+                                    let col_refs_vec: Option<Vec<&str>> = col_refs
+                                        .as_ref()
+                                        .map(|v| v.iter().map(|s| s.as_str()).collect());
+                                    // NULL group keys force a plain read: the
+                                    // dictionary fast paths assume no NULLs.
+                                    let group_has_nulls = stmt
+                                        .group_by
+                                        .iter()
+                                        .any(|col| {
+                                            let clean = col
+                                                .trim_matches('"')
+                                                .rsplit('.')
+                                                .next()
+                                                .unwrap_or(col.trim_matches('"'));
+                                            backend.column_has_nulls(clean)
+                                        });
+                                    // Expression/aggregate-only projections
+                                    // (e.g. COUNT(CASE ...)) run the generic
+                                    // with-indices path; a plain read matches
+                                    // the pre-dictionary behaviour and avoids
+                                    // per-row dict-value hashing on the key.
+                                    let has_expression = stmt.columns.iter().any(|column| {
+                                        matches!(column, SelectColumn::Expression { .. })
+                                    });
+                                    if group_has_nulls || has_expression {
+                                        backend.read_columns_to_arrow(
+                                            col_refs_vec.as_deref(),
+                                            0,
+                                            None,
+                                        )?
+                                    } else {
+                                        let table_refs: Option<Vec<&str>> = match &col_refs_vec {
+                                            Some(refs) => {
+                                                Self::filter_columns_for_backend(&backend, refs)
+                                            }
+                                            None => None,
+                                        };
+                                        backend
+                                            .read_columns_to_arrow_dict(table_refs.as_deref())?
+                                    }
                                 } else if let Some(batch) =
                                     Self::try_numeric_predicate_pushdown(&backend, &stmt)?
                                 {
                                     batch
                                 } else {
                                     let col_refs = Self::get_col_refs(&stmt);
-                                    backend.read_columns_to_arrow(
-                                        col_refs
-                                            .as_ref()
-                                            .map(|v| {
-                                                v.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-                                            })
-                                            .as_deref(),
-                                        0,
-                                        None,
-                                    )?
+                                    let col_refs_vec: Option<Vec<&str>> = col_refs
+                                        .as_ref()
+                                        .map(|v| v.iter().map(|s| s.as_str()).collect());
+                                    let table_refs: Option<Vec<&str>> = match &col_refs_vec {
+                                        Some(refs) => {
+                                            Self::filter_columns_for_backend(&backend, refs)
+                                        }
+                                        None => None,
+                                    };
+                                    backend.read_columns_to_arrow_dict(table_refs.as_deref())?
                                 }
                             } else if can_late_materialize_where {
                                 // FAST PATH 1: Try dictionary-based filter for simple string equality
@@ -949,7 +1030,26 @@ impl ApexExecutor {
                                 } else if let Some(result) =
                                     Self::try_fast_numeric_range_filter(&backend, &stmt)?
                                 {
-                                    result
+                                    // The scan consumed the whole WHERE; the
+                                    // batch is final except for OFFSET.
+                                    let offset = stmt.offset.unwrap_or(0);
+                                    let limited = if offset > 0
+                                        && result.num_rows() > offset
+                                    {
+                                        result.slice(offset, result.num_rows() - offset)
+                                    } else {
+                                        result
+                                    };
+                                    if !stmt.is_pure_star() {
+                                        let projected =
+                                            Self::apply_projection_with_storage(
+                                                &limited,
+                                                &stmt.columns,
+                                                Some(storage_path),
+                                            )?;
+                                        return Ok(ApexResult::Data(projected));
+                                    }
+                                    return Ok(ApexResult::Data(limited));
                                 // FAST PATH 3: Try combined string + numeric filter for multi-condition
                                 } else if let Some(result) =
                                     Self::try_fast_multi_condition_filter(&backend, &stmt)?
@@ -980,16 +1080,16 @@ impl ApexExecutor {
                                     batch
                                 } else {
                                     let col_refs = Self::get_col_refs(&stmt);
-                                    backend.read_columns_to_arrow(
-                                        col_refs
-                                            .as_ref()
-                                            .map(|v| {
-                                                v.iter().map(|s| s.as_str()).collect::<Vec<_>>()
-                                            })
-                                            .as_deref(),
-                                        0,
-                                        None,
-                                    )?
+                                    let col_refs_vec: Option<Vec<&str>> = col_refs
+                                        .as_ref()
+                                        .map(|v| v.iter().map(|s| s.as_str()).collect());
+                                    let table_refs: Option<Vec<&str>> = match &col_refs_vec {
+                                        Some(refs) => {
+                                            Self::filter_columns_for_backend(&backend, refs)
+                                        }
+                                        None => None,
+                                    };
+                                    backend.read_columns_to_arrow_dict(table_refs.as_deref())?
                                 }
                             } else if can_late_materialize_order {
                                 // Late materialization for ORDER BY + LIMIT path
@@ -1013,19 +1113,41 @@ impl ApexExecutor {
                                     {
                                         return Ok(result);
                                     }
+                                    // V4 FAST PATH: COUNT(CASE WHEN range THEN 1 END)
+                                    // over a cached string group, no WHERE.
+                                    if let Some(result) =
+                                        Self::try_fast_cached_case_count(&backend, &stmt)?
+                                    {
+                                        return Ok(result);
+                                    }
                                     // Fallback: dict-encoded Arrow path
                                     backend.read_columns_to_arrow_dict(col_refs_vec.as_deref())?
                                 } else {
+                                    // V4 FAST PATH: ORDER BY LENGTH(col) [DESC], <tie> LIMIT n
+                                    // scanned from the mmap string offsets.
+                                    if let Some(result) =
+                                        Self::try_fast_order_by_length(&backend, &stmt, storage_path)?
+                                    {
+                                        return Ok(result);
+                                    }
                                     let _row_limit = if can_pushdown_limit {
                                         stmt.limit.map(|l| l + stmt.offset.unwrap_or(0))
                                     } else {
                                         None
                                     };
-                                    backend.read_columns_to_arrow(
-                                        col_refs_vec.as_deref(),
-                                        0,
-                                        _row_limit,
-                                    )?
+                                    if can_pushdown_limit {
+                                        backend.read_columns_to_arrow(
+                                            col_refs_vec.as_deref(),
+                                            0,
+                                            _row_limit,
+                                        )?
+                                    } else {
+                                        // Dictionary-encoded reads make string
+                                        // filters/expressions evaluate over the
+                                        // distinct values; projections decode
+                                        // back to plain arrays when needed.
+                                        backend.read_columns_to_arrow_dict(col_refs_vec.as_deref())?
+                                    }
                                 }
                             }
                         }
@@ -1063,7 +1185,42 @@ impl ApexExecutor {
         }
 
         // Apply WHERE filter (with storage path for subquery support)
+        // Pure COUNT(*) with WHERE: evaluate the mask and count directly,
+        // skipping the filtered-batch materialization.
         let filtered = if let Some(ref where_clause) = stmt.where_clause {
+            if Self::is_simple_count_star(&stmt) {
+                let mask =
+                    Self::evaluate_predicate_with_storage(&batch, where_clause, storage_path)?;
+                // Count the true bits directly: per-row BooleanArray access is
+                // far slower than the packed-buffer count.
+                let count = if mask.null_count() == 0 {
+                    mask.values().count_set_bits() as i64
+                } else {
+                    let mut count: i64 = 0;
+                    for i in 0..mask.len() {
+                        if !mask.is_null(i) && mask.value(i) {
+                            count += 1;
+                        }
+                    }
+                    count
+                };
+                // Match execute_aggregation's output shape: a one-row Data
+                // batch carrying the declared alias.
+                let mut fields = Vec::with_capacity(stmt.columns.len());
+                let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+                for col in &stmt.columns {
+                    if let SelectColumn::Aggregate { alias, column, .. } = col {
+                        let output = alias.clone().unwrap_or_else(|| {
+                            format!("COUNT({})", column.as_deref().unwrap_or("*"))
+                        });
+                        fields.push(Field::new(output, ArrowDataType::Int64, false));
+                        arrays.push(Arc::new(Int64Array::from(vec![count])) as ArrayRef);
+                    }
+                }
+                let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                    .map_err(|e| err_data(e.to_string()))?;
+                return Ok(ApexResult::Data(batch));
+            }
             Self::apply_filter_with_storage(&batch, where_clause, storage_path)?
         } else {
             batch
@@ -1161,13 +1318,13 @@ impl ApexExecutor {
         // For DISTINCT ON: sort, deduplicate by ON columns, project, then limit/offset
         // For non-DISTINCT: apply top-k sort + limit, then project
         let result = if stmt.distinct {
-            let sorted = if !stmt.order_by.is_empty() {
-                Self::apply_order_by(&filtered, &stmt.order_by)?
-            } else {
-                filtered
-            };
             if let Some(ref on_cols) = stmt.distinct_on {
                 // DISTINCT ON: deduplicate by ON columns, then project + limit/offset
+                let sorted = if !stmt.order_by.is_empty() {
+                    Self::apply_order_by(&filtered, &stmt.order_by)?
+                } else {
+                    filtered
+                };
                 let deduped = Self::deduplicate_batch_on(&sorted, on_cols)?;
                 let projected = Self::apply_projection_with_storage(
                     &deduped,
@@ -1176,14 +1333,50 @@ impl ApexExecutor {
                 )?;
                 Self::apply_limit_offset(&projected, stmt.limit, stmt.offset)?
             } else {
-                // Regular DISTINCT: project, deduplicate all columns, then limit
+                // Regular DISTINCT: project and deduplicate BEFORE sorting.
+                // Sorting the full input first is O(N log N) over every row,
+                // while the deduplicated result is usually far smaller; the
+                // ORDER BY semantics are identical because the sort key must be
+                // part of the SELECT list for DISTINCT queries.
+                //
+                // When the read columns are exactly the SELECT list (no WHERE),
+                // deduplicate the dictionary-encoded batch directly — the
+                // decode-to-plain projection then only touches the survivors.
+                let can_dedup_raw = stmt.where_clause.is_none()
+                    && stmt.columns.len() == filtered.num_columns()
+                    && stmt.columns.iter().all(|column| {
+                        matches!(
+                            column,
+                            SelectColumn::Column(_) | SelectColumn::ColumnAlias { .. }
+                        )
+                    });
+                let deduped = if can_dedup_raw {
+                    Self::deduplicate_batch(&filtered)?
+                } else {
+                    let projected = Self::apply_projection_with_storage(
+                        &filtered,
+                        &stmt.columns,
+                        Some(storage_path),
+                    )?;
+                    Self::deduplicate_batch(&projected)?
+                };
+                // ORDER BY must see plain values (dictionary key ids are not
+                // in value order); decoding after dedup touches few rows.
+                let deduped = Self::decode_dict_columns(&deduped);
+                let sorted = if !stmt.order_by.is_empty() {
+                    Self::apply_order_by(&deduped, &stmt.order_by)?
+                } else {
+                    deduped
+                };
+                let limited = Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?;
                 let projected = Self::apply_projection_with_storage(
-                    &sorted,
+                    &limited,
                     &stmt.columns,
                     Some(storage_path),
                 )?;
-                let deduped = Self::deduplicate_batch(&projected)?;
-                Self::apply_limit_offset(&deduped, stmt.limit, stmt.offset)?
+                // The deduplicated input may still carry dictionary-encoded
+                // columns; decode them for the client.
+                Self::decode_dict_columns(&projected)
             }
         } else {
             // Apply ORDER BY with LIMIT optimization (top-k heap sort)
@@ -1202,6 +1395,30 @@ impl ApexExecutor {
         };
 
         Ok(ApexResult::Data(result))
+    }
+
+    /// True when the statement is exactly `SELECT COUNT(*)` / `COUNT(1)` with
+    /// no GROUP BY, HAVING, DISTINCT, ORDER BY, LIMIT or window columns.
+    fn is_simple_count_star(stmt: &SelectStatement) -> bool {
+        use crate::query::AggregateFunc;
+        stmt.group_by.is_empty()
+            && stmt.having.is_none()
+            && !stmt.distinct
+            && stmt.order_by.is_empty()
+            && stmt.limit.is_none()
+            && stmt.offset.is_none()
+            && stmt.columns.len() == 1
+            && matches!(
+                &stmt.columns[0],
+                SelectColumn::Aggregate {
+                    func: AggregateFunc::Count,
+                    column,
+                    distinct: false,
+                    ..
+                } if column
+                    .as_deref()
+                    .map_or(true, |c| c == "*" || c == "1")
+            )
     }
 
     fn extract_outer_row_number_limit(
@@ -2818,6 +3035,14 @@ impl ApexExecutor {
                     alias,
                     ..
                 } => {
+                    // The storage cached path only tracks (sum, count) per group,
+                    // so MIN/MAX cannot be answered here.  Let the Arrow path run.
+                    if matches!(
+                        func,
+                        AggregateFunc::Min | AggregateFunc::Max
+                    ) {
+                        return Ok(None);
+                    }
                     let is_count_star = matches!(func, AggregateFunc::Count) && column.is_none();
                     let col_name = column.as_deref().unwrap_or("*");
                     agg_info.push((col_name, is_count_star, func.clone(), alias.clone()));
@@ -3480,6 +3705,242 @@ impl ApexExecutor {
         Ok(Some(ApexResult::Data(result)))
     }
 
+    /// V4 FAST PATH: COUNT(*) WHERE str_col IN (non-correlated subquery).
+    /// Materializes the small subquery set once, then counts matching rows at
+    /// the storage layer without building the full row mask.
+    fn try_fast_in_subquery_count(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
+        {
+            return Ok(None);
+        }
+        if !Self::is_simple_count_star(stmt) {
+            return Ok(None);
+        }
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let (col, sub_stmt) = match where_clause {
+            SqlExpr::InSubquery {
+                column,
+                stmt,
+                negated: false,
+            } => (column, stmt.as_ref()),
+            _ => return Ok(None),
+        };
+        let col = col
+            .trim_matches('"')
+            .rsplit('.')
+            .next()
+            .unwrap_or(col.trim_matches('"'))
+            .to_string();
+        if !Self::column_is_string(backend, &col) {
+            return Ok(None);
+        }
+
+        // Execute the (non-correlated) subquery once and collect its values.
+        let sub_result = Self::execute_select(sub_stmt.clone(), backend.path())?;
+        let sub_batch = sub_result.to_record_batch()?;
+        if sub_batch.num_columns() == 0 {
+            return Ok(None);
+        }
+        let sub_col = sub_batch.column(0);
+        let mut values: Vec<String> = Vec::with_capacity(sub_batch.num_rows());
+        for i in 0..sub_batch.num_rows() {
+            if sub_col.is_null(i) {
+                continue;
+            }
+            values.push(Self::arrow_value_to_string(sub_col, i));
+        }
+
+        let count = match backend.count_string_in_set_mmap(&col, &values)? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Mirror execute_aggregation's one-row COUNT output shape.
+        let mut fields = Vec::with_capacity(stmt.columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+        for c in &stmt.columns {
+            if let SelectColumn::Aggregate { alias, column, .. } = c {
+                let output = alias.clone().unwrap_or_else(|| {
+                    format!("COUNT({})", column.as_deref().unwrap_or("*"))
+                });
+                fields.push(Field::new(output, ArrowDataType::Int64, false));
+                arrays.push(Arc::new(Int64Array::from(vec![count])) as ArrayRef);
+            }
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// V4 FAST PATH: COUNT(*) WHERE <expr> <op> <literal>, where <expr> is a
+    /// deterministic function of a single dictionary-encoded string column.
+    /// Evaluates the predicate once per distinct dict value (using the warm
+    /// global dict cache), then counts matching rows at the storage layer —
+    /// avoiding both the full Arrow batch and the per-row mask.
+    fn try_fast_dict_scalar_count(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::sql_parser::BinaryOperator;
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
+        {
+            return Ok(None);
+        }
+        if !Self::is_simple_count_star(stmt) {
+            return Ok(None);
+        }
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        // Must be a comparison between an expression and a literal.
+        let expr = match where_clause {
+            SqlExpr::BinaryOp { left, op, right } => {
+                if !matches!(
+                    op,
+                    BinaryOperator::Eq
+                        | BinaryOperator::NotEq
+                        | BinaryOperator::Lt
+                        | BinaryOperator::Le
+                        | BinaryOperator::Gt
+                        | BinaryOperator::Ge
+                ) {
+                    return Ok(None);
+                }
+                match (left.as_ref(), right.as_ref()) {
+                    (e, SqlExpr::Literal(_)) | (SqlExpr::Literal(_), e) => e,
+                    _ => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        if matches!(expr, SqlExpr::Column(_)) {
+            return Ok(None); // column-vs-literal already has a scalar fast path
+        }
+
+        // Collect the single referenced column from the expression.
+        fn collect_columns(expr: &SqlExpr, out: &mut Vec<String>, has_subquery: &mut bool) {
+            match expr {
+                SqlExpr::Column(name) => {
+                    let bare = name
+                        .trim_matches('"')
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(name.trim_matches('"'))
+                        .to_string();
+                    if !out.contains(&bare) {
+                        out.push(bare);
+                    }
+                }
+                SqlExpr::InSubquery { .. }
+                | SqlExpr::ExistsSubquery { .. }
+                | SqlExpr::ScalarSubquery { .. } => *has_subquery = true,
+                SqlExpr::BinaryOp { left, right, .. } => {
+                    collect_columns(left, out, has_subquery);
+                    collect_columns(right, out, has_subquery);
+                }
+                SqlExpr::UnaryOp { expr, .. }
+                | SqlExpr::Paren(expr)
+                | SqlExpr::Cast { expr, .. } => collect_columns(expr, out, has_subquery),
+                SqlExpr::Function { args, .. } => {
+                    for arg in args {
+                        collect_columns(arg, out, has_subquery);
+                    }
+                }
+                SqlExpr::Case {
+                    when_then,
+                    else_expr,
+                } => {
+                    for (cond, value) in when_then {
+                        collect_columns(cond, out, has_subquery);
+                        collect_columns(value, out, has_subquery);
+                    }
+                    if let Some(value) = else_expr {
+                        collect_columns(value, out, has_subquery);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut cols: Vec<String> = Vec::new();
+        let mut has_subquery = false;
+        collect_columns(expr, &mut cols, &mut has_subquery);
+        if has_subquery || cols.len() != 1 {
+            return Ok(None);
+        }
+        let col = cols[0].clone();
+        if !Self::column_is_string(backend, &col) {
+            return Ok(None);
+        }
+
+        // Use the global dict cache (validated against file mtime + table epoch
+        // by `get_*`; it rebuilds transparently if stale). Only low-cardinality
+        // columns are served, and null-containing columns fall back.
+        let Some((dict_arc, has_nulls, _)) =
+            crate::storage::backend::get_global_dict_cache_with_nulls(
+                backend.path(),
+                &col,
+                &backend.storage,
+            )?
+        else {
+            return Ok(None);
+        };
+        if has_nulls {
+            return Ok(None);
+        }
+        let values: Vec<String> = dict_arc.0.iter().cloned().collect();
+        if values.len() > 4096 {
+            return Ok(None);
+        }
+
+        // Evaluate the full predicate on the distinct values.
+        let arr: ArrayRef = Arc::new(StringArray::from(values.clone()));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            &col,
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        let small_batch =
+            RecordBatch::try_new(schema, vec![arr]).map_err(|e| err_data(e.to_string()))?;
+        let mask = Self::evaluate_predicate(&small_batch, where_clause)?;
+        let mut matching: Vec<String> = Vec::with_capacity(values.len());
+        for i in 0..values.len() {
+            if !mask.is_null(i) && mask.value(i) {
+                matching.push(values[i].clone());
+            }
+        }
+
+        let count = match backend.count_string_in_set_mmap(&col, &matching)? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        let mut fields = Vec::with_capacity(stmt.columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+        for c in &stmt.columns {
+            if let SelectColumn::Aggregate { alias, column, .. } = c {
+                let output = alias.clone().unwrap_or_else(|| {
+                    format!("COUNT({})", column.as_deref().unwrap_or("*"))
+                });
+                fields.push(Field::new(output, ArrowDataType::Int64, false));
+                arrays.push(Arc::new(Int64Array::from(vec![count])) as ArrayRef);
+            }
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
     /// V4 FAST PATH: Filtered aggregation with a numeric WHERE predicate.
     /// Handles: SELECT COUNT(*), AVG(col), MAX(col) FROM table WHERE num_col > value
     fn try_fast_filtered_numeric_agg(
@@ -3964,6 +4425,221 @@ impl ApexExecutor {
     }
 
     /// V4 FAST PATH: Cached GROUP BY (builds dict cache on first call, reuses on subsequent calls)
+    fn try_fast_cached_case_count(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
+            || stmt.distinct
+            || stmt.distinct_on.is_some()
+            || stmt.group_by.len() != 1
+            || stmt.having.is_some()
+            || stmt.group_by_exprs.iter().any(Option::is_some)
+            || stmt.order_by.iter().any(|clause| clause.expr.is_some())
+            || stmt.where_clause.is_some()
+        {
+            return Ok(None);
+        }
+        let group_col = stmt.group_by[0].trim_matches('"');
+
+        // Columns: the group column plus one COUNT(CASE WHEN <range> THEN 1 END)
+        // with no ELSE (an ELSE makes every non-null condition row count, which
+        // is the group size and not a range count).
+        let mut case_alias: Option<String> = None;
+        let mut range: Option<(String, f64, f64)> = None;
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(name) if name.trim_matches('"') == group_col => {}
+                SelectColumn::ColumnAlias { column, .. }
+                    if column.trim_matches('"') == group_col => {}
+                SelectColumn::Expression { expr, alias } => {
+                    if range.is_some() {
+                        return Ok(None);
+                    }
+                    let SqlExpr::Function { name, args } = expr else {
+                        return Ok(None);
+                    };
+                    if !name.eq_ignore_ascii_case("COUNT") || args.len() != 1 {
+                        return Ok(None);
+                    }
+                    let Some((cond, count_true)) = Self::count_case_condition(&args[0]) else {
+                        return Ok(None);
+                    };
+                    if !count_true {
+                        return Ok(None);
+                    }
+                    let Some((col, lo, hi)) = Self::extract_any_numeric_range(&cond) else {
+                        return Ok(None);
+                    };
+                    range = Some((col, lo, hi));
+                    case_alias = alias.clone();
+                }
+                _ => return Ok(None),
+            }
+        }
+        let Some((filter_col, lo, hi)) = range else {
+            return Ok(None);
+        };
+        if backend.column_has_nulls(&filter_col) || backend.column_has_nulls(group_col) {
+            return Ok(None);
+        }
+
+        let Some(dict_arc) = crate::storage::backend::get_global_dict_cache(
+            backend.path(),
+            group_col,
+            &backend.storage,
+        )? else {
+            return Ok(None);
+        };
+        let Some(raw) = backend.execute_between_group_agg_cached(
+            &filter_col,
+            lo,
+            hi,
+            &dict_arc.0,
+            &dict_arc.1,
+            None,
+        )? else {
+            return Ok(None);
+        };
+
+        // `raw` only lists groups with a non-zero CASE count, but GROUP BY
+        // must emit every group (with 0 for groups that match no row).
+        let mut count_map: std::collections::HashMap<&str, i64> = raw
+            .iter()
+            .map(|(group, _, count)| (group.as_str(), *count))
+            .collect();
+        let group_name = Self::group_output_name(stmt, group_col);
+        let count_name = case_alias.unwrap_or_else(|| "expr".to_string());
+        let fields = vec![
+            Field::new(&group_name, ArrowDataType::Utf8, false),
+            Field::new(&count_name, ArrowDataType::Int64, false),
+        ];
+        let group_values: Vec<&str> = dict_arc.0.iter().map(|s| s.as_str()).collect();
+        let counts: Vec<i64> = dict_arc
+            .0
+            .iter()
+            .map(|s| count_map.get(s.as_str()).copied().unwrap_or(0))
+            .collect();
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(group_values)),
+            Arc::new(Int64Array::from(counts)),
+        ];
+        let schema = Arc::new(Schema::new(fields));
+        let mut batch = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
+
+        if !stmt.order_by.is_empty() {
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            batch = Self::apply_order_by_topk(&batch, &resolved_ob, k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            batch = Self::apply_limit_offset(&batch, stmt.limit, stmt.offset)?;
+        }
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// V4 FAST PATH: Cached GROUP BY (builds dict cache on first call, reuses on subsequent calls)
+    fn try_fast_order_by_length(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+        storage_path: &Path,
+    ) -> io::Result<Option<ApexResult>> {
+        if stmt.where_clause.is_some()
+            || !stmt.group_by.is_empty()
+            || stmt.distinct
+            || stmt.offset.is_some()
+            || stmt.having.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(limit) = stmt.limit else {
+            return Ok(None);
+        };
+        // Single ORDER BY key: LENGTH(col), optionally followed by one tie column.
+        if stmt.order_by.is_empty() || stmt.order_by.len() > 2 {
+            return Ok(None);
+        }
+        let first = &stmt.order_by[0];
+        let Some(expr) = &first.expr else {
+            return Ok(None);
+        };
+        let SqlExpr::Function { name, args } = expr else {
+            return Ok(None);
+        };
+        if !name.eq_ignore_ascii_case("LENGTH") || args.len() != 1 {
+            return Ok(None);
+        }
+        let SqlExpr::Column(length_col) = &args[0] else {
+            return Ok(None);
+        };
+        let length_col = length_col
+            .trim_matches('"')
+            .rsplit('.')
+            .next()
+            .unwrap_or(length_col.trim_matches('"'))
+            .to_string();
+        let tie_col = if stmt.order_by.len() == 2 {
+            let second = &stmt.order_by[1];
+            if second.expr.is_some() {
+                return Ok(None);
+            }
+            let c = second.column.trim_matches('"');
+            let c = c.rsplit('.').next().unwrap_or(c);
+            Some((c.to_string(), second.descending))
+        } else {
+            None
+        };
+
+        let tie_col_name = tie_col.as_ref().map(|(c, _)| c.as_str());
+        let tie_desc = tie_col.as_ref().map_or(false, |(_, d)| *d);
+        let Some(indices) = backend.scan_top_k_by_length_mmap(
+            &length_col,
+            tie_col_name,
+            limit,
+            first.descending,
+            tie_desc,
+        )? else {
+            return Ok(None);
+        };
+
+        // Read the SELECT columns for the top-k rows only.
+        let select_cols: Option<Vec<String>> = if stmt.is_select_star() {
+            None
+        } else {
+            let mut cols: Vec<String> = Vec::new();
+            for column in &stmt.columns {
+                match column {
+                    SelectColumn::Column(name) | SelectColumn::ColumnAlias { column: name, .. } => {
+                        let plain = name
+                            .trim_matches('"')
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(name.trim_matches('"'))
+                            .to_string();
+                        if !cols.contains(&plain) {
+                            cols.push(plain);
+                        }
+                    }
+                    _ => return Ok(None),
+                }
+            }
+            if cols.is_empty() {
+                return Ok(None);
+            }
+            Some(cols)
+        };
+        let select_refs: Option<Vec<&str>> = select_cols
+            .as_ref()
+            .map(|cols| cols.iter().map(|s| s.as_str()).collect());
+        let batch = backend.read_columns_by_indices_to_arrow(&indices, select_refs.as_deref())?;
+        let projected =
+            Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
+        Ok(Some(ApexResult::Data(projected)))
+    }
+
+    /// V4 FAST PATH: Cached GROUP BY (builds dict cache on first call, reuses on subsequent calls)
     fn try_fast_cached_group_by(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
@@ -4005,6 +4681,14 @@ impl ApexExecutor {
                     alias,
                     ..
                 } => {
+                    // The storage cached path only tracks (sum, count) per group,
+                    // so MIN/MAX cannot be answered here.  Let the Arrow path run.
+                    if matches!(
+                        func,
+                        AggregateFunc::Min | AggregateFunc::Max
+                    ) {
+                        return Ok(None);
+                    }
                     let is_count_star = matches!(func, AggregateFunc::Count) && column.is_none();
                     let col_name = column.as_deref().unwrap_or("*");
                     agg_info.push((col_name, is_count_star, func.clone(), alias.clone()));
@@ -4039,6 +4723,12 @@ impl ApexExecutor {
             None => return Ok(None),
         };
         if group_has_nulls {
+            return Ok(None);
+        }
+        // The cached dictionary must cover the CURRENT active row set.  A
+        // stale entry (e.g. built before a later insert) has fewer group ids
+        // than rows and would silently aggregate only the prefix of the table.
+        if dict_arc.1.len() != backend.active_row_count() as usize {
             return Ok(None);
         }
         let (dict_strings, group_ids) = (dict_arc.0.as_slice(), dict_arc.1.as_slice());
@@ -4203,6 +4893,13 @@ impl ApexExecutor {
             .is_some_and(|max_id| max_id as usize >= dict1_arc.0.len())
             || dict2_max_group_id
                 .is_some_and(|max_id| max_id as usize >= dict2_arc.0.len())
+        {
+            return Ok(None);
+        }
+        // Stale caches (built before a later insert) hold fewer group ids than
+        // active rows and would aggregate only the row prefix.
+        if dict1_arc.1.len() != backend.active_row_count() as usize
+            || dict2_arc.1.len() != backend.active_row_count() as usize
         {
             return Ok(None);
         }
@@ -4464,6 +5161,36 @@ impl ApexExecutor {
         }
     }
 
+    /// Extract a negated BETWEEN: `col NOT BETWEEN low AND high`.
+    fn extract_not_between(expr: &SqlExpr) -> Option<(String, f64, f64)> {
+        match expr {
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated: true,
+            } => {
+                let col = column.trim_matches('"').to_string();
+                let low_val = Self::extract_numeric_value(low).ok()?;
+                let high_val = Self::extract_numeric_value(high).ok()?;
+                Some((col, low_val, high_val))
+            }
+            _ => None,
+        }
+    }
+
+    /// Extract a negated LIKE: `col NOT LIKE 'pattern'`.
+    fn extract_not_like(expr: &SqlExpr) -> Option<(String, String)> {
+        match expr {
+            SqlExpr::Like {
+                column,
+                pattern,
+                negated: true,
+            } => Some((column.trim_matches('"').to_string(), pattern.clone())),
+            _ => None,
+        }
+    }
+
     /// Convert a single-sided numeric comparison to an inclusive range for scan_numeric_range_mmap.
     /// col > N  → (col, next_f64(N), MAX)   exclusive lower bound via next representable f64
     /// col >= N → (col, N, MAX)
@@ -4704,6 +5431,80 @@ impl ApexExecutor {
                 Self::apply_projection_with_storage(&batch, &stmt.columns, Some(storage_path))?;
             return Ok(Some(ApexResult::Data(projected)));
         }
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// Fused storage count for `COUNT(*) WHERE num NOT BETWEEN lo AND hi AND str NOT LIKE pat`.
+    /// Counts both negated predicates in one mmap pass without Arrow materialization.
+    fn try_fast_not_filter_count(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::sql_parser::BinaryOperator;
+        if !backend.is_mmap_only() || backend.has_pending_deltas() || backend.has_delta() {
+            return Ok(None);
+        }
+        if !Self::is_simple_count_star(stmt) {
+            return Ok(None);
+        }
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let w = match where_clause {
+            SqlExpr::Paren(inner) => inner.as_ref(),
+            other => other,
+        };
+        let (left, right) = match w {
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => (left.as_ref(), right.as_ref()),
+            _ => return Ok(None),
+        };
+        // Try both orderings: (NOT BETWEEN, NOT LIKE) and (NOT LIKE, NOT BETWEEN).
+        let left = match left {
+            SqlExpr::Paren(inner) => inner.as_ref(),
+            other => other,
+        };
+        let right = match right {
+            SqlExpr::Paren(inner) => inner.as_ref(),
+            other => other,
+        };
+        let (num_col, lo, hi, str_col, pattern) = match (
+            Self::extract_not_between(left),
+            Self::extract_not_like(right),
+        ) {
+            (Some((nc, l, h)), Some((sc, p))) => (nc, l, h, sc, p),
+            _ => match (
+                Self::extract_not_between(right),
+                Self::extract_not_like(left),
+            ) {
+                (Some((nc, l, h)), Some((sc, p))) => (nc, l, h, sc, p),
+                _ => return Ok(None),
+            },
+        };
+
+        let count = match backend.scan_not_filter_count_mmap(&num_col, lo, hi, &str_col, &pattern)? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Mirror execute_aggregation's one-row COUNT output shape.
+        let mut fields = Vec::with_capacity(stmt.columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+        for col in &stmt.columns {
+            if let SelectColumn::Aggregate { alias, column, .. } = col {
+                let output = alias.clone().unwrap_or_else(|| {
+                    format!("COUNT({})", column.as_deref().unwrap_or("*"))
+                });
+                fields.push(Field::new(output, ArrowDataType::Int64, false));
+                arrays.push(Arc::new(Int64Array::from(vec![count])) as ArrayRef);
+            }
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| err_data(e.to_string()))?;
         Ok(Some(ApexResult::Data(batch)))
     }
 
@@ -5013,7 +5814,11 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         row_indices: &[usize],
     ) -> io::Result<RecordBatch> {
-        let col_refs = Self::get_col_refs(stmt);
+        // Every caller reaches this with the WHERE already applied by a
+        // storage-level scan, so only the post-filter columns (SELECT /
+        // ORDER BY / GROUP BY) are needed — reading the filter columns again
+        // wastes a full-column scatter.
+        let col_refs = Self::post_filter_col_refs(stmt);
         let col_refs_vec: Option<Vec<&str>> = col_refs
             .as_ref()
             .map(|v| v.iter().map(|s| s.as_str()).collect());
@@ -5036,7 +5841,7 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         row_indices: &[usize],
     ) -> io::Result<RecordBatch> {
-        let col_refs = Self::get_col_refs(stmt);
+        let col_refs = Self::post_filter_col_refs(stmt);
         let col_refs_vec: Option<Vec<&str>> = col_refs
             .as_ref()
             .map(|v| v.iter().map(|s| s.as_str()).collect());
@@ -5046,6 +5851,74 @@ impl ApexExecutor {
         }
 
         backend.read_columns_by_indices_to_arrow(row_indices, col_refs_vec.as_deref())
+    }
+
+    /// Columns needed after the storage-level scan has applied the WHERE:
+    /// required columns minus WHERE-only references (WHERE columns that are
+    /// also SELECT/ORDER BY/GROUP BY outputs must still be read).
+    fn post_filter_col_refs(stmt: &SelectStatement) -> Option<Vec<String>> {
+        let required = stmt.required_columns()?;
+        let where_cols = stmt.where_columns();
+        let mut output: Vec<String> = Vec::new();
+        let mut push = |name: &str| {
+            let plain = name
+                .trim_matches('"')
+                .rsplit('.')
+                .next()
+                .unwrap_or(name.trim_matches('"'))
+                .to_string();
+            if !output.contains(&plain) {
+                output.push(plain);
+            }
+        };
+        for col in &stmt.columns {
+            match col {
+                SelectColumn::Column(name) => push(name),
+                SelectColumn::ColumnAlias { column, .. } => push(column),
+                SelectColumn::Aggregate {
+                    column: Some(c), ..
+                } => {
+                    if c != "*"
+                        && !c
+                            .chars()
+                            .next()
+                            .map(|ch| ch.is_ascii_digit())
+                            .unwrap_or(false)
+                    {
+                        push(c);
+                    }
+                }
+                SelectColumn::Expression { expr, .. } => {
+                    for col in Self::expr_referenced_columns(expr) {
+                        push(&col);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for ob in &stmt.order_by {
+            if let Some(ref expr) = ob.expr {
+                for col in Self::expr_referenced_columns(expr) {
+                    push(&col);
+                }
+            } else {
+                push(&ob.column);
+            }
+        }
+        for group in &stmt.group_by {
+            push(group);
+        }
+        let post: Vec<String> = required
+            .into_iter()
+            .filter(|c| {
+                !where_cols.iter().any(|w| w == c) || output.iter().any(|o| o == c)
+            })
+            .collect();
+        if post.is_empty() {
+            None
+        } else {
+            Some(post)
+        }
     }
 
     /// MMAP fast path for IN filter on string column.

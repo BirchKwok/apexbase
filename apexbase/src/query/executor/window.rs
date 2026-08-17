@@ -5,11 +5,34 @@ impl ApexExecutor {
     fn execute_union(union: UnionStatement, base_dir: &Path, default_table_path: &Path) -> io::Result<ApexResult> {
         use crate::query::SetOpType;
 
-        let left_result = Self::execute_parsed_multi(*union.left, base_dir, default_table_path)?;
-        let left_batch = left_result.to_record_batch()?;
+        // ── FAST PATH: DISTINCT INTERSECT/EXCEPT over `SELECT dict_col WHERE
+        // num_col BETWEEN lo AND hi` (both sides on the same table). The sides
+        // are answered directly as small distinct-value sets at the storage
+        // layer, avoiding the full row-set materialization.
+        if let Some(batch) =
+            Self::try_fast_setop_distinct(&union, base_dir, default_table_path)?
+        {
+            let mut result = batch;
+            if !union.order_by.is_empty() {
+                result = Self::apply_order_by(&result, &union.order_by)?;
+            }
+            if union.limit.is_some() || union.offset.is_some() {
+                result = Self::apply_limit_offset(&result, union.limit, union.offset)?;
+            }
+            return Ok(ApexResult::Data(result));
+        }
 
-        let right_result = Self::execute_parsed_multi(*union.right, base_dir, default_table_path)?;
-        let right_batch = right_result.to_record_batch()?;
+        // Keep dictionary-encoded string columns in the side batches: the set
+        // op hashes distinct values once instead of every row, and only the
+        // (small) result is decoded below.
+        let left_batch = crate::query::executor::with_keep_dict_projection(|| {
+            Self::execute_parsed_multi(*union.left, base_dir, default_table_path)?
+                .to_record_batch()
+        })?;
+        let right_batch = crate::query::executor::with_keep_dict_projection(|| {
+            Self::execute_parsed_multi(*union.right, base_dir, default_table_path)?
+                .to_record_batch()
+        })?;
 
         if left_batch.num_columns() != right_batch.num_columns() {
             return Err(io::Error::new(
@@ -33,6 +56,10 @@ impl ApexExecutor {
             }
         };
 
+        // Decode any dictionary columns before ORDER BY (key ids are not in
+        // value order) and before returning to the client.
+        result = Self::decode_dict_columns(&result);
+
         if !union.order_by.is_empty() {
             result = Self::apply_order_by(&result, &union.order_by)?;
         }
@@ -43,17 +70,142 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result))
     }
 
+    /// DISTINCT INTERSECT/EXCEPT fast path: both sides are
+    /// `SELECT <dict_col> FROM <table> WHERE <num_col> BETWEEN lo AND hi`.
+    /// Answers each side as a small distinct-value set via the storage layer and
+    /// computes the set operation directly, returning a plain StringArray batch.
+    fn try_fast_setop_distinct(
+        union: &UnionStatement,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<Option<RecordBatch>> {
+        use crate::query::sql_parser::{FromItem, SelectColumn, SqlExpr, SqlStatement};
+        use crate::query::SetOpType;
+        if union.all || union.set_op == SetOpType::Union {
+            return Ok(None);
+        }
+
+        let extract = |stmt: &SqlStatement| -> Option<(String, String, String, f64, f64)> {
+            let SqlStatement::Select(sel) = stmt else {
+                return None;
+            };
+            if sel.distinct
+                || sel.distinct_on.is_some()
+                || !sel.group_by.is_empty()
+                || !sel.order_by.is_empty()
+                || sel.limit.is_some()
+                || sel.offset.is_some()
+                || !sel.joins.is_empty()
+                || sel.having.is_some()
+                || sel.columns.len() != 1
+            {
+                return None;
+            }
+            let FromItem::Table { table, alias: None } = sel.from.as_ref()? else {
+                return None;
+            };
+            let SelectColumn::Column(dict_col) = &sel.columns[0] else {
+                return None;
+            };
+            let SqlExpr::Between {
+                column: num_col,
+                low,
+                high,
+                negated: false,
+            } = sel.where_clause.as_ref()?
+            else {
+                return None;
+            };
+            let lo = Self::extract_numeric_value(low).ok()?;
+            let hi = Self::extract_numeric_value(high).ok()?;
+            Some((
+                table.clone(),
+                dict_col.trim_matches('"').to_string(),
+                num_col.trim_matches('"').to_string(),
+                lo,
+                hi,
+            ))
+        };
+
+        let (table, dict_col, num_col, lo1, hi1) = match extract(union.left.as_ref()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let (table2, dict_col2, num_col2, lo2, hi2) = match extract(union.right.as_ref()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if table != table2 || dict_col != dict_col2 || num_col != num_col2 {
+            return Ok(None);
+        }
+
+        let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+        let backend = crate::query::executor::get_cached_backend(&table_path)?;
+
+        let left_vals = match backend.scan_distinct_dict_values_in_range(&num_col, lo1, hi1, &dict_col)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let right_vals = match backend.scan_distinct_dict_values_in_range(&num_col, lo2, hi2, &dict_col)? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let right_set: std::collections::HashSet<&str> =
+            right_vals.iter().map(|s| s.as_str()).collect();
+        let mut result_vals: Vec<String> = match union.set_op {
+            SetOpType::Intersect => left_vals
+                .into_iter()
+                .filter(|v| right_set.contains(v.as_str()))
+                .collect(),
+            SetOpType::Except => left_vals
+                .into_iter()
+                .filter(|v| !right_set.contains(v.as_str()))
+                .collect(),
+            SetOpType::Union => return Ok(None),
+        };
+        // `left_vals` is already sorted by the storage scan; a stable filter
+        // preserves that order, so no extra sort is needed for ORDER BY.
+        result_vals.dedup();
+
+        let arr: ArrayRef = Arc::new(arrow::array::StringArray::from(result_vals));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            &dict_col,
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![arr])
+            .map(|b| Some(b))
+            .map_err(|e| err_data(e.to_string()))
+    }
+
     /// INTERSECT: rows in left that also appear in right
     fn intersect_batches(left: &RecordBatch, right: &RecordBatch, all: bool) -> io::Result<RecordBatch> {
-        // Build a hash set of right rows
-        let right_hashes: std::collections::HashSet<u64> = (0..right.num_rows())
-            .map(|i| Self::hash_row(right, i))
-            .collect();
+        use rayon::prelude::*;
+        // Single-column side batches (the common case) skip the per-row downcast:
+        // the row fingerprint is the dictionary key id directly.
+        let right_hashes: std::collections::HashSet<u64> = if right.num_columns() == 1 {
+            Self::single_col_row_hashes(right).into_par_iter().collect()
+        } else {
+            let right_dict_hashes = Self::dict_value_hashes(right);
+            (0..right.num_rows())
+                .into_par_iter()
+                .map(|i| Self::hash_row_dict_aware(right, i, &right_dict_hashes))
+                .collect()
+        };
 
+        let left_hashes: Vec<u64> = if left.num_columns() == 1 {
+            Self::single_col_row_hashes(left)
+        } else {
+            let left_dict_hashes = Self::dict_value_hashes(left);
+            (0..left.num_rows())
+                .into_par_iter()
+                .map(|i| Self::hash_row_dict_aware(left, i, &left_dict_hashes))
+                .collect()
+        };
         let mut keep: Vec<u32> = Vec::new();
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for i in 0..left.num_rows() {
-            let h = Self::hash_row(left, i);
+        for (i, &h) in left_hashes.iter().enumerate() {
             if right_hashes.contains(&h) {
                 if all || seen.insert(h) {
                     keep.push(i as u32);
@@ -65,14 +217,29 @@ impl ApexExecutor {
 
     /// EXCEPT: rows in left that do NOT appear in right
     fn except_batches(left: &RecordBatch, right: &RecordBatch, all: bool) -> io::Result<RecordBatch> {
-        let right_hashes: std::collections::HashSet<u64> = (0..right.num_rows())
-            .map(|i| Self::hash_row(right, i))
-            .collect();
+        use rayon::prelude::*;
+        let right_hashes: std::collections::HashSet<u64> = if right.num_columns() == 1 {
+            Self::single_col_row_hashes(right).into_par_iter().collect()
+        } else {
+            let right_dict_hashes = Self::dict_value_hashes(right);
+            (0..right.num_rows())
+                .into_par_iter()
+                .map(|i| Self::hash_row_dict_aware(right, i, &right_dict_hashes))
+                .collect()
+        };
 
+        let left_hashes: Vec<u64> = if left.num_columns() == 1 {
+            Self::single_col_row_hashes(left)
+        } else {
+            let left_dict_hashes = Self::dict_value_hashes(left);
+            (0..left.num_rows())
+                .into_par_iter()
+                .map(|i| Self::hash_row_dict_aware(left, i, &left_dict_hashes))
+                .collect()
+        };
         let mut keep: Vec<u32> = Vec::new();
         let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for i in 0..left.num_rows() {
-            let h = Self::hash_row(left, i);
+        for (i, &h) in left_hashes.iter().enumerate() {
             if !right_hashes.contains(&h) {
                 if all || seen.insert(h) {
                     keep.push(i as u32);
@@ -80,6 +247,55 @@ impl ApexExecutor {
             }
         }
         Self::take_rows(left, &keep)
+    }
+
+    /// Single-column row fingerprints for set operations. Dictionary columns
+    /// hash the distinct values once (no per-row downcast) and resolve each row
+    /// through its key id; other columns hash the value. Nulls hash to 0.
+    fn single_col_row_hashes(batch: &RecordBatch) -> Vec<u64> {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+        use rayon::prelude::*;
+        use std::hash::Hasher;
+        let col = batch.column(0);
+        if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+            let Some(values) = dict.values().as_any().downcast_ref::<StringArray>() else {
+                return (0..batch.num_rows())
+                    .into_par_iter()
+                    .map(|i| Self::hash_array_value_fast(col, i))
+                    .collect();
+            };
+            let value_hashes: Vec<u64> = (0..values.len())
+                .map(|i| {
+                    if values.is_null(i) {
+                        0u64
+                    } else {
+                        let mut h = AHasher::default();
+                        h.write(values.value(i).as_bytes());
+                        h.finish()
+                    }
+                })
+                .collect();
+            let keys = dict.keys();
+            (0..batch.num_rows())
+                .into_par_iter()
+                .map(|i| {
+                    if keys.is_null(i) {
+                        0u64
+                    } else {
+                        value_hashes
+                            .get(keys.value(i) as usize)
+                            .copied()
+                            .unwrap_or(u64::MAX)
+                    }
+                })
+                .collect()
+        } else {
+            (0..batch.num_rows())
+                .into_par_iter()
+                .map(|i| Self::hash_array_value_fast(col, i))
+                .collect()
+        }
     }
 
     /// Hash all column values in a single row to a u64 fingerprint
@@ -90,6 +306,69 @@ impl ApexExecutor {
             hasher.write_u64(Self::hash_array_value_fast(col, row));
         }
         hasher.finish()
+    }
+
+    /// Row hash that resolves dictionary-encoded string columns through their
+    /// key ids: O(dict) string hashing for the whole set operation instead of
+    /// one hash per row.
+    fn hash_row_dict_aware(batch: &RecordBatch, row: usize, dict_hashes: &[Option<Vec<u64>>]) -> u64 {
+        use std::hash::Hasher;
+        let mut hasher = AHasher::default();
+        for (col_idx, col) in batch.columns().iter().enumerate() {
+            match dict_hashes.get(col_idx) {
+                Some(Some(dict_hash)) => {
+                    // Dictionary-encoded string column: hash the key id, which
+                    // uniquely identifies the value.
+                    use arrow::array::DictionaryArray;
+                    use arrow::datatypes::UInt32Type;
+                    if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+                        if dict.keys().is_null(row) {
+                            hasher.write_u64(0);
+                        } else {
+                            hasher.write_u64(
+                                dict_hash
+                                    .get(dict.keys().value(row) as usize)
+                                    .copied()
+                                    .unwrap_or(u64::MAX),
+                            );
+                        }
+                        continue;
+                    }
+                    hasher.write_u64(Self::hash_array_value_fast(col, row));
+                }
+                _ => hasher.write_u64(Self::hash_array_value_fast(col, row)),
+            }
+        }
+        hasher.finish()
+    }
+
+    /// Pre-compute the per-dict-value hashes for every dictionary-encoded
+    /// column in the batch (None entries for non-dict columns).
+    fn dict_value_hashes(batch: &RecordBatch) -> Vec<Option<Vec<u64>>> {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+        use std::hash::Hasher;
+        batch
+            .columns()
+            .iter()
+            .map(|col| {
+                let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() else {
+                    return None;
+                };
+                let Some(values) = dict.values().as_any().downcast_ref::<StringArray>() else {
+                    return None;
+                };
+                Some(
+                    (0..values.len())
+                        .map(|i| {
+                            let mut h = AHasher::default();
+                            h.write(values.value(i).as_bytes());
+                            h.finish()
+                        })
+                        .collect(),
+                )
+            })
+            .collect()
     }
 
     /// Take rows by index from a RecordBatch
@@ -132,6 +411,7 @@ impl ApexExecutor {
     /// OPTIMIZATION: Fast path for single-column DISTINCT using dictionary indexing
     fn deduplicate_batch(batch: &RecordBatch) -> io::Result<RecordBatch> {
         use ahash::AHashSet;
+        use rayon::prelude::*;
         use std::hash::Hasher;
         use arrow::array::DictionaryArray;
         use arrow::datatypes::UInt32Type;
@@ -243,6 +523,7 @@ impl ApexExecutor {
             Float64(&'a Float64Array),
             String(&'a StringArray, Vec<u64>),  // Pre-computed string hashes
             Bool(&'a BooleanArray),
+            StringDict(&'a DictionaryArray<UInt32Type>),
             Other(&'a ArrayRef),
         }
         
@@ -263,13 +544,21 @@ impl ApexExecutor {
                 ColType::String(arr, hashes)
             } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
                 ColType::Bool(arr)
+            } else if let Some(arr) =
+                col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>()
+            {
+                // Dictionary-encoded string: the key id uniquely identifies
+                // the value, so rows with the same key deduplicate exactly and
+                // no per-row string hashing is needed.
+                ColType::StringDict(arr)
             } else {
                 ColType::Other(col)
             }
         }).collect();
         
-        // Pre-compute all row hashes for parallel deduplication
+        // Pre-compute all row hashes for deduplication (parallel over rows).
         let row_hashes: Vec<u64> = (0..num_rows)
+            .into_par_iter()
             .map(|row_idx| {
                 let mut hasher = ahash::AHasher::default();
                 for typed_col in &typed_cols {
@@ -300,9 +589,42 @@ impl ApexExecutor {
                                 hasher.write_u8(if arr.value(row_idx) { 2 } else { 1 });
                             }
                         }
+                        ColType::StringDict(arr) => {
+                            if arr.keys().is_null(row_idx) {
+                                hasher.write_u8(0);
+                            } else {
+                                hasher.write_u8(1);
+                                hasher.write_u32(arr.keys().value(row_idx));
+                            }
+                        }
                         ColType::Other(arr) => {
-                            hasher.write_u8(if arr.is_null(row_idx) { 0 } else { 1 });
-                            hasher.write_usize(row_idx);
+                            // Dictionary-encoded string column: hash the VALUE
+                            // so distinct rows with the same key deduplicate.
+                            if let Some(dict) = arr
+                                .as_any()
+                                .downcast_ref::<DictionaryArray<UInt32Type>>()
+                            {
+                                if dict.keys().is_null(row_idx) {
+                                    hasher.write_u8(0);
+                                } else {
+                                    if let Some(values) = dict
+                                        .values()
+                                        .as_any()
+                                        .downcast_ref::<StringArray>()
+                                    {
+                                        let key = dict.keys().value(row_idx) as usize;
+                                        if key < values.len() && !values.is_null(key) {
+                                            hasher.write_u8(1);
+                                            hasher.write(values.value(key).as_bytes());
+                                            continue;
+                                        }
+                                    }
+                                    hasher.write_u8(0);
+                                }
+                            } else {
+                                hasher.write_u8(if arr.is_null(row_idx) { 0 } else { 1 });
+                                hasher.write_usize(row_idx);
+                            }
                         }
                     }
                 }
@@ -376,6 +698,19 @@ impl ApexExecutor {
                         key.extend_from_slice(arr.value(row_idx).as_bytes());
                     } else if let Some(arr) = col.as_any().downcast_ref::<BooleanArray>() {
                         key.push(arr.value(row_idx) as u8);
+                    } else if let Some(arr) = col.as_any().downcast_ref::<
+                        arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>,
+                    >() {
+                        if !arr.keys().is_null(row_idx) {
+                            if let Some(values) =
+                                arr.values().as_any().downcast_ref::<StringArray>()
+                            {
+                                let dict_key = arr.keys().value(row_idx) as usize;
+                                if dict_key < values.len() && !values.is_null(dict_key) {
+                                    key.extend_from_slice(values.value(dict_key).as_bytes());
+                                }
+                            }
+                        }
                     } else {
                         // Fallback: use Debug representation
                         key.extend_from_slice(format!("{:?}", col).as_bytes());
@@ -905,8 +1240,20 @@ impl ApexExecutor {
         }
 
         let schema = Arc::new(Schema::new(result_fields));
-        let result = RecordBatch::try_new(schema, result_arrays)
+        let mut result = RecordBatch::try_new(schema, result_arrays)
             .map_err(|e| err_data(e.to_string()))?;
+
+        // Window evaluation must still honour the outer ORDER BY and LIMIT/OFFSET.
+        // Apply them after the window columns are materialized so aliases such as
+        // `ORDER BY rk LIMIT 10` resolve against the projected result.
+        if !stmt.order_by.is_empty() {
+            let resolved_ob = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+            result = Self::apply_order_by_topk(&result, &resolved_ob, k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result = Self::apply_limit_offset(&result, stmt.limit, stmt.offset)?;
+        }
 
         Ok(ApexResult::Data(result))
     }
@@ -931,6 +1278,33 @@ impl ApexExecutor {
             arr.value(a).partial_cmp(&arr.value(b)).unwrap_or(Ordering::Equal)
         } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
             arr.value(a).cmp(arr.value(b))
+        } else if let Some(arr) = array.as_any().downcast_ref::<
+            arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>,
+        >() {
+            // Dictionary-encoded string column: compare the VALUES, not the
+            // key ids, so ORDER BY over dict-encoded inputs stays correct.
+            let get = |idx: usize| -> Option<&str> {
+                if arr.keys().is_null(idx) {
+                    return None;
+                }
+                let key = arr.keys().value(idx) as usize;
+                arr.values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .and_then(|values| {
+                        if key < values.len() && !values.is_null(key) {
+                            Some(values.value(key))
+                        } else {
+                            None
+                        }
+                    })
+            };
+            match (get(a), get(b)) {
+                (Some(a_val), Some(b_val)) => a_val.cmp(b_val),
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Greater,
+                (Some(_), None) => Ordering::Less,
+            }
         } else {
             Ordering::Equal
         }

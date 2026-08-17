@@ -317,14 +317,14 @@ impl OnDemandStorage {
                             let mut sample_unique = ahash::AHashSet::with_capacity(100);
                             let step = if row_count > sample_size { row_count / sample_size } else { 1 };
                             let mut si = 0;
-                            while si < row_count && sample_unique.len() <= 1000 {
+                            while si < row_count && sample_unique.len() < 1000 {
                                 let start = offsets[si] as usize;
                                 let end = offsets[si + 1] as usize;
                                 sample_unique.insert(&data[start..end]);
                                 si += step;
                             }
                             
-                            if sample_unique.len() <= 1000 {
+                            if sample_unique.len() < 1000 {
                                 // Low cardinality → build DictionaryArray<UInt32Type>
                                 use arrow::array::{UInt32Array, DictionaryArray};
                                 use arrow::datatypes::UInt32Type;
@@ -992,8 +992,11 @@ impl OnDemandStorage {
                     }
                     // MMAP path: handles multi-RG, deletes, compressed, unknown encodings,
                     // and applies DeltaMerger overlay for pending cell-level updates.
+                    // Plain LIMIT reads (SELECT * LIMIT n) must NOT dict-encode: the
+                    // result is decoded to plain strings at projection, so the
+                    // dictionary build+decode round-trip only adds work.
                     if let Some(batch) = self.to_arrow_batch_mmap(
-                        column_names, include_id, Some(limit), true,
+                        column_names, include_id, Some(limit), false,
                     )? {
                         return Ok(batch);
                     }

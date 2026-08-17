@@ -189,6 +189,29 @@ class TestOlapOrderBy:
         for row in result:
             assert row["age"] == 22  # min age
 
+    def test_order_by_length_with_tie(self):
+        """ORDER BY LENGTH(col) DESC, <tie> must match the Python reference
+        (ties broken by the numeric column, not by row order)."""
+        tmp = tempfile.mkdtemp()
+        client = ApexClient(os.path.join(tmp, "len_order"))
+        client.create_table("default")
+        n = 20000
+        names = [f"user_{i}" for i in range(n)]
+        ages = [18 + (i * 7) % 63 for i in range(n)]
+        client.store({"name": names, "age": ages})
+        client.flush()
+        try:
+            result = client.execute(
+                "SELECT name FROM default ORDER BY LENGTH(name) DESC, age LIMIT 100"
+            )
+            got = [r["name"] for r in result]
+            expected = sorted(
+                range(n), key=lambda i: (-len(names[i]), ages[i])
+            )[:100]
+            assert got == [names[i] for i in expected]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class TestOlapWhereFilter:
     def test_between(self, olap_client):
@@ -240,6 +263,61 @@ class TestOlapWhereFilter:
             "SELECT COUNT(*) as cnt FROM default WHERE is_manager = false"
         )
         assert result[0]["cnt"] == 4500
+
+
+class TestOlapDictScalarCount:
+    def test_count_function_of_dict_column(self):
+        """COUNT(*) with a scalar function predicate over a dict column is
+        evaluated per distinct value and counted at the storage layer."""
+        tmp = tempfile.mkdtemp()
+        client = ApexClient(os.path.join(tmp, "dict_scalar"))
+        client.create_table("default")
+        n = 20000
+        categories = [
+            ["Electronics", "Clothing", "Food", "Sports", "Books"][i % 5]
+            for i in range(n)
+        ]
+        client.store({"category": categories})
+        client.flush()  # mmap-only so the dict fast path is exercised
+        try:
+            r = client.execute(
+                "SELECT COUNT(*) AS c FROM default "
+                "WHERE COALESCE(NULLIF(category, 'Books'), 'none') = 'Books'"
+            )
+            assert r[0]["c"] == 0  # provably false predicate
+            r = client.execute(
+                "SELECT COUNT(*) AS c FROM default WHERE UPPER(category) = 'BOOKS'"
+            )
+            assert r[0]["c"] == sum(1 for c in categories if c.upper() == "BOOKS")
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+class TestOlapNotFilter:
+    def test_not_between_and_not_like_count(self):
+        """Fused mmap count path: NOT BETWEEN AND NOT LIKE must match the
+        Python reference exactly (nulls absent here)."""
+        tmp = tempfile.mkdtemp()
+        client = ApexClient(os.path.join(tmp, "not_filter"))
+        client.create_table("default")
+        n = 20000
+        names = [f"user_{i}" for i in range(n)]
+        ages = [18 + (i % 63) for i in range(n)]  # 18..80
+        client.store({"name": names, "age": ages})
+        client.flush()  # mmap-only so the fused storage count path is exercised
+        try:
+            result = client.execute(
+                "SELECT COUNT(*) AS c FROM default "
+                "WHERE age NOT BETWEEN 20 AND 40 AND name NOT LIKE 'user_5%'"
+            )
+            expected = sum(
+                1
+                for i in range(n)
+                if not (20 <= ages[i] <= 40) and not names[i].startswith("user_5")
+            )
+            assert result[0]["c"] == expected
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 class TestOlapMultiCondition:

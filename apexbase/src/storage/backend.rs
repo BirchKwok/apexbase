@@ -50,6 +50,12 @@ static GLOBAL_DICT_CACHE_CLOCK: AtomicU64 = AtomicU64::new(1);
 static GLOBAL_COLUMN_NULL_CACHE: once_cell::sync::Lazy<
     RwLock<HashMap<(PathBuf, String), (SystemTime, u64, bool)>>,
 > = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
+// Columns whose sampling showed high cardinality (not worth dictionary
+// building).  Negative-cached by (path, col, mtime, epoch) so the sampling
+// pass does not re-run on every dict-read query.
+static GLOBAL_DICT_HIGH_CARD_CACHE: once_cell::sync::Lazy<
+    RwLock<HashMap<(PathBuf, String), (SystemTime, u64)>>,
+> = once_cell::sync::Lazy::new(|| RwLock::new(HashMap::new()));
 
 fn global_dict_entry_bytes(key: &(PathBuf, String), data: &(Vec<String>, Vec<u16>)) -> usize {
     key.0.as_os_str().len()
@@ -173,8 +179,59 @@ pub fn get_global_dict_cache_with_nulls(
     get_global_dict_cache_entry(path, col_name, storage)
 }
 
-fn get_global_column_has_nulls(path: &Path, col_name: &str, storage: &OnDemandStorage) -> bool {
+/// Return the global dictionary cache only when it already exists.  Building
+/// it here would scan the full column, which is expensive for high-cardinality
+/// strings that are merely read once (e.g. `name LIKE ...` filters).
+pub fn peek_global_dict_cache_with_nulls(
+    path: &Path,
+    col_name: &str,
+    _storage: &OnDemandStorage,
+) -> io::Result<Option<(Arc<(Vec<String>, Vec<u16>)>, bool, Option<u16>)>> {
+    let key = (path.to_path_buf(), col_name.to_string());
+    let cache = GLOBAL_DICT_CACHE.read();
+    Ok(cache.get(&key).map(|entry| {
+        (
+            Arc::clone(&entry.data),
+            entry.has_nulls,
+            entry.max_group_id,
+        )
+    }))
+}
+
+/// Whether a column was previously sampled as high-cardinality (and therefore
+/// not worth dictionary building).  Validated against the file mtime and
+/// table epoch, so a later write invalidates the negative result.
+fn high_cardinality_cached(path: &Path, col_name: &str) -> bool {
     let modified_time = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let epoch = crate::storage::epoch::current(path);
+    let key = (path.to_path_buf(), col_name.to_string());
+    GLOBAL_DICT_HIGH_CARD_CACHE
+        .read()
+        .get(&key)
+        .map_or(false, |(cached_mtime, cached_epoch)| {
+            *cached_epoch == epoch && *cached_mtime >= modified_time
+        })
+}
+
+/// Record a high-cardinality sampling result for a column.
+fn cache_high_cardinality(path: &Path, col_name: &str) {
+    let modified_time = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let epoch = crate::storage::epoch::current(path);
+    let key = (path.to_path_buf(), col_name.to_string());
+    let mut cache = GLOBAL_DICT_HIGH_CARD_CACHE.write();
+    if cache.len() >= GLOBAL_DICT_CACHE_MAX_ENTRIES * 2 && !cache.contains_key(&key) {
+        if let Some(oldest) = cache.keys().next().cloned() {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(key, (modified_time, epoch));
+}
+
+fn get_global_column_has_nulls(path: &Path, col_name: &str, storage: &OnDemandStorage) -> bool {    let modified_time = std::fs::metadata(path)
         .and_then(|metadata| metadata.modified())
         .unwrap_or(SystemTime::UNIX_EPOCH);
     let epoch = crate::storage::epoch::current(path);
@@ -201,6 +258,9 @@ fn get_global_column_has_nulls(path: &Path, col_name: &str, storage: &OnDemandSt
 /// Invalidate global dict cache for a file path
 pub fn invalidate_global_dict_cache(path: &Path) {
     GLOBAL_COLUMN_NULL_CACHE
+        .write()
+        .retain(|(cached_path, _), _| cached_path != path);
+    GLOBAL_DICT_HIGH_CARD_CACHE
         .write()
         .retain(|(cached_path, _), _| cached_path != path);
     let mut cache = GLOBAL_DICT_CACHE.write();
@@ -1809,8 +1869,23 @@ impl TableStorageBackend {
         column_names: Option<&[&str]>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
         if self.has_delta() || self.has_pending_deltas() || self.pending_v4_in_memory_rows() > 0 {
+            // Pending/delta rows must be merged through the general read path;
+            // the cached dictionary describes the persisted file only.
             return self.read_columns_to_arrow(column_names, 0, None);
         }
+        // Fast path: reuse the globally cached per-row string dictionary when
+        // every requested column is a null-free string column.  Building the
+        // DictionaryArray from cached ids is an O(N) index copy instead of
+        // re-hashing every string on each read.
+        {
+            if let Some(batch) = self.read_cached_dict_columns(column_names)? {
+                return Ok(batch);
+            }
+        }
+        // The storage layer already merges pending/delta rows correctly and
+        // dict-encodes low-cardinality strings for both the mmap and in-memory
+        // paths, so do not bail out just because rows are pending.  Only fall
+        // back to plain reads when the dict conversion itself fails.
         if let Ok(batch) = self.storage.to_arrow_batch_dict(
             column_names,
             column_names.map(|c| c.contains(&"_id")).unwrap_or(true),
@@ -1821,6 +1896,223 @@ impl TableStorageBackend {
         }
         // Fallback to normal path
         self.read_columns_to_arrow(column_names, 0, None)
+    }
+
+    /// Build a dictionary-encoded batch from the global string dictionary
+    /// cache, falling back to a plain per-column read for non-cached columns
+    /// so mixed string/numeric column lists stay fast.  Low-cardinality string
+    /// columns missing from the cache are sampled first and then built (the
+    /// build is amortised across queries); high-cardinality strings are read
+    /// plainly and never trigger a full-column scan.
+    fn read_cached_dict_columns(
+        &self,
+        column_names: Option<&[&str]>,
+    ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray, UInt32Array};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, UInt32Type};
+        use std::sync::Arc;
+
+        let Some(names) = column_names else {
+            return Ok(None);
+        };
+        if names.is_empty() {
+            return Ok(None);
+        }
+        let active_rows = self.active_row_count() as usize;
+
+        fn cached_dict_usable(
+            dict: &(std::sync::Arc<(Vec<String>, Vec<u16>)>, bool, Option<u16>),
+            active_rows: usize,
+        ) -> bool {
+            let (dict_strings, group_ids) = dict.0.as_ref();
+            !dict.1
+                && dict
+                    .2
+                    .map_or(false, |max| (max as usize) < dict_strings.len())
+                && group_ids.len() == active_rows
+                && dict_strings.len() <= 4096
+        }
+
+        // Pass 1: determine whether any column can be served from a dictionary
+        // (cached, or buildable because it is a low-cardinality string).
+        let mut any_dictable = false;
+        let mut buildable: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for name in names {
+            if *name == "_id" {
+                continue;
+            }
+            if let Some((dict, has_nulls, max_id)) =
+                crate::storage::backend::peek_global_dict_cache_with_nulls(
+                    self.path(),
+                    name,
+                    &self.storage,
+                )?
+            {
+                if cached_dict_usable(&(dict, has_nulls, max_id), active_rows) {
+                    any_dictable = true;
+                    continue;
+                }
+            } else if matches!(
+                self.get_column_type(name),
+                Some(crate::data::DataType::String)
+            ) {
+                // Skip the sampling pass when a prior query already found this
+                // column high-cardinality (the negative result is validated
+                // against the file mtime and table epoch).
+                if crate::storage::backend::high_cardinality_cached(self.path(), name) {
+                    continue;
+                }
+                // Sample the first 1024 rows; low cardinality means building
+                // the global dictionary is worthwhile (and cheap to reuse).
+                // The limited read may already return a dictionary-encoded
+                // array (mmap dict path), so count distinct values on either
+                // representation.
+                if let Ok(sample) = self.read_columns_to_arrow(Some(&[*name]), 0, Some(1024)) {
+                    let mut distinct: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    if sample.num_columns() > 0 {
+                        let arr = sample.column(0);
+                        use arrow::array::DictionaryArray;
+                        use arrow::datatypes::UInt32Type;
+                        if let Some(dict_arr) =
+                            arr.as_any().downcast_ref::<DictionaryArray<UInt32Type>>()
+                        {
+                            if let Some(str_values) = dict_arr
+                                .values()
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                            {
+                                for i in 0..str_values.len() {
+                                    if !str_values.is_null(i) {
+                                        distinct.insert(str_values.value(i).to_string());
+                                    }
+                                }
+                            }
+                        } else if let Some(arr) = arr.as_any().downcast_ref::<StringArray>() {
+                            for i in 0..sample.num_rows() {
+                                if !arr.is_null(i) {
+                                    distinct.insert(arr.value(i).to_string());
+                                }
+                            }
+                        }
+                    }
+                    if !distinct.is_empty() && distinct.len() < 1000 {
+                        any_dictable = true;
+                        buildable.insert(name.to_string());
+                    } else if !distinct.is_empty() {
+                        // High cardinality: remember so the next dict-read
+                        // query skips this sampling scan.
+                        crate::storage::backend::cache_high_cardinality(self.path(), name);
+                    }
+                }
+            }
+        }
+        if !any_dictable {
+            return Ok(None);
+        }
+
+        // Pass 2: assemble per-column (cached dictionary, buildable
+        // low-cardinality dictionary, or plain read).
+        let mut fields: Vec<Field> = Vec::with_capacity(names.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(names.len());
+        for name in names {
+            if *name == "_id" {
+                let batch = self.read_columns_to_arrow(Some(&[*name]), 0, None)?;
+                if batch.num_columns() == 0 {
+                    return Ok(None);
+                }
+                fields.push(batch.schema().field(0).as_ref().clone());
+                arrays.push(batch.column(0).clone());
+                continue;
+            }
+            // Reuse the cache when present; otherwise build it for string
+            // columns that pass 1 identified as low cardinality.
+            let entry = match crate::storage::backend::peek_global_dict_cache_with_nulls(
+                self.path(),
+                name,
+                &self.storage,
+            )? {
+                Some(entry) => Some(entry),
+                None if buildable.contains(*name) => {
+                    crate::storage::backend::get_global_dict_cache_with_nulls(
+                        self.path(),
+                        name,
+                        &self.storage,
+                    )?
+                }
+                None => None,
+            };
+            let Some((dict, has_nulls, max_id)) = entry else {
+                let batch = self.read_columns_to_arrow(Some(&[*name]), 0, None)?;
+                if batch.num_columns() == 0 {
+                    return Ok(None);
+                }
+                fields.push(batch.schema().field(0).as_ref().clone());
+                arrays.push(batch.column(0).clone());
+                continue;
+            };
+            if has_nulls {
+                let batch = self.read_columns_to_arrow(Some(&[*name]), 0, None)?;
+                if batch.num_columns() == 0 {
+                    return Ok(None);
+                }
+                fields.push(batch.schema().field(0).as_ref().clone());
+                arrays.push(batch.column(0).clone());
+                continue;
+            }
+            let (dict_strings, group_ids) = dict.as_ref();
+            let Some(max) = max_id else {
+                let batch = self.read_columns_to_arrow(Some(&[*name]), 0, None)?;
+                if batch.num_columns() == 0 {
+                    return Ok(None);
+                }
+                fields.push(batch.schema().field(0).as_ref().clone());
+                arrays.push(batch.column(0).clone());
+                continue;
+            };
+            if max as usize >= dict_strings.len() || group_ids.len() != active_rows {
+                let batch = self.read_columns_to_arrow(Some(&[*name]), 0, None)?;
+                if batch.num_columns() == 0 {
+                    return Ok(None);
+                }
+                fields.push(batch.schema().field(0).as_ref().clone());
+                arrays.push(batch.column(0).clone());
+                continue;
+            }
+            // Low-cardinality only: a cached dictionary with tens of thousands
+            // of distinct values is not worth gathering per row.
+            if dict_strings.len() > 4096 {
+                let batch = self.read_columns_to_arrow(Some(&[*name]), 0, None)?;
+                if batch.num_columns() == 0 {
+                    return Ok(None);
+                }
+                fields.push(batch.schema().field(0).as_ref().clone());
+                arrays.push(batch.column(0).clone());
+                continue;
+            }
+            let keys = UInt32Array::from(
+                group_ids
+                    .iter()
+                    .map(|&id| id as u32)
+                    .collect::<Vec<_>>(),
+            );
+            let values =
+                StringArray::from_iter_values(dict_strings.iter().map(|s| s.as_str()));
+            let dict_array = DictionaryArray::<UInt32Type>::try_new(keys, Arc::new(values))
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let array: ArrayRef = Arc::new(dict_array);
+            fields.push(Field::new(
+                *name,
+                array.data_type().clone(),
+                false,
+            ));
+            arrays.push(array);
+        }
+        Ok(Some(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+        ))
     }
 
     /// Fast path for FTS backfill on persisted V4 tables.
@@ -2478,6 +2770,71 @@ impl TableStorageBackend {
 
     /// Read columns for specific row indices to Arrow (for late materialization)
     /// Only reads the specified rows from disk, reducing I/O for filtered queries
+    /// Indexed read over the cached global string dictionaries: every
+    /// requested non-`_id` column must have a usable cached dictionary, and
+    /// the result is a dictionary-encoded batch.  Returns None when any
+    /// column is not covered (caller falls back to the plain extraction).
+    fn try_dict_indexed_read(
+        &self,
+        row_indices: &[usize],
+        col_refs: Option<&[&str]>,
+    ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        use arrow::array::{Array, ArrayRef, DictionaryArray, Int64Array, StringArray, UInt32Array};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, UInt32Type};
+        use std::sync::Arc;
+
+        let Some(refs) = col_refs else {
+            return Ok(None);
+        };
+        if refs.is_empty() {
+            return Ok(None);
+        }
+        let active_rows = self.active_row_count() as usize;
+        let mut fields: Vec<Field> = Vec::with_capacity(refs.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(refs.len());
+        for name in refs {
+            let plain = name.rsplit('.').next().unwrap_or(name);
+            if plain == "_id" {
+                let id_values: Vec<i64> = row_indices.iter().map(|&i| i as i64).collect();
+                fields.push(Field::new("_id", ArrowDataType::Int64, false));
+                arrays.push(Arc::new(Int64Array::from(id_values)) as ArrayRef);
+                continue;
+            }
+            let Some((dict, has_nulls, max_id)) =
+                crate::storage::backend::peek_global_dict_cache_with_nulls(
+                    self.path(),
+                    plain,
+                    &self.storage,
+                )?
+            else {
+                return Ok(None);
+            };
+            if has_nulls
+                || max_id.map_or(true, |max| max as usize >= dict.0.len())
+                || dict.1.len() != active_rows
+                || dict.0.len() > 4096
+            {
+                return Ok(None);
+            }
+            let keys: Vec<u32> = row_indices
+                .iter()
+                .map(|&i| dict.1[i] as u32)
+                .collect();
+            let values =
+                StringArray::from_iter_values(dict.0.iter().map(|s| s.as_str()));
+            let dict_array = DictionaryArray::<UInt32Type>::try_new(
+                UInt32Array::from(keys),
+                Arc::new(values),
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            fields.push(Field::new(plain, dict_array.data_type().clone(), false));
+            arrays.push(Arc::new(dict_array) as ArrayRef);        }
+        Ok(Some(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+        ))
+    }
+
     pub fn read_columns_by_indices_to_arrow(
         &self,
         row_indices: &[usize],
@@ -2493,6 +2850,13 @@ impl TableStorageBackend {
 
         // V4: use mmap indexed extraction when available (faster than full-table read + take)
         if self.storage.is_v4_format() {
+            // Low-cardinality string columns: take the cached dictionary key
+            // ids (u16 → u32 per selected row) instead of decoding every
+            // string; the DictionaryArray is decoded downstream only when a
+            // plain result is actually needed.
+            if let Some(batch) = self.try_dict_indexed_read(row_indices, col_refs)? {
+                return self.apply_delta_overlay_to_batch(batch);
+            }
             if let Some(batch) = self
                 .storage
                 .extract_rows_by_indices_to_arrow(row_indices, col_refs)?
@@ -3949,6 +4313,28 @@ impl TableStorageBackend {
         self.storage.scan_string_in_mmap(col_name, values, limit)
     }
 
+    /// Mmap-level string IN count: count matching rows without materializing
+    /// indices or an Arrow batch.
+    pub fn count_string_in_set_mmap(
+        &self,
+        col_name: &str,
+        values: &[String],
+    ) -> io::Result<Option<i64>> {
+        self.storage.count_string_in_set_mmap(col_name, values)
+    }
+
+    /// Distinct dictionary values of `dict_col` where `num_col` is in [lo, hi].
+    pub fn scan_distinct_dict_values_in_range(
+        &self,
+        num_col: &str,
+        lo: f64,
+        hi: f64,
+        dict_col: &str,
+    ) -> io::Result<Option<Vec<String>>> {
+        self.storage
+            .scan_distinct_dict_values_in_range(num_col, lo, hi, dict_col)
+    }
+
     /// Mmap-level LIKE pattern scan: find matching row indices without Arrow arrays.
     pub fn scan_like_filter_mmap(
         &self,
@@ -3957,6 +4343,20 @@ impl TableStorageBackend {
         limit: Option<usize>,
     ) -> io::Result<Option<Vec<usize>>> {
         self.storage.scan_like_filter_mmap(col_name, pattern, limit)
+    }
+
+    /// Fused mmap count for `num_col NOT BETWEEN lo AND hi AND str_col NOT LIKE pattern`.
+    /// Returns `Some(count)` on the fast path, `None` when ineligible for fallback.
+    pub fn scan_not_filter_count_mmap(
+        &self,
+        num_col: &str,
+        lo: f64,
+        hi: f64,
+        str_col: &str,
+        pattern: &str,
+    ) -> io::Result<Option<i64>> {
+        self.storage
+            .scan_not_filter_count_mmap(num_col, lo, hi, str_col, pattern)
     }
 
     /// Single-pass parallel LIKE scan + row extraction: no separate scan/extract passes.
@@ -4075,6 +4475,19 @@ impl TableStorageBackend {
     ) -> io::Result<Option<Vec<(usize, f64)>>> {
         self.storage
             .scan_top_k_indices_mmap(col_name, k, descending)
+    }
+
+    /// Top-K row indices by `LENGTH(str_col)` with a numeric tie-break column.
+    pub fn scan_top_k_by_length_mmap(
+        &self,
+        str_col: &str,
+        tie_col: Option<&str>,
+        k: usize,
+        length_desc: bool,
+        tie_desc: bool,
+    ) -> io::Result<Option<Vec<usize>>> {
+        self.storage
+            .scan_top_k_by_length_mmap(str_col, tie_col, k, length_desc, tie_desc)
     }
 
     /// Decode persisted rows for a projection through the mmap fast path.

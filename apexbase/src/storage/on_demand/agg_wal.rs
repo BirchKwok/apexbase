@@ -3084,6 +3084,11 @@ impl OnDemandStorage {
                 let gid = match dict_map.get(key) {
                     Some(&id) => id,
                     None => {
+                        if dict_map.len() >= 4096 {
+                            // High-cardinality column: a dictionary is not
+                            // worth building; let the caller use plain reads.
+                            return Ok(None);
+                        }
                         let id = dict_strings.len() as u16;
                         dict_map.insert(key, id);
                         dict_strings.push(std::str::from_utf8(key).unwrap_or("").to_string());
@@ -3148,6 +3153,9 @@ impl OnDemandStorage {
                     let gid = match dict_map.get(key) {
                         Some(&id) => id,
                         None => {
+                            if dict_map.len() >= 4096 {
+                                return Ok(None);
+                            }
                             let id = dict_strings.len() as u16;
                             dict_map.insert(key, id);
                             dict_strings.push(std::str::from_utf8(key).unwrap_or("").to_string());
@@ -4404,8 +4412,12 @@ impl OnDemandStorage {
         if filter_idx >= columns.len() { return Ok(None); }
         
         let has_deleted = deleted.iter().any(|&b| b != 0);
-        let lo_i64 = lo as i64;
-        let hi_i64 = hi as i64;
+        // `lo`/`hi` carry strict-inequality epsilon bounds (next/prev f64) for
+        // `>` / `<`; ceil/floor map those to the exact inclusive integer
+        // range (age > 40 -> [41, MAX]), which a plain truncation would get
+        // wrong (40.000000000000007 as i64 == 40).
+        let lo_i64 = lo.ceil() as i64;
+        let hi_i64 = hi.floor() as i64;
         let scan_rows = total_rows.min(group_ids.len());
         let num_groups = dict_strings.len();
         
@@ -4548,8 +4560,8 @@ impl OnDemandStorage {
         let num_groups = dict_strings.len();
         let mut group_sums = vec![0.0f64; num_groups];
         let mut group_counts = vec![0i64; num_groups];
-        let lo_i64 = lo as i64;
-        let hi_i64 = hi as i64;
+        let lo_i64 = lo.ceil() as i64;
+        let hi_i64 = hi.floor() as i64;
 
         if all_rcix {
             // STREAMING: process per-RG without materializing full columns
@@ -5019,8 +5031,8 @@ impl OnDemandStorage {
         }
         
         let has_deleted = deleted.iter().any(|&b| b != 0);
-        let lo_i64 = lo as i64;
-        let hi_i64 = hi as i64;
+        let lo_i64 = lo.ceil() as i64;
+        let hi_i64 = hi.floor() as i64;
         
         let (group_offsets, group_bytes) = match &columns[group_idx] {
             ColumnData::String { offsets, data } => (offsets, data),

@@ -99,6 +99,13 @@ CITIES = ["Beijing", "Shanghai", "Guangzhou", "Shenzhen", "Hangzhou",
           "Nanjing", "Chengdu", "Wuhan", "Xian", "Qingdao"]
 CATEGORIES = ["Electronics", "Clothing", "Food", "Sports", "Books",
               "Home", "Auto", "Health", "Travel", "Gaming"]
+META_CITY_POP = [
+    ("Beijing", 21_540_000), ("Shanghai", 24_870_000),
+    ("Guangzhou", 18_680_000), ("Shenzhen", 17_680_000),
+    ("Hangzhou", 10_360_000), ("Nanjing", 9_490_000),
+    ("Chengdu", 20_940_000), ("Wuhan", 13_690_000),
+    ("Xian", 13_150_000), ("Qingdao", 9_480_000),
+]
 TXN_BACKLOG_ROWS = 1500
 TXN_BACKLOG_MISSING_NAME = "__txn_backlog_missing__"
 MICROBENCH_TARGET_SAMPLE_NS = 2_000_000
@@ -586,6 +593,8 @@ class SQLiteBench:
                 category TEXT
             )
         """)
+        self.conn.execute("CREATE TABLE meta (city TEXT, pop INTEGER)")
+        self.conn.executemany("INSERT INTO meta VALUES (?,?)", META_CITY_POP)
         self._txn_counter = 0
         self._txn_backlog_ready = False
 
@@ -1129,6 +1138,157 @@ class SQLiteBench:
             "FROM bench LIMIT 1000"
         )
 
+    # --- Advanced SQL: joins, set operations, subqueries, expressions ---
+
+    def bench_join_group_order_limit(self):
+        return self._query_all(
+            "SELECT b.city, COUNT(*) AS c FROM bench b JOIN meta m ON b.city = m.city "
+            "GROUP BY b.city ORDER BY c DESC LIMIT 5"
+        )
+
+    def bench_left_join_count(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b LEFT JOIN meta m ON b.city = m.city"
+        )
+
+    def bench_left_join_extra_on(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b LEFT JOIN meta m "
+            "ON b.city = m.city AND m.pop > 15000000"
+        )
+
+    def bench_full_outer_join_bounded(self):
+        return self._query_all(
+            "SELECT b.city, m.pop FROM bench b FULL OUTER JOIN meta m ON b.city = m.city "
+            "WHERE b.age < 25 LIMIT 1000"
+        )
+
+    def bench_comma_cross_join(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b CROSS JOIN meta m "
+            "WHERE b.age < 20 AND m.pop > 0"
+        )
+
+    def bench_union_all(self):
+        return self._query_all(
+            "SELECT city FROM bench WHERE age = 25 "
+            "UNION ALL SELECT city FROM bench WHERE age = 26 ORDER BY city LIMIT 100"
+        )
+
+    def bench_union_distinct(self):
+        return self._query_all(
+            "SELECT city FROM bench WHERE age = 25 "
+            "UNION SELECT city FROM bench WHERE age = 26 ORDER BY city"
+        )
+
+    def bench_intersect(self):
+        return self._query_all(
+            "SELECT city FROM bench WHERE age BETWEEN 20 AND 30 "
+            "INTERSECT SELECT city FROM bench WHERE age BETWEEN 25 AND 35 ORDER BY city"
+        )
+
+    def bench_except(self):
+        return self._query_all(
+            "SELECT city FROM bench WHERE age BETWEEN 20 AND 30 "
+            "EXCEPT SELECT city FROM bench WHERE age BETWEEN 25 AND 35 ORDER BY city"
+        )
+
+    def bench_in_subquery(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench "
+            "WHERE city IN (SELECT city FROM meta WHERE pop > 15000000)"
+        )
+
+    def bench_exists_subquery(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b WHERE EXISTS "
+            "(SELECT 1 FROM meta m WHERE m.city = b.city AND m.pop > 15000000)"
+        )
+
+    def bench_derived_table(self):
+        return self._query_all(
+            "SELECT city, cnt FROM "
+            "(SELECT city, COUNT(*) AS cnt FROM bench GROUP BY city) d "
+            "ORDER BY cnt DESC LIMIT 5"
+        )
+
+    def bench_cte(self):
+        return self._query_all(
+            "WITH c AS (SELECT city, AVG(score) AS av FROM bench GROUP BY city) "
+            "SELECT city FROM c WHERE av > 50 ORDER BY av DESC LIMIT 5"
+        )
+
+    def bench_case_aggregate(self):
+        return self._query_all(
+            "SELECT city, COUNT(CASE WHEN age > 40 THEN 1 END) AS c "
+            "FROM bench GROUP BY city ORDER BY city"
+        )
+
+    def bench_string_functions(self):
+        return self._query_all(
+            "SELECT UPPER(city) AS u, LENGTH(name) AS ln, SUBSTR(name, 1, 5) AS sub, "
+            "CONCAT(city, '-', category) AS cc, TRIM(category) AS tr "
+            "FROM bench WHERE age BETWEEN 30 AND 40 LIMIT 1000"
+        )
+
+    def bench_numeric_functions(self):
+        return self._query_all(
+            "SELECT ROUND(score, 0) AS r, ABS(age - 40) AS a, FLOOR(score) AS f, "
+            "CEIL(score) AS c, MOD(age, 7) AS m "
+            "FROM bench WHERE age BETWEEN 30 AND 40 LIMIT 1000"
+        )
+
+    def bench_coalesce_nullif(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench "
+            "WHERE COALESCE(NULLIF(category, 'Books'), 'none') = 'Books'"
+        )
+
+    def bench_not_filter(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench "
+            "WHERE age NOT BETWEEN 20 AND 40 AND name NOT LIKE 'user_5%'"
+        )
+
+    def bench_deep_offset(self):
+        return self._query_all(
+            "SELECT name, age FROM bench ORDER BY age, name LIMIT 100 OFFSET 100000"
+        )
+
+    def bench_order_by_expression(self):
+        return self._query_all(
+            "SELECT name FROM bench ORDER BY LENGTH(name) DESC, age LIMIT 100"
+        )
+
+    def bench_window_sum_over(self):
+        return self._query_all(
+            "SELECT city, score, SUM(score) OVER (PARTITION BY city ORDER BY age) AS run "
+            "FROM bench LIMIT 1000"
+        )
+
+    def bench_window_rank(self):
+        return self._query_all(
+            "SELECT city, RANK() OVER (PARTITION BY city ORDER BY score DESC) AS rk "
+            "FROM bench LIMIT 1000"
+        )
+
+    def bench_window_lag(self):
+        return self._query_all(
+            "SELECT city, LAG(score) OVER (PARTITION BY city ORDER BY age) AS prev "
+            "FROM bench LIMIT 1000"
+        )
+
+    def bench_distinct_rows(self):
+        return self._query_all(
+            "SELECT DISTINCT city, category FROM bench ORDER BY city, category"
+        )
+
+    def bench_multi_col_group_having(self):
+        return self._query_all(
+            "SELECT city, category, COUNT(*) AS c FROM bench "
+            "GROUP BY city, category HAVING c > 2000 ORDER BY city, category LIMIT 20"
+        )
+
     def bench_fts_build(self):
         try:
             self.conn.execute("DROP TABLE IF EXISTS bench_fts")
@@ -1209,6 +1369,8 @@ class DuckDBBench:
                 category VARCHAR
             )
         """)
+        self.conn.execute("CREATE TABLE meta (city VARCHAR, pop INTEGER)")
+        self.conn.executemany("INSERT INTO meta VALUES (?,?)", META_CITY_POP)
         self._txn_counter = 0
         self._txn_backlog_ready = False
         self._temp_csv_name = None
@@ -1725,6 +1887,157 @@ class DuckDBBench:
             "FROM bench LIMIT 1000"
         )
 
+    # --- Advanced SQL: joins, set operations, subqueries, expressions ---
+
+    def bench_join_group_order_limit(self):
+        return self._query_all(
+            "SELECT b.city, COUNT(*) AS c FROM bench b JOIN meta m ON b.city = m.city "
+            "GROUP BY b.city ORDER BY c DESC LIMIT 5"
+        )
+
+    def bench_left_join_count(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b LEFT JOIN meta m ON b.city = m.city"
+        )
+
+    def bench_left_join_extra_on(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b LEFT JOIN meta m "
+            "ON b.city = m.city AND m.pop > 15000000"
+        )
+
+    def bench_full_outer_join_bounded(self):
+        return self._query_all(
+            "SELECT b.city, m.pop FROM bench b FULL OUTER JOIN meta m ON b.city = m.city "
+            "WHERE b.age < 25 LIMIT 1000"
+        )
+
+    def bench_comma_cross_join(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b CROSS JOIN meta m "
+            "WHERE b.age < 20 AND m.pop > 0"
+        )
+
+    def bench_union_all(self):
+        return self._query_all(
+            "SELECT city FROM bench WHERE age = 25 "
+            "UNION ALL SELECT city FROM bench WHERE age = 26 ORDER BY city LIMIT 100"
+        )
+
+    def bench_union_distinct(self):
+        return self._query_all(
+            "SELECT city FROM bench WHERE age = 25 "
+            "UNION SELECT city FROM bench WHERE age = 26 ORDER BY city"
+        )
+
+    def bench_intersect(self):
+        return self._query_all(
+            "SELECT city FROM bench WHERE age BETWEEN 20 AND 30 "
+            "INTERSECT SELECT city FROM bench WHERE age BETWEEN 25 AND 35 ORDER BY city"
+        )
+
+    def bench_except(self):
+        return self._query_all(
+            "SELECT city FROM bench WHERE age BETWEEN 20 AND 30 "
+            "EXCEPT SELECT city FROM bench WHERE age BETWEEN 25 AND 35 ORDER BY city"
+        )
+
+    def bench_in_subquery(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench "
+            "WHERE city IN (SELECT city FROM meta WHERE pop > 15000000)"
+        )
+
+    def bench_exists_subquery(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b WHERE EXISTS "
+            "(SELECT 1 FROM meta m WHERE m.city = b.city AND m.pop > 15000000)"
+        )
+
+    def bench_derived_table(self):
+        return self._query_all(
+            "SELECT city, cnt FROM "
+            "(SELECT city, COUNT(*) AS cnt FROM bench GROUP BY city) d "
+            "ORDER BY cnt DESC LIMIT 5"
+        )
+
+    def bench_cte(self):
+        return self._query_all(
+            "WITH c AS (SELECT city, AVG(score) AS av FROM bench GROUP BY city) "
+            "SELECT city FROM c WHERE av > 50 ORDER BY av DESC LIMIT 5"
+        )
+
+    def bench_case_aggregate(self):
+        return self._query_all(
+            "SELECT city, COUNT(CASE WHEN age > 40 THEN 1 END) AS c "
+            "FROM bench GROUP BY city ORDER BY city"
+        )
+
+    def bench_string_functions(self):
+        return self._query_all(
+            "SELECT UPPER(city) AS u, LENGTH(name) AS ln, SUBSTR(name, 1, 5) AS sub, "
+            "CONCAT(city, '-', category) AS cc, TRIM(category) AS tr "
+            "FROM bench WHERE age BETWEEN 30 AND 40 LIMIT 1000"
+        )
+
+    def bench_numeric_functions(self):
+        return self._query_all(
+            "SELECT ROUND(score, 0) AS r, ABS(age - 40) AS a, FLOOR(score) AS f, "
+            "CEIL(score) AS c, MOD(age, 7) AS m "
+            "FROM bench WHERE age BETWEEN 30 AND 40 LIMIT 1000"
+        )
+
+    def bench_coalesce_nullif(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench "
+            "WHERE COALESCE(NULLIF(category, 'Books'), 'none') = 'Books'"
+        )
+
+    def bench_not_filter(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench "
+            "WHERE age NOT BETWEEN 20 AND 40 AND name NOT LIKE 'user_5%'"
+        )
+
+    def bench_deep_offset(self):
+        return self._query_all(
+            "SELECT name, age FROM bench ORDER BY age, name LIMIT 100 OFFSET 100000"
+        )
+
+    def bench_order_by_expression(self):
+        return self._query_all(
+            "SELECT name FROM bench ORDER BY LENGTH(name) DESC, age LIMIT 100"
+        )
+
+    def bench_window_sum_over(self):
+        return self._query_all(
+            "SELECT city, score, SUM(score) OVER (PARTITION BY city ORDER BY age) AS run "
+            "FROM bench LIMIT 1000"
+        )
+
+    def bench_window_rank(self):
+        return self._query_all(
+            "SELECT city, RANK() OVER (PARTITION BY city ORDER BY score DESC) AS rk "
+            "FROM bench LIMIT 1000"
+        )
+
+    def bench_window_lag(self):
+        return self._query_all(
+            "SELECT city, LAG(score) OVER (PARTITION BY city ORDER BY age) AS prev "
+            "FROM bench LIMIT 1000"
+        )
+
+    def bench_distinct_rows(self):
+        return self._query_all(
+            "SELECT DISTINCT city, category FROM bench ORDER BY city, category"
+        )
+
+    def bench_multi_col_group_having(self):
+        return self._query_all(
+            "SELECT city, category, COUNT(*) AS c FROM bench "
+            "GROUP BY city, category HAVING c > 2000 ORDER BY city, category LIMIT 20"
+        )
+
     def bench_fts_build(self):
         try:
             self.conn.execute("INSTALL fts")
@@ -1842,6 +2155,14 @@ class ApexBaseBench:
             shutil.rmtree(self.db_dir)
         self.client = ApexClient(self.db_dir, drop_if_exists=True)
         self.client.create_table('default')
+        self.client.create_table('meta')
+        self.client.use_table('meta')
+        self.client.store({
+            "city": [row[0] for row in META_CITY_POP],
+            "pop": [row[1] for row in META_CITY_POP],
+        })
+        self.client.flush()
+        self.client.use_table('default')
         self._next_id = 1
         self._txn_counter = 0
         self._txn_backlog_ready = False
@@ -2456,6 +2777,157 @@ class ApexBaseBench:
             "FROM default LIMIT 1000"
         )
 
+    # --- Advanced SQL: joins, set operations, subqueries, expressions ---
+
+    def bench_join_group_order_limit(self):
+        return self._query_all(
+            "SELECT b.city, COUNT(*) AS c FROM default b JOIN meta m ON b.city = m.city "
+            "GROUP BY b.city ORDER BY c DESC LIMIT 5"
+        )
+
+    def bench_left_join_count(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM default b LEFT JOIN meta m ON b.city = m.city"
+        )
+
+    def bench_left_join_extra_on(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM default b LEFT JOIN meta m "
+            "ON b.city = m.city AND m.pop > 15000000"
+        )
+
+    def bench_full_outer_join_bounded(self):
+        return self._query_all(
+            "SELECT b.city, m.pop FROM default b FULL OUTER JOIN meta m ON b.city = m.city "
+            "WHERE b.age < 25 LIMIT 1000"
+        )
+
+    def bench_comma_cross_join(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM default b CROSS JOIN meta m "
+            "WHERE b.age < 20 AND m.pop > 0"
+        )
+
+    def bench_union_all(self):
+        return self._query_all(
+            "SELECT city FROM default WHERE age = 25 "
+            "UNION ALL SELECT city FROM default WHERE age = 26 ORDER BY city LIMIT 100"
+        )
+
+    def bench_union_distinct(self):
+        return self._query_all(
+            "SELECT city FROM default WHERE age = 25 "
+            "UNION SELECT city FROM default WHERE age = 26 ORDER BY city"
+        )
+
+    def bench_intersect(self):
+        return self._query_all(
+            "SELECT city FROM default WHERE age BETWEEN 20 AND 30 "
+            "INTERSECT SELECT city FROM default WHERE age BETWEEN 25 AND 35 ORDER BY city"
+        )
+
+    def bench_except(self):
+        return self._query_all(
+            "SELECT city FROM default WHERE age BETWEEN 20 AND 30 "
+            "EXCEPT SELECT city FROM default WHERE age BETWEEN 25 AND 35 ORDER BY city"
+        )
+
+    def bench_in_subquery(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM default "
+            "WHERE city IN (SELECT city FROM meta WHERE pop > 15000000)"
+        )
+
+    def bench_exists_subquery(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM default b WHERE EXISTS "
+            "(SELECT 1 FROM meta m WHERE m.city = b.city AND m.pop > 15000000)"
+        )
+
+    def bench_derived_table(self):
+        return self._query_all(
+            "SELECT city, cnt FROM "
+            "(SELECT city, COUNT(*) AS cnt FROM default GROUP BY city) d "
+            "ORDER BY cnt DESC LIMIT 5"
+        )
+
+    def bench_cte(self):
+        return self._query_all(
+            "WITH c AS (SELECT city, AVG(score) AS av FROM default GROUP BY city) "
+            "SELECT city FROM c WHERE av > 50 ORDER BY av DESC LIMIT 5"
+        )
+
+    def bench_case_aggregate(self):
+        return self._query_all(
+            "SELECT city, COUNT(CASE WHEN age > 40 THEN 1 END) AS c "
+            "FROM default GROUP BY city ORDER BY city"
+        )
+
+    def bench_string_functions(self):
+        return self._query_all(
+            "SELECT UPPER(city) AS u, LENGTH(name) AS ln, SUBSTR(name, 1, 5) AS sub, "
+            "CONCAT(city, '-', category) AS cc, TRIM(category) AS tr "
+            "FROM default WHERE age BETWEEN 30 AND 40 LIMIT 1000"
+        )
+
+    def bench_numeric_functions(self):
+        return self._query_all(
+            "SELECT ROUND(score, 0) AS r, ABS(age - 40) AS a, FLOOR(score) AS f, "
+            "CEIL(score) AS c, MOD(age, 7) AS m "
+            "FROM default WHERE age BETWEEN 30 AND 40 LIMIT 1000"
+        )
+
+    def bench_coalesce_nullif(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM default "
+            "WHERE COALESCE(NULLIF(category, 'Books'), 'none') = 'Books'"
+        )
+
+    def bench_not_filter(self):
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM default "
+            "WHERE age NOT BETWEEN 20 AND 40 AND name NOT LIKE 'user_5%'"
+        )
+
+    def bench_deep_offset(self):
+        return self._query_all(
+            "SELECT name, age FROM default ORDER BY age, name LIMIT 100 OFFSET 100000"
+        )
+
+    def bench_order_by_expression(self):
+        return self._query_all(
+            "SELECT name FROM default ORDER BY LENGTH(name) DESC, age LIMIT 100"
+        )
+
+    def bench_window_sum_over(self):
+        return self._query_all(
+            "SELECT city, score, SUM(score) OVER (PARTITION BY city ORDER BY age) AS run "
+            "FROM default LIMIT 1000"
+        )
+
+    def bench_window_rank(self):
+        return self._query_all(
+            "SELECT city, RANK() OVER (PARTITION BY city ORDER BY score DESC) AS rk "
+            "FROM default LIMIT 1000"
+        )
+
+    def bench_window_lag(self):
+        return self._query_all(
+            "SELECT city, LAG(score) OVER (PARTITION BY city ORDER BY age) AS prev "
+            "FROM default LIMIT 1000"
+        )
+
+    def bench_distinct_rows(self):
+        return self._query_all(
+            "SELECT DISTINCT city, category FROM default ORDER BY city, category"
+        )
+
+    def bench_multi_col_group_having(self):
+        return self._query_all(
+            "SELECT city, category, COUNT(*) AS c FROM default "
+            "GROUP BY city, category HAVING c > 2000 ORDER BY city, category LIMIT 20"
+        )
+
     def bench_fts_build(self):
         try:
             # Close + reopen to clear the executor STORAGE_CACHE before backfill,
@@ -2591,6 +3063,32 @@ BENCHMARKS = [
     ("Numeric OR (age=20|30|40|50)",      "bench_filter_numeric_or",False, False, False, None),
     # --- Window ---
     ("Window ROW_NUMBER PARTITION BY city",  "bench_window_row_number", False, False, False, None),
+    # --- Advanced SQL: joins, set operations, subqueries, expressions ---
+    ("JOIN GROUP BY ORDER LIMIT",        "bench_join_group_order_limit",    False, False, False, None),
+    ("LEFT JOIN COUNT",                  "bench_left_join_count",           False, False, False, None),
+    ("LEFT JOIN extra ON predicate",     "bench_left_join_extra_on",        False, False, False, None),
+    ("FULL OUTER JOIN (bounded)",        "bench_full_outer_join_bounded",   False, False, False, None),
+    ("CROSS JOIN COUNT",                 "bench_comma_cross_join",          False, False, False, None),
+    ("UNION ALL (ordered)",              "bench_union_all",                 False, False, False, None),
+    ("UNION DISTINCT (ordered)",         "bench_union_distinct",            False, False, False, None),
+    ("INTERSECT (ordered)",              "bench_intersect",                 False, False, False, None),
+    ("EXCEPT (ordered)",                 "bench_except",                    False, False, False, None),
+    ("IN subquery COUNT",                "bench_in_subquery",               False, False, False, None),
+    ("EXISTS subquery COUNT",            "bench_exists_subquery",           False, False, False, None),
+    ("Derived table GROUP BY",           "bench_derived_table",             False, False, False, None),
+    ("CTE with AVG filter",              "bench_cte",                       False, False, False, None),
+    ("CASE aggregate GROUP BY",          "bench_case_aggregate",            False, False, False, None),
+    ("String functions (UPPER/LENGTH/SUBSTR/CONCAT/TRIM)", "bench_string_functions", False, False, False, None),
+    ("Numeric functions (ROUND/ABS/FLOOR/CEIL/MOD)", "bench_numeric_functions", False, False, False, None),
+    ("COALESCE/NULLIF filter",           "bench_coalesce_nullif",           False, False, False, None),
+    ("NOT filter (age NOT BETWEEN, name NOT LIKE)", "bench_not_filter",     False, False, False, None),
+    ("Deep offset (LIMIT 100 OFFSET 100K)", "bench_deep_offset",            False, False, False, None),
+    ("ORDER BY expression (LENGTH)",     "bench_order_by_expression",       False, False, False, None),
+    ("Window SUM OVER (running)",        "bench_window_sum_over",           False, False, False, None),
+    ("Window RANK (partitioned)",        "bench_window_rank",               False, False, False, None),
+    ("Window LAG (partitioned)",         "bench_window_lag",                False, False, False, None),
+    ("DISTINCT (city, category)",        "bench_distinct_rows",             False, False, False, None),
+    ("GROUP BY 2 cols + HAVING",         "bench_multi_col_group_having",    False, False, False, None),
     # --- File reading / temp table benchmarks ---
     ("CSV Read + COUNT(*)",               "bench_csv_read_count",        False, False, False, None),
     ("CSV Read + Filter + GROUP BY",      "bench_csv_read_filter_group", False, False, False, None),
@@ -2676,6 +3174,31 @@ OLAP_BENCHMARK_NAMES = [
     "OR cross-col (age=25 OR city=BJ)",
     "Numeric OR (age=20|30|40|50)",
     "Window ROW_NUMBER PARTITION BY city",
+    "JOIN GROUP BY ORDER LIMIT",
+    "LEFT JOIN COUNT",
+    "LEFT JOIN extra ON predicate",
+    "FULL OUTER JOIN (bounded)",
+    "CROSS JOIN COUNT",
+    "UNION ALL (ordered)",
+    "UNION DISTINCT (ordered)",
+    "INTERSECT (ordered)",
+    "EXCEPT (ordered)",
+    "IN subquery COUNT",
+    "EXISTS subquery COUNT",
+    "Derived table GROUP BY",
+    "CTE with AVG filter",
+    "CASE aggregate GROUP BY",
+    "String functions (UPPER/LENGTH/SUBSTR/CONCAT/TRIM)",
+    "Numeric functions (ROUND/ABS/FLOOR/CEIL/MOD)",
+    "COALESCE/NULLIF filter",
+    "NOT filter (age NOT BETWEEN, name NOT LIKE)",
+    "Deep offset (LIMIT 100 OFFSET 100K)",
+    "ORDER BY expression (LENGTH)",
+    "Window SUM OVER (running)",
+    "Window RANK (partitioned)",
+    "Window LAG (partitioned)",
+    "DISTINCT (city, category)",
+    "GROUP BY 2 cols + HAVING",
     "CSV Read + COUNT(*)",
     "CSV Read + Filter + GROUP BY",
     "CSV Read + Full Scan LIMIT 1000",
@@ -2781,6 +3304,7 @@ FAIR_WORKLOAD_GROUPS = [
             "Numeric OR (age=20|30|40|50)",
             "String equality (projected)",
             "COUNT WHERE category",
+            "NOT filter (age NOT BETWEEN, name NOT LIKE)",
         ],
     ),
     (
@@ -2799,6 +3323,7 @@ FAIR_WORKLOAD_GROUPS = [
             "GROUP BY city,category (100 grp)",
             "COUNT(DISTINCT city)",
             "COUNT(DISTINCT category)",
+            "GROUP BY 2 cols + HAVING",
         ],
     ),
     (
@@ -2809,6 +3334,10 @@ FAIR_WORKLOAD_GROUPS = [
             "ORDER BY score ASC LIMIT 100",
             "ORDER BY city,score DESC LIMIT100",
             "Window ROW_NUMBER PARTITION BY city",
+            "Window SUM OVER (running)",
+            "Window RANK (partitioned)",
+            "Window LAG (partitioned)",
+            "Deep offset (LIMIT 100 OFFSET 100K)",
         ],
     ),
     (
@@ -2816,6 +3345,45 @@ FAIR_WORKLOAD_GROUPS = [
         [
             "Projection full scan (3 cols)",
             "SELECT * -> pandas (full scan)",
+            "DISTINCT (city, category)",
+        ],
+    ),
+    (
+        "Joins",
+        [
+            "JOIN GROUP BY ORDER LIMIT",
+            "LEFT JOIN COUNT",
+            "LEFT JOIN extra ON predicate",
+            "FULL OUTER JOIN (bounded)",
+            "CROSS JOIN COUNT",
+        ],
+    ),
+    (
+        "Set Operations",
+        [
+            "UNION ALL (ordered)",
+            "UNION DISTINCT (ordered)",
+            "INTERSECT (ordered)",
+            "EXCEPT (ordered)",
+        ],
+    ),
+    (
+        "Subqueries & CTE",
+        [
+            "IN subquery COUNT",
+            "EXISTS subquery COUNT",
+            "Derived table GROUP BY",
+            "CTE with AVG filter",
+        ],
+    ),
+    (
+        "Expression Evaluation",
+        [
+            "CASE aggregate GROUP BY",
+            "String functions (UPPER/LENGTH/SUBSTR/CONCAT/TRIM)",
+            "Numeric functions (ROUND/ABS/FLOOR/CEIL/MOD)",
+            "COALESCE/NULLIF filter",
+            "ORDER BY expression (LENGTH)",
         ],
     ),
     (

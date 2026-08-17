@@ -55,6 +55,49 @@ impl ApexStorageImpl {
         Ok((schema_ptr, array_ptr))
     }
 
+    /// Execute a SELECT and materialize the result directly into a Python dict
+    /// of column lists (bypassing the PyArrow FFI round-trip). This is much
+    /// faster than `to_pylist()` for small result sets; the caller should only
+    /// use it for bounded (LIMIT) queries.
+    fn _execute_pylist(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
+        use crate::query::query_signature::{self, QuerySignature};
+        use arrow::array::Array;
+
+        let sql = sql.to_string();
+        let sig = query_signature::classify(&sql);
+        let is_write = matches!(&sig, QuerySignature::DmlWrite | QuerySignature::Ddl { .. });
+        let table_name = self.current_table.read().clone();
+        let base_dir = self.current_base_dir();
+        let table_path = self
+            .get_current_table_path()
+            .unwrap_or_else(|_| base_dir.clone());
+        self.release_backends_for_file_replacing_sql(&sql);
+        let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
+            let result = crate::Session::new(&base_dir, &table_path)
+                .with_root_dir(&self.root_dir)
+                .with_temp_dir(&self.temp_dir)
+                .execute_classified(&sql, &sig)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+
+            result
+                .to_record_batch()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        if is_write && !table_name.is_empty() {
+            self.invalidate_backend(&table_name);
+        }
+
+        let columns_dict = PyDict::new_bound(py);
+        let schema = batch.schema();
+        for col_idx in 0..batch.num_columns() {
+            let col_name = schema.field(col_idx).name().to_string();
+            let arr = batch.column(col_idx);
+            let col_list = arrow_col_to_pylist(py, arr)?;
+            columns_dict.set_item(col_name, col_list)?;
+        }
+        Ok(columns_dict.into())
+    }
+
     fn _execute_like_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
         use crate::query::query_signature::{self, QuerySignature};
         use arrow::array::{Array, StructArray};

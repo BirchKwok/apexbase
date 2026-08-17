@@ -41,8 +41,49 @@ pub type MinMaxFnI64 = unsafe extern "C" fn(*const i64, usize) -> i64;
 /// Takes: (data_ptr, row_count, out_sum_ptr, out_count_ptr)
 pub type AvgFnI64 = unsafe extern "C" fn(*const i64, usize, *mut i64, *mut i64);
 
-/// Cache for compiled filter functions (function pointers only, not the module)
-static JIT_CACHE: Lazy<Mutex<HashMap<u64, usize>>> = Lazy::new(|| Mutex::new(HashMap::new()));
+/// Cache for compiled filter functions.  The owning `ExprJIT` module must
+/// stay alive for the code pointer to remain valid, so the cache keeps a
+/// boxed module per compiled (op, literal) pair.  The cache is bounded; on
+/// overflow the evicted modules are leaked (never dropped) because another
+/// thread may still hold a code pointer into them.
+static JIT_FILTER_CACHE: Lazy<
+    Mutex<HashMap<(u8, i64), (FilterFnI64, Box<ExprJIT>)>>,
+> = Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn op_code(op: &BinaryOperator) -> u8 {
+    match op {
+        BinaryOperator::Eq => 0,
+        BinaryOperator::NotEq => 1,
+        BinaryOperator::Lt => 2,
+        BinaryOperator::Le => 3,
+        BinaryOperator::Gt => 4,
+        BinaryOperator::Ge => 5,
+        _ => 6,
+    }
+}
+
+/// Compile (or reuse) the JIT filter for `col <op> literal`.
+pub fn compile_int_filter_cached(
+    op: BinaryOperator,
+    literal_value: i64,
+) -> Option<FilterFnI64> {
+    let code = op_code(&op);
+    let mut cache = JIT_FILTER_CACHE.lock();
+    if let Some((f, _)) = cache.get(&(code, literal_value)) {
+        return Some(*f);
+    }
+    if cache.len() >= 64 {
+        // Leak the evicted modules: dropping them would free the executable
+        // pages while other threads may still hold a cached code pointer.
+        for (_, (_, module)) in cache.drain() {
+            std::mem::forget(module);
+        }
+    }
+    let mut jit = ExprJIT::new().ok()?;
+    let f = jit.compile_int_filter(op, literal_value).ok()?;
+    cache.insert((code, literal_value), (f, Box::new(jit)));
+    Some(f)
+}
 
 /// JIT compiler for query expressions
 pub struct ExprJIT {

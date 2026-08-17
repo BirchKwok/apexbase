@@ -15,10 +15,67 @@ impl ApexExecutor {
             base_dir,
             default_table_path,
         );
-        let required_columns = stmt.required_columns();
-        let required_refs: Option<Vec<&str>> = required_columns
-            .as_ref()
-            .map(|columns| columns.iter().map(String::as_str).collect());
+
+        // COUNT-only fast path: `SELECT COUNT(*) FROM l JOIN r ...` never needs
+        // the materialized join — per-side filters plus key multiplicities
+        // answer the count directly (a LEFT join's null-extended rows are just
+        // the unmatched probes).
+        if let Some(count) = Self::try_count_only_join(&stmt, &joins, base_dir, default_table_path)?
+        {
+            return Ok(ApexResult::Scalar(count));
+        }
+
+        // Bounded FULL OUTER JOIN with a single left-side numeric-range WHERE
+        // and a LIMIT: scan the left side for the first `limit` matching rows
+        // and join only those, instead of reading the whole base table.
+        if let Some(result) = Self::try_bounded_full_outer_scan(
+            &stmt,
+            &joins,
+            base_dir,
+            default_table_path,
+        )? {
+            return Ok(result);
+        }
+
+        let mut required_columns = stmt.required_columns().unwrap_or_default();
+        // JOIN ON keys and extra ON predicates are needed by the hash join even
+        // when they are not projected.  Without them a COUNT(*) join would read
+        // every column of the base table just to probe the key.
+        for join_clause in &stmt.joins {
+            if let Ok((left_key, right_key, _, _, extra_filter)) =
+                Self::extract_join_keys_with_filter(&join_clause.on)
+            {
+                for key in [left_key, right_key] {
+                    let plain = key
+                        .trim_matches('"')
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(key.trim_matches('"'))
+                        .to_string();
+                    if !required_columns.contains(&plain) {
+                        required_columns.push(plain);
+                    }
+                }
+                if let Some(filter) = extra_filter {
+                    for col in Self::expr_referenced_columns(&filter) {
+                        let plain = col.rsplit('.').next().unwrap_or(&col).to_string();
+                        if !required_columns.contains(&plain) {
+                            required_columns.push(plain);
+                        }
+                    }
+                }
+            }
+        }
+        let required_refs: Option<Vec<&str>> = Some(
+            required_columns
+                .iter()
+                .map(String::as_str)
+                .collect(),
+        );
+        // COUNT(*)-style queries have no required projection columns.  Reading
+        // zero columns into a non-empty Arrow batch is invalid, so fall back to
+        // a full-column read; the join still evaluates the filter correctly.
+        let required_refs = required_refs.filter(|refs| !refs.is_empty());
 
         // Get the left (base) table - supports both Table and Subquery (VIEW)
         let mut result_batch = match &stmt.from {
@@ -28,7 +85,14 @@ impl ApexExecutor {
                     batch
                 } else {
                     let left_backend = get_cached_backend(&left_path)?;
-                    left_backend.read_columns_to_arrow(required_refs.as_deref(), 0, None)?
+                    let left_refs = Self::filter_columns_for_backend(
+                        &left_backend,
+                        required_refs.as_deref().unwrap_or(&[]),
+                    );
+                    // Dictionary-encoded string columns make low-cardinality
+                    // join keys dramatically cheaper to probe; the dict reader
+                    // falls back to plain reads when deltas are pending.
+                    left_backend.read_columns_to_arrow_dict(left_refs.as_deref())?
                 }
             }
             Some(FromItem::Subquery { stmt: sub_stmt, .. }) => match sub_stmt.as_ref() {
@@ -94,14 +158,50 @@ impl ApexExecutor {
             stmt.where_clause.as_ref(),
             Self::source_names(&stmt.from),
         ) {
-            if Self::predicate_is_local(&result_batch, where_clause, &source_names) {
-                result_batch = Self::apply_filter_with_storage(
-                    &result_batch,
-                    where_clause,
-                    default_table_path,
-                )?;
+            // For INNER/CROSS joins, WHERE conjuncts can be pushed to either
+            // side independently.  Split the AND chain and push each conjunct
+            // that only touches the base relation; outer joins keep the
+            // whole-clause locality check so unmatched rows are preserved.
+            let is_inner_like = stmt.joins.iter().all(|join_clause| {
+                matches!(
+                    join_clause.join_type,
+                    JoinType::Inner | JoinType::Cross
+                )
+            });
+            let conjuncts = if is_inner_like {
+                Self::split_conjuncts(where_clause)
+            } else {
+                vec![where_clause.clone()]
+            };
+            let pushable: Vec<SqlExpr> = conjuncts
+                .into_iter()
+                .filter(|conjunct| Self::predicate_is_local(&result_batch, conjunct, &source_names))
+                .collect();
+            if !pushable.is_empty() {
+                let combined = pushable.into_iter().reduce(|left, right| SqlExpr::BinaryOp {
+                    left: Box::new(left),
+                    op: crate::query::sql_parser::BinaryOperator::And,
+                    right: Box::new(right),
+                });
+                if let Some(combined) = combined {
+                    result_batch = Self::apply_filter_with_storage(
+                        &result_batch,
+                        &combined,
+                        default_table_path,
+                    )?;
+                }
             }
         }
+
+        // The base relation's alias is used to name preserved join keys for
+        // outer joins (ON operand order must not leak into column names).
+        let left_alias: Option<String> = match &stmt.from {
+            Some(FromItem::Table { table, alias, .. }) => {
+                Some(alias.clone().unwrap_or_else(|| table.clone()))
+            }
+            Some(FromItem::Subquery { alias, .. }) => Some(alias.clone()),
+            _ => None,
+        };
 
         // Process each JOIN clause - supports both Table and Subquery (VIEW)
         for join_clause in &joins {
@@ -151,7 +251,11 @@ impl ApexExecutor {
                         batch
                     } else {
                         let right_backend = get_cached_backend(&right_path)?;
-                        right_backend.read_columns_to_arrow(required_refs.as_deref(), 0, None)?
+                        let right_refs = Self::filter_columns_for_backend(
+                            &right_backend,
+                            required_refs.as_deref().unwrap_or(&[]),
+                        );
+                        right_backend.read_columns_to_arrow_dict(right_refs.as_deref())?
                     }
                 }
                 FromItem::Subquery { stmt: sub_stmt, .. } => match sub_stmt.as_ref() {
@@ -208,12 +312,36 @@ impl ApexExecutor {
                 stmt.where_clause.as_ref(),
                 Self::source_names(&Some(join_clause.right.clone())),
             ) {
-                if Self::predicate_is_local(&right_batch, where_clause, &source_names) {
-                    right_batch = Self::apply_filter_with_storage(
-                        &right_batch,
-                        where_clause,
-                        default_table_path,
-                    )?;
+                let is_inner_like = matches!(
+                    join_clause.join_type,
+                    JoinType::Inner | JoinType::Cross
+                );
+                let conjuncts = if is_inner_like {
+                    Self::split_conjuncts(where_clause)
+                } else {
+                    vec![where_clause.clone()]
+                };
+                let pushable: Vec<SqlExpr> = conjuncts
+                    .into_iter()
+                    .filter(|conjunct| {
+                        Self::predicate_is_local(&right_batch, conjunct, &source_names)
+                    })
+                    .collect();
+                if !pushable.is_empty() {
+                    let combined = pushable
+                        .into_iter()
+                        .reduce(|left, right| SqlExpr::BinaryOp {
+                            left: Box::new(left),
+                            op: crate::query::sql_parser::BinaryOperator::And,
+                            right: Box::new(right),
+                        });
+                    if let Some(combined) = combined {
+                        right_batch = Self::apply_filter_with_storage(
+                            &right_batch,
+                            &combined,
+                            default_table_path,
+                        )?;
+                    }
                 }
             }
 
@@ -302,24 +430,178 @@ impl ApexExecutor {
                     continue;
                 };
 
-                // Perform the join (passing right alias for self-join column naming)
-                result_batch = Self::hash_join_aliased(
-                    &result_batch,
-                    &right_batch,
-                    &left_key,
-                    &right_key,
-                    &join_clause.join_type,
-                    right_alias.as_deref(),
-                    left_key_qualifier.as_deref(),
-                    right_key_qualifier.as_deref(),
-                )?;
-
-                // Apply extra ON predicates (non-equality conditions from AND)
+                // Perform the join (passing right alias for self-join column naming).
+                // Extra ON predicates are handled by join type:
+                // - INNER JOIN: a post-join filter is equivalent.
+                // - OUTER JOIN: a post-join filter would drop null-extended
+                //   rows, so predicates that only touch the right side are
+                //   pushed before the hash join and cross-side predicates use
+                //   the generic outer-join path that restores unmatched rows.
                 if let Some(filter) = extra_filter {
-                    result_batch = Self::apply_filter_with_storage(
+                    if join_clause.join_type == JoinType::Inner {
+                        result_batch = Self::hash_join_aliased(
+                            &result_batch,
+                            &right_batch,
+                            &left_key,
+                            &right_key,
+                            &join_clause.join_type,
+                            left_alias.as_deref(),
+                            right_alias.as_deref(),
+                            left_key_qualifier.as_deref(),
+                            right_key_qualifier.as_deref(),
+                        )?;
+                        result_batch = Self::apply_filter_with_storage(
+                            &result_batch,
+                            &filter,
+                            default_table_path,
+                        )?;
+                    } else {
+                        let referenced = Self::expr_referenced_columns(&filter);
+                        let left_plain: Vec<&str> = referenced
+                            .iter()
+                            .map(|col| col.rsplit('.').next().unwrap_or(col))
+                            .collect();
+                        let left_only = !left_plain.is_empty()
+                            && left_plain
+                                .iter()
+                                .all(|col| result_batch.column_by_name(col).is_some())
+                            && left_plain
+                                .iter()
+                                .all(|col| right_batch.column_by_name(col).is_none());
+                        let right_only = !left_plain.is_empty()
+                            && left_plain
+                                .iter()
+                                .all(|col| right_batch.column_by_name(col).is_some())
+                            && left_plain
+                                .iter()
+                                .all(|col| result_batch.column_by_name(col).is_none());
+                        // Pre-filtering one side is only equivalent for the
+                        // single-sided OUTER joins.  FULL OUTER JOIN must keep
+                        // unmatched rows from BOTH sides, so it always uses the
+                        // generic path that evaluates the full ON condition.
+                        if join_clause.join_type == JoinType::Left && right_only {
+                            let filtered_right = Self::apply_filter_with_storage(
+                                &right_batch,
+                                &filter,
+                                default_table_path,
+                            )?;
+                            result_batch = Self::hash_join_aliased(
+                                &result_batch,
+                                &filtered_right,
+                                &left_key,
+                                &right_key,
+                                &join_clause.join_type,
+                                left_alias.as_deref(),
+                                right_alias.as_deref(),
+                                left_key_qualifier.as_deref(),
+                                right_key_qualifier.as_deref(),
+                            )?;
+                        } else if join_clause.join_type == JoinType::Right && left_only {
+                            let filtered_left = Self::apply_filter_with_storage(
+                                &result_batch,
+                                &filter,
+                                default_table_path,
+                            )?;
+                            result_batch = Self::hash_join_aliased(
+                                &filtered_left,
+                                &right_batch,
+                                &left_key,
+                                &right_key,
+                                &join_clause.join_type,
+                                left_alias.as_deref(),
+                                right_alias.as_deref(),
+                                left_key_qualifier.as_deref(),
+                                right_key_qualifier.as_deref(),
+                            )?;
+                        } else if join_clause.join_type == JoinType::Right {
+                            // RIGHT JOIN = LEFT JOIN with swapped sides, then
+                            // restore the original column order.
+                            let swapped = Self::outer_join_with_extra_filter(
+                                &right_batch,
+                                &result_batch,
+                                &right_key,
+                                &left_key,
+                                &JoinType::Left,
+                                None,
+                                right_key_qualifier.as_deref(),
+                                left_key_qualifier.as_deref(),
+                                &filter,
+                                default_table_path,
+                            )?;
+                            result_batch = Self::reorder_join_columns(
+                                &swapped,
+                                &result_batch,
+                                &right_batch,
+                                &right_key,
+                            )?;
+                        } else {
+                            result_batch = Self::outer_join_with_extra_filter(
+                                &result_batch,
+                                &right_batch,
+                                &left_key,
+                                &right_key,
+                                &join_clause.join_type,
+                                right_alias.as_deref(),
+                                left_key_qualifier.as_deref(),
+                                right_key_qualifier.as_deref(),
+                                &filter,
+                                default_table_path,
+                            )?;
+                        }
+                    }
+                } else {
+                    // FULL OUTER JOIN with a bounded result (LIMIT, no ORDER
+                    // BY/DISTINCT/OFFSET): push side-local WHERE conjuncts
+                    // before materializing.  The post-join WHERE stays in
+                    // place, so unmatched (null-extended) rows still observe
+                    // exactly the same predicate on their NULL side.
+                    if join_clause.join_type == JoinType::Full
+                        && stmt.limit.is_some()
+                        && stmt.offset.is_none()
+                        && stmt.order_by.is_empty()
+                        && !stmt.distinct
+                    {
+                        let left_names =
+                            Self::source_names(&stmt.from).unwrap_or_default();
+                        let right_names = Self::source_names(&Some(join_clause.right.clone()))
+                            .unwrap_or_default();
+                        let pre_filtered = match Self::push_side_local_where(                            &result_batch,
+                            &right_batch,
+                            stmt.where_clause.as_ref(),
+                            &left_names,
+                            &right_names,
+                            default_table_path,
+                            stmt.limit,
+                        )? {
+                            Some((filtered_left, filtered_right)) => {
+                                result_batch = filtered_left;
+                                right_batch = filtered_right;
+                                true
+                            }
+                            None => false,
+                        };
+                        if pre_filtered {
+                            // Every left row emits at least one FULL OUTER
+                            // output row (matched pairs or null-extension), so
+                            // without ORDER BY the first `limit` filtered left
+                            // rows alone can satisfy the LIMIT; materializing
+                            // more is waste.
+                            let bound = stmt.limit.unwrap_or(0);
+                            if result_batch.num_rows() > bound {
+                                result_batch = result_batch.slice(0, bound);
+                            }
+                        }
+                    }
+                    result_batch = Self::hash_join_aliased(
                         &result_batch,
-                        &filter,
-                        default_table_path,
+                        &right_batch,
+                        &left_key,
+                        &right_key,
+                        &join_clause.join_type,
+                        left_alias.as_deref(),
+                        right_alias.as_deref(),
+                        left_key_qualifier.as_deref(),
+                        right_key_qualifier.as_deref(),
                     )?;
                 }
             }
@@ -464,8 +746,7 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result))
     }
 
-    fn source_names(from: &Option<FromItem>) -> Option<Vec<String>> {
-        match from.as_ref()? {
+    fn source_names(from: &Option<FromItem>) -> Option<Vec<String>> {        match from.as_ref()? {
             FromItem::Table { table, alias } => {
                 let mut names = vec![table.clone()];
                 if let Some(alias) = alias {
@@ -475,6 +756,804 @@ impl ApexExecutor {
             }
             _ => None,
         }
+    }
+
+    /// CROSS JOIN COUNT via storage-level numeric range scans: each WHERE
+    /// conjunct must be a single numeric comparison on exactly one side.
+    /// Returns None when any conjunct is not covered (falls back to the
+    /// batch-materializing path).
+    fn try_cross_count_storage(
+        left_backend: &TableStorageBackend,
+        right_backend: &TableStorageBackend,
+        conjuncts: &[SqlExpr],
+    ) -> io::Result<Option<i64>> {
+        let mut left_count: Option<i64> = None;
+        let mut right_count: Option<i64> = None;
+        for conjunct in conjuncts {
+            let refs = Self::expr_referenced_columns(conjunct);
+            let plain: Vec<String> = refs
+                .iter()
+                .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+                .collect();
+            if plain.is_empty() {
+                return Ok(None);
+            }
+            let on_left = plain
+                .iter()
+                .all(|c| left_backend.get_column_type(c).is_some());
+            let on_right = plain
+                .iter()
+                .all(|c| right_backend.get_column_type(c).is_some());
+            let (backend, slot) = match (on_left, on_right) {
+                (true, false) => (left_backend, &mut left_count),
+                (false, true) => (right_backend, &mut right_count),
+                _ => return Ok(None),
+            };
+            // One conjunct per side only: intersecting multiple ranges is not
+            // expressible as a single storage scan here.
+            if slot.is_some() {
+                return Ok(None);
+            }
+            let Some((col, low, high)) = Self::extract_single_comparison_as_range(conjunct) else {
+                return Ok(None);
+            };
+            // Storage schema uses unqualified names; strip any table alias.
+            let plain_col = col
+                .trim_matches('"')
+                .rsplit('.')
+                .next()
+                .unwrap_or(col.trim_matches('"'));
+            let Some(stats) = backend.execute_filtered_numeric_agg_mmap(plain_col, low, high, &["*"])?
+            else {
+                return Ok(None);
+            };
+            *slot = Some(stats.first().map(|s| s.0).unwrap_or(0));
+        }
+        let left = left_count.unwrap_or_else(|| left_backend.active_row_count() as i64);
+        let right = right_count.unwrap_or_else(|| right_backend.active_row_count() as i64);
+        Ok(Some(left.saturating_mul(right)))
+    }
+
+    /// COUNT(*) over a single CROSS/INNER/LEFT/RIGHT join answered from
+    /// per-side filters and key multiplicities, without materializing the
+    /// join.  Returns None when the query shape is not covered.
+    fn try_bounded_full_outer_scan(
+        stmt: &SelectStatement,
+        joins: &[JoinClause],
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<Option<ApexResult>> {
+        if stmt.distinct
+            || !stmt.order_by.is_empty()
+            || stmt.offset.is_some()
+            || stmt.limit.is_none()
+            || joins.len() != 1
+        {
+            return Ok(None);
+        }
+        let join = &joins[0];
+        if join.join_type != JoinType::Full {
+            return Ok(None);
+        }
+        // Both sides plain tables, no extra ON predicates.
+        let left_path = match &stmt.from {
+            Some(FromItem::Table { table, .. }) => {
+                Self::resolve_table_path(table, base_dir, default_table_path)
+            }
+            _ => return Ok(None),
+        };
+        let right_path = match &join.right {
+            FromItem::Table { table, .. } => {
+                Self::resolve_table_path(table, base_dir, default_table_path)
+            }
+            _ => return Ok(None),
+        };
+        let Ok((left_key, right_key, _, _, extra_filter)) =
+            Self::extract_join_keys_with_filter(&join.on)
+        else {
+            return Ok(None);
+        };
+        if extra_filter.is_some() {
+            return Ok(None);
+        }
+        let plain_key = |key: &str| {
+            key.trim_matches('"')
+                .rsplit('.')
+                .next()
+                .unwrap_or(key.trim_matches('"'))
+                .to_string()
+        };
+        let left_key = plain_key(&left_key);
+        let right_key = plain_key(&right_key);
+
+        let left_backend = get_cached_backend(&left_path)?;
+        let right_backend = get_cached_backend(&right_path)?;
+
+        // WHERE conjuncts: exactly one left-side numeric range is required
+        // (the bounded scan); right-side conjuncts are filtered after read.
+        let where_conjuncts = stmt
+            .where_clause
+            .as_ref()
+            .map(|w| Self::split_conjuncts(w))
+            .unwrap_or_default();
+        let mut left_range: Option<(String, f64, f64)> = None;
+        let mut right_conjuncts: Vec<SqlExpr> = Vec::new();
+        for conjunct in &where_conjuncts {
+            let refs = Self::expr_referenced_columns(conjunct);
+            let plain_refs: Vec<String> = refs
+                .iter()
+                .map(|c| c.rsplit('.').next().unwrap_or(c).to_string())
+                .collect();
+            let on_left = !plain_refs.is_empty()
+                && plain_refs
+                    .iter()
+                    .all(|c| left_backend.get_column_type(c).is_some());
+            let on_right = !plain_refs.is_empty()
+                && plain_refs
+                    .iter()
+                    .all(|c| right_backend.get_column_type(c).is_some());
+            match (on_left, on_right) {
+                (true, false) => {
+                    if left_range.is_some() {
+                        return Ok(None);
+                    }
+                    let Some((col, lo, hi)) = Self::extract_any_numeric_range(conjunct) else {
+                        return Ok(None);
+                    };
+                    left_range = Some((col.rsplit('.').next().unwrap_or(&col).to_string(), lo, hi));
+                }
+                (false, true) => right_conjuncts.push(conjunct.clone()),
+                _ => return Ok(None),
+            }
+        }
+        let Some((filter_col, lo, hi)) = left_range else {
+            return Ok(None);
+        };
+
+        // Scan the left side for the first `limit` matching rows.
+        let limit = stmt.limit.unwrap();
+        let Some(indices) = left_backend.scan_numeric_range_mmap(&filter_col, lo, hi, Some(limit))?
+        else {
+            return Ok(None);
+        };
+
+        // Collect the columns each side must read: SELECT references and join
+        // keys (unknown columns are filtered per backend), plus right-side
+        // conjunct references.
+        let mut left_cols: Vec<String> = Vec::new();
+        let mut right_cols: Vec<String> = Vec::new();
+        {
+            let mut push = |cols: &mut Vec<String>, col: &str| {
+                let plain = col
+                    .trim_matches('"')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(col.trim_matches('"'))
+                    .to_string();
+                if !cols.contains(&plain) {
+                    cols.push(plain);
+                }
+            };
+            for column in &stmt.columns {
+                if let SelectColumn::Column(name) | SelectColumn::ColumnAlias { column: name, .. } =
+                    column
+                {
+                    push(&mut left_cols, name);
+                    push(&mut right_cols, name);
+                } else {
+                    return Ok(None);
+                }
+            }
+            push(&mut left_cols, &left_key);
+            push(&mut right_cols, &right_key);
+            // The scan column must stay in the batch so the post-join WHERE
+            // re-application can evaluate it (it is dropped by projection).
+            push(&mut left_cols, &filter_col);
+            for conjunct in &right_conjuncts {
+                for col in Self::expr_referenced_columns(conjunct) {
+                    push(&mut right_cols, &col);
+                }
+            }
+        }
+        let left_refs_vec: Vec<&str> = left_cols.iter().map(|s| s.as_str()).collect();
+        let right_refs_vec: Vec<&str> = right_cols.iter().map(|s| s.as_str()).collect();
+        let left_refs = Self::filter_columns_for_backend(&left_backend, &left_refs_vec);
+        let right_refs = Self::filter_columns_for_backend(&right_backend, &right_refs_vec);
+
+        // Bounded left read (dict-take for low-cardinality keys), full right read.
+        let left_batch = left_backend.read_columns_by_indices_to_arrow(&indices, left_refs.as_deref())?;
+        let mut right_batch = right_backend.read_columns_to_arrow_dict(right_refs.as_deref())?;
+        if !right_conjuncts.is_empty() {
+            let combined = right_conjuncts.into_iter().reduce(|a, b| SqlExpr::BinaryOp {
+                left: Box::new(a),
+                op: BinaryOperator::And,
+                right: Box::new(b),
+            });
+            if let Some(combined) = combined {
+                right_batch =
+                    Self::apply_filter_with_storage(&right_batch, &combined, default_table_path)?;
+            }
+        }
+
+        // Full outer join of the (small) bounded batches.
+        let joined = Self::hash_join_aliased(
+            &left_batch,
+            &right_batch,
+            &left_key,
+            &right_key,
+            &JoinType::Full,
+            None,
+            None,
+            None,
+            None,
+        )?;
+
+        // Re-apply the WHERE (null-extension semantics) and the LIMIT/OFFSET,
+        // then project.
+        let filtered = if let Some(ref where_clause) = stmt.where_clause {
+            Self::apply_filter_with_storage(&joined, where_clause, default_table_path)?
+        } else {
+            joined
+        };
+        let limited = Self::apply_limit_offset(&filtered, stmt.limit, stmt.offset)?;
+        let projected = Self::apply_projection_with_storage(
+            &limited,
+            &stmt.columns,
+            Some(default_table_path),
+        )?;
+        Ok(Some(ApexResult::Data(projected)))
+    }
+
+    /// COUNT(*) over a single CROSS/INNER/LEFT/RIGHT join answered from
+    /// per-side filters and key multiplicities, without materializing the
+    /// join.  Returns None when the query shape is not covered.
+    fn try_count_only_join(        stmt: &SelectStatement,        joins: &[JoinClause],
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<Option<i64>> {
+        if !stmt.group_by.is_empty()
+            || stmt.having.is_some()
+            || stmt.distinct
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.columns.len() != 1
+            || joins.len() != 1
+        {
+            return Ok(None);
+        }
+        let count_star = match &stmt.columns[0] {
+            SelectColumn::Aggregate {
+                func: AggregateFunc::Count,
+                column,
+                distinct: false,
+                ..
+            } => column
+                .as_deref()
+                .map_or(true, |c| c == "*" || c == "1"),
+            _ => false,
+        };
+        if !count_star {
+            return Ok(None);
+        }
+        let join = &joins[0];
+        let join_type = &join.join_type;
+        if matches!(join_type, JoinType::Full | JoinType::Semi | JoinType::Anti) {
+            return Ok(None);
+        }
+        let is_cross = *join_type == JoinType::Cross;
+
+        // Both sides must be plain tables.
+        let left_path = match &stmt.from {
+            Some(FromItem::Table { table, .. }) => {
+                Self::resolve_table_path(table, base_dir, default_table_path)
+            }
+            _ => return Ok(None),
+        };
+        let right_path = match &join.right {
+            FromItem::Table { table, .. } => {
+                Self::resolve_table_path(table, base_dir, default_table_path)
+            }
+            _ => return Ok(None),
+        };
+        let left_names = Self::source_names(&stmt.from).unwrap_or_default();
+        let right_names = Self::source_names(&Some(join.right.clone())).unwrap_or_default();
+
+        let (left_key, right_key, extra_filter) = if is_cross {
+            (String::new(), String::new(), None)
+        } else {
+            match Self::extract_join_keys_with_filter(&join.on) {
+                Ok((lk, rk, _, _, extra)) => (lk, rk, extra),
+                Err(_) => return Ok(None),
+            }
+        };
+        let plain_key = |key: &str| {
+            key.trim_matches('"')
+                .rsplit('.')
+                .next()
+                .unwrap_or(key.trim_matches('"'))
+                .to_string()
+        };
+        let left_key = plain_key(&left_key);
+        let right_key = plain_key(&right_key);
+
+        // Collect the columns each side must read: WHERE conjunct references,
+        // the join key, and extra-ON-filter references.
+        let where_conjuncts = stmt
+            .where_clause
+            .as_ref()
+            .map(|w| Self::split_conjuncts(w))
+            .unwrap_or_default();
+        let mut left_cols: Vec<String> = Vec::new();
+        let mut right_cols: Vec<String> = Vec::new();
+        {
+            let mut push = |cols: &mut Vec<String>, col: &str| {
+                let plain = col
+                    .trim_matches('"')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(col.trim_matches('"'))
+                    .to_string();
+                if !cols.contains(&plain) {
+                    cols.push(plain);
+                }
+            };
+            for conjunct in &where_conjuncts {
+                for col in Self::expr_referenced_columns(conjunct) {
+                    push(&mut left_cols, &col);
+                    push(&mut right_cols, &col);
+                }
+            }
+            if !is_cross {
+                push(&mut left_cols, &left_key);
+                push(&mut right_cols, &right_key);
+            }
+            if let Some(filter) = &extra_filter {
+                for col in Self::expr_referenced_columns(filter) {
+                    push(&mut left_cols, &col);
+                    push(&mut right_cols, &col);
+                }
+            }
+        }
+        if left_cols.is_empty() && right_cols.is_empty() {
+            return Ok(None);
+        }
+
+        let left_backend = get_cached_backend(&left_path)?;
+        let right_backend = get_cached_backend(&right_path)?;
+
+        // CROSS JOIN COUNT with per-side numeric range conjuncts: answer from
+        // storage-level scans without materializing either side.
+        if is_cross && !where_conjuncts.is_empty() {
+            if let Some(total) = Self::try_cross_count_storage(
+                &left_backend,
+                &right_backend,
+                &where_conjuncts,
+            )? {
+                return Ok(Some(total));
+            }
+        }
+
+        let left_refs_vec: Vec<&str> = left_cols.iter().map(|s| s.as_str()).collect();
+        let right_refs_vec: Vec<&str> = right_cols.iter().map(|s| s.as_str()).collect();
+        let left_refs = Self::filter_columns_for_backend(&left_backend, &left_refs_vec);
+        let right_refs = Self::filter_columns_for_backend(&right_backend, &right_refs_vec);
+        let mut left_batch = left_backend.read_columns_to_arrow_dict(left_refs.as_deref())?;
+        let mut right_batch = right_backend.read_columns_to_arrow_dict(right_refs.as_deref())?;
+
+        // Split conjuncts and the extra ON filter onto the side they touch.
+        // Outer joins may only pre-filter their OWN side: a right-side WHERE
+        // conjunct on a LEFT join must drop unmatched rows (null-extended)
+        // after the join, which pre-filtering cannot express.
+        let mut left_filters: Vec<SqlExpr> = Vec::new();
+        let mut right_filters: Vec<SqlExpr> = Vec::new();
+        for conjunct in &where_conjuncts {
+            let on_left =
+                Self::predicate_is_local(&left_batch, conjunct, &left_names);
+            let on_right =
+                Self::predicate_is_local(&right_batch, conjunct, &right_names);
+            match (on_left, on_right) {
+                (true, false) => left_filters.push(conjunct.clone()),
+                (false, true) => right_filters.push(conjunct.clone()),
+                _ => return Ok(None), // cross-side or ambiguous
+            }
+        }
+        if let Some(filter) = &extra_filter {
+            let refs = Self::expr_referenced_columns(filter);
+            let only = |batch: &RecordBatch| {
+                !refs.is_empty()
+                    && refs.iter().all(|col| {
+                        let plain = col.rsplit('.').next().unwrap_or(col);
+                        batch.column_by_name(plain).is_some()
+                    })
+            };
+            let left_only = only(&left_batch);
+            let right_only = only(&right_batch);
+            match join_type {
+                JoinType::Inner => {
+                    if left_only && !right_only {
+                        left_filters.push(filter.clone());
+                    } else if right_only && !left_only {
+                        right_filters.push(filter.clone());
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                JoinType::Left => {
+                    if right_only && !left_only {
+                        right_filters.push(filter.clone());
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                JoinType::Right => {
+                    if left_only && !right_only {
+                        left_filters.push(filter.clone());
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+
+        // Apply the per-side filters (empty filter list is a no-op).
+        if !left_filters.is_empty() {
+            let combined = left_filters.into_iter().reduce(|a, b| SqlExpr::BinaryOp {
+                left: Box::new(a),
+                op: BinaryOperator::And,
+                right: Box::new(b),
+            });
+            if let Some(combined) = combined {
+                left_batch =
+                    Self::apply_filter_with_storage(&left_batch, &combined, default_table_path)?;
+            }
+        }
+        if !right_filters.is_empty() {
+            let combined = right_filters.into_iter().reduce(|a, b| SqlExpr::BinaryOp {
+                left: Box::new(a),
+                op: BinaryOperator::And,
+                right: Box::new(b),
+            });
+            if let Some(combined) = combined {
+                right_batch =
+                    Self::apply_filter_with_storage(&right_batch, &combined, default_table_path)?;
+            }
+        }
+
+
+        // COUNT computations.
+        if is_cross {
+            return Ok(Some(
+                (left_batch.num_rows() as i64).saturating_mul(right_batch.num_rows() as i64),
+            ));
+        }
+        // INNER/LEFT: probe the left side against a right-key multiset.
+        // RIGHT: probe the right side against a left-key multiset.
+        let (probe_batch, build_batch, probe_key, build_key) = if *join_type == JoinType::Right {
+            (
+                right_batch,
+                left_batch,
+                right_key.as_str(),
+                left_key.as_str(),
+            )
+        } else {
+            (
+                left_batch,
+                right_batch,
+                left_key.as_str(),
+                right_key.as_str(),
+            )
+        };
+        let probe_col = match probe_batch.column_by_name(probe_key) {
+            Some(col) => col.clone(),
+            None => return Ok(None),
+        };
+        let build_col = match build_batch.column_by_name(build_key) {
+            Some(col) => col.clone(),
+            None => return Ok(None),
+        };
+        let is_outer = matches!(join_type, JoinType::Left | JoinType::Right);
+
+        // Build a value multiset on the build side.  Dictionary-encoded
+        // strings hash each distinct value once; per-hash buckets are
+        // verified for collisions at build time, so the probe loop needs no
+        // per-row verification when the hash is collision-free.
+        let build_dict_hashes = Self::join_dict_value_hashes(&build_col);
+        let mut first_row: AHashMap<u64, usize> = AHashMap::with_capacity(build_batch.num_rows());
+        let mut multiset: AHashMap<u64, i64> = AHashMap::with_capacity(build_batch.num_rows());
+        let mut collision = false;
+        for i in 0..build_batch.num_rows() {
+            if build_col.is_null(i) {
+                continue;
+            }
+            let hash = Self::value_hash_at(&build_col, i, &build_dict_hashes);
+            match first_row.get(&hash) {
+                None => {
+                    first_row.insert(hash, i);
+                    multiset.insert(hash, 1);
+                }
+                Some(&j) => {
+                    *multiset.get_mut(&hash).unwrap() += 1;
+                    if !collision && !Self::values_equal(&build_col, i, &build_col, j) {
+                        collision = true;
+                    }
+                }
+            }
+        }
+
+        if !collision {
+            // Outer join with unique build keys: every probe row emits exactly
+            // one output row (the match or its null-extension), so the count
+            // is just the probe row count — no per-row probe is needed.
+            if is_outer && multiset.values().all(|&c| c == 1) {
+                return Ok(Some(probe_batch.num_rows() as i64));
+            }
+            // Collision-free probe: hash lookup per row, no verification.
+            let probe_dict_hashes = Self::join_dict_value_hashes(&probe_col);
+            let mut total: i64 = 0;
+            if let (Some(probe_hashes), Some(probe_dict)) = (
+                probe_dict_hashes.as_ref(),
+                probe_col
+                    .as_any()
+                    .downcast_ref::<arrow::array::DictionaryArray<
+                        arrow::datatypes::UInt32Type,
+                    >>(),
+            ) {
+                let keys = probe_dict.keys();
+                for row in 0..probe_batch.num_rows() {
+                    if keys.is_null(row) {
+                        if is_outer {
+                            total += 1;
+                        }
+                        continue;
+                    }
+                    let hash = probe_hashes[keys.value(row) as usize];
+                    match multiset.get(&hash) {
+                        None => {
+                            if is_outer {
+                                total += 1;
+                            }
+                        }
+                        Some(&count) => total += if is_outer { count.max(1) } else { count },
+                    }
+                }
+            } else {
+                for row in 0..probe_batch.num_rows() {
+                    if probe_col.is_null(row) {
+                        if is_outer {
+                            total += 1;
+                        }
+                        continue;
+                    }
+                    let hash = Self::value_hash_at(&probe_col, row, &probe_dict_hashes);
+                    match multiset.get(&hash) {
+                        None => {
+                            if is_outer {
+                                total += 1;
+                            }
+                        }
+                        Some(&count) => total += if is_outer { count.max(1) } else { count },
+                    }
+                }
+            }
+            return Ok(Some(total));
+        }
+
+        // Hash-collision fallback: bucket rows per hash and verify equality
+        // per probe, mirroring the materialized hash join.
+        let mut table: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(build_batch.num_rows());
+        for i in 0..build_batch.num_rows() {
+            if build_col.is_null(i) {
+                continue;
+            }
+            let hash = Self::value_hash_at(&build_col, i, &build_dict_hashes);
+            table
+                .entry(hash)
+                .or_insert_with(|| Vec::with_capacity(2))
+                .push(i);
+        }
+        let mut total: i64 = 0;
+        for row in 0..probe_batch.num_rows() {
+            if probe_col.is_null(row) {
+                if is_outer {
+                    total += 1;
+                }
+                continue;
+            }
+            let hash = Self::value_hash_at(&probe_col, row, &build_dict_hashes);
+            match table.get(&hash) {
+                None => {
+                    if is_outer {
+                        total += 1;
+                    }
+                }
+                Some(bucket) => {
+                    let mut matches: i64 = 0;
+                    for &build_row in bucket {
+                        if Self::values_equal(&probe_col, row, &build_col, build_row) {
+                            matches += 1;
+                        }
+                    }
+                    total += if is_outer { matches.max(1) } else { matches };
+                }
+            }
+        }
+        Ok(Some(total))
+    }
+
+    /// Pre-computed per-dict-value hashes for a dictionary-encoded string
+    /// column (None for other array types).
+    fn join_dict_value_hashes(col: &ArrayRef) -> Option<Vec<u64>> {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+        use std::hash::{Hash, Hasher};
+        let dict = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>()?;
+        let values = dict.values().as_any().downcast_ref::<StringArray>()?;
+        Some(
+            (0..values.len())
+                .map(|i| {
+                    let mut hasher = AHasher::default();
+                    values.value(i).hash(&mut hasher);
+                    hasher.finish()
+                })
+                .collect(),
+        )
+    }
+
+    /// Hash a value at a row, using the pre-computed dictionary hashes when
+    /// the column is dictionary-encoded (O(dict) total instead of per-row).
+    #[inline]
+    fn value_hash_at(col: &ArrayRef, row: usize, dict_hashes: &Option<Vec<u64>>) -> u64 {
+        if let Some(hashes) = dict_hashes {
+            use arrow::array::DictionaryArray;
+            use arrow::datatypes::UInt32Type;
+            if let Some(dict) = col.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+                return hashes
+                    .get(dict.keys().value(row) as usize)
+                    .copied()
+                    .unwrap_or(u64::MAX);
+            }
+        }
+        Self::hash_array_value_fast(col, row)
+    }
+
+    /// Push WHERE conjuncts that each touch exactly one side before an outer
+    /// join.  Returns None when no conjunct is safely pushable (cross-side or
+    /// ambiguous), in which case the caller keeps both batches unfiltered.
+    /// The post-join WHERE remains in place, so null-extended rows still see
+    /// their NULL side of every conjunct exactly as before.
+    fn push_side_local_where(
+        left: &RecordBatch,
+        right: &RecordBatch,
+        where_clause: Option<&SqlExpr>,
+        left_names: &[String],
+        right_names: &[String],
+        default_table_path: &Path,
+        bounded_limit: Option<usize>,
+    ) -> io::Result<Option<(RecordBatch, RecordBatch)>> {
+        let Some(w) = where_clause else {
+            return Ok(None);
+        };
+        let mut left_filters: Vec<SqlExpr> = Vec::new();
+        let mut right_filters: Vec<SqlExpr> = Vec::new();
+        for conjunct in Self::split_conjuncts(w) {
+            let on_left = Self::predicate_is_local(left, &conjunct, left_names);
+            let on_right = Self::predicate_is_local(right, &conjunct, right_names);
+            match (on_left, on_right) {
+                (true, false) => left_filters.push(conjunct),
+                (false, true) => right_filters.push(conjunct),
+                _ => return Ok(None), // cross-side or ambiguous — keep whole-clause behaviour
+            }
+        }
+        if left_filters.is_empty() && right_filters.is_empty() {
+            return Ok(None);
+        }
+        let mut filtered_left = left.clone();
+        if !left_filters.is_empty() {
+            let combined = left_filters.into_iter().reduce(|a, b| SqlExpr::BinaryOp {
+                left: Box::new(a),
+                op: BinaryOperator::And,
+                right: Box::new(b),
+            });
+            if let Some(combined) = combined {
+                // Bounded pre-filter (LIMIT without ORDER BY): keep only the
+                // first `limit` matching rows instead of gathering every
+                // match — later rows cannot affect the output.
+                if let Some(bound) = bounded_limit {
+                    let mask =
+                        Self::evaluate_predicate_with_storage(&filtered_left, &combined, default_table_path)?;
+                    let mut keep: Vec<u32> = Vec::with_capacity(bound.min(mask.len()));
+                    for i in 0..mask.len() {
+                        if !mask.is_null(i) && mask.value(i) {
+                            keep.push(i as u32);
+                            if keep.len() >= bound {
+                                break;
+                            }
+                        }
+                    }
+                    let indices = arrow::array::UInt32Array::from(keep);
+                    let taken: Vec<ArrayRef> = filtered_left
+                        .columns()
+                        .iter()
+                        .map(|col| {
+                            compute::take(col.as_ref(), &indices, None)
+                                .map_err(|e| err_data(e.to_string()))
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    filtered_left = RecordBatch::try_new(filtered_left.schema(), taken)
+                        .map_err(|e| err_data(e.to_string()))?;
+                } else {
+                    filtered_left = Self::apply_filter_with_storage(
+                        &filtered_left,
+                        &combined,
+                        default_table_path,
+                    )?;
+                }
+            }
+        }
+        let mut filtered_right = right.clone();
+        if !right_filters.is_empty() {
+            let combined = right_filters.into_iter().reduce(|a, b| SqlExpr::BinaryOp {
+                left: Box::new(a),
+                op: BinaryOperator::And,
+                right: Box::new(b),
+            });
+            if let Some(combined) = combined {
+                filtered_right =
+                    Self::apply_filter_with_storage(&filtered_right, &combined, default_table_path)?;
+            }
+        }
+        Ok(Some((filtered_left, filtered_right)))
+    }
+
+    /// Compare two array values at the given indices (mixed dict/plain strings
+    /// supported).  Used by the count-only join probe for collision checks.
+    fn values_equal(a: &ArrayRef, ia: usize, b: &ArrayRef, ib: usize) -> bool {
+        if let (Some(x), Some(y)) = (
+            a.as_any().downcast_ref::<Int64Array>(),
+            b.as_any().downcast_ref::<Int64Array>(),
+        ) {
+            return x.value(ia) == y.value(ib);
+        }
+        if let (Some(x), Some(y)) = (
+            a.as_any().downcast_ref::<Float64Array>(),
+            b.as_any().downcast_ref::<Float64Array>(),
+        ) {
+            return x.value(ia).to_bits() == y.value(ib).to_bits();
+        }
+        if let (Some(x), Some(y)) = (
+            a.as_any().downcast_ref::<BooleanArray>(),
+            b.as_any().downcast_ref::<BooleanArray>(),
+        ) {
+            return x.value(ia) == y.value(ib);
+        }
+        match (Self::string_value_at(a, ia), Self::string_value_at(b, ib)) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
+    }
+
+    /// Borrow the string at a row from a StringArray or dictionary-encoded
+    /// StringArray; None for NULL or non-string arrays.
+    fn string_value_at(arr: &ArrayRef, idx: usize) -> Option<&str> {
+        if arr.is_null(idx) {
+            return None;
+        }
+        if let Some(s) = arr.as_any().downcast_ref::<StringArray>() {
+            return Some(s.value(idx));
+        }
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+        if let Some(d) = arr.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+            if let Some(v) = d.values().as_any().downcast_ref::<StringArray>() {
+                let k = d.keys().value(idx) as usize;
+                if k < v.len() && !v.is_null(k) {
+                    return Some(v.value(k));
+                }
+            }
+        }
+        None
     }
 
     /// Whether an expression can be evaluated against one input relation.
@@ -537,6 +1616,27 @@ impl ApexExecutor {
             | SqlExpr::ExistsSubquery { .. }
             | SqlExpr::ScalarSubquery { .. } => false,
         }
+    }
+
+    /// Decompose an AND chain into its individual conjuncts so WHERE
+    /// predicates can be pushed to the join side they reference.
+    fn split_conjuncts(expr: &SqlExpr) -> Vec<SqlExpr> {
+        fn walk(expr: &SqlExpr, out: &mut Vec<SqlExpr>) {
+            if let SqlExpr::BinaryOp {
+                left,
+                op: crate::query::sql_parser::BinaryOperator::And,
+                right,
+            } = expr
+            {
+                walk(left, out);
+                walk(right, out);
+            } else {
+                out.push(expr.clone());
+            }
+        }
+        let mut out = Vec::new();
+        walk(expr, &mut out);
+        out
     }
 
     fn apply_lateral_explode(
@@ -820,7 +1920,15 @@ impl ApexExecutor {
         }
 
         if clean_name == "default" {
-            if default_table_path.is_dir() {
+            // `FROM default` must resolve to the actual default.apex table in
+            // the current database when it exists.  Falling straight through to
+            // default_table_path is only valid at the top level; inside a
+            // subquery that path points at the OUTER query's table and reading
+            // it would resolve the wrong columns (e.g. "b.age" not found).
+            let explicit_default = base_dir.join("default.apex");
+            if explicit_default.exists() {
+                explicit_default
+            } else if default_table_path.is_dir() {
                 base_dir.join("default.apex")
             } else {
                 default_table_path.to_path_buf()
@@ -1270,6 +2378,7 @@ impl ApexExecutor {
         left_key: &str,
         right_key: &str,
         join_type: &JoinType,
+        left_alias: Option<&str>,
         right_alias: Option<&str>,
         left_key_qualifier: Option<&str>,
         right_key_qualifier: Option<&str>,
@@ -1286,7 +2395,9 @@ impl ApexExecutor {
             Some(Self::append_qualified_join_key(
                 left,
                 left_key,
-                left_key_qualifier,
+                // Name the preserved left join key with the LEFT table's alias
+                // (the ON-clause operand qualifier may name the right table).
+                left_alias,
             )?)
         } else {
             None
@@ -1302,7 +2413,9 @@ impl ApexExecutor {
             right_key,
             right_alias,
             if preserve_qualified_right_key {
-                right_key_qualifier
+                // Name the preserved right join key with the RIGHT table's
+                // alias, independent of ON operand order.
+                right_alias
             } else {
                 None
             },
@@ -1485,6 +2598,271 @@ impl ApexExecutor {
             .map_err(|e| err_data(e.to_string()))
     }
 
+    /// OUTER JOIN whose ON clause contains extra predicates beyond the equality
+    /// key (e.g. `LEFT JOIN m ON t.city = m.city AND m.pop > 5`).
+    ///
+    /// A post-join WHERE filter is NOT equivalent to an ON predicate for outer
+    /// joins: unmatched rows that are null-extended by the equality join must
+    /// survive even when the extra predicate evaluates false.  This helper
+    /// performs the equality hash join with LEFT semantics, keeps only rows
+    /// satisfying the full ON condition, and then re-appends null-extended
+    /// rows for every left row (and, for FULL, every right row) with no match.
+    fn outer_join_with_extra_filter(
+        left: &RecordBatch,
+        right: &RecordBatch,
+        left_key: &str,
+        right_key: &str,
+        join_type: &JoinType,
+        right_alias: Option<&str>,
+        left_key_qualifier: Option<&str>,
+        right_key_qualifier: Option<&str>,
+        extra_filter: &SqlExpr,
+        storage_path: &Path,
+    ) -> io::Result<RecordBatch> {
+        const LEFT_RID: &str = "__apex_outer_left_rid";
+        const RIGHT_RID: &str = "__apex_outer_right_rid";
+
+        // LEFT JOIN core: keep every left row, tag rows so unmatched left rows
+        // can be restored after the extra ON predicate is evaluated.
+        let tagged_left = Self::append_row_id(left, LEFT_RID)?;
+        let prepared_right = Self::prepare_right_join_columns(
+            right,
+            left,
+            right_key,
+            right_alias,
+            if matches!(
+                join_type,
+                JoinType::Left | JoinType::Right | JoinType::Full
+            ) {
+                right_alias
+            } else {
+                None
+            },
+        )?;
+        let tagged_right = Self::append_row_id(&prepared_right, RIGHT_RID)?;
+        let joined = Self::hash_join(
+            &tagged_left,
+            &tagged_right,
+            left_key,
+            right_key,
+            &JoinType::Left,
+        )?;
+
+        // Rows satisfying the FULL ON condition (equality AND extra predicate).
+        let matched = Self::apply_filter_with_storage(&joined, extra_filter, storage_path)?;
+        let mut matched_left: ahash::AHashSet<u64> = ahash::AHashSet::with_capacity(matched.num_rows());
+        let mut matched_right: ahash::AHashSet<u64> = ahash::AHashSet::with_capacity(matched.num_rows());
+        if let Some(arr) = matched.column_by_name(LEFT_RID) {
+            if let Some(ids) = arr.as_any().downcast_ref::<arrow::array::UInt64Array>() {
+                for i in 0..ids.len() {
+                    if !ids.is_null(i) {
+                        matched_left.insert(ids.value(i));
+                    }
+                }
+            }
+        }
+        if let Some(arr) = matched.column_by_name(RIGHT_RID) {
+            if let Some(ids) = arr.as_any().downcast_ref::<arrow::array::UInt64Array>() {
+                for i in 0..ids.len() {
+                    if !ids.is_null(i) {
+                        matched_right.insert(ids.value(i));
+                    }
+                }
+            }
+        }
+
+        // Output layout: [left columns (minus LEFT_RID)] + [right columns
+        // (minus right join key and RIGHT_RID)].  The equality join already
+        // drops the unqualified right key and keeps qualified copies.
+        let left_schema = left.schema();
+        let right_schema = tagged_right.schema();
+        let left_fields: Vec<&Field> = left_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref())
+            .collect();
+        let right_fields: Vec<&Field> = right_schema
+            .fields()
+            .iter()
+            .map(|f| f.as_ref())
+            .filter(|f| f.name() != right_key && f.name() != RIGHT_RID)
+            .collect();
+
+        let left_nullable = *join_type == JoinType::Right || *join_type == JoinType::Full;
+        let right_nullable = *join_type == JoinType::Left || *join_type == JoinType::Full;
+        let mut fields: Vec<Field> = Vec::with_capacity(left_fields.len() + right_fields.len());
+        fields.extend(
+            left_fields
+                .iter()
+                .map(|f| Field::new(f.name(), f.data_type().clone(), left_nullable)),
+        );
+        fields.extend(
+            right_fields
+                .iter()
+                .map(|f| Field::new(f.name(), f.data_type().clone(), right_nullable)),
+        );
+        let schema = Arc::new(Schema::new(fields));
+
+        // Drop the tag columns from the matched rows.
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+        for (field, column) in matched.schema().fields().iter().zip(matched.columns()) {
+            if field.name() == LEFT_RID || field.name() == RIGHT_RID {
+                continue;
+            }
+            columns.push(column.clone());
+        }
+        let mut result = RecordBatch::try_new(schema.clone(), columns)
+            .map_err(|e| err_data(e.to_string()))?;
+
+        // Re-append rows that the extra predicate excluded.
+        let mut extra_rows: Vec<RecordBatch> = Vec::new();
+        if left_nullable || *join_type == JoinType::Left {
+            let left_unmatched: Vec<u32> = (0..left.num_rows())
+                .filter(|i| !matched_left.contains(&(*i as u64)))
+                .map(|i| i as u32)
+                .collect();
+            if !left_unmatched.is_empty() {
+                let indices = arrow::array::UInt32Array::from(left_unmatched);
+                let mut extra_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+                for (idx, field) in left.schema().fields().iter().enumerate() {
+                    let taken = compute::take(left.column(idx).as_ref(), &indices, None)
+                        .map_err(|e| err_data(e.to_string()))?;
+                    extra_columns.push(taken);
+                }
+                for field in &right_fields {
+                    extra_columns
+                        .push(arrow::array::new_null_array(field.data_type(), indices.len()));
+                }
+                extra_rows.push(RecordBatch::try_new(schema.clone(), extra_columns)
+                    .map_err(|e| err_data(e.to_string()))?);
+            }
+        }
+        if *join_type == JoinType::Full {
+            let right_unmatched: Vec<u32> = (0..prepared_right.num_rows())
+                .filter(|i| !matched_right.contains(&(*i as u64)))
+                .map(|i| i as u32)
+                .collect();
+            if !right_unmatched.is_empty() {
+                let indices = arrow::array::UInt32Array::from(right_unmatched);
+                let mut extra_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
+                for field in left.schema().fields() {
+                    extra_columns.push(arrow::array::new_null_array(
+                        field.data_type(),
+                        indices.len(),
+                    ));
+                }
+                for (idx, field) in tagged_right.schema().fields().iter().enumerate() {
+                    if field.name() == right_key || field.name() == RIGHT_RID {
+                        continue;
+                    }
+                    let taken = compute::take(tagged_right.column(idx).as_ref(), &indices, None)
+                        .map_err(|e| err_data(e.to_string()))?;
+                    extra_columns.push(taken);
+                }
+                extra_rows.push(RecordBatch::try_new(schema.clone(), extra_columns)
+                    .map_err(|e| err_data(e.to_string()))?);
+            }
+        }
+
+        if !extra_rows.is_empty() {
+            let mut batches: Vec<RecordBatch> = Vec::with_capacity(extra_rows.len() + 1);
+            batches.push(result);
+            batches.extend(extra_rows);
+            result = arrow::compute::concat_batches(&schema, &batches)
+                .map_err(|e| err_data(e.to_string()))?;
+        }
+        Ok(result)
+    }
+
+    /// Append a UInt64 row-identity column to a batch (used by outer joins that
+    /// must restore unmatched rows after evaluating the full ON predicate).
+    fn append_row_id(batch: &RecordBatch, name: &str) -> io::Result<RecordBatch> {
+        let mut fields: Vec<Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.as_ref().clone())
+            .collect();
+        fields.push(Field::new(name, ArrowDataType::UInt64, false));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(arrow::array::UInt64Array::from_iter_values(
+            0..batch.num_rows() as u64,
+        )) as ArrayRef);
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    /// Collect the column names referenced by a predicate expression.
+    fn expr_referenced_columns(expr: &SqlExpr) -> Vec<String> {
+        fn walk(expr: &SqlExpr, out: &mut Vec<String>) {
+            match expr {
+                SqlExpr::Column(name) => out.push(name.trim_matches('"').to_string()),
+                SqlExpr::BinaryOp { left, right, .. } => {
+                    walk(left, out);
+                    walk(right, out);
+                }
+                SqlExpr::UnaryOp { expr, .. } => walk(expr, out),
+                SqlExpr::Paren(inner) => walk(inner, out),
+                SqlExpr::Function { args, .. } => {
+                    for arg in args {
+                        walk(arg, out);
+                    }
+                }
+                SqlExpr::Case { when_then, else_expr } => {
+                    for (cond, value) in when_then {
+                        walk(cond, out);
+                        walk(value, out);
+                    }
+                    if let Some(value) = else_expr {
+                        walk(value, out);
+                    }
+                }
+                SqlExpr::InSubquery { column, .. } => out.push(column.trim_matches('"').to_string()),
+                SqlExpr::In { column, values, .. } => {
+                    out.push(column.trim_matches('"').to_string());
+                    // `values` are literals and never reference columns.
+                    let _ = values;
+                }
+                SqlExpr::Between {
+                    column, low, high, ..
+                } => {
+                    out.push(column.trim_matches('"').to_string());
+                    walk(low, out);
+                    walk(high, out);
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        walk(expr, &mut out);
+        out
+    }
+
+    /// Restrict a query-wide projection/filter column list to the columns that
+    /// actually exist on one side of a join.  A global column list (which mixes
+    /// left and right WHERE/join-key columns) must not be passed verbatim to a
+    /// single table read: a missing column would produce an empty Arrow batch
+    /// and silently corrupt or abort the join.  An empty intersection falls
+    /// back to a full-column read (None), which is always safe.
+    pub(in crate::query::executor) fn filter_columns_for_backend<'a>(
+        backend: &TableStorageBackend,
+        refs: &'a [&str],
+    ) -> Option<Vec<&'a str>> {
+        let filtered: Vec<&str> = refs
+            .iter()
+            .copied()
+            .filter(|name| {
+                let plain = name.rsplit('.').next().unwrap_or(name);
+                plain == "_id" || backend.get_column_type(plain).is_some()
+            })
+            .collect();
+        if filtered.is_empty() {
+            None
+        } else {
+            Some(filtered)
+        }
+    }
+
     /// Hash an equality JOIN whose keys are expressions rather than bare columns.
     ///
     /// This avoids materializing a Cartesian product for common normalization
@@ -1554,6 +2932,7 @@ impl ApexExecutor {
             LEFT_KEY,
             RIGHT_KEY,
             join_type,
+            None,
             right_alias,
             None,
             None,
@@ -1711,7 +3090,10 @@ impl ApexExecutor {
             )
         })?;
 
-        if *join_type == JoinType::Left {
+        // Unique string keys on the right side allow an O(N) probe for both
+        // INNER and LEFT joins.  Dictionary-encoded keys are resolved per
+        // distinct value, so low-cardinality keys avoid per-row string hashing.
+        if matches!(join_type, JoinType::Left | JoinType::Inner) {
             if let Some(joined) = Self::try_unique_string_left_join(
                 left,
                 right,
@@ -1719,6 +3101,7 @@ impl ApexExecutor {
                 right_key,
                 left_key_col,
                 right_key_col,
+                join_type,
             )? {
                 return Ok(joined);
             }
@@ -2012,30 +3395,80 @@ impl ApexExecutor {
         right_key: &str,
         left_key_col: &ArrayRef,
         right_key_col: &ArrayRef,
+        join_type: &JoinType,
     ) -> io::Result<Option<RecordBatch>> {
-        let Some(left_keys) = left_key_col.as_any().downcast_ref::<StringArray>() else {
-            return Ok(None);
-        };
-        let Some(right_keys) = right_key_col.as_any().downcast_ref::<StringArray>() else {
-            return Ok(None);
-        };
-        if left_keys.null_count() > 0 || right_keys.null_count() > 0 {
-            return Ok(None);
-        }
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
 
+        // Collect right key strings (plain or dictionary-encoded) and require
+        // uniqueness so every left row matches at most one right row.
         let mut right_index: AHashMap<&str, u32> = AHashMap::with_capacity(right.num_rows());
-        for row in 0..right.num_rows() {
-            if right_index
-                .insert(right_keys.value(row), row as u32)
-                .is_some()
-            {
+        if let Some(dict_arr) = right_key_col
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+        {
+            let values = dict_arr
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| err_data("dictionary join key values must be strings"))?;
+            for row in 0..right.num_rows() {
+                if dict_arr.keys().is_null(row) {
+                    return Ok(None);
+                }
+                let value = values.value(dict_arr.keys().value(row) as usize);
+                if right_index.insert(value, row as u32).is_some() {
+                    return Ok(None);
+                }
+            }
+        } else if let Some(right_keys) = right_key_col.as_any().downcast_ref::<StringArray>() {
+            if right_keys.null_count() > 0 {
                 return Ok(None);
             }
+            for row in 0..right.num_rows() {
+                if right_index
+                    .insert(right_keys.value(row), row as u32)
+                    .is_some()
+                {
+                    return Ok(None);
+                }
+            }
+        } else {
+            return Ok(None);
         }
 
         let mut right_indices = Vec::with_capacity(left.num_rows());
-        for row in 0..left.num_rows() {
-            right_indices.push(right_index.get(left_keys.value(row)).copied());
+        if let Some(dict_arr) = left_key_col
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+        {
+            // Dictionary-encoded left key: resolve each distinct VALUE once,
+            // then map every row through its key id — O(dict) hashing instead
+            // of hashing the same string for each of the N rows.
+            let values = dict_arr
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| err_data("dictionary join key values must be strings"))?;
+            if dict_arr.null_count() > 0 {
+                return Ok(None);
+            }
+            let dict_lookup: Vec<Option<u32>> = (0..values.len())
+                .map(|i| right_index.get(values.value(i)).copied())
+                .collect();
+            let keys = dict_arr.keys();
+            for row in 0..left.num_rows() {
+                right_indices.push(dict_lookup[keys.value(row) as usize]);
+            }
+        } else if let Some(left_keys) = left_key_col.as_any().downcast_ref::<StringArray>() {
+            if left_keys.null_count() > 0 {
+                return Ok(None);
+            }
+            for row in 0..left.num_rows() {
+                right_indices.push(right_index.get(left_keys.value(row)).copied());
+            }
+        } else {
+            return Ok(None);
         }
 
         let mut fields: Vec<Field> = left
@@ -2057,11 +3490,38 @@ impl ApexExecutor {
         }
 
         let mut columns = Vec::with_capacity(left.num_columns() + right.num_columns());
-        columns.extend(left.columns().iter().cloned());
-        for (col_idx, field) in right.schema().fields().iter().enumerate() {
-            if field.name() != right_key {
-                let taken = Self::take_with_nulls(right.column(col_idx), &right_indices)?;
+        if *join_type == JoinType::Inner {
+            // Keep only matched rows for INNER JOIN.
+            let keep: Vec<u32> = right_indices
+                .iter()
+                .enumerate()
+                .filter_map(|(i, matched)| matched.map(|_| i as u32))
+                .collect();
+            let left_take = arrow::array::UInt32Array::from(keep);
+            for col in left.columns() {
+                let taken = compute::take(col.as_ref(), &left_take, None)
+                    .map_err(|e| err_data(e.to_string()))?;
                 columns.push(taken);
+            }
+            let right_take_values: Vec<u32> = right_indices
+                .iter()
+                .filter_map(|matched| *matched)
+                .collect();
+            let right_take = arrow::array::UInt32Array::from(right_take_values);
+            for (col_idx, field) in right.schema().fields().iter().enumerate() {
+                if field.name() != right_key {
+                    let taken = compute::take(right.column(col_idx).as_ref(), &right_take, None)
+                        .map_err(|e| err_data(e.to_string()))?;
+                    columns.push(taken);
+                }
+            }
+        } else {
+            columns.extend(left.columns().iter().cloned());
+            for (col_idx, field) in right.schema().fields().iter().enumerate() {
+                if field.name() != right_key {
+                    let taken = Self::take_with_nulls(right.column(col_idx), &right_indices)?;
+                    columns.push(taken);
+                }
             }
         }
 
@@ -2190,11 +3650,48 @@ impl ApexExecutor {
         // side after every hash hit makes a fully matched join quadratic.
         let mut left_key_rows: AHashMap<u64, Vec<usize>> =
             AHashMap::with_capacity(left.num_rows());
-        for i in 0..left.num_rows() {
-            left_key_rows
-                .entry(Self::hash_array_value_fast(left_key_col, i))
-                .or_insert_with(|| Vec::with_capacity(1))
-                .push(i);
+        if let Some(dict_arr) = left_key_col
+            .as_any()
+            .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>>()
+        {
+            // Dictionary-encoded left key: hash each distinct VALUE once and
+            // bucket rows by their key id — O(dict) hashes instead of one hash
+            // per row.
+            if let Some(values) = dict_arr
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+            {
+                let keys = dict_arr.keys();
+                let mut dict_rows: Vec<Vec<usize>> = vec![Vec::new(); values.len()];
+                for i in 0..left.num_rows() {
+                    if !keys.is_null(i) {
+                        dict_rows[keys.value(i) as usize].push(i);
+                    }
+                }
+                for (value_idx, rows) in dict_rows.into_iter().enumerate() {
+                    if rows.is_empty() {
+                        continue;
+                    }
+                    let mut hasher = AHasher::default();
+                    values.value(value_idx).hash(&mut hasher);
+                    left_key_rows.insert(hasher.finish(), rows);
+                }
+            } else {
+                for i in 0..left.num_rows() {
+                    left_key_rows
+                        .entry(Self::hash_array_value_fast(left_key_col, i))
+                        .or_insert_with(|| Vec::with_capacity(1))
+                        .push(i);
+                }
+            }
+        } else {
+            for i in 0..left.num_rows() {
+                left_key_rows
+                    .entry(Self::hash_array_value_fast(left_key_col, i))
+                    .or_insert_with(|| Vec::with_capacity(1))
+                    .push(i);
+            }
         }
 
         // Find right rows whose keys don't exist in left
@@ -2399,6 +3896,21 @@ impl ApexExecutor {
             arr.value(idx).hash(&mut hasher);
         } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
             arr.value(idx).hash(&mut hasher);
+        } else if let Some(arr) = array
+            .as_any()
+            .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>>()
+        {
+            // Dictionary-encoded string key: hash the VALUE, not the row index.
+            let key = arr.keys().value(idx);
+            if let Some(values) = arr
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+            {
+                values.value(key as usize).hash(&mut hasher);
+            } else {
+                idx.hash(&mut hasher);
+            }
         } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
             arr.value(idx).to_bits().hash(&mut hasher);
         } else if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
@@ -2457,6 +3969,41 @@ impl ApexExecutor {
         ) {
             return l.value(left_idx) == r.value(right_idx);
         }
+        // Dictionary-encoded string keys: compare the underlying VALUES so a
+        // dict-encoded join input produces identical matches to a plain one.
+        fn dict_string_value(
+            array: &ArrayRef,
+            idx: usize,
+        ) -> Option<&str> {
+            use arrow::array::DictionaryArray;
+            use arrow::datatypes::UInt32Type;
+            if let Some(arr) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+                let key = arr.keys().value(idx);
+                let values = arr.values().as_any().downcast_ref::<StringArray>()?;
+                if values.is_null(key as usize) {
+                    return None;
+                }
+                return Some(values.value(key as usize));
+            }
+            None
+        }
+        let (l_dict, r_dict) = (
+            dict_string_value(left, left_idx),
+            dict_string_value(right, right_idx),
+        );
+        if let (Some(l), Some(r)) = (l_dict, r_dict) {
+            return l == r;
+        }
+        if let Some(l) = l_dict {
+            if let Some(r) = right.as_any().downcast_ref::<StringArray>() {
+                return !r.is_null(right_idx) && l == r.value(right_idx);
+            }
+        }
+        if let Some(r) = r_dict {
+            if let Some(l) = left.as_any().downcast_ref::<StringArray>() {
+                return !l.is_null(left_idx) && l.value(left_idx) == r;
+            }
+        }
         if let (Some(l), Some(r)) = (
             left.as_any().downcast_ref::<Float64Array>(),
             right.as_any().downcast_ref::<Float64Array>(),
@@ -2473,40 +4020,18 @@ impl ApexExecutor {
 
         let len = indices.len();
 
-        if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
-            let values: Vec<Option<i64>> = indices
+        // Arrow's null-propagating take: a NULL index yields a NULL output row.
+        // This is uniformly fast for primitive, string, and dictionary columns
+        // and avoids per-element Vec<Option<T>> construction for large results.
+        let index_array = UInt32Array::from(
+            indices
                 .iter()
-                .map(|opt_idx| opt_idx.map(|idx| arr.value(idx as usize)))
-                .collect();
-            return Ok(Arc::new(Int64Array::from(values)));
-        }
-
-        if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-            let values: Vec<Option<f64>> = indices
-                .iter()
-                .map(|opt_idx| opt_idx.map(|idx| arr.value(idx as usize)))
-                .collect();
-            return Ok(Arc::new(Float64Array::from(values)));
-        }
-
-        if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-            let values: Vec<Option<&str>> = indices
-                .iter()
-                .map(|opt_idx| opt_idx.map(|idx| arr.value(idx as usize)))
-                .collect();
-            return Ok(Arc::new(StringArray::from(values)));
-        }
-
-        if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
-            let values: Vec<Option<bool>> = indices
-                .iter()
-                .map(|opt_idx| opt_idx.map(|idx| arr.value(idx as usize)))
-                .collect();
-            return Ok(Arc::new(BooleanArray::from(values)));
-        }
-
-        // Fallback: create null array
-        Ok(arrow::array::new_null_array(array.data_type(), len))
+                .map(|opt| opt.map(|i| i as u32))
+                .collect::<Vec<_>>(),
+        );
+        let taken = compute::take(array.as_ref(), &index_array, None)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Arc::new(taken) as ArrayRef)
     }
 }
 

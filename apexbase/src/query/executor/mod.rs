@@ -58,6 +58,27 @@ use std::hash::{Hash, Hasher};
 static SQL_PARSE_CACHE: Lazy<RwLock<AHashMap<String, Vec<SqlStatement>>>> =
     Lazy::new(|| RwLock::new(AHashMap::new()));
 
+// Set-operation inputs keep their dictionary-encoded string columns so the
+// set op hashes distinct values once instead of per row; the (small) result
+// is decoded before ORDER BY / return.
+thread_local! {
+    static KEEP_DICT_PROJECTION: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(in crate::query::executor) fn with_keep_dict_projection<T>(f: impl FnOnce() -> T) -> T {
+    KEEP_DICT_PROJECTION.with(|k| {
+        let prev = k.get();
+        k.set(true);
+        let r = f();
+        k.set(prev);
+        r
+    })
+}
+
+pub(in crate::query::executor) fn keep_dict_projection() -> bool {
+    KEEP_DICT_PROJECTION.with(|k| k.get())
+}
+
 // Shared CTEs are immutable within one statement. Keep their Arrow batch in
 // memory for the statement lifetime instead of serializing multi-million-row
 // EXPLODE results to a temporary Apex file and reading them back repeatedly.

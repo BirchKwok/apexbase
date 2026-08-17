@@ -76,3 +76,5 @@ AGENTS.md
 
 *.lock
 *.stats
+
+*.apex_tables

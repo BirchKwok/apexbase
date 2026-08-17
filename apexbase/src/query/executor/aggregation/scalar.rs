@@ -84,14 +84,18 @@ impl ApexExecutor {
                             .unwrap_or(false)
                     {
                         batch.num_rows() as i64
-                    } else if let Some(array) = batch.column_by_name(col_name) {
-                        if distinct {
-                            Self::count_distinct(array)
-                        } else {
-                            (array.len() - array.null_count()) as i64
-                        }
                     } else {
-                        0
+                        let clean_name = col_name.trim_matches('"');
+                        let clean_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
+                        if let Some(array) = batch.column_by_name(clean_name) {
+                            if distinct {
+                                Self::count_distinct(array)
+                            } else {
+                                (array.len() - array.null_count()) as i64
+                            }
+                        } else {
+                            0
+                        }
                     }
                 } else {
                     batch.num_rows() as i64
@@ -105,9 +109,11 @@ impl ApexExecutor {
                 let col_name = column
                     .as_ref()
                     .ok_or_else(|| err_input("SUM requires column"))?;
+                let clean_name = col_name.trim_matches('"');
+                let clean_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
                 let array = batch
-                    .column_by_name(col_name)
-                    .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
+                    .column_by_name(clean_name)
+                    .ok_or_else(|| err_not_found(format!("Column: {}", clean_name)))?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // SIMD-optimized sum for non-null arrays
@@ -145,9 +151,11 @@ impl ApexExecutor {
                 let col_name = column
                     .as_ref()
                     .ok_or_else(|| err_input("AVG requires column"))?;
+                let clean_name = col_name.trim_matches('"');
+                let clean_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
                 let array = batch
-                    .column_by_name(col_name)
-                    .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
+                    .column_by_name(clean_name)
+                    .ok_or_else(|| err_not_found(format!("Column: {}", clean_name)))?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // SIMD-optimized AVG for non-null arrays
@@ -200,9 +208,11 @@ impl ApexExecutor {
                 let col_name = column
                     .as_ref()
                     .ok_or_else(|| err_input(format!("{} requires column", fn_name)))?;
+                let clean_name = col_name.trim_matches('"');
+                let clean_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
                 let array = batch
-                    .column_by_name(col_name)
-                    .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
+                    .column_by_name(clean_name)
+                    .ok_or_else(|| err_not_found(format!("Column: {}", clean_name)))?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     let val = if is_min {

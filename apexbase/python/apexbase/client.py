@@ -235,6 +235,9 @@ _RE_QUALIFIED_REF = re.compile(r"\b\w+\.\w+\b")
 _RE_SELECT_FROM = re.compile(r"\bselect\b(.*?)\bfrom\b", re.IGNORECASE | re.DOTALL)
 _RE_AGGREGATE_FUNC = re.compile(r"\b(count|sum|avg|min|max)\s*\(", re.IGNORECASE)
 _RE_EXPLICIT_ID = re.compile(r"(^|[^\w])(_id|\"_id\")([^\w]|$)|\._id([^\w]|$)", re.IGNORECASE)
+# Bounded SELECT with a small LIMIT: materialize via Rust-direct Python lists
+# (much faster than the PyArrow FFI round-trip for `to_dict()`).
+_RE_BOUNDED_SELECT_LIMIT = re.compile(r"\blimit\s+(\d+)", re.IGNORECASE)
 _RE_POINT_LOOKUP_ID = re.compile(r"\bwhere\s+_id\s*=\s*(\d+)\b", re.IGNORECASE)
 _RE_SIMPLE_COUNT_STAR = re.compile(
     r"^\s*select\s+count\s*\(\s*\*\s*\)(?:\s+(?:as\s+)?([A-Za-z_][\w]*))?\s+from\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)\s*;?\s*$",
@@ -3940,6 +3943,29 @@ class ApexClient:
             if _sig == 'write':
                 self._has_writes = True
                 self._invalidate_replace_cache()
+
+            # ── Fast materialization: bounded SELECT → Rust-direct Python lists ──
+            # `to_dict()` on a small LIMIT result is dominated by the PyArrow
+            # FFI import + `to_pylist()` round-trip; materializing to Python
+            # lists directly in Rust is several times faster. Bounded queries
+            # (LIMIT <= 10000) are small enough that this never becomes a
+            # memory problem, and the vector/topk paths use dedicated methods,
+            # not this general `execute` flow.
+            if sql_upper.startswith('SELECT') and _sig not in ('write', 'multi', 'transaction', 'session', 'table_func'):
+                _lm = _RE_BOUNDED_SELECT_LIMIT.search(sql_upper)
+                if _lm is not None:
+                    try:
+                        _lim_val = int(_lm.group(1).replace('_', ''))
+                    except ValueError:
+                        _lim_val = 0
+                    if 0 < _lim_val <= 10000:
+                        try:
+                            columns_dict = self._storage._execute_pylist(sql)
+                            rv = ResultView(lazy_pydict=columns_dict)
+                            rv._show_internal_id = show_internal_id
+                            return rv
+                        except Exception:
+                            pass  # fall through to Arrow FFI
 
             # ── Default path: Arrow C Data Interface (zero-copy) ──
             try:

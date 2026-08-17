@@ -102,14 +102,14 @@ with ApexClient("./rag-data") as client:
 
 ## Performance At A Glance
 
-Latest local snapshot (2026-08-07): **ApexBase 1.28.0**, 1M-row tabular dataset, 1M-vector dataset, Apple arm, Python 3.12.
+Latest local snapshot (2026-08-15): **ApexBase 1.29.0**, 1M-row tabular dataset, 1M-vector dataset, Apple arm, Python 3.12.
 
 | Area | Snapshot |
 | --- | --- |
-| **Fair OLAP + OLTP comparison** | **77 public tabular metrics** tracked; ApexBase wins **75 / 77** in the benchmark harness (the 2 losses are `Table DROP` / `Table CREATE+DROP cycle` vs SQLite) |
-| **GROUP BY city** | **1.9x faster** than DuckDB in the representative snapshot |
-| **FTS search** | **5.5x faster** than SQLite in the representative snapshot |
-| **Batch vector TopK cosine** | **6.8x faster** than DuckDB in the representative snapshot |
+| **Fair OLAP + OLTP comparison** | **102 public tabular metrics** tracked; ApexBase wins **87 / 102** in the benchmark harness. The remaining losses are the DDL gaps vs SQLite (`Table DROP`, `Table CREATE+DROP cycle`, `ALTER TABLE ADD COLUMN`, 1.3x–2.0x) and a dozen advanced-SQL metrics vs DuckDB at 1.2x–2.0x, plus `NOT` filter (4.6x) and `ORDER BY LENGTH(...)` (3.9x) as the two remaining larger gaps — down from the 1.5x–75x these metrics previously showed. |
+| **GROUP BY city** | **2.0x faster** than DuckDB in the representative snapshot |
+| **FTS search** | **5.6x faster** than SQLite in the representative snapshot |
+| **Batch vector TopK cosine** | **7.1x faster** than DuckDB in the representative snapshot |
 
 Benchmarks are workload-sensitive. The default benchmark command tracks this public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/apexbase/latest/performance/).
 

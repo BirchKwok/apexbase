@@ -1513,11 +1513,19 @@ impl SqlParser {
                 let mut has_dot = c == b'.';
                 let mut has_exponent = false;
                 i += 1;
-                while i < len && (bytes[i].is_ascii_digit() || (!has_dot && bytes[i] == b'.')) {
-                    if bytes[i] == b'.' {
-                        has_dot = true;
+                while i < len {
+                    let b = bytes[i];
+                    if b.is_ascii_digit() || (!has_dot && b == b'.') {
+                        if b == b'.' {
+                            has_dot = true;
+                        }
+                        i += 1;
+                    } else if b == b'_' && i + 1 < len && bytes[i + 1].is_ascii_digit() {
+                        // SQL-style digit separators (e.g. 10_000, 1_000_000).
+                        i += 1;
+                    } else {
+                        break;
                     }
-                    i += 1;
                 }
                 if i < len && matches!(bytes[i], b'e' | b'E') {
                     let exponent_marker = i;
@@ -1526,8 +1534,16 @@ impl SqlParser {
                         exponent_end += 1;
                     }
                     let exponent_digits = exponent_end;
-                    while exponent_end < len && bytes[exponent_end].is_ascii_digit() {
-                        exponent_end += 1;
+                    while exponent_end < len {
+                        if bytes[exponent_end].is_ascii_digit()
+                            || (bytes[exponent_end] == b'_'
+                                && exponent_end + 1 < len
+                                && bytes[exponent_end + 1].is_ascii_digit())
+                        {
+                            exponent_end += 1;
+                        } else {
+                            break;
+                        }
                     }
                     if exponent_end > exponent_digits {
                         has_exponent = true;
@@ -1537,8 +1553,9 @@ impl SqlParser {
                     }
                 }
                 let num_str = &sql[start..i];
+                let cleaned: String = num_str.chars().filter(|c| *c != '_').collect();
                 if has_dot || has_exponent {
-                    let f: f64 = num_str.parse().map_err(|_| {
+                    let f: f64 = cleaned.parse().map_err(|_| {
                         ApexError::QueryParseError(format!(
                             "Syntax error at byte {}: Invalid number: {}",
                             start, num_str
@@ -1550,7 +1567,7 @@ impl SqlParser {
                         end: i,
                     });
                 } else {
-                    let n: i64 = num_str.parse().map_err(|_| {
+                    let n: i64 = cleaned.parse().map_err(|_| {
                         ApexError::QueryParseError(format!(
                             "Syntax error at byte {}: Invalid number: {}",
                             start, num_str
@@ -3330,6 +3347,10 @@ impl SqlParser {
             } else if matches!(self.current(), Token::Cross) {
                 self.advance();
                 self.expect(Token::Join)?;
+                JoinType::Cross
+            } else if matches!(self.current(), Token::Comma) {
+                // Legacy SQL comma cross-join: FROM t1, t2 [alias]
+                self.advance();
                 JoinType::Cross
             } else {
                 break;
@@ -6321,6 +6342,50 @@ mod tests {
                 alias: None
             }) if table == "users"
         ));
+    }
+
+    #[test]
+    fn test_numeric_literals_with_underscore_separators() {
+        // SQL-style digit separators must parse to the same values as the
+        // plain literals (10_000 == 10000, 1.5_0 == 1.50, 1_000_000_000).
+        let sql = "SELECT * FROM users WHERE id > 10_000 AND score < 1_000.5_0 LIMIT 5_000";
+        let stmt = SqlParser::parse(sql).unwrap();
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
+        assert_eq!(s.limit, Some(5_000));
+        let Some(where_clause) = &s.where_clause else {
+            panic!("expected WHERE clause");
+        };
+        // WHERE id > 10_000 AND score < 1_000.5_0 — both separated literals
+        // must have been consumed as numbers (no identifier token leakage).
+        match where_clause {
+            SqlExpr::BinaryOp {
+                op: BinaryOperator::And,
+                ..
+            } => {}
+            _ => panic!("expected AND"),
+        }
+    }
+
+    #[test]
+    fn test_comma_cross_join_parses_as_cross_join() {
+        let sql = "SELECT t.id, m.city FROM t, meta m WHERE t.id <= 1000 LIMIT 50";
+        let stmt = SqlParser::parse(sql).unwrap();
+        let SqlStatement::Select(s) = stmt else {
+            panic!("expected select");
+        };
+        assert_eq!(s.joins.len(), 1);
+        assert_eq!(s.joins[0].join_type, JoinType::Cross);
+        let FromItem::Table {
+            table,
+            alias: Some(alias),
+        } = &s.joins[0].right
+        else {
+            panic!("expected table with alias");
+        };
+        assert_eq!(table, "meta");
+        assert_eq!(alias, "m");
     }
 
     #[test]

@@ -498,8 +498,13 @@ fn classify_impl(sql: &str) -> QuerySignature {
         upper_buf = s.to_ascii_uppercase();
         &upper_buf
     } else {
-        // For very long SQL, only uppercase the first 4 KiB for classification
-        upper_buf = s[..4096].to_ascii_uppercase();
+        // For very long SQL, only uppercase the first 4 KiB for classification.
+        // Step back to a char boundary so multi-byte UTF-8 is never split.
+        let mut end = 4096;
+        while end > 0 && !s.is_char_boundary(end) {
+            end -= 1;
+        }
+        upper_buf = s[..end].to_ascii_uppercase();
         &upper_buf
     };
 
@@ -1611,6 +1616,21 @@ mod tests {
             QuerySignature::DmlWrite
         );
         assert_eq!(classify("UPDATE t SET x = 1"), QuerySignature::DmlWrite);
+    }
+
+    #[test]
+    fn test_classify_long_utf8_no_panic() {
+        // A >4 KiB SQL string whose 4096-byte boundary falls inside a multi-byte
+        // UTF-8 sequence must not panic during prefix uppercasing.
+        // "SE" is 2 bytes, '中' is 3 bytes, so boundaries sit at 2+3k and byte
+        // 4096 (== 2 + 3*1364 + 2) lands 2 bytes into a '中'.
+        let mut s = String::from("SE");
+        while s.len() < 4096 {
+            s.push('中');
+        }
+        s.push_str(", 42)");
+        assert!(!s.is_char_boundary(4096));
+        let _ = classify(&s);
     }
 
     #[test]

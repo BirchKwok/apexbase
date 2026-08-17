@@ -3,6 +3,7 @@
 use crate::query::vectorized_join::{
     count_matching_float64, count_matching_int64, filter_float64_batch, filter_int64_batch,
 };
+use ahash::AHashSet;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JsonMutationMode {
@@ -514,6 +515,43 @@ impl ApexExecutor {
                 }
             }
 
+            // Dictionary-encoded main column: resolve the membership once per
+            // distinct value, then map each row through its key id — O(dict)
+            // string hashing instead of one hash per row.
+            use arrow::array::DictionaryArray;
+            use arrow::datatypes::UInt32Type;
+            if let Some(dict_arr) = main_col
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+            {
+                let keys = dict_arr.keys();
+                let values = dict_arr.values();
+                if let Some(str_values) = values.as_any().downcast_ref::<StringArray>() {
+                    let mut dict_match: Vec<bool> = Vec::with_capacity(str_values.len());
+                    for i in 0..str_values.len() {
+                        let hash = {
+                            let mut hasher = ahash::AHasher::default();
+                            str_values.value(i).hash(&mut hasher);
+                            hasher.finish()
+                        };
+                        dict_match.push(!str_values.is_null(i) && value_set.contains(&hash));
+                    }
+                    let mut results = Vec::with_capacity(batch.num_rows());
+                    for row in 0..batch.num_rows() {
+                        let found = if keys.is_null(row) {
+                            false
+                        } else {
+                            dict_match
+                                .get(keys.value(row) as usize)
+                                .copied()
+                                .unwrap_or(false)
+                        };
+                        results.push(if negated { !found } else { found });
+                    }
+                    return Ok(BooleanArray::from(results));
+                }
+            }
+
             let mut results = Vec::with_capacity(batch.num_rows());
             for i in 0..batch.num_rows() {
                 let hash = Self::hash_array_value(main_col, i);
@@ -680,11 +718,11 @@ impl ApexExecutor {
             // Pattern: WHERE inner_col = outer_col (simple equality correlation)
             // Instead of executing subquery N times, execute once and hash-join.
             // Use Ok(...) swallowing: if decorrelation fails/has complex predicates, fall through.
-            if let Ok(Some(result)) =
-                Self::try_decorrelate_exists(batch, stmt, &outer_cols, &subquery_path)
-            {
-                return Ok(result);
-            }
+        if let Ok(Some(result)) =
+            Self::try_decorrelate_exists(batch, stmt, &outer_cols, &subquery_path)
+        {
+            return Ok(result);
+        }
 
             // Fallback: Correlated, evaluate for each row
             let mut results = Vec::with_capacity(batch.num_rows());
@@ -795,17 +833,60 @@ impl ApexExecutor {
             .column_by_name(outer_col_clean)
             .ok_or_else(|| err_not_found(format!("Outer column: {}", outer_col_clean)))?;
 
-        let mut results = Vec::with_capacity(batch.num_rows());
-        for i in 0..batch.num_rows() {
-            if outer_array.is_null(i) {
-                results.push(false);
-            } else {
-                let val = Self::arrow_value_to_string(outer_array, i);
-                results.push(hash_set.contains(&val));
+        Ok(Some(BooleanArray::from(Self::probe_string_set(
+            outer_array,
+            &hash_set,
+            batch.num_rows(),
+        ))))
+    }
+
+    /// Probe an array against a set of string values, returning a per-row mask.
+    /// Dictionary-encoded arrays resolve membership once per distinct value
+    /// (O(dict) string lookups) and then map each row through its key id, so
+    /// million-row probes over low-cardinality columns never hash per row.
+    fn probe_string_set(array: &ArrayRef, set: &AHashSet<String>, num_rows: usize) -> Vec<bool> {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+
+        if let Some(dict_arr) = array.as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+            let keys = dict_arr.keys();
+            let values = dict_arr.values();
+            if let Some(str_values) = values.as_any().downcast_ref::<StringArray>() {
+                let dict_match: Vec<bool> = (0..str_values.len())
+                    .map(|i| !str_values.is_null(i) && set.contains(str_values.value(i)))
+                    .collect();
+                let mut results = Vec::with_capacity(num_rows);
+                for row in 0..num_rows {
+                    let found = if keys.is_null(row) {
+                        false
+                    } else {
+                        dict_match
+                            .get(keys.value(row) as usize)
+                            .copied()
+                            .unwrap_or(false)
+                    };
+                    results.push(found);
+                }
+                return results;
             }
         }
-
-        Ok(Some(BooleanArray::from(results)))
+        if let Some(str_arr) = array.as_any().downcast_ref::<StringArray>() {
+            let mut results = Vec::with_capacity(num_rows);
+            for i in 0..num_rows {
+                results.push(!str_arr.is_null(i) && set.contains(str_arr.value(i)));
+            }
+            return results;
+        }
+        // Generic fallback: hash-based membership via arrow_value_to_string.
+        let mut results = Vec::with_capacity(num_rows);
+        for i in 0..num_rows {
+            if array.is_null(i) {
+                results.push(false);
+            } else {
+                results.push(set.contains(&Self::arrow_value_to_string(array, i)));
+            }
+        }
+        results
     }
 
     /// Extract correlation equality from a WHERE clause.
@@ -877,6 +958,24 @@ impl ApexExecutor {
         }
         if let Some(a) = array.as_any().downcast_ref::<UInt64Array>() {
             return a.value(idx).to_string();
+        }
+        if let Some(a) = array
+            .as_any()
+            .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>>()
+        {
+            if !a.keys().is_null(idx) {
+                if let Some(values) = a
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                {
+                    let key = a.keys().value(idx) as usize;
+                    if key < values.len() && !values.is_null(key) {
+                        return values.value(key).to_string();
+                    }
+                }
+            }
+            return String::new();
         }
         format!("{:?}", array)
     }
@@ -1060,6 +1159,25 @@ impl ApexExecutor {
             SqlExpr::Literal(Value::Float64(arr.value(idx)))
         } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
             SqlExpr::Literal(Value::String(arr.value(idx).to_string()))
+        } else if let Some(arr) = array
+            .as_any()
+            .downcast_ref::<arrow::array::DictionaryArray<arrow::datatypes::UInt32Type>>()
+        {
+            // Dictionary-encoded string: substitute the VALUE so correlated
+            // subqueries over dict-encoded outer batches still work.
+            if !arr.keys().is_null(idx) {
+                if let Some(values) = arr
+                    .values()
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                {
+                    let key = arr.keys().value(idx) as usize;
+                    if key < values.len() && !values.is_null(key) {
+                        return SqlExpr::Literal(Value::String(values.value(key).to_string()));
+                    }
+                }
+            }
+            SqlExpr::Literal(Value::Null)
         } else if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
             SqlExpr::Literal(Value::Bool(arr.value(idx)))
         } else {
@@ -1080,6 +1198,12 @@ impl ApexExecutor {
         // OPTIMIZATION: Fast path for column vs literal comparisons using scalar ops
         // This avoids broadcasting the literal to a full array
         if let Some(result) = Self::try_scalar_comparison(batch, left, op, right)? {
+            return Ok(result);
+        }
+        // OPTIMIZATION: expression-vs-literal over dictionary-encoded columns
+        // (e.g. COALESCE(NULLIF(category,'x'),'y') = 'x'): compare per distinct
+        // value instead of per row.
+        if let Some(result) = Self::try_dict_scalar_predicate(batch, left, op, right)? {
             return Ok(result);
         }
 
@@ -1282,8 +1406,16 @@ impl ApexExecutor {
                 _ => "",
             };
 
-            // Use batch filtering for simple range comparisons (> < >= <=)
+            // Use batch filtering for simple range comparisons (> < >= <=).
+            // For large arrays the (cached) JIT filter runs first: it avoids
+            // materializing the match-index vector, which the sparse/dense
+            // discrimination would otherwise build for the same comparison.
             if !op_str.is_empty() && int_arr.null_count() == 0 {
+                if num_rows > 100_000 {
+                    if let Some(result) = Self::try_jit_int_filter(int_arr, op, int_val, reversed) {
+                        return Ok(Some(result));
+                    }
+                }
                 let values = int_arr.values();
                 let is_equal = op_str == ">=" || op_str == "<=";
                 let indices =
@@ -1312,13 +1444,6 @@ impl ApexExecutor {
                     return Ok(Some(builder.finish()));
                 }
                 // Otherwise fall through to Arrow compute (dense result)
-            }
-
-            // JIT optimization for large arrays (>100k rows)
-            if num_rows > 100_000 {
-                if let Some(result) = Self::try_jit_int_filter(int_arr, op, int_val, reversed) {
-                    return Ok(Some(result));
-                }
             }
 
             let scalar = Scalar::new(Int64Array::from(vec![int_val]));
@@ -1536,9 +1661,9 @@ impl ApexExecutor {
             op.clone()
         };
 
-        // Try to compile and execute JIT filter
-        let mut jit = ExprJIT::new().ok()?;
-        let filter_fn = jit.compile_int_filter(actual_op, lit_val).ok()?;
+        // Try to compile and execute JIT filter (cached across calls: the
+        // compile itself costs milliseconds, so it must not run per query).
+        let filter_fn = crate::query::jit::compile_int_filter_cached(actual_op, lit_val)?;
 
         let num_rows = int_arr.len();
         let mut result_bytes = vec![0u8; num_rows];
@@ -1558,6 +1683,14 @@ impl ApexExecutor {
 
     /// Evaluate expression to Arrow array
     fn evaluate_expr_to_array(batch: &RecordBatch, expr: &SqlExpr) -> io::Result<ArrayRef> {
+        // Dictionary fast path: a pure expression over ONE dictionary-encoded
+        // string column only needs to be evaluated once per distinct value,
+        // then gathered back to row order.  This turns per-row string work
+        // (UPPER/NULLIF/COALESCE/SUBSTR over millions of rows) into O(dict)
+        // evaluations plus an O(N) index gather.
+        if let Some(result) = Self::try_evaluate_dict_expr(batch, expr)? {
+            return Ok(result);
+        }
         match expr {
             SqlExpr::Column(name) => {
                 let col_name = name.trim_matches('"');
@@ -1712,6 +1845,333 @@ impl ApexExecutor {
         }
     }
 
+    /// Evaluate an expression whose referenced columns are all
+    /// dictionary-encoded strings by running it over the cartesian product of
+    /// the distinct values, then gathering the result back to row order.
+    /// This makes UPPER/NULLIF/COALESCE/CONCAT over low-cardinality columns
+    /// O(dicts) instead of O(rows) per function call.
+    fn try_evaluate_dict_expr(
+        batch: &RecordBatch,
+        expr: &SqlExpr,
+    ) -> io::Result<Option<ArrayRef>> {
+        // A bare column reference is handled by the caller (it must stay
+        // dictionary-encoded so projections/joins can decode it later).
+        if matches!(expr, SqlExpr::Column(_)) {
+            return Ok(None);
+        }
+        let Some((value_batch, row_combo, combos)) = Self::try_build_dict_combo(batch, expr)? else {
+            return Ok(None);
+        };
+        let value_result = Self::evaluate_expr_to_array(&value_batch, expr)?;
+        if value_result.len() != combos {
+            return Ok(None);
+        }
+        let index_array = arrow::array::UInt32Array::from(row_combo);
+        let taken = compute::take(value_result.as_ref(), &index_array, None)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(taken))
+    }
+
+    /// Build a small batch holding the cartesian product of the distinct
+    /// values of every dictionary-encoded string column referenced by `expr`,
+    /// plus the per-row combo index of the original batch.  Returns None when
+    /// any referenced column is not dictionary-encoded, a subquery is
+    /// present, or the product exceeds 4096 combos.
+    fn try_build_dict_combo(
+        batch: &RecordBatch,
+        expr: &SqlExpr,
+    ) -> io::Result<Option<(RecordBatch, Vec<Option<u32>>, usize)>> {
+        use arrow::array::DictionaryArray;
+        use arrow::datatypes::UInt32Type;
+
+        fn collect_columns(expr: &SqlExpr, out: &mut Vec<String>, has_subquery: &mut bool) {
+            match expr {
+                SqlExpr::Column(name) => {
+                    let bare = name
+                        .trim_matches('"')
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(name.trim_matches('"'))
+                        .to_string();
+                    if !out.contains(&bare) {
+                        out.push(bare);
+                    }
+                }
+                SqlExpr::InSubquery { .. }
+                | SqlExpr::ExistsSubquery { .. }
+                | SqlExpr::ScalarSubquery { .. } => *has_subquery = true,
+                SqlExpr::BinaryOp { left, right, .. } => {
+                    collect_columns(left, out, has_subquery);
+                    collect_columns(right, out, has_subquery);
+                }
+                SqlExpr::UnaryOp { expr, .. } | SqlExpr::Paren(expr) | SqlExpr::Cast { expr, .. } => {
+                    collect_columns(expr, out, has_subquery);
+                }
+                SqlExpr::Function { args, .. } => {
+                    for arg in args {
+                        collect_columns(arg, out, has_subquery);
+                    }
+                }
+                SqlExpr::Case {
+                    when_then,
+                    else_expr,
+                } => {
+                    for (cond, value) in when_then {
+                        collect_columns(cond, out, has_subquery);
+                        collect_columns(value, out, has_subquery);
+                    }
+                    if let Some(value) = else_expr {
+                        collect_columns(value, out, has_subquery);
+                    }
+                }
+                SqlExpr::In { column, .. } => {
+                    let bare = column
+                        .trim_matches('"')
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(column.trim_matches('"'))
+                        .to_string();
+                    if !out.contains(&bare) {
+                        out.push(bare);
+                    }
+                }
+                SqlExpr::Between {
+                    column, low, high, ..
+                } => {
+                    let bare = column
+                        .trim_matches('"')
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(column.trim_matches('"'))
+                        .to_string();
+                    if !out.contains(&bare) {
+                        out.push(bare);
+                    }
+                    collect_columns(low, out, has_subquery);
+                    collect_columns(high, out, has_subquery);
+                }
+                _ => {}
+            }
+        }
+
+        let mut columns = Vec::new();
+        let mut has_subquery = false;
+        collect_columns(expr, &mut columns, &mut has_subquery);
+        if has_subquery || columns.is_empty() {
+            return Ok(None);
+        }
+
+        // Resolve every referenced column to a dictionary-encoded string array.
+        let mut dict_sizes: Vec<usize> = Vec::with_capacity(columns.len());
+        let mut str_arrays: Vec<StringArray> = Vec::with_capacity(columns.len());
+        for col in &columns {
+            let Some(array) = batch.column_by_name(col) else {
+                return Ok(None);
+            };
+            let Some(dict_arr) = array
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+            else {
+                return Ok(None);
+            };
+            let Some(str_values) = dict_arr
+                .values()
+                .as_any()
+                .downcast_ref::<StringArray>()
+            else {
+                return Ok(None);
+            };
+            dict_sizes.push(str_values.len());
+            str_arrays.push(str_values.clone());
+        }
+        // Cap the cartesian product so high-cardinality columns fall back to
+        // the plain per-row path.
+        let combos: usize = dict_sizes.iter().product();
+        if combos == 0 || combos > 4096 {
+            return Ok(None);
+        }
+
+        // Build the small combo batch: row `combo` holds one distinct value
+        // per referenced column.  Column i uses stride_i = product of sizes
+        // after it.
+        let mut strides: Vec<usize> = vec![1; columns.len()];
+        for i in (0..columns.len().saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * dict_sizes[i + 1];
+        }
+        let mut fields: Vec<Field> = Vec::with_capacity(columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(columns.len());
+        for (col, (values, stride)) in columns
+            .iter()
+            .zip(str_arrays.iter().zip(strides.iter()))
+        {
+            let ids: Vec<usize> = (0..combos)
+                .map(|combo| (combo / stride) % values.len())
+                .collect();
+            let col_array = StringArray::from(
+                ids.iter()
+                    .map(|&id| Some(values.value(id)))
+                    .collect::<Vec<_>>(),
+            );
+            fields.push(Field::new(col, ArrowDataType::Utf8, false));
+            arrays.push(Arc::new(col_array) as ArrayRef);
+        }
+        let value_batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+
+        // Per-row combo index: fold the dictionary key ids with the same
+        // strides; any NULL key yields NULL.  The dict arrays are resolved
+        // once — per-row column lookups would dominate a million-row batch.
+        let mut dict_arrays: Vec<&DictionaryArray<UInt32Type>> = Vec::with_capacity(columns.len());
+        for col in &columns {
+            let Some(array) = batch.column_by_name(col) else {
+                return Ok(None);
+            };
+            let Some(dict_arr) = array
+                .as_any()
+                .downcast_ref::<DictionaryArray<UInt32Type>>()
+            else {
+                return Ok(None);
+            };
+            dict_arrays.push(dict_arr);
+        }
+        let mut row_combo: Vec<Option<u32>> = Vec::with_capacity(batch.num_rows());
+        'rows: for row in 0..batch.num_rows() {
+            let mut combo = 0usize;
+            for (dict_arr, stride) in dict_arrays.iter().zip(strides.iter()) {
+                if dict_arr.keys().is_null(row) {
+                    row_combo.push(None);
+                    continue 'rows;
+                }
+                combo += (dict_arr.keys().value(row) as usize) * stride;
+            }
+            row_combo.push(Some(combo as u32));
+        }
+        Ok(Some((value_batch, row_combo, combos)))
+    }
+
+    /// Predicate fast path for `expr <op> literal` (or reversed) where `expr`
+    /// references only dictionary-encoded string columns: evaluate `expr`
+    /// over the distinct-value combos, compare each combo result with the
+    /// literal once, then map rows through their combo index.  NULL keys map
+    /// to false (SQL NULL comparisons are never true, including NOT_EQ).
+    fn try_dict_scalar_predicate(
+        batch: &RecordBatch,
+        left: &SqlExpr,
+        op: &BinaryOperator,
+        right: &SqlExpr,
+    ) -> io::Result<Option<BooleanArray>> {
+        use crate::query::sql_parser::BinaryOperator;
+        let (expr, lit, reversed) = match (left, right) {
+            (expr, SqlExpr::Literal(_)) => (expr, right, false),
+            (SqlExpr::Literal(_), expr) => (expr, left, true),
+            _ => return Ok(None),
+        };
+        if matches!(expr, SqlExpr::Column(_)) {
+            return Ok(None); // column-vs-literal already has a scalar fast path
+        }
+        if !matches!(
+            op,
+            BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::Le
+                | BinaryOperator::Gt
+                | BinaryOperator::Ge
+        ) {
+            return Ok(None);
+        }
+        let SqlExpr::Literal(lit_val) = lit else {
+            return Ok(None);
+        };
+        let Some((value_batch, row_combo, combos)) = Self::try_build_dict_combo(batch, expr)?
+        else {
+            return Ok(None);
+        };
+        let value_result = Self::evaluate_expr_to_array(&value_batch, expr)?;
+        if value_result.len() != combos {
+            return Ok(None);
+        }
+        // Compare each combo result with the literal once.
+        let effective_op = if reversed {
+            match op {
+                BinaryOperator::Lt => BinaryOperator::Gt,
+                BinaryOperator::Le => BinaryOperator::Ge,
+                BinaryOperator::Gt => BinaryOperator::Lt,
+                BinaryOperator::Ge => BinaryOperator::Le,
+                _ => op.clone(),
+            }
+        } else {
+            op.clone()
+        };
+        let mut combo_match: Vec<bool> = Vec::with_capacity(combos);
+        for i in 0..combos {
+            // SQL NULL semantics: any comparison with NULL is NULL, which
+            // never selects the row (including NOT_EQ).
+            let matched = match Self::compare_array_value_to_literal(&value_result, i, lit_val) {
+                Some(std::cmp::Ordering::Equal) => {
+                    !matches!(effective_op, BinaryOperator::NotEq)
+                }
+                Some(std::cmp::Ordering::Less) => matches!(
+                    effective_op,
+                    BinaryOperator::NotEq | BinaryOperator::Lt | BinaryOperator::Le
+                ),
+                Some(std::cmp::Ordering::Greater) => matches!(
+                    effective_op,
+                    BinaryOperator::NotEq | BinaryOperator::Gt | BinaryOperator::Ge
+                ),
+                None => false,
+            };
+            combo_match.push(matched);
+        }
+        let mut results = Vec::with_capacity(batch.num_rows());
+        for combo in &row_combo {
+            let found = combo
+                .and_then(|c| combo_match.get(c as usize))
+                .copied()
+                .unwrap_or(false);
+            results.push(found);
+        }
+        Ok(Some(BooleanArray::from(results)))
+    }
+
+    /// Three-way comparison of an array value against a SQL literal, without
+    /// materializing a broadcast array.
+    fn compare_array_value_to_literal(
+        array: &ArrayRef,
+        idx: usize,
+        lit: &Value,
+    ) -> Option<std::cmp::Ordering> {
+        use std::cmp::Ordering;
+        if array.is_null(idx) {
+            return None;
+        }
+        if let (Some(arr), Value::Int64(v)) = (
+            array.as_any().downcast_ref::<Int64Array>(),
+            lit,
+        ) {
+            return arr.value(idx).partial_cmp(v);
+        }
+        if let (Some(arr), Value::Float64(v)) = (
+            array.as_any().downcast_ref::<Float64Array>(),
+            lit,
+        ) {
+            return arr.value(idx).partial_cmp(v);
+        }
+        if let (Some(arr), Value::String(v)) = (
+            array.as_any().downcast_ref::<StringArray>(),
+            lit,
+        ) {
+            return Some(arr.value(idx).cmp(v.as_str()));
+        }
+        if let (Some(arr), Value::Bool(v)) = (
+            array.as_any().downcast_ref::<BooleanArray>(),
+            lit,
+        ) {
+            return Some(arr.value(idx).cmp(v));
+        }
+        None
+    }
+
     /// Evaluate expression to Arrow array with storage path (for scalar subqueries)
     fn evaluate_expr_to_array_with_storage(
         batch: &RecordBatch,
@@ -1767,8 +2227,18 @@ impl ApexExecutor {
             return Self::broadcast_scalar_array(sub_col, 0, batch.num_rows());
         }
 
-        // Correlated: execute for each row
-        let mut results: Vec<Option<i64>> = Vec::with_capacity(batch.num_rows());
+        // Correlated: execute for each row.  The subquery's SELECT expression
+        // fixes the result type, so keep the native value (INT/FLOAT/STRING/
+        // BOOL) instead of truncating every value into an Int64 slot.
+        #[derive(Clone)]
+        enum CorrelatedScalar {
+            Null,
+            Int(i64),
+            Float(f64),
+            String(String),
+            Bool(bool),
+        }
+        let mut results: Vec<CorrelatedScalar> = Vec::with_capacity(batch.num_rows());
 
         for row_idx in 0..batch.num_rows() {
             let modified_stmt = Self::substitute_outer_refs(stmt, batch, row_idx, &outer_cols);
@@ -1776,24 +2246,82 @@ impl ApexExecutor {
             let sub_batch = sub_result.to_record_batch()?;
 
             if sub_batch.num_rows() == 0 || sub_batch.num_columns() == 0 {
-                results.push(None);
+                results.push(CorrelatedScalar::Null);
             } else if sub_batch.num_rows() > 1 {
                 return Err(err_data("Scalar subquery returned more than one row"));
             } else {
                 let sub_col = sub_batch.column(0);
                 if sub_col.is_null(0) {
-                    results.push(None);
+                    results.push(CorrelatedScalar::Null);
                 } else if let Some(arr) = sub_col.as_any().downcast_ref::<Int64Array>() {
-                    results.push(Some(arr.value(0)));
+                    results.push(CorrelatedScalar::Int(arr.value(0)));
                 } else if let Some(arr) = sub_col.as_any().downcast_ref::<Float64Array>() {
-                    results.push(Some(arr.value(0) as i64));
+                    results.push(CorrelatedScalar::Float(arr.value(0)));
+                } else if let Some(arr) = sub_col.as_any().downcast_ref::<StringArray>() {
+                    results.push(CorrelatedScalar::String(arr.value(0).to_string()));
+                } else if let Some(arr) = sub_col.as_any().downcast_ref::<BooleanArray>() {
+                    results.push(CorrelatedScalar::Bool(arr.value(0)));
                 } else {
-                    results.push(None);
+                    results.push(CorrelatedScalar::Null);
                 }
             }
         }
 
-        return Ok(Arc::new(Int64Array::from(results)));
+        // Build the typed column.  INT/FLOAT mixtures are promoted to FLOAT;
+        // STRING and BOOL columns stay in their native type.  All-NULL results
+        // default to Int64, matching the non-correlated path.
+        let mut has_int = false;
+        let mut has_float = false;
+        let mut has_string = false;
+        let mut has_bool = false;
+        for value in &results {
+            match value {
+                CorrelatedScalar::Int(_) => has_int = true,
+                CorrelatedScalar::Float(_) => has_float = true,
+                CorrelatedScalar::String(_) => has_string = true,
+                CorrelatedScalar::Bool(_) => has_bool = true,
+                CorrelatedScalar::Null => {}
+            }
+        }
+        if has_float {
+            let values: Vec<Option<f64>> = results
+                .iter()
+                .map(|value| match value {
+                    CorrelatedScalar::Int(v) => Some(*v as f64),
+                    CorrelatedScalar::Float(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            return Ok(Arc::new(Float64Array::from(values)));
+        }
+        if has_string {
+            let values: Vec<Option<&str>> = results
+                .iter()
+                .map(|value| match value {
+                    CorrelatedScalar::String(v) => Some(v.as_str()),
+                    _ => None,
+                })
+                .collect();
+            return Ok(Arc::new(StringArray::from(values)));
+        }
+        if has_bool {
+            let values: Vec<Option<bool>> = results
+                .iter()
+                .map(|value| match value {
+                    CorrelatedScalar::Bool(v) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            return Ok(Arc::new(BooleanArray::from(values)));
+        }
+        let values: Vec<Option<i64>> = results
+            .iter()
+            .map(|value| match value {
+                CorrelatedScalar::Int(v) => Some(*v),
+                _ => None,
+            })
+            .collect();
+        Ok(Arc::new(Int64Array::from(values)))
     }
 
     /// Execute non-correlated scalar subquery (original implementation)
@@ -2928,7 +3456,14 @@ impl ApexExecutor {
                 map_string_to_int(
                     &arr,
                     batch.num_rows(),
-                    |s| s.chars().count() as i64,
+                    // ASCII fast path: byte length == char count.
+                    |s| {
+                        if s.is_ascii() {
+                            s.len() as i64
+                        } else {
+                            s.chars().count() as i64
+                        }
+                    },
                     "LENGTH",
                 )
             }
@@ -6014,12 +6549,195 @@ impl ApexExecutor {
             // Exact match (no wildcards at all)
             let exact = pattern.to_string();
             Ok(Box::new(move |s: &str| s == exact.as_str()))
+        } else if !leading_pct && !inner.contains('%') {
+            // Fixed-length pattern anchored at the start (e.g. "user_5%",
+            // "a_c", "_x"): only literal and single-char '_' runs, no internal
+            // '%'.  A single linear scan per row, no backtracking.
+            fn char_len(b: u8) -> usize {
+                if b < 0x80 {
+                    1
+                } else if b >> 5 == 0b110 {
+                    2
+                } else if b >> 4 == 0b1110 {
+                    3
+                } else {
+                    4
+                }
+            }
+            let mut runs: Vec<(bool, Vec<u8>)> = Vec::new(); // (is_any1, literal bytes)
+            {
+                let mut lit: Vec<u8> = Vec::new();
+                let mut chars = inner.chars().peekable();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '_' => {
+                            if !lit.is_empty() {
+                                runs.push((false, std::mem::take(&mut lit)));
+                            }
+                            runs.push((true, Vec::new()));
+                        }
+                        '\\' => {
+                            if let Some(&next) = chars.peek() {
+                                if next == '_' || next == '\\' {
+                                    lit.push(next as u8);
+                                    chars.next();
+                                    continue;
+                                }
+                            }
+                            lit.push(b'\\');
+                        }
+                        c => {
+                            let mut buf = [0u8; 4];
+                            lit.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                }
+                if !lit.is_empty() {
+                    runs.push((false, lit));
+                }
+            }
+            Ok(Box::new(move |s: &str| {
+                let bytes = s.as_bytes();
+                let mut si = 0usize;
+                let mut ok = true;
+                for (is_any1, lit) in &runs {
+                    if *is_any1 {
+                        if si >= bytes.len() {
+                            ok = false;
+                            break;
+                        }
+                        si += char_len(bytes[si]);
+                    } else {
+                        if bytes.len() - si < lit.len() || &bytes[si..si + lit.len()] != lit.as_slice()
+                        {
+                            ok = false;
+                            break;
+                        }
+                        si += lit.len();
+                    }
+                }
+                if !ok {
+                    false
+                } else if trailing_pct {
+                    true
+                } else {
+                    si == bytes.len()
+                }
+            }))
         } else {
-            // Complex pattern: compile regex once
-            let regex_pat = Self::like_to_regex(pattern);
-            let re = regex::Regex::new(&regex_pat)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e.to_string()))?;
-            Ok(Box::new(move |s: &str| re.is_match(s)))
+            // Compile the pattern into literal runs separated by wildcard
+            // ops and match with byte scanning.  This is 10-100x faster than
+            // a regex automaton per row for short strings (the common LIKE
+            // shape "prefix_suffix%" contains '_' and previously fell into
+            // the regex path).
+            #[derive(Clone)]
+            enum Seg {
+                Lit(Vec<u8>),
+                Any1, // '_'
+                AnyN, // '%'
+            }
+            fn compile_segments(pattern: &str) -> Vec<Seg> {
+                let mut segs: Vec<Seg> = Vec::new();
+                let mut lit: Vec<u8> = Vec::new();
+                let mut chars = pattern.chars().peekable();
+                while let Some(c) = chars.next() {
+                    match c {
+                        '%' => {
+                            if !lit.is_empty() {
+                                segs.push(Seg::Lit(std::mem::take(&mut lit)));
+                            }
+                            segs.push(Seg::AnyN);
+                        }
+                        '_' => {
+                            if !lit.is_empty() {
+                                segs.push(Seg::Lit(std::mem::take(&mut lit)));
+                            }
+                            segs.push(Seg::Any1);
+                        }
+                        '\\' => {
+                            // Escaped wildcard: treat the next char literally.
+                            if let Some(&next) = chars.peek() {
+                                if next == '%' || next == '_' || next == '\\' {
+                                    lit.push(next as u8);
+                                    chars.next();
+                                    continue;
+                                }
+                            }
+                            lit.push(b'\\');
+                        }
+                        c => {
+                            let mut buf = [0u8; 4];
+                            lit.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
+                    }
+                }
+                if !lit.is_empty() {
+                    segs.push(Seg::Lit(lit));
+                }
+                segs
+            }
+            fn seg_match(s: &[u8], segs: &[Seg], si: usize, segi: usize) -> bool {
+                if segi == segs.len() {
+                    return si == s.len();
+                }
+                match &segs[segi] {
+                    Seg::Lit(lit) => {
+                        if s.len() - si < lit.len() {
+                            return false;
+                        }
+                        &s[si..si + lit.len()] == lit.as_slice()
+                            && seg_match(s, segs, si + lit.len(), segi + 1)
+                    }
+                    Seg::Any1 => {
+                        // '_' matches one full UTF-8 character, not one byte.
+                        if si >= s.len() {
+                            return false;
+                        }
+                        let first = s[si];
+                        let char_len = if first < 0x80 {
+                            1
+                        } else if first >> 5 == 0b110 {
+                            2
+                        } else if first >> 4 == 0b1110 {
+                            3
+                        } else {
+                            4
+                        };
+                        seg_match(s, segs, si + char_len, segi + 1)
+                    }
+                    Seg::AnyN => {
+                        if segi + 1 == segs.len() {
+                            return true; // trailing '%' matches the rest
+                        }
+                        // Anchor on the next literal segment: try each of its
+                        // occurrences from the current position.
+                        match &segs[segi + 1] {
+                            Seg::Lit(next) => {
+                                let mut pos = si;
+                                while pos + next.len() <= s.len() {
+                                    if &s[pos..pos + next.len()] == next.as_slice()
+                                        && seg_match(s, segs, pos + next.len(), segi + 2)
+                                    {
+                                        return true;
+                                    }
+                                    pos += 1;
+                                }
+                                false
+                            }
+                            _ => {
+                                for pos in si..=s.len() {
+                                    if seg_match(s, segs, pos, segi + 1) {
+                                        return true;
+                                    }
+                                }
+                                false
+                            }
+                        }
+                    }
+                }
+            }
+            let segs = compile_segments(pattern);
+            Ok(Box::new(move |s: &str| seg_match(s.as_bytes(), &segs, 0, 0)))
         }
     }
 
@@ -6159,35 +6877,5 @@ impl ApexExecutor {
         } else {
             Ok(result)
         }
-    }
-
-    /// Convert SQL LIKE pattern to regex
-    fn like_to_regex(pattern: &str) -> String {
-        let mut regex = String::from("^");
-        let mut chars = pattern.chars().peekable();
-
-        while let Some(c) = chars.next() {
-            match c {
-                '%' => regex.push_str(".*"),
-                '_' => regex.push('.'),
-                '\\' => {
-                    if let Some(&next) = chars.peek() {
-                        if next == '%' || next == '_' {
-                            regex.push(chars.next().unwrap());
-                            continue;
-                        }
-                    }
-                    regex.push_str("\\\\");
-                }
-                c if "[](){}|^$.*+?\\".contains(c) => {
-                    regex.push('\\');
-                    regex.push(c);
-                }
-                c => regex.push(c),
-            }
-        }
-
-        regex.push('$');
-        regex
     }
 }
