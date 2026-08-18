@@ -1633,6 +1633,286 @@ impl OnDemandStorage {
         Ok(Some(merged))
     }
 
+    /// Counts rows of `dict_col` whose `num_col` falls in either of two ranges
+    /// (e.g. `age = 25` or `age = 26`) in a single pass over the column, and
+    /// returns the per-value combined counts as `(value, count)` sorted by
+    /// value. Used by UNION ALL … ORDER BY <dict_col> LIMIT k to construct the
+    /// top-k rows directly instead of materializing both side row sets.
+    pub fn count_dict_values_two_ranges(
+        &self,
+        num_col: &str,
+        lo1: f64,
+        hi1: f64,
+        lo2: f64,
+        hi2: f64,
+        dict_col: &str,
+    ) -> io::Result<Option<Vec<(String, i64)>>> {
+        use rayon::prelude::*;
+
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let num_idx = match schema.get_index(num_col) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let dict_idx = match schema.get_index(dict_col) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let num_type = schema.columns[num_idx].1;
+        let num_is_int = matches!(
+            num_type,
+            ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date
+        );
+        let num_is_float = matches!(num_type, ColumnType::Float64 | ColumnType::Float32);
+        if !num_is_int && !num_is_float {
+            return Ok(None);
+        }
+        if schema.columns[dict_idx].1 != ColumnType::StringDict {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for dict count scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let all_fast = footer.row_groups.iter().enumerate().all(|(rg_i, rg_meta)| {
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return false;
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
+            let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
+            if compress_flag != RG_COMPRESS_NONE || enc_ver < 1 {
+                return false;
+            }
+            let Some(col_offsets) = footer.col_offsets.get(rg_i) else {
+                return false;
+            };
+            if col_offsets.len() <= num_idx.max(dict_idx) {
+                return false;
+            }
+            true
+        });
+        if !all_fast {
+            return Ok(None);
+        }
+
+        struct RgDesc {
+            rg_offset: usize,
+            rg_data_size: usize,
+            rg_rows: usize,
+            num_rcix: usize,
+            dict_rcix: usize,
+            has_deletes: bool,
+            id_section_len: usize,
+        }
+        let mut rg_descs: Vec<RgDesc> = Vec::with_capacity(footer.row_groups.len());
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            rg_descs.push(RgDesc {
+                rg_offset: rg_meta.offset as usize,
+                rg_data_size: rg_meta.data_size as usize,
+                rg_rows: rg_meta.row_count as usize,
+                num_rcix: footer.col_offsets[rg_i][num_idx] as usize,
+                dict_rcix: footer.col_offsets[rg_i][dict_idx] as usize,
+                has_deletes: rg_meta.deletion_count > 0,
+                id_section_len: rg_id_section_len(
+                    rg_meta.row_count as usize,
+                    mmap_ref
+                        .get(rg_meta.offset as usize + 30)
+                        .copied()
+                        .unwrap_or(RG_IDS_PLAIN),
+                ),
+            });
+        }
+
+        let mmap_ptr: usize = mmap_ref.as_ptr() as usize;
+        let mmap_len: usize = mmap_ref.len();
+        let low1 = lo1.ceil() as i64;
+        let high1 = hi1.floor() as i64;
+        let low2 = lo2.ceil() as i64;
+        let high2 = hi2.floor() as i64;
+        let results: Vec<io::Result<Option<Vec<(String, i64)>>>> = rg_descs
+            .par_iter()
+            .map(|desc| {
+                let mmap =
+                    unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
+                let rg_end = desc.rg_offset + desc.rg_data_size;
+                if rg_end > mmap.len() || rg_end < desc.rg_offset + 32 {
+                    return Ok(None);
+                }
+                let body = &mmap[desc.rg_offset + 32..rg_end];
+                let rg_rows = desc.rg_rows;
+                let bitmap_len = (rg_rows + 7) / 8;
+                let del_bytes: Option<&[u8]> =
+                    if desc.has_deletes && desc.id_section_len + bitmap_len <= body.len() {
+                        Some(&body[desc.id_section_len..desc.id_section_len + bitmap_len])
+                    } else {
+                        None
+                    };
+                if desc.has_deletes && del_bytes.is_none() {
+                    return Ok(None);
+                }
+
+                if desc.num_rcix + bitmap_len > body.len() {
+                    return Ok(None);
+                }
+                let num_nulls = &body[desc.num_rcix..desc.num_rcix + bitmap_len];
+                let (num_col_data, _) =
+                    read_column_encoded(&body[desc.num_rcix + bitmap_len..], num_type)?;
+
+                if desc.dict_rcix + bitmap_len > body.len() {
+                    return Ok(None);
+                }
+                let dict_nulls = &body[desc.dict_rcix..desc.dict_rcix + bitmap_len];
+                let dict_col_bytes = &body[desc.dict_rcix + bitmap_len..];
+                let Some(&dict_encoding) = dict_col_bytes.first() else {
+                    return Ok(None);
+                };
+                if !matches!(
+                    dict_encoding,
+                    COL_ENCODING_PLAIN | COL_ENCODING_COMPACT_DICTIONARY
+                ) {
+                    return Ok(None);
+                }
+                let Ok(view) = StringDictView::parse(
+                    &dict_col_bytes[1..],
+                    dict_encoding == COL_ENCODING_COMPACT_DICTIONARY,
+                ) else {
+                    return Ok(None);
+                };
+                let values: Vec<String> = (1..view.dict_size)
+                    .filter_map(|k| {
+                        view.value(k as u32)
+                            .map(|b| String::from_utf8_lossy(b).into_owned())
+                    })
+                    .collect();
+                let value_index = |key: u32| -> Option<usize> {
+                    if key == 0 {
+                        None
+                    } else {
+                        Some((key as usize) - 1)
+                    }
+                };
+
+                let n = rg_rows;
+                let mut counts: Vec<i64> = vec![0; values.len()];
+                match &num_col_data {
+                    ColumnData::Int64(v) => {
+                        if v.len() < n {
+                            return Ok(None);
+                        }
+                        for i in 0..n {
+                            if let Some(db) = del_bytes {
+                                if (db[i / 8] >> (i % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                            }
+                            if (num_nulls[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            if (dict_nulls[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            let vv = v[i];
+                            let mut c = 0i64;
+                            if vv >= low1 && vv <= high1 {
+                                c += 1;
+                            }
+                            if vv >= low2 && vv <= high2 {
+                                c += 1;
+                            }
+                            if c == 0 {
+                                continue;
+                            }
+                            if let Some(idx) = view.index(i).and_then(value_index) {
+                                if idx < counts.len() {
+                                    counts[idx] += c;
+                                }
+                            }
+                        }
+                    }
+                    ColumnData::Float64(v) => {
+                        if v.len() < n {
+                            return Ok(None);
+                        }
+                        for i in 0..n {
+                            if let Some(db) = del_bytes {
+                                if (db[i / 8] >> (i % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                            }
+                            if (num_nulls[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            if (dict_nulls[i / 8] >> (i % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            let vv = v[i];
+                            let mut c = 0i64;
+                            if vv >= lo1 && vv <= hi1 {
+                                c += 1;
+                            }
+                            if vv >= lo2 && vv <= hi2 {
+                                c += 1;
+                            }
+                            if c == 0 {
+                                continue;
+                            }
+                            if let Some(idx) = view.index(i).and_then(value_index) {
+                                if idx < counts.len() {
+                                    counts[idx] += c;
+                                }
+                            }
+                        }
+                    }
+                    _ => return Ok(None),
+                }
+                Ok(Some(
+                    values
+                        .into_iter()
+                        .zip(counts.into_iter())
+                        .filter(|(_, c)| *c > 0)
+                        .collect(),
+                ))
+            })
+            .collect();
+
+        drop(mmap_guard);
+        drop(file_guard);
+
+        let mut merged: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        for r in results {
+            match r? {
+                Some(pairs) => {
+                    for (v, c) in pairs {
+                        *merged.entry(v).or_insert(0) += c;
+                    }
+                }
+                None => return Ok(None),
+            }
+        }
+        let mut out: Vec<(String, i64)> = merged.into_iter().collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Some(out))
+    }
+
     pub fn scan_bool_filter_mmap(
         &self,
         col_name: &str,

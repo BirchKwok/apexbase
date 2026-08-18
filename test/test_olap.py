@@ -320,6 +320,85 @@ class TestOlapNotFilter:
             shutil.rmtree(tmp, ignore_errors=True)
 
 
+class TestOlapUnionAllTopk:
+    """UNION ALL … ORDER BY <dict_col> LIMIT k fast path: per-value counts are
+    gathered in one storage pass and the top-k rows are built directly."""
+
+    def _ref(self, n, cities):
+        left = [cities[i % 10] for i in range(n) if 22 + (i % 40) == 25]
+        right = [cities[i % 10] for i in range(n) if 22 + (i % 40) == 26]
+        return sorted(left + right)
+
+    def _client(self):
+        tmp = tempfile.mkdtemp()
+        client = ApexClient(os.path.join(tmp, "union_topk"))
+        client.create_table("default")
+        cities = ["Beijing", "Shanghai", "Shenzhen", "Guangzhou", "Hangzhou",
+                  "Chengdu", "Wuhan", "Nanjing", "Tianjin", "Xian"]
+        n = 20000
+        rows = []
+        for i in range(n):
+            rows.append({
+                "emp_id": i + 1,
+                "age": 22 + (i % 40),
+                "city": cities[i % 10],
+            })
+        client.store(rows)
+        client.flush()  # mmap-only so the fused storage count path is exercised
+        return tmp, client, n, cities
+
+    def test_union_all_order_limit_asc(self):
+        tmp, client, n, cities = self._client()
+        try:
+            result = client.execute(
+                "SELECT city FROM default WHERE age = 25 "
+                "UNION ALL SELECT city FROM default WHERE age = 26 "
+                "ORDER BY city LIMIT 100"
+            )
+            got = [r["city"] for r in result]
+            assert got == self._ref(n, cities)[:100]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_union_all_order_limit_desc(self):
+        tmp, client, n, cities = self._client()
+        try:
+            result = client.execute(
+                "SELECT city FROM default WHERE age = 25 "
+                "UNION ALL SELECT city FROM default WHERE age = 26 "
+                "ORDER BY city DESC LIMIT 100"
+            )
+            got = [r["city"] for r in result]
+            assert got == self._ref(n, cities)[::-1][:100]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_union_all_order_limit_offset(self):
+        tmp, client, n, cities = self._client()
+        try:
+            result = client.execute(
+                "SELECT city FROM default WHERE age = 25 "
+                "UNION ALL SELECT city FROM default WHERE age = 26 "
+                "ORDER BY city LIMIT 50 OFFSET 25"
+            )
+            got = [r["city"] for r in result]
+            assert got == self._ref(n, cities)[25:75]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_union_distinct_order(self):
+        tmp, client, n, cities = self._client()
+        try:
+            result = client.execute(
+                "SELECT city FROM default WHERE age = 25 "
+                "UNION SELECT city FROM default WHERE age = 26 ORDER BY city"
+            )
+            got = [r["city"] for r in result]
+            assert got == sorted(set(self._ref(n, cities)))
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 class TestOlapMultiCondition:
     def test_and_condition(self, olap_client):
         result = olap_client.execute(

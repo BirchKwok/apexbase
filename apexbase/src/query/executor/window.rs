@@ -22,6 +22,17 @@ impl ApexExecutor {
             return Ok(ApexResult::Data(result));
         }
 
+        // ── FAST PATH: `SELECT dict_col WHERE num_col = v1 UNION [ALL] SELECT
+        // dict_col WHERE num_col = v2 ORDER BY dict_col [LIMIT k]`. Both sides'
+        // per-value counts are computed in a single storage pass and the result
+        // (top-k rows for ALL, distinct values for DISTINCT) is built directly,
+        // skipping the 2×side-row materialization.
+        if let Some(batch) =
+            Self::try_fast_union_topk(&union, base_dir, default_table_path)?
+        {
+            return Ok(ApexResult::Data(batch));
+        }
+
         // Keep dictionary-encoded string columns in the side batches: the set
         // op hashes distinct values once instead of every row, and only the
         // (small) result is decoded below.
@@ -61,7 +72,14 @@ impl ApexExecutor {
         result = Self::decode_dict_columns(&result);
 
         if !union.order_by.is_empty() {
-            result = Self::apply_order_by(&result, &union.order_by)?;
+            // With a LIMIT smaller than the result, use a limited top-k sort
+            // instead of sorting every row (O(n log n) → O(n log k)).
+            let k = union.limit.map(|l| l + union.offset.unwrap_or(0));
+            if let Some(k) = k.filter(|&k| k < result.num_rows()) {
+                result = Self::apply_order_by_topk(&result, &union.order_by, Some(k))?;
+            } else {
+                result = Self::apply_order_by(&result, &union.order_by)?;
+            }
         }
         if union.limit.is_some() || union.offset.is_some() {
             result = Self::apply_limit_offset(&result, union.limit, union.offset)?;
@@ -169,6 +187,180 @@ impl ApexExecutor {
         result_vals.dedup();
 
         let arr: ArrayRef = Arc::new(arrow::array::StringArray::from(result_vals));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            &dict_col,
+            ArrowDataType::Utf8,
+            false,
+        )]));
+        RecordBatch::try_new(schema, vec![arr])
+            .map(|b| Some(b))
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    /// UNION fast path: both sides are
+    /// `SELECT <dict_col> FROM <table> WHERE <num_col> = <v>` (equality) or
+    /// `BETWEEN lo AND hi`, and the statement is `ORDER BY <dict_col>` with an
+    /// optional LIMIT. The per-value counts of both sides are gathered in one
+    /// storage pass; UNION ALL emits the top-k rows directly, UNION DISTINCT
+    /// emits the distinct values.
+    fn try_fast_union_topk(
+        union: &UnionStatement,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<Option<RecordBatch>> {
+        use crate::query::sql_parser::{BinaryOperator, FromItem, SelectColumn, SqlExpr, SqlStatement};
+        use crate::query::SetOpType;
+        if union.set_op != SetOpType::Union {
+            return Ok(None);
+        }
+        // UNION ALL without a LIMIT would materialize the full side row sets;
+        // only the bounded top-k form is answered here.
+        if union.all && union.limit.is_none() {
+            return Ok(None);
+        }
+        let limit = union.limit;
+        let offset = union.offset.unwrap_or(0);
+        // OFFSET without LIMIT cannot be answered by a top-k build; fall back.
+        if offset > 0 && limit.is_none() {
+            return Ok(None);
+        }
+        if union.order_by.len() != 1 {
+            return Ok(None);
+        }
+        let ob = &union.order_by[0];
+        if ob.expr.is_some() || ob.nulls_first.is_some() {
+            return Ok(None);
+        }
+
+        let extract = |stmt: &SqlStatement| -> Option<(String, String, String, f64, f64)> {
+            let SqlStatement::Select(sel) = stmt else {
+                return None;
+            };
+            if sel.distinct
+                || sel.distinct_on.is_some()
+                || !sel.group_by.is_empty()
+                || !sel.order_by.is_empty()
+                || sel.limit.is_some()
+                || sel.offset.is_some()
+                || !sel.joins.is_empty()
+                || sel.having.is_some()
+                || sel.columns.len() != 1
+            {
+                return None;
+            }
+            let FromItem::Table { table, alias: None } = sel.from.as_ref()? else {
+                return None;
+            };
+            let SelectColumn::Column(dict_col) = &sel.columns[0] else {
+                return None;
+            };
+            let (num_col, lo, hi) = match sel.where_clause.as_ref()? {
+                SqlExpr::Between {
+                    column,
+                    low,
+                    high,
+                    negated: false,
+                } => (
+                    column.clone(),
+                    Self::extract_numeric_value(low).ok()?,
+                    Self::extract_numeric_value(high).ok()?,
+                ),
+                SqlExpr::BinaryOp {
+                    left,
+                    op: BinaryOperator::Eq,
+                    right,
+                } => match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(c), lit) => {
+                        (c.clone(), Self::extract_numeric_value(lit).ok()?, Self::extract_numeric_value(lit).ok()?)
+                    }
+                    (lit, SqlExpr::Column(c)) => {
+                        (c.clone(), Self::extract_numeric_value(lit).ok()?, Self::extract_numeric_value(lit).ok()?)
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            Some((
+                table.clone(),
+                dict_col.trim_matches('"').to_string(),
+                num_col.trim_matches('"').to_string(),
+                lo,
+                hi,
+            ))
+        };
+
+        let (table, dict_col, num_col, lo1, hi1) = match extract(union.left.as_ref()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let (table2, dict_col2, num_col2, lo2, hi2) = match extract(union.right.as_ref()) {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        if table != table2 || dict_col != dict_col2 || num_col != num_col2 {
+            return Ok(None);
+        }
+        if ob.column.trim_matches('"') != dict_col {
+            return Ok(None);
+        }
+
+        let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
+        let backend = crate::query::executor::get_cached_backend(&table_path)?;
+        // NULL dictionary keys are dropped by the count scan; fall back when the
+        // dict column can contain NULLs so the null multiplicity/set semantics
+        // are preserved.
+        if backend.column_has_nulls(&dict_col) {
+            return Ok(None);
+        }
+
+        let counts = match backend.count_dict_values_two_ranges(
+            &num_col, lo1, hi1, lo2, hi2, &dict_col,
+        )? {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let iter: Box<dyn Iterator<Item = &(String, i64)>> = if ob.descending {
+            Box::new(counts.iter().rev())
+        } else {
+            Box::new(counts.iter())
+        };
+        let mut vals: Vec<String> = Vec::new();
+        if union.all {
+            let total_need = limit.unwrap() + offset;
+            for (v, c) in iter {
+                for _ in 0..(*c).max(0) as usize {
+                    vals.push(v.clone());
+                    if vals.len() >= total_need {
+                        break;
+                    }
+                }
+                if vals.len() >= total_need {
+                    break;
+                }
+            }
+            vals = if offset > 0 {
+                vals.into_iter().skip(offset).take(limit.unwrap()).collect()
+            } else {
+                vals.into_iter().take(limit.unwrap()).collect()
+            };
+        } else {
+            // UNION DISTINCT: one row per value that appears on either side.
+            for (v, c) in iter {
+                if *c > 0 {
+                    vals.push(v.clone());
+                }
+            }
+            if let Some(l) = limit {
+                vals = if offset > 0 {
+                    vals.into_iter().skip(offset).take(l).collect()
+                } else {
+                    vals.into_iter().take(l).collect()
+                };
+            }
+        }
+
+        let arr: ArrayRef = Arc::new(arrow::array::StringArray::from(vals));
         let schema = Arc::new(Schema::new(vec![Field::new(
             &dict_col,
             ArrowDataType::Utf8,

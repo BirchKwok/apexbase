@@ -4335,6 +4335,21 @@ impl TableStorageBackend {
             .scan_distinct_dict_values_in_range(num_col, lo, hi, dict_col)
     }
 
+    /// Combined per-value counts of `dict_col` for `num_col` in either of two
+    /// ranges, returned as `(value, count)` sorted by value (single pass).
+    pub fn count_dict_values_two_ranges(
+        &self,
+        num_col: &str,
+        lo1: f64,
+        hi1: f64,
+        lo2: f64,
+        hi2: f64,
+        dict_col: &str,
+    ) -> io::Result<Option<Vec<(String, i64)>>> {
+        self.storage
+            .count_dict_values_two_ranges(num_col, lo1, hi1, lo2, hi2, dict_col)
+    }
+
     /// Mmap-level LIKE pattern scan: find matching row indices without Arrow arrays.
     pub fn scan_like_filter_mmap(
         &self,
