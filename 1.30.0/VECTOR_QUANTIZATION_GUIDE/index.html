@@ -1513,6 +1513,16 @@ ApexBase then reads only those rows from <code>embedding</code>, recomputes the 
 distance in Float32, and returns the exact ranking within the candidate set.
 Increasing <code>candidate_k</code> improves recall at the cost of more source reads and
 exact distance calculations.</p>
+<p>Compressed L2 scans operate directly on the stored representation. Float16
+and BFloat16 decode inside the scan; Int8 and UInt8 reuse a query
+quantization and integer dot/norm terms for dimensions of 64 or more; 1Bit
+uses a Hamming candidate pass followed by a small magnitude-aware rerank; and
+TurboQuant reuses one rotated query plus byte lookup tables. Batch search
+shares the encoded query state across rows and parallelizes across queries.</p>
+<p>The exact Int8/UInt8 kernels use runtime-selected SIMD on both major desktop
+architectures: AVX2/FMA on x86_64 and NEON on AArch64. Unsupported CPUs retain
+the scalar implementation, so stored formats and query results do not depend
+on the instruction set available at write time.</p>
 <h2 id="stored-formats">Stored formats<a class="headerlink" href="#stored-formats" title="Permanent link">&para;</a></h2>
 <table>
 <thead>
@@ -1596,6 +1606,11 @@ future re-quantization, or model migration matters.</p>
 </ul>
 <p>Quantization rejects empty, ragged, NaN, and infinite vectors. Vector dimension
 is fixed by the first valid batch and must remain consistent.</p>
+<p>Int8/UInt8 compressed scans at dimensions of 64 or more use an approximate
+query-once integer score; exact source reranking is the appropriate path when
+the final ordering must match Float32. Likewise, very compact 1Bit and
+TurboQuant codecs trade candidate recall for storage and scan speed. Always
+measure recall and tune <code>candidate_k</code> on representative embeddings.</p>
 
 
 

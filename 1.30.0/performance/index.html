@@ -1027,15 +1027,15 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#all-108-metrics" class="md-nav__link">
+  <a href="#tabular-and-exact-vector-metrics" class="md-nav__link">
     <span class="md-ellipsis">
       
-        All 108 Metrics
+        Tabular and Exact Vector Metrics
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="All 108 Metrics">
+    <nav class="md-nav" aria-label="Tabular and Exact Vector Metrics">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -1061,10 +1061,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#vector-similarity-6" class="md-nav__link">
+  <a href="#exact-vector-similarity-6" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Vector Similarity (6)
+        Exact Vector Similarity (6)
       
     </span>
   </a>
@@ -1073,6 +1073,17 @@
         
       </ul>
     </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#quantized-l2-distance-snapshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quantized L2 Distance Snapshot
+      
+    </span>
+  </a>
   
 </li>
       
@@ -1469,19 +1480,22 @@ reproducible snapshot, not a universal claim: rerun the suite on your own
 hardware and workload.</p>
 <h2 id="v1300-public-snapshot">v1.30.0 Public Snapshot<a class="headerlink" href="#v1300-public-snapshot" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>Date / source</strong>: 2026-08-21, <code>d8b27a4</code> plus the v1.30.0 release workspace</li>
+<li><strong>Date / source</strong>: 2026-08-22, v1.30.0 optimized <code>main</code> workspace</li>
 <li><strong>System</strong>: macOS 26.6.2, Apple arm64 (10 cores), 32 GB RAM</li>
-<li><strong>Stack</strong>: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Tabular stack</strong>: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Vector stack</strong>: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1</li>
 <li><strong>Tabular dataset</strong>: 1,000,000 rows x 5 columns</li>
 <li><strong>Vector dataset</strong>: 1,000,000 Float32 vectors x 128 dimensions, <code>k=10</code>, 10 batch queries</li>
 <li><strong>Method</strong>: 2 warmup iterations + 5 timed iterations, materialized results</li>
-<li><strong>Report</strong>: <code>benchmarks/results/v1.30.0-vector-quantization-public-final.json</code></li>
+<li><strong>Report</strong>: <code>benchmarks/results/v1.30.0-public-unified-vector-1m.json</code></li>
 </ul>
-<p>The public suite completed all <strong>108/108 metrics</strong>. ApexBase won <strong>106/108</strong>:
-all 70 OLAP metrics, 30 of 32 OLTP metrics, and all 6 vector metrics. The only
-two slower results were <code>Table DROP</code> and <code>Table CREATE+DROP cycle</code> against
-SQLite's minimal empty-table DDL path; ApexBase remained faster than DuckDB on
-both.</p>
+<p>The unified public suite completed all <strong>116/116 named metrics</strong>: 102 tabular,
+6 exact-vector, and 8 ApexBase quantized precision rows. Of the 114 rows with a
+direct competitor, ApexBase won <strong>111/114</strong>: 99 of 102 tabular metrics, all 6
+exact-vector metrics, and all 6 quantized codecs shared with sqlite-vector.
+Float16 and BFloat16 have no sqlite-vector quantized equivalent. The three
+slower tabular results were small table-management operations against SQLite's
+minimal empty-table DDL path; ApexBase remained faster than DuckDB on them.</p>
 <table>
 <thead>
 <tr>
@@ -1503,9 +1517,9 @@ both.</p>
 <tr>
 <td>OLTP fair</td>
 <td style="text-align: right;">32</td>
-<td style="text-align: right;">30</td>
+<td style="text-align: right;">29</td>
 <td style="text-align: right;">0</td>
-<td style="text-align: right;">2</td>
+<td style="text-align: right;">3</td>
 </tr>
 <tr>
 <td>Exact vector similarity</td>
@@ -1515,20 +1529,27 @@ both.</p>
 <td style="text-align: right;">0</td>
 </tr>
 <tr>
-<td><strong>Total</strong></td>
-<td style="text-align: right;"><strong>108</strong></td>
-<td style="text-align: right;"><strong>106</strong></td>
+<td>Quantized vector, shared codecs</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td><strong>Comparable total</strong></td>
+<td style="text-align: right;"><strong>114</strong></td>
+<td style="text-align: right;"><strong>111</strong></td>
 <td style="text-align: right;"><strong>0</strong></td>
-<td style="text-align: right;"><strong>2</strong></td>
+<td style="text-align: right;"><strong>3</strong></td>
 </tr>
 </tbody>
 </table>
-<p>The six public vector rows use exact Float32 scans; quantization is deliberately
-excluded from the cross-engine scoreboard. SQLite 3.46.0 was below the minimum
-supported by the installed sqlite-vector binary, so those rows compare
-ApexBase and DuckDB. For compressed candidate retrieval with exact reranking,
-see the <a href="../VECTOR_QUANTIZATION_GUIDE/">Vector Quantization Guide</a>.</p>
-<h2 id="all-108-metrics">All 108 Metrics<a class="headerlink" href="#all-108-metrics" title="Permanent link">&para;</a></h2>
+<p>The six public vector rows use exact Float32 scans. SQLite is represented by
+the <a href="https://github.com/sqliteai/sqlite-vector">sqlite-vector</a> extension's
+<code>vector_full_scan()</code> rather than by SQLite core, which has no native vector
+distance operator. Quantized scans remain a separate diagnostic because their
+recall and storage contracts differ from exact Float32 search.</p>
+<h2 id="tabular-and-exact-vector-metrics">Tabular and Exact Vector Metrics<a class="headerlink" href="#tabular-and-exact-vector-metrics" title="Permanent link">&para;</a></h2>
 <h3 id="olap-fair-metrics-70">OLAP Fair Metrics (70)<a class="headerlink" href="#olap-fair-metrics-70" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
@@ -2167,58 +2188,199 @@ see the <a href="../VECTOR_QUANTIZATION_GUIDE/">Vector Quantization Guide</a>.</
 </tr>
 </tbody>
 </table>
-<h3 id="vector-similarity-6">Vector Similarity (6)<a class="headerlink" href="#vector-similarity-6" title="Permanent link">&para;</a></h3>
+<h3 id="exact-vector-similarity-6">Exact Vector Similarity (6)<a class="headerlink" href="#exact-vector-similarity-6" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
 <tr>
 <th>Metric</th>
 <th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite + sqlite-vector</th>
 <th style="text-align: right;">DuckDB</th>
 </tr>
 </thead>
 <tbody>
 <tr>
 <td>TopK L2</td>
-<td style="text-align: right;">7.789 ms</td>
-<td style="text-align: right;">32.761 ms</td>
+<td style="text-align: right;">7.684 ms</td>
+<td style="text-align: right;">135.728 ms</td>
+<td style="text-align: right;">35.056 ms</td>
 </tr>
 <tr>
 <td>TopK Cosine</td>
-<td style="text-align: right;">7.577 ms</td>
-<td style="text-align: right;">39.001 ms</td>
+<td style="text-align: right;">7.888 ms</td>
+<td style="text-align: right;">160.234 ms</td>
+<td style="text-align: right;">41.254 ms</td>
 </tr>
 <tr>
 <td>TopK Dot</td>
-<td style="text-align: right;">7.879 ms</td>
-<td style="text-align: right;">32.261 ms</td>
+<td style="text-align: right;">8.080 ms</td>
+<td style="text-align: right;">134.895 ms</td>
+<td style="text-align: right;">32.260 ms</td>
 </tr>
 <tr>
 <td>Batch TopK L2 (10 queries)</td>
-<td style="text-align: right;">50.860 ms</td>
-<td style="text-align: right;">319.979 ms</td>
+<td style="text-align: right;">49.072 ms</td>
+<td style="text-align: right;">1,347.899 ms</td>
+<td style="text-align: right;">340.936 ms</td>
 </tr>
 <tr>
 <td>Batch TopK Cosine (10 queries)</td>
-<td style="text-align: right;">48.101 ms</td>
-<td style="text-align: right;">385.503 ms</td>
+<td style="text-align: right;">50.763 ms</td>
+<td style="text-align: right;">1,505.297 ms</td>
+<td style="text-align: right;">390.632 ms</td>
 </tr>
 <tr>
 <td>Batch TopK Dot (10 queries)</td>
-<td style="text-align: right;">46.407 ms</td>
-<td style="text-align: right;">331.353 ms</td>
+<td style="text-align: right;">49.674 ms</td>
+<td style="text-align: right;">1,337.900 ms</td>
+<td style="text-align: right;">344.654 ms</td>
 </tr>
 </tbody>
 </table>
 <p>All vector rows matched the brute-force exact top-k row sets.</p>
+<h2 id="quantized-l2-distance-snapshot">Quantized L2 Distance Snapshot<a class="headerlink" href="#quantized-l2-distance-snapshot" title="Permanent link">&para;</a></h2>
+<p>The public benchmark entrypoint includes this snapshot alongside the tabular
+and exact-vector modules. It uses 1,000,000 identical normally
+distributed Float32 vectors with 128 dimensions, 20 query vectors, <code>k=10</code>, two
+warmups, and five timed iterations. Latency is the median per query across
+repeated query batches. ApexBase uses its native <code>batch_topk_distance()</code> API;
+sqlite-vector has no batch API, so its measurement repeats
+<code>vector_quantize_scan()</code> once per query. These values therefore describe
+batch-amortized retrieval, not isolated single-query latency.</p>
+<p>Recall is overlap with each engine's own exact Float32 top-10. sqlite-vector
+quantized data was preloaded, and ApexBase exact reranking used
+<code>candidate_k=100</code>.</p>
+<p>The common comparison covers the six modes supported by both engines. The
+codec names describe each engine's implementation, not a shared binary format.</p>
+<table>
+<thead>
+<tr>
+<th>Codec</th>
+<th style="text-align: right;">ApexBase quantized</th>
+<th style="text-align: right;">Apex recall</th>
+<th style="text-align: right;">Apex exact-rescore</th>
+<th style="text-align: right;">Rescore recall</th>
+<th style="text-align: right;">sqlite-vector quantized</th>
+<th style="text-align: right;">SQLite recall</th>
+<th style="text-align: right;">SQLite preload</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>INT8</td>
+<td style="text-align: right;">1.306 ms</td>
+<td style="text-align: right;">0.975</td>
+<td style="text-align: right;">18.785 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">8.779 ms</td>
+<td style="text-align: right;">0.945</td>
+<td style="text-align: right;">129.70 MiB</td>
+</tr>
+<tr>
+<td>UINT8</td>
+<td style="text-align: right;">3.467 ms</td>
+<td style="text-align: right;">0.985</td>
+<td style="text-align: right;">23.775 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">8.765 ms</td>
+<td style="text-align: right;">0.960</td>
+<td style="text-align: right;">129.70 MiB</td>
+</tr>
+<tr>
+<td>1-bit</td>
+<td style="text-align: right;">0.695 ms</td>
+<td style="text-align: right;">0.140</td>
+<td style="text-align: right;">16.158 ms</td>
+<td style="text-align: right;">0.415</td>
+<td style="text-align: right;">2.057 ms</td>
+<td style="text-align: right;">0.100</td>
+<td style="text-align: right;">22.89 MiB</td>
+</tr>
+<tr>
+<td>TurboQuant 2-bit</td>
+<td style="text-align: right;">5.094 ms</td>
+<td style="text-align: right;">0.450</td>
+<td style="text-align: right;">21.372 ms</td>
+<td style="text-align: right;">0.870</td>
+<td style="text-align: right;">27.343 ms</td>
+<td style="text-align: right;">0.535</td>
+<td style="text-align: right;">41.96 MiB</td>
+</tr>
+<tr>
+<td>TurboQuant 3-bit</td>
+<td style="text-align: right;">18.641 ms</td>
+<td style="text-align: right;">0.595</td>
+<td style="text-align: right;">34.990 ms</td>
+<td style="text-align: right;">0.990</td>
+<td style="text-align: right;">66.771 ms</td>
+<td style="text-align: right;">0.725</td>
+<td style="text-align: right;">57.22 MiB</td>
+</tr>
+<tr>
+<td>TurboQuant 4-bit</td>
+<td style="text-align: right;">9.559 ms</td>
+<td style="text-align: right;">0.760</td>
+<td style="text-align: right;">26.240 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">52.141 ms</td>
+<td style="text-align: right;">0.840</td>
+<td style="text-align: right;">72.48 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>sqlite-vector does not expose Float16 or BFloat16 through
+<code>vector_quantize_scan()</code>. ApexBase's additional derived-column results were:</p>
+<table>
+<thead>
+<tr>
+<th>ApexBase-only codec</th>
+<th style="text-align: right;">Quantized L2</th>
+<th style="text-align: right;">Recall@10</th>
+<th style="text-align: right;">Exact-rescore</th>
+<th style="text-align: right;">Rescore recall</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Float16</td>
+<td style="text-align: right;">2.504 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">17.064 ms</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+<tr>
+<td>BFloat16</td>
+<td style="text-align: right;">10.527 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">31.441 ms</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+</tbody>
+</table>
+<p>Across all six shared quantizers, ApexBase's batch-amortized compressed scan
+was 2.53x to 6.72x faster. INT8, UINT8, and 1Bit also had higher
+recall in this dataset; TurboQuant 2/3/4 traded lower initial candidate recall
+for speed, while exact source reranking recovered 0.935-1.000 recall. The JSON
+report also retains build time, database size, and sqlite-vector's estimated
+preloaded representation size for every mode.</p>
 <h2 id="reproduce">Reproduce<a class="headerlink" href="#reproduce" title="Permanent link">&para;</a></h2>
 <p>Run the same default public profile:</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>python<span class="w"> </span>benchmarks/bench_vs_sqlite_duckdb.py<span class="w"> </span><span class="se">\</span>
 </span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>--output<span class="w"> </span>benchmarks/results/public.json
 </span></code></pre></div>
-<p>Use <code>--skip-vector</code> for a tabular-only run. Use
-<code>benchmarks/bench_vector_quantization.py</code> to measure compressed storage,
-candidate recall, and exact rescore separately from this public exact-scan
-scoreboard.</p>
+<p>Use <code>--skip-vector</code> for a tabular-only run, or
+<code>--skip-quantized-vector</code> to retain exact-vector metrics while omitting the
+compressed module. The unified command accepts <code>--quantized-vector-rows</code>,
+<code>--quantized-vector-queries</code>, <code>--quantized-vector-candidate-k</code>, and
+<code>--quantized-vector-seed</code> when a different compressed workload is required:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>python<span class="w"> </span>benchmarks/bench_vs_sqlite_duckdb.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span>--quantized-vector-rows<span class="w"> </span><span class="m">1000000</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>--quantized-vector-queries<span class="w"> </span><span class="m">20</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span>--quantized-vector-candidate-k<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span>--output<span class="w"> </span>benchmarks/results/public-with-quantization.json
+</span></code></pre></div>
+<p>The quantization benchmark requires the optional <code>sqliteai-vector</code> Python
+package and a Python build linked against a compatible SQLite version.</p>
 
 
 
