@@ -63,6 +63,13 @@ def test_github_release_requires_the_combined_publication_job():
     assert "needs.publish-crate.result" not in block
 
 
+def test_github_release_reads_notes_from_the_release_tag():
+    block = _job_block("create-release")
+
+    assert "ref: ${{ needs.resolve-release.outputs.tag_name }}" in block
+    assert "github.event.repository.default_branch" not in block
+
+
 def test_publication_confirms_both_registries():
     block = _job_block("publish-packages")
 
