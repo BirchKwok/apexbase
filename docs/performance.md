@@ -8,11 +8,12 @@ hardware and workload.
 
 - **Date / source**: 2026-08-21, `d8b27a4` plus the v1.30.0 release workspace
 - **System**: macOS 26.6.2, Apple arm64 (10 cores), 32 GB RAM
-- **Stack**: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
+- **Tabular stack**: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
+- **Vector supplement stack**: Python 3.13.3, ApexBase 1.30.0, SQLite 3.53.3 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1
 - **Tabular dataset**: 1,000,000 rows x 5 columns
 - **Vector dataset**: 1,000,000 Float32 vectors x 128 dimensions, `k=10`, 10 batch queries
 - **Method**: 2 warmup iterations + 5 timed iterations, materialized results
-- **Report**: `benchmarks/results/v1.30.0-vector-quantization-public-final.json`
+- **Reports**: `benchmarks/results/v1.30.0-vector-quantization-public-final.json`, `benchmarks/results/v1.30.0-sqlite-vector-exact.json`, and `benchmarks/results/v1.30.0-sqlite-vector-quantization.json`
 
 The public suite completed all **108/108 metrics**. ApexBase won **106/108**:
 all 70 OLAP metrics, 30 of 32 OLTP metrics, and all 6 vector metrics. The only
@@ -27,11 +28,11 @@ both.
 | Exact vector similarity | 6 | 6 | 0 | 0 |
 | **Total** | **108** | **106** | **0** | **2** |
 
-The six public vector rows use exact Float32 scans; quantization is deliberately
-excluded from the cross-engine scoreboard. SQLite 3.46.0 was below the minimum
-supported by the installed sqlite-vector binary, so those rows compare
-ApexBase and DuckDB. For compressed candidate retrieval with exact reranking,
-see the [Vector Quantization Guide](VECTOR_QUANTIZATION_GUIDE.md).
+The six public vector rows use exact Float32 scans. SQLite is represented by
+the [sqlite-vector](https://github.com/sqliteai/sqlite-vector) extension's
+`vector_full_scan()` rather than by SQLite core, which has no native vector
+distance operator. Quantized scans remain a separate diagnostic because their
+recall and storage contracts differ from exact Float32 search.
 
 ## All 108 Metrics
 
@@ -147,18 +148,52 @@ see the [Vector Quantization Guide](VECTOR_QUANTIZATION_GUIDE.md).
 | List tables (10) | 0.011 ms | 0.020 ms | 2.846 ms |
 | ALTER TABLE ADD COLUMN | 0.067 ms | 0.082 ms | 0.107 ms |
 
-### Vector Similarity (6)
+### Exact Vector Similarity (6)
 
-| Metric | ApexBase | DuckDB |
-| --- | ---: | ---: |
-| TopK L2 | 7.789 ms | 32.761 ms |
-| TopK Cosine | 7.577 ms | 39.001 ms |
-| TopK Dot | 7.879 ms | 32.261 ms |
-| Batch TopK L2 (10 queries) | 50.860 ms | 319.979 ms |
-| Batch TopK Cosine (10 queries) | 48.101 ms | 385.503 ms |
-| Batch TopK Dot (10 queries) | 46.407 ms | 331.353 ms |
+| Metric | ApexBase | SQLite + sqlite-vector | DuckDB |
+| --- | ---: | ---: | ---: |
+| TopK L2 | 7.951 ms | 123.397 ms | 31.644 ms |
+| TopK Cosine | 7.843 ms | 131.655 ms | 37.821 ms |
+| TopK Dot | 8.420 ms | 120.771 ms | 32.322 ms |
+| Batch TopK L2 (10 queries) | 47.107 ms | 1,225.980 ms | 320.179 ms |
+| Batch TopK Cosine (10 queries) | 51.042 ms | 1,317.794 ms | 377.865 ms |
+| Batch TopK Dot (10 queries) | 47.494 ms | 1,203.704 ms | 316.817 ms |
 
 All vector rows matched the brute-force exact top-k row sets.
+
+## Quantized L2 Distance Snapshot
+
+This separate snapshot uses 100,000 identical normally distributed Float32
+vectors with 128 dimensions, 20 query vectors, `k=10`, two warmups, and five
+timed iterations. Latency is the median per query. Recall is overlap with each
+engine's own exact Float32 top-10. sqlite-vector quantized data was preloaded,
+and ApexBase exact reranking used `candidate_k=100`.
+
+The common comparison covers the six modes supported by both engines. The
+codec names describe each engine's implementation, not a shared binary format.
+
+| Codec | ApexBase quantized | Apex recall | Apex exact-rescore | Rescore recall | sqlite-vector quantized | SQLite recall | SQLite preload |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| INT8 | 7.992 ms | 0.995 | 9.239 ms | 1.000 | 0.936 ms | 0.985 | 12.97 MiB |
+| UINT8 | 8.708 ms | 0.995 | 9.886 ms | 1.000 | 0.927 ms | 0.975 | 12.97 MiB |
+| 1-bit | 15.473 ms | 0.250 | 16.839 ms | 0.670 | 0.206 ms | 0.145 | 2.29 MiB |
+| TurboQuant 2-bit | 89.180 ms | 0.440 | 90.461 ms | 0.935 | 2.802 ms | 0.540 | 4.20 MiB |
+| TurboQuant 3-bit | 95.410 ms | 0.650 | 96.949 ms | 1.000 | 7.357 ms | 0.745 | 5.72 MiB |
+| TurboQuant 4-bit | 101.204 ms | 0.775 | 102.594 ms | 1.000 | 5.355 ms | 0.860 | 7.25 MiB |
+
+sqlite-vector does not expose Float16 or BFloat16 through
+`vector_quantize_scan()`. ApexBase's additional derived-column results were:
+
+| ApexBase-only codec | Quantized L2 | Recall@10 | Exact-rescore | Rescore recall |
+| --- | ---: | ---: | ---: | ---: |
+| Float16 | 0.826 ms | 1.000 | 2.204 ms | 1.000 |
+| BFloat16 | 8.113 ms | 1.000 | 9.492 ms | 1.000 |
+
+For context, the exact Float32 scans in this 100K snapshot were approximately
+1.05-1.33 ms/query for ApexBase and 22.11-22.40 ms/query for sqlite-vector.
+Compression therefore did not imply a latency win on every ApexBase codec in
+this workload. The JSON report also retains build time, database size, and
+sqlite-vector's estimated preloaded representation size for every mode.
 
 ## Reproduce
 
@@ -171,5 +206,15 @@ python benchmarks/bench_vs_sqlite_duckdb.py \
 
 Use `--skip-vector` for a tabular-only run. Use
 `benchmarks/bench_vector_quantization.py` to measure compressed storage,
-candidate recall, and exact rescore separately from this public exact-scan
-scoreboard.
+candidate recall, exact rescore, and sqlite-vector quantized scans separately
+from this public exact-scan scoreboard:
+
+```bash
+python benchmarks/bench_vector_quantization.py \
+  --rows 100000 --dim 128 --queries 20 \
+  --warmup 2 --iterations 5 \
+  --output benchmarks/results/quantization.json
+```
+
+The quantization benchmark requires the optional `sqliteai-vector` Python
+package and a Python build linked against a compatible SQLite version.

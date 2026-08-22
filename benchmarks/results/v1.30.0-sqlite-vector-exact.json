@@ -1,0 +1,81 @@
+{
+  "system": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.13.3",
+    "cpu_count": 10,
+    "memory_gb": "N/A",
+    "apexbase": "1.30.0",
+    "duckdb": "1.1.3",
+    "sqlite": "3.53.3",
+    "sqlite_vector": "1.0.0",
+    "pyarrow": "23.0.1"
+  },
+  "vector_similarity": {
+    "config": {
+      "rows": 1000000,
+      "dim": 128,
+      "k": 10,
+      "batch_queries": 10,
+      "sqlite_note": "SQLite rows use the sqlite-vector extension's exact vector_full_scan() top-k; without the extension installed, SQLite shows N/A for ranked vector metrics.",
+      "sqlite_vector_available": true,
+      "profile": "public"
+    },
+    "skipped": false,
+    "skip_reason": null,
+    "head_to_head": [
+      {
+        "category": "Vector Head-to-Head (single query)",
+        "query": "TopK L2",
+        "ApexBase": 7.95125,
+        "DuckDB": 31.644375,
+        "SQLite": 123.3965
+      },
+      {
+        "category": "Vector Head-to-Head (single query)",
+        "query": "TopK Cosine",
+        "ApexBase": 7.843292,
+        "DuckDB": 37.820834,
+        "SQLite": 131.655333
+      },
+      {
+        "category": "Vector Head-to-Head (single query)",
+        "query": "TopK Dot",
+        "ApexBase": 8.419708,
+        "DuckDB": 32.321709,
+        "SQLite": 120.771125
+      }
+    ],
+    "batch": [
+      {
+        "category": "Vector Head-to-Head (batch queries)",
+        "query": "Batch TopK L2 (10 queries)",
+        "ApexBase": 47.106666,
+        "DuckDB": 320.179208,
+        "SQLite": 1225.980166
+      },
+      {
+        "category": "Vector Head-to-Head (batch queries)",
+        "query": "Batch TopK Cosine (10 queries)",
+        "ApexBase": 51.041666,
+        "DuckDB": 377.865,
+        "SQLite": 1317.793917
+      },
+      {
+        "category": "Vector Head-to-Head (batch queries)",
+        "query": "Batch TopK Dot (10 queries)",
+        "ApexBase": 47.494291,
+        "DuckDB": 316.817292,
+        "SQLite": 1203.704417
+      }
+    ],
+    "apex_only": [],
+    "summary": {
+      "wins": 6,
+      "ties": 0,
+      "slower": 0,
+      "total": 6
+    }
+  }
+}

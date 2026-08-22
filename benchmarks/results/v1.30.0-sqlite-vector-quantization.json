@@ -1,0 +1,176 @@
+{
+  "config": {
+    "rows": 100000,
+    "dim": 128,
+    "queries": 20,
+    "k": 10,
+    "candidate_k": 100,
+    "seed": 20260821,
+    "warmup": 2,
+    "iterations": 5,
+    "output": "benchmarks/results/v1.30.0-sqlite-vector-quantization.json"
+  },
+  "system": {
+    "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "python": "3.13.3",
+    "sqlite": "3.53.3",
+    "apexbase": "1.30.0",
+    "sqliteai_vector": "1.0.0",
+    "sqlite_vector_extension": {
+      "version": "1.0.0",
+      "backend": "NEON",
+      "turboquant_backend": "NEON"
+    }
+  },
+  "apexbase": [
+    {
+      "codec": "float16",
+      "build_ms": 63.059,
+      "exact_ms_per_query": 1.063,
+      "quantized_ms_per_query": 0.826,
+      "rescore_ms_per_query": 2.204,
+      "recall_at_k": 1.0,
+      "rescore_recall_at_k": 1.0,
+      "database_bytes": 77638313
+    },
+    {
+      "codec": "bfloat16",
+      "build_ms": 64.604,
+      "exact_ms_per_query": 1.051,
+      "quantized_ms_per_query": 8.113,
+      "rescore_ms_per_query": 9.492,
+      "recall_at_k": 1.0,
+      "rescore_recall_at_k": 1.0,
+      "database_bytes": 77638315
+    },
+    {
+      "codec": "int8",
+      "build_ms": 67.125,
+      "exact_ms_per_query": 1.333,
+      "quantized_ms_per_query": 7.992,
+      "rescore_ms_per_query": 9.239,
+      "recall_at_k": 0.995,
+      "rescore_recall_at_k": 1.0,
+      "database_bytes": 65238307
+    },
+    {
+      "codec": "uint8",
+      "build_ms": 63.101,
+      "exact_ms_per_query": 1.092,
+      "quantized_ms_per_query": 8.708,
+      "rescore_ms_per_query": 9.886,
+      "recall_at_k": 0.995,
+      "rescore_recall_at_k": 1.0,
+      "database_bytes": 65638309
+    },
+    {
+      "codec": "bit1",
+      "build_ms": 106.109,
+      "exact_ms_per_query": 1.084,
+      "quantized_ms_per_query": 15.473,
+      "rescore_ms_per_query": 16.839,
+      "recall_at_k": 0.25,
+      "rescore_recall_at_k": 0.67,
+      "database_bytes": 54038307
+    },
+    {
+      "codec": "turboquant2",
+      "build_ms": 217.396,
+      "exact_ms_per_query": 1.062,
+      "quantized_ms_per_query": 89.18,
+      "rescore_ms_per_query": 90.461,
+      "recall_at_k": 0.44,
+      "rescore_recall_at_k": 0.935,
+      "database_bytes": 55638321
+    },
+    {
+      "codec": "turboquant3",
+      "build_ms": 261.549,
+      "exact_ms_per_query": 1.061,
+      "quantized_ms_per_query": 95.41,
+      "rescore_ms_per_query": 96.949,
+      "recall_at_k": 0.65,
+      "rescore_recall_at_k": 1.0,
+      "database_bytes": 57238321
+    },
+    {
+      "codec": "turboquant4",
+      "build_ms": 347.048,
+      "exact_ms_per_query": 1.08,
+      "quantized_ms_per_query": 101.204,
+      "rescore_ms_per_query": 102.594,
+      "recall_at_k": 0.775,
+      "rescore_recall_at_k": 1.0,
+      "database_bytes": 58838321
+    }
+  ],
+  "sqlite_vector": [
+    {
+      "codec": "int8",
+      "qtype": "INT8",
+      "build_ms": 72.814,
+      "exact_ms_per_query": 22.111,
+      "quantized_ms_per_query": 0.936,
+      "recall_at_k": 0.985,
+      "quantized_rows": 100000,
+      "quantized_memory_bytes": 13600000,
+      "database_bytes": 72290304
+    },
+    {
+      "codec": "uint8",
+      "qtype": "UINT8",
+      "build_ms": 70.521,
+      "exact_ms_per_query": 22.387,
+      "quantized_ms_per_query": 0.927,
+      "recall_at_k": 0.975,
+      "quantized_rows": 100000,
+      "quantized_memory_bytes": 13600000,
+      "database_bytes": 72290304
+    },
+    {
+      "codec": "bit1",
+      "qtype": "1BIT",
+      "build_ms": 82.301,
+      "exact_ms_per_query": 22.399,
+      "quantized_ms_per_query": 0.206,
+      "recall_at_k": 0.145,
+      "quantized_rows": 100000,
+      "quantized_memory_bytes": 2400000,
+      "database_bytes": 61079552
+    },
+    {
+      "codec": "turboquant2",
+      "qtype": "TURBO2",
+      "build_ms": 136.556,
+      "exact_ms_per_query": 22.308,
+      "quantized_ms_per_query": 2.802,
+      "recall_at_k": 0.54,
+      "quantized_rows": 100000,
+      "quantized_memory_bytes": 4400000,
+      "database_bytes": 63082496
+    },
+    {
+      "codec": "turboquant3",
+      "qtype": "TURBO3",
+      "build_ms": 145.541,
+      "exact_ms_per_query": 22.375,
+      "quantized_ms_per_query": 7.357,
+      "recall_at_k": 0.745,
+      "quantized_rows": 100000,
+      "quantized_memory_bytes": 6000000,
+      "database_bytes": 64684032
+    },
+    {
+      "codec": "turboquant4",
+      "qtype": "TURBO4",
+      "build_ms": 169.335,
+      "exact_ms_per_query": 22.236,
+      "quantized_ms_per_query": 5.355,
+      "recall_at_k": 0.86,
+      "quantized_rows": 100000,
+      "quantized_memory_bytes": 7600000,
+      "database_bytes": 66285568
+    }
+  ]
+}
