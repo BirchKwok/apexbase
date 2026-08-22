@@ -575,6 +575,7 @@ impl OnDemandStorage {
                         }
                         ColumnData::FixedList { .. } => {} // pads implicitly
                         ColumnData::Float16List { .. } => {} // pads implicitly
+                        ColumnData::QuantizedList { .. } => {} // pads implicitly until dimension is known
                     }
                 }
                 columns.push(col);
@@ -680,6 +681,7 @@ impl OnDemandStorage {
                         }
                         ColumnData::FixedList { .. } => {} // pads implicitly
                         ColumnData::Float16List { .. } => {} // pads implicitly
+                        ColumnData::QuantizedList { .. } => {} // pads implicitly until dimension is known
                         ColumnData::Bool { data, len } => {
                             for _ in 0..pad_count {
                                 let byte_idx = *len / 8;
@@ -783,7 +785,8 @@ impl OnDemandStorage {
                     .and_then(|idx| columns.get(idx))
                     .and_then(|column| match column {
                         ColumnData::FixedList { dim, .. }
-                        | ColumnData::Float16List { dim, .. } if *dim > 0 => {
+                        | ColumnData::Float16List { dim, .. }
+                        | ColumnData::QuantizedList { dim, .. } if *dim > 0 => {
                             Some(*dim as usize)
                         }
                         _ => None,
@@ -915,16 +918,7 @@ impl OnDemandStorage {
                     .map(|(_, t)| *t)
                     .unwrap_or(ColumnType::FixedList);
                 while columns.len() <= idx {
-                    let col = match actual_type {
-                        ColumnType::Float16List => ColumnData::Float16List {
-                            data: Vec::new(),
-                            dim: 0,
-                        },
-                        _ => ColumnData::FixedList {
-                            data: Vec::new(),
-                            dim: 0,
-                        },
-                    };
+                    let col = ColumnData::new(actual_type);
                     columns.push(col);
                     nulls.push(Vec::new());
                 }
@@ -996,12 +990,15 @@ impl OnDemandStorage {
             }
             for (name, values) in fixedlist_columns {
                 if let Some(idx) = schema.get_index(&name) {
-                    let is_f16 = matches!(columns[idx], ColumnData::Float16List { .. });
                     for v in &values {
-                        if is_f16 {
-                            columns[idx].push_float16_list_from_f32(v);
-                        } else {
-                            columns[idx].push_fixed_list(v);
+                        match &mut columns[idx] {
+                            ColumnData::Float16List { .. } => {
+                                columns[idx].push_float16_list_from_f32(v)
+                            }
+                            ColumnData::QuantizedList { .. } => {
+                                columns[idx].push_quantized_list_from_f32(v)?
+                            }
+                            _ => columns[idx].push_fixed_list(v),
                         }
                     }
                 }
@@ -3643,6 +3640,18 @@ impl OnDemandStorage {
     pub fn drop_column(&self, name: &str) -> io::Result<()> {
         let mut schema = self.schema.write();
 
+        let dependents = schema.vector_dependents(name);
+        if !dependents.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "Cannot drop source vector column '{}'; quantized columns depend on it: {}",
+                    name,
+                    dependents.join(", ")
+                ),
+            ));
+        }
+
         // Find column index
         let idx = match schema.get_index(name) {
             Some(idx) => idx,
@@ -3657,6 +3666,10 @@ impl OnDemandStorage {
         // Remove from schema (logical delete)
         schema.columns.remove(idx);
         schema.name_to_idx.remove(name);
+        schema.remove_vector_derivation(name);
+        if idx < schema.constraints.len() {
+            schema.constraints.remove(idx);
+        }
 
         // Rebuild name_to_idx with updated indices
         // Collect names first to avoid borrow conflict
@@ -3766,6 +3779,7 @@ impl OnDemandStorage {
                 }
                 ColumnData::FixedList { .. } => {}
                 ColumnData::Float16List { .. } => {}
+                ColumnData::QuantizedList { .. } => {}
             }
             columns.push(col);
             // SQL schema evolution has no implicit zero/empty default. Keep the
@@ -3816,6 +3830,7 @@ impl OnDemandStorage {
         let mut float_columns: HashMap<String, Vec<f64>> = HashMap::new();
         let mut string_columns: HashMap<String, Vec<String>> = HashMap::new();
         let mut binary_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
+        let mut fixedlist_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut blob_columns: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
 
@@ -3837,7 +3852,7 @@ impl OnDemandStorage {
                     blob_columns.insert(name.clone(), vec![self.write_blob_value(v)?]);
                 }
                 ColumnValue::FixedList(v) => {
-                    binary_columns.insert(name.clone(), vec![v.clone()]);
+                    fixedlist_columns.insert(name.clone(), vec![v.clone()]);
                 }
                 ColumnValue::Bool(v) => {
                     bool_columns.insert(name.clone(), vec![*v]);
@@ -3912,6 +3927,14 @@ impl OnDemandStorage {
                     nulls.push(Vec::new());
                 }
             }
+            for name in fixedlist_columns.keys() {
+                let idx = schema.add_column(name, ColumnType::FixedList);
+                let actual_type = schema.columns[idx].1;
+                while columns.len() <= idx {
+                    columns.push(ColumnData::new(actual_type));
+                    nulls.push(Vec::new());
+                }
+            }
             for name in blob_columns.keys() {
                 let idx = schema.add_column(name, ColumnType::Blob);
                 while columns.len() <= idx {
@@ -3970,6 +3993,27 @@ impl OnDemandStorage {
                     }
                 }
             }
+            for (name, values) in fixedlist_columns {
+                if let Some(idx) = schema.get_index(&name) {
+                    for value in &values {
+                        match &mut columns[idx] {
+                            ColumnData::FixedList { .. } => columns[idx].push_fixed_list(value),
+                            ColumnData::Float16List { .. } => {
+                                columns[idx].push_float16_list_from_f32(value)
+                            }
+                            ColumnData::QuantizedList { .. } => {
+                                columns[idx].push_quantized_list_from_f32(value)?
+                            }
+                            _ => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!("column '{}' is not a vector column", name),
+                                ))
+                            }
+                        }
+                    }
+                }
+            }
             for (name, values) in blob_columns {
                 if let Some(idx) = schema.get_index(&name) {
                     for v in &values {
@@ -4012,6 +4056,7 @@ impl OnDemandStorage {
                             ColumnData::StringDict { indices, .. } => indices.push(0),
                             ColumnData::FixedList { .. } => {} // pads implicitly
                             ColumnData::Float16List { .. } => {} // pads implicitly
+                            ColumnData::QuantizedList { .. } => {} // pads implicitly
                         }
                     }
                     // Mark padded rows as null
@@ -4676,6 +4721,7 @@ impl OnDemandStorage {
             }
             // Copy constraints from original schema
             ms.constraints = schema_clone.constraints.clone();
+            ms.vector_derivations = schema_clone.vector_derivations.clone();
             ms
         } else {
             schema_clone.clone()
@@ -6527,11 +6573,16 @@ impl OnDemandStorage {
             Some(ColumnData::StringDict { .. }) => 4.0,
             Some(ColumnData::FixedList { dim, .. }) => (*dim as f64 * 4.0).max(8.0),
             Some(ColumnData::Float16List { dim, .. }) => (*dim as f64 * 2.0).max(4.0),
+            Some(ColumnData::QuantizedList { dim, codec, .. }) => codec
+                .row_width(*dim as usize)
+                .map(|width| width as f64)
+                .unwrap_or(16.0),
             None => match col_type {
                 ColumnType::Bool => 1.0,
                 ColumnType::Binary | ColumnType::String | ColumnType::StringDict => 16.0,
                 ColumnType::FixedList => 32.0,
                 ColumnType::Float16List => 16.0,
+                dtype if dtype.vector_codec().is_some() => 16.0,
                 _ => 8.0,
             },
         }

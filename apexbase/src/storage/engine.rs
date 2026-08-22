@@ -67,6 +67,111 @@ fn binary_column_to_values(offsets: &[u64], data: &[u8], row_count: usize) -> Ve
     values
 }
 
+fn materialize_vector_derivations(
+    columns: &mut HashMap<String, super::on_demand::ColumnData>,
+    null_positions: &mut HashMap<String, Vec<bool>>,
+    schema: &[(String, ColumnType)],
+    derivations: &[super::on_demand::VectorDerivation],
+) -> io::Result<()> {
+    use super::on_demand::ColumnData;
+
+    for derivation in derivations {
+        if columns.contains_key(&derivation.target) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "quantized vector column '{}' is system-maintained and cannot be written directly",
+                    derivation.target
+                ),
+            ));
+        }
+        let target_type = schema
+            .iter()
+            .find(|(name, _)| name == &derivation.target)
+            .map(|(_, dtype)| *dtype)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "quantized vector derivation target '{}' is missing from schema",
+                        derivation.target
+                    ),
+                )
+            })?;
+        let codec = target_type.vector_codec().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("column '{}' has no vector codec", derivation.target),
+            )
+        })?;
+        let source = columns.get(&derivation.source).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "write must include source vector column '{}' required by '{}'",
+                    derivation.source, derivation.target
+                ),
+            )
+        })?;
+
+        let (source_bytes, dim, source_codec) = match source {
+            ColumnData::FixedList { data, dim } => (
+                data.as_slice(),
+                *dim as usize,
+                crate::compute::vector_quantization::VectorCodec::Float32,
+            ),
+            ColumnData::Float16List { data, dim } => (
+                data.as_slice(),
+                *dim as usize,
+                crate::compute::vector_quantization::VectorCodec::Float16,
+            ),
+            ColumnData::QuantizedList { data, dim, codec } => {
+                (data.as_slice(), *dim as usize, *codec)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("source vector column '{}' is not a vector", derivation.source),
+                ))
+            }
+        };
+        let source_stride = source_codec.row_width(dim)?;
+        if dim == 0 || source_stride == 0 || source_bytes.len() % source_stride != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("source vector column '{}' has invalid row width", derivation.source),
+            ));
+        }
+
+        let row_count = source_bytes.len() / source_stride;
+        let mut data = Vec::with_capacity(row_count * codec.row_width(dim)?);
+        let mut values = vec![0.0f32; dim];
+        for row in source_bytes.chunks_exact(source_stride) {
+            crate::compute::vector_quantization::decode_vector(
+                source_codec,
+                row,
+                dim,
+                &mut values,
+            )?;
+            crate::compute::vector_quantization::encode_vector(codec, &values, &mut data)?;
+        }
+        let derived = if target_type == ColumnType::Float16List {
+            ColumnData::Float16List { data, dim: dim as u32 }
+        } else {
+            ColumnData::QuantizedList {
+                data,
+                dim: dim as u32,
+                codec,
+            }
+        };
+        columns.insert(derivation.target.clone(), derived);
+        if let Some(source_nulls) = null_positions.get(&derivation.source).cloned() {
+            null_positions.insert(derivation.target.clone(), source_nulls);
+        }
+    }
+    Ok(())
+}
+
 // ============================================================================
 // Cache Entry
 // ============================================================================
@@ -459,6 +564,57 @@ impl StorageEngine {
         }
         let epoch_write = crate::storage::epoch::logical_write(table_path);
 
+        // Stored vector accelerators are derived state. Expand row-oriented
+        // writes before routing so the delta/full-write classifier sees the
+        // physical target columns and callers cannot write stale accelerators.
+        let mut expanded_rows = None;
+        if table_path.exists() {
+            let derivations = self.get_read_backend(table_path)?.storage.vector_derivations();
+            if !derivations.is_empty() {
+                let mut expanded = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let mut output = row.clone();
+                    for derivation in &derivations {
+                        if row.contains_key(&derivation.target) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!(
+                                    "quantized vector column '{}' is system-maintained and cannot be written directly",
+                                    derivation.target
+                                ),
+                            ));
+                        }
+                        let derived = match row.get(&derivation.source) {
+                            Some(Value::FixedList(bytes)) => Value::FixedList(bytes.clone()),
+                            Some(Value::Null) => Value::Null,
+                            Some(_) => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!(
+                                        "source vector column '{}' must be a Float32 vector",
+                                        derivation.source
+                                    ),
+                                ))
+                            }
+                            None => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidInput,
+                                    format!(
+                                        "write must include source vector column '{}' required by '{}'",
+                                        derivation.source, derivation.target
+                                    ),
+                                ))
+                            }
+                        };
+                        output.insert(derivation.target.clone(), derived);
+                    }
+                    expanded.push(output);
+                }
+                expanded_rows = Some(expanded);
+            }
+        }
+        let rows = expanded_rows.as_deref().unwrap_or(rows);
+
         // Determine write strategy and V4 status in one pass (avoids double is_v4_file)
         let (use_delta, is_v4) = self.classify_write(table_path, rows);
 
@@ -762,7 +918,30 @@ impl StorageEngine {
         let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
         let backend = self.get_write_backend(table_path, durability)?;
-        let result = backend.replace(id, fields)?;
+        let derivations = backend.storage.vector_derivations();
+        let mut expanded_fields = None;
+        if !derivations.is_empty() {
+            let mut expanded = fields.clone();
+            for derivation in &derivations {
+                if fields.contains_key(&derivation.target) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "quantized vector column '{}' is system-maintained and cannot be written directly",
+                            derivation.target
+                        ),
+                    ));
+                }
+                if let Some(Value::FixedList(bytes)) = fields.get(&derivation.source) {
+                    expanded.insert(
+                        derivation.target.clone(),
+                        Value::FixedList(bytes.clone()),
+                    );
+                }
+            }
+            expanded_fields = Some(expanded);
+        }
+        let result = backend.replace(id, expanded_fields.as_ref().unwrap_or(fields))?;
         if result {
             backend.save()?;
         }
@@ -824,6 +1003,95 @@ impl StorageEngine {
         Ok(())
     }
 
+    /// Add a system-maintained stored vector projection.
+    ///
+    /// Existing rows are backfilled Row Group by Row Group and published by an
+    /// atomic file replacement; empty tables need only a footer schema update.
+    pub fn add_quantized_vector_column(
+        &self,
+        table_path: &Path,
+        source_column: &str,
+        target_column: &str,
+        target_dtype: crate::data::DataType,
+        durability: DurabilityLevel,
+    ) -> io::Result<()> {
+        use crate::storage::on_demand::ColumnType;
+
+        let target_type = ColumnType::from_data_type(target_dtype);
+        if !matches!(
+            target_type,
+            ColumnType::Float16List
+                | ColumnType::BFloat16List
+                | ColumnType::Int8Vector
+                | ColumnType::UInt8Vector
+                | ColumnType::Bit1Vector
+                | ColumnType::TurboQuant2Vector
+                | ColumnType::TurboQuant3Vector
+                | ColumnType::TurboQuant4Vector
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "quantized target must use Float16, BFloat16, Int8, UInt8, 1Bit, or TurboQuant 2/3/4-bit",
+            ));
+        }
+
+        crate::storage::table_catalog::ensure_table_file(table_path, durability)?;
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
+        self.invalidate(table_path);
+        let backend = self.get_insert_backend(table_path, durability)?;
+        let schema = backend.storage.get_schema();
+        let source_type = schema
+            .iter()
+            .find(|(name, _)| name == source_column)
+            .map(|(_, dtype)| *dtype)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("source vector column '{}' not found", source_column),
+                )
+            })?;
+        if !matches!(
+            source_type,
+            ColumnType::FixedList | ColumnType::Float16List | ColumnType::BFloat16List
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "column '{}' is not a rescore-capable vector source",
+                    source_column
+                ),
+            ));
+        }
+        if schema.iter().any(|(name, _)| name == target_column) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Column '{}' already exists", target_column),
+            ));
+        }
+        if Self::has_delta_file(table_path) {
+            backend.storage.compact()?;
+        }
+        let has_rows = backend.storage.row_count() != 0;
+        let result = (|| -> io::Result<()> {
+            backend.add_column(target_column, target_dtype)?;
+            backend.storage.register_vector_derivation(
+                source_column,
+                target_column,
+                crate::compute::vector_quantization::TURBOQUANT_CODEC_VERSION as u16,
+            )?;
+            if has_rows {
+                backend.storage.rewrite_v4_drop_columns()?;
+            } else {
+                backend.save()?;
+            }
+            Ok(())
+        })();
+        self.invalidate(table_path);
+        result?;
+        epoch_write.commit();
+        Ok(())
+    }
+
     /// Drop a column from the table
     pub fn drop_column(
         &self,
@@ -853,6 +1121,31 @@ impl StorageEngine {
         self.invalidate(table_path);
         epoch_write.commit();
         Ok(())
+    }
+
+    /// Drop only a registered system-maintained vector accelerator.
+    pub fn drop_quantized_vector_column(
+        &self,
+        table_path: &Path,
+        target_column: &str,
+        durability: DurabilityLevel,
+    ) -> io::Result<()> {
+        let is_target = self
+            .get_read_backend(table_path)?
+            .storage
+            .vector_derivations()
+            .iter()
+            .any(|derivation| derivation.target == target_column);
+        if !is_target {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "column '{}' is not a registered quantized accelerator",
+                    target_column
+                ),
+            ));
+        }
+        self.drop_column(table_path, target_column, durability)
     }
 
     /// Rename a column
@@ -1160,6 +1453,33 @@ impl StorageEngine {
                                                 });
                                             }
                                         }
+                                        dtype @ (ColumnType::BFloat16List
+                                        | ColumnType::Int8Vector
+                                        | ColumnType::UInt8Vector
+                                        | ColumnType::Bit1Vector
+                                        | ColumnType::TurboQuant2Vector
+                                        | ColumnType::TurboQuant3Vector
+                                        | ColumnType::TurboQuant4Vector) => {
+                                            let codec = dtype.vector_codec().unwrap();
+                                            if let Some(vals) = fixedlist_columns.get(col_name) {
+                                                let dim = vals.iter().find(|row| !row.is_empty())
+                                                    .map(|row| row.len() / 4).unwrap_or(0) as u32;
+                                                let mut data = Vec::with_capacity(
+                                                    row_count * codec.row_width(dim as usize)?,
+                                                );
+                                                for row in vals {
+                                                    let values = row.chunks_exact(4).map(|bytes| {
+                                                        f32::from_le_bytes(bytes.try_into().unwrap())
+                                                    }).collect::<Vec<_>>();
+                                                    crate::compute::vector_quantization::encode_vector(
+                                                        codec, &values, &mut data,
+                                                    )?;
+                                                }
+                                                new_columns.push(ColumnData::QuantizedList { data, dim, codec });
+                                            } else {
+                                                new_columns.push(ColumnData::QuantizedList { data: Vec::new(), dim: 0, codec });
+                                            }
+                                        }
                                     }
                                 }
 
@@ -1253,7 +1573,7 @@ impl StorageEngine {
         &self,
         table_path: &Path,
         mut columns: HashMap<String, crate::storage::on_demand::ColumnData>,
-        null_positions: HashMap<String, Vec<bool>>,
+        mut null_positions: HashMap<String, Vec<bool>>,
         durability: DurabilityLevel,
     ) -> io::Result<Vec<u64>> {
         use crate::storage::on_demand::{ColumnData, ColumnType};
@@ -1262,6 +1582,20 @@ impl StorageEngine {
         let row_count = columns.values().map(|c| c.len()).max().unwrap_or(0);
         if row_count == 0 {
             return Ok(Vec::new());
+        }
+
+        if table_path.exists() {
+            let backend = self.get_insert_backend(table_path, durability)?;
+            let derivations = backend.storage.vector_derivations();
+            if !derivations.is_empty() {
+                let schema = backend.storage.get_schema();
+                materialize_vector_derivations(
+                    &mut columns,
+                    &mut null_positions,
+                    &schema,
+                    &derivations,
+                )?;
+            }
         }
 
         // FAST PATH: V4 append for existing tables with matching schema
@@ -1451,6 +1785,31 @@ impl StorageEngine {
                                             };
                                             new_columns.push(col);
                                         }
+                                        dtype @ (ColumnType::BFloat16List
+                                        | ColumnType::Int8Vector
+                                        | ColumnType::UInt8Vector
+                                        | ColumnType::Bit1Vector
+                                        | ColumnType::TurboQuant2Vector
+                                        | ColumnType::TurboQuant3Vector
+                                        | ColumnType::TurboQuant4Vector) => {
+                                            let codec = dtype.vector_codec().unwrap();
+                                            let encoded = match col {
+                                                Some(ColumnData::QuantizedList { data, dim, codec: actual })
+                                                    if actual == codec => ColumnData::QuantizedList { data, dim, codec },
+                                                Some(ColumnData::FixedList { data, dim }) => {
+                                                    let mut encoded = Vec::new();
+                                                    for row in data.chunks_exact(dim as usize * 4) {
+                                                        let values = row.chunks_exact(4).map(|bytes| {
+                                                            f32::from_le_bytes(bytes.try_into().unwrap())
+                                                        }).collect::<Vec<_>>();
+                                                        crate::compute::vector_quantization::encode_vector(codec, &values, &mut encoded)?;
+                                                    }
+                                                    ColumnData::QuantizedList { data: encoded, dim, codec }
+                                                }
+                                                _ => ColumnData::QuantizedList { data: Vec::new(), dim: 0, codec },
+                                            };
+                                            new_columns.push(encoded);
+                                        }
                                     }
                                 }
 
@@ -1570,6 +1929,18 @@ impl StorageEngine {
                             );
                         }
                         vals.push(f32_row);
+                    }
+                    fixedlist_columns.insert(name, vals);
+                }
+                ColumnData::QuantizedList { data, dim, codec } => {
+                    let stride = codec.row_width(dim as usize)?;
+                    let mut vals = Vec::with_capacity(if stride == 0 { 0 } else { data.len() / stride });
+                    let mut decoded = vec![0.0f32; dim as usize];
+                    for row in data.chunks_exact(stride) {
+                        crate::compute::vector_quantization::decode_vector(codec, row, dim as usize, &mut decoded)?;
+                        let mut bytes = Vec::with_capacity(dim as usize * 4);
+                        for &value in &decoded { bytes.extend_from_slice(&value.to_le_bytes()); }
+                        vals.push(bytes);
                     }
                     fixedlist_columns.insert(name, vals);
                 }

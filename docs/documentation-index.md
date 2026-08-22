@@ -30,6 +30,7 @@ python -m mkdocs serve
 | [Usage Examples](EXAMPLES.md) | Users looking for task-oriented snippets |
 | [Full-Text Search Guide](FTS_GUIDE.md) | Users building text search workflows |
 | [Float16 Vector Guide](FLOAT16_VECTOR_GUIDE.md) | Users storing and querying embeddings |
+| [Vector Quantization Guide](VECTOR_QUANTIZATION_GUIDE.md) | Users building compressed candidate retrieval with exact reranking |
 | [Storage Architecture](STORAGE_ARCHITECTURE.md) | Contributors and maintainers |
 | [Engineering Guidelines](ENGINEERING_GUIDELINES.md) | Contributors changing query or storage paths |
 | [HTAP Roadmap](HTAP_ROADMAP.md) | High-level project direction |

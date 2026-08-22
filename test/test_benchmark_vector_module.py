@@ -89,3 +89,72 @@ def test_extended_profile_keeps_diagnostics_available():
     assert len(module.benchmark_specs_for_profile(module.PROFILE_EXTENDED)) == 102
     assert module.module_metric_counts(module.PROFILE_EXTENDED) == (78, 53, 9)
     assert module.vector_metric_count(module.PROFILE_EXTENDED) == 9
+
+
+def test_sqliteai_vector_metric_options_cover_head_to_head_metrics():
+    module = load_benchmark_module()
+
+    head_metrics, batch_metrics, _ = module.vector_metric_sets(module.PROFILE_PUBLIC)
+    for _, metric in list(head_metrics) + list(batch_metrics):
+        assert metric in module.VECTOR_SQLITE_DISTANCE_OPTIONS
+
+
+def test_build_sqliteai_vector_sql_uses_per_metric_full_scan_tables():
+    module = load_benchmark_module()
+
+    sql_l2 = module.build_sqliteai_vector_sql("l2", 10)
+    sql_cos = module.build_sqliteai_vector_sql("cosine", 5)
+    sql_dot = module.build_sqliteai_vector_sql("dot", 3)
+
+    assert "vector_full_scan('vec_l2'" in sql_l2
+    assert "?," in sql_l2 and ", 10)" in sql_l2
+    assert "t.id = v.rowid" in sql_l2
+    assert "vec_cosine" in sql_cos and ", 5)" in sql_cos
+    assert "vec_dot" in sql_dot and ", 3)" in sql_dot
+
+
+def _require_sqliteai_vector(module):
+    if module.locate_sqliteai_vector_binary() is None:
+        pytest.skip("sqliteai-vector is not installed in this environment")
+
+
+def test_sqliteai_vector_topk_matches_bruteforce():
+    module = load_benchmark_module()
+    _require_sqliteai_vector(module)
+
+    vecs, query, _ = module.generate_vector_data(200, 8, seed=11)
+    con = module.setup_sqliteai_vector_bench(vecs)
+    try:
+        for metric in ("l2", "cosine", "dot"):
+            rows = module.bench_sqliteai_vector_query(con, query, 5, metric)
+            got_ids = list(rows.column("id").to_pylist()) if hasattr(rows, "column") else [r[0] for r in rows]
+
+            d = vecs - query.reshape(1, -1)
+            if metric == "l2":
+                dist = np.linalg.norm(d, axis=1)
+            elif metric == "cosine":
+                dist = 1 - (vecs @ query) / (np.linalg.norm(vecs, axis=1) * np.linalg.norm(query))
+            else:
+                dist = -(vecs @ query)
+            expected_ids = [int(i) for i in np.argsort(dist)[:5]]
+
+            assert got_ids == expected_ids, f"{metric} top-k mismatch"
+    finally:
+        con.close()
+
+
+def test_sqliteai_vector_batch_query_runs_all_queries():
+    module = load_benchmark_module()
+    _require_sqliteai_vector(module)
+
+    vecs, _, batch_queries = module.generate_vector_data(64, 8, seed=12)
+    con = module.setup_sqliteai_vector_bench(vecs)
+    try:
+        results = [
+            module.bench_sqliteai_vector_query(con, q, 3, "cosine")
+            for q in batch_queries[:2]
+        ]
+        assert len(results) == 2
+        module.bench_sqliteai_batch_vector_query(con, batch_queries[:2], 3, "cosine")
+    finally:
+        con.close()

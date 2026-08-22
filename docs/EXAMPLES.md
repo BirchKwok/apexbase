@@ -1022,6 +1022,37 @@ client.store({"label": "query_item", "vec": np.array([0.1] * D, dtype=np.float32
 client.store({"label": "list_item", "vec": [0.1, 0.2, 0.3]})
 ```
 
+### Quantized candidate retrieval with exact reranking
+
+Keep the authoritative vector and add a separate compressed accelerator. The
+accelerator generates a wider candidate set; ApexBase then recomputes distances
+from `vec` and returns the exact order within that set.
+
+```python
+client.create_quantized_column(
+    source="vec",
+    target="vec_tq4",
+    codec="turboquant4",
+)
+
+results = client.topk_distance(
+    "vec",
+    query,
+    k=10,
+    accelerator="vec_tq4",
+    candidate_k=80,
+    rescore=True,
+)
+
+# Removes the compressed column; vec and ordinary exact search remain intact.
+client.drop_quantized_column("vec_tq4")
+```
+
+Supported codecs are `float32`, `float16`, `bfloat16`, `int8`, `uint8`,
+`bit1`, `turboquant2`, `turboquant3`, and `turboquant4`. See the
+[Vector Quantization Guide](VECTOR_QUANTIZATION_GUIDE.md) for storage sizes,
+recall tradeoffs, automatic maintenance, and deletion constraints.
+
 ### `topk_distance` — single-query search
 
 Returns the k nearest neighbours for one query vector as a `ResultView`.

@@ -129,6 +129,32 @@ stats = client.execute_batch_parallel([
 `execute_batch_parallel` accepts only `SELECT` / `WITH` / `EXPLAIN` statements
 and returns one `ResultView` per input query.
 
+## Quantized Vector Retrieval
+
+Use a separate derived column when you want compressed candidate generation
+without giving up exact reranking or future re-quantization:
+
+```python
+client.create_quantized_column("embedding", "embedding_tq4", "turboquant4")
+
+hits = client.topk_distance(
+    "embedding",
+    query,
+    k=20,
+    accelerator="embedding_tq4",
+    candidate_k=160,
+    rescore=True,
+)
+
+client.drop_quantized_column("embedding_tq4")
+```
+
+Inserts and source-vector replacements automatically update the accelerator.
+Direct accelerator writes are rejected. Deleting the accelerator preserves the
+source column; deleting a source with active accelerators is rejected. See the
+[Vector Quantization Guide](../VECTOR_QUANTIZATION_GUIDE.md) for all nine
+codecs and their storage/recall tradeoffs.
+
 ## Working With Results
 
 ```python

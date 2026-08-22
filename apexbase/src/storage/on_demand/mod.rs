@@ -1804,6 +1804,13 @@ const TYPE_DATE: u8 = 16; // Date (days since Unix epoch)
 const TYPE_FIXED_LIST: u8 = 17; // Fixed-size list of f32 (no offset array)
 const TYPE_FLOAT16_LIST: u8 = 18; // Fixed-size list of f16 (half-precision, dim*2 bytes/row)
 const TYPE_BLOB: u8 = 19; // Large blob descriptor column (payload may live in sidecar files)
+const TYPE_BFLOAT16_LIST: u8 = 20;
+const TYPE_INT8_VECTOR: u8 = 21;
+const TYPE_UINT8_VECTOR: u8 = 22;
+const TYPE_BIT1_VECTOR: u8 = 23;
+const TYPE_TURBOQUANT2_VECTOR: u8 = 24;
+const TYPE_TURBOQUANT3_VECTOR: u8 = 25;
+const TYPE_TURBOQUANT4_VECTOR: u8 = 26;
 
 // ============================================================================
 // Data Types

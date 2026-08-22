@@ -215,8 +215,19 @@ impl OnDemandStorage {
             Some(i) => i,
             None => return Ok(None),
         };
-        let is_f16 = schema.columns[col_idx].1 == ColumnType::Float16List;
-        if schema.columns[col_idx].1 != ColumnType::FixedList && !is_f16 {
+        let column_type = schema.columns[col_idx].1;
+        let is_f16 = column_type == ColumnType::Float16List;
+        let quant_codec = match column_type {
+            ColumnType::BFloat16List
+            | ColumnType::Int8Vector
+            | ColumnType::UInt8Vector
+            | ColumnType::Bit1Vector
+            | ColumnType::TurboQuant2Vector
+            | ColumnType::TurboQuant3Vector
+            | ColumnType::TurboQuant4Vector => column_type.vector_codec(),
+            _ => None,
+        };
+        if column_type != ColumnType::FixedList && !is_f16 && quant_codec.is_none() {
             return Ok(None);
         }
 
@@ -308,9 +319,14 @@ impl OnDemandStorage {
                 return Ok(None);
             }
 
-            let elem_bytes = if is_f16 { 2 } else { 4 };
+            let row_width = if let Some(codec) = quant_codec {
+                codec.row_width(dim)?
+            } else {
+                dim * if is_f16 { 2 } else { 4 }
+            };
             let float_abs = data_abs + 13;
-            let byte_len = count * dim * elem_bytes;
+            let byte_len = count.checked_mul(row_width)
+                .ok_or_else(|| err_data("vector block length overflow"))?;
             if float_abs + byte_len > mmap.len() {
                 return Ok(None);
             }
@@ -325,6 +341,18 @@ impl OnDemandStorage {
 
         if total_active == 0 {
             return Ok(Some(vec![]));
+        }
+
+        if let Some(codec) = quant_codec {
+            let row_width = codec.row_width(query_dim)?;
+            let mut encoded = Vec::with_capacity(total_active.saturating_mul(row_width));
+            for desc in &rg_descs {
+                let Some(desc) = desc else { continue };
+                encoded.extend_from_slice(&mmap[desc.float_abs..desc.float_abs + desc.byte_len]);
+            }
+            return crate::compute::vector_quantization::topk_encoded_rows(
+                &encoded, query_dim, codec, computer, k,
+            ).map(Some);
         }
 
         let file_size = mmap.len() as u64;
@@ -466,8 +494,19 @@ impl OnDemandStorage {
             Some(i) => i,
             None => return Ok(None),
         };
-        let is_f16_batch = schema.columns[col_idx].1 == ColumnType::Float16List;
-        if schema.columns[col_idx].1 != ColumnType::FixedList && !is_f16_batch {
+        let column_type = schema.columns[col_idx].1;
+        let is_f16_batch = column_type == ColumnType::Float16List;
+        let quant_codec = match column_type {
+            ColumnType::BFloat16List
+            | ColumnType::Int8Vector
+            | ColumnType::UInt8Vector
+            | ColumnType::Bit1Vector
+            | ColumnType::TurboQuant2Vector
+            | ColumnType::TurboQuant3Vector
+            | ColumnType::TurboQuant4Vector => column_type.vector_codec(),
+            _ => None,
+        };
+        if column_type != ColumnType::FixedList && !is_f16_batch && quant_codec.is_none() {
             return Ok(None);
         }
 
@@ -553,9 +592,14 @@ impl OnDemandStorage {
                 return Ok(None);
             }
 
-            let elem_bytes_b = if is_f16_batch { 2 } else { 4 };
+            let row_width = if let Some(codec) = quant_codec {
+                codec.row_width(dim)?
+            } else {
+                dim * if is_f16_batch { 2 } else { 4 }
+            };
             let float_abs = data_abs + 13;
-            let byte_len = count * dim * elem_bytes_b;
+            let byte_len = count.checked_mul(row_width)
+                .ok_or_else(|| err_data("vector block length overflow"))?;
             if float_abs + byte_len > mmap.len() {
                 return Ok(None);
             }
@@ -569,6 +613,18 @@ impl OnDemandStorage {
 
         if total_active == 0 {
             return Ok(Some(vec![vec![]; n_queries]));
+        }
+
+        if let Some(codec) = quant_codec {
+            let row_width = codec.row_width(query_dim)?;
+            let mut encoded = Vec::with_capacity(total_active.saturating_mul(row_width));
+            for desc in &rg_descs {
+                let Some(desc) = desc else { continue };
+                encoded.extend_from_slice(&mmap[desc.float_abs..desc.float_abs + desc.byte_len]);
+            }
+            return crate::compute::vector_quantization::batch_topk_encoded_rows(
+                &encoded, query_dim, codec, queries, n_queries, k, metric,
+            ).map(Some);
         }
 
         let file_size = mmap.len() as u64;

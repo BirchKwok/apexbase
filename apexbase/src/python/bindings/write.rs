@@ -304,6 +304,13 @@ impl ApexStorageImpl {
                 ty,
                 crate::storage::on_demand::ColumnType::FixedList
                     | crate::storage::on_demand::ColumnType::Float16List
+                    | crate::storage::on_demand::ColumnType::BFloat16List
+                    | crate::storage::on_demand::ColumnType::Int8Vector
+                    | crate::storage::on_demand::ColumnType::UInt8Vector
+                    | crate::storage::on_demand::ColumnType::Bit1Vector
+                    | crate::storage::on_demand::ColumnType::TurboQuant2Vector
+                    | crate::storage::on_demand::ColumnType::TurboQuant3Vector
+                    | crate::storage::on_demand::ColumnType::TurboQuant4Vector
                     | crate::storage::on_demand::ColumnType::Null
             )
         }) {
@@ -420,6 +427,13 @@ impl ApexStorageImpl {
                 ColumnType::Blob
                 | ColumnType::FixedList
                 | ColumnType::Float16List
+                | ColumnType::BFloat16List
+                | ColumnType::Int8Vector
+                | ColumnType::UInt8Vector
+                | ColumnType::Bit1Vector
+                | ColumnType::TurboQuant2Vector
+                | ColumnType::TurboQuant3Vector
+                | ColumnType::TurboQuant4Vector
                 | ColumnType::Null => {
                     return Ok(None);
                 }
@@ -887,11 +901,31 @@ impl ApexStorageImpl {
                             .and_then(|f32arr| f32arr.call_method0("tobytes"))
                             .and_then(|b| b.extract::<Vec<u8>>())
                         {
+                            if bytes.is_empty() || bytes.chunks_exact(4).any(|chunk| {
+                                !f32::from_le_bytes(chunk.try_into().unwrap()).is_finite()
+                            }) {
+                                return Err(PyValueError::new_err(format!(
+                                    "Vector column '{}' must contain non-empty finite vectors",
+                                    col_name
+                                )));
+                            }
                             rows.push(bytes);
                         } else if let Ok(seq) = item.downcast::<pyo3::types::PyList>() {
+                            if seq.is_empty() {
+                                return Err(PyValueError::new_err(format!(
+                                    "Vector column '{}' must contain non-empty vectors", col_name
+                                )));
+                            }
                             let mut bytes = Vec::with_capacity(seq.len() * 4);
                             for elem in seq.iter() {
-                                let f = elem.extract::<f32>().unwrap_or(0.0);
+                                let f = elem.extract::<f32>().map_err(|_| PyValueError::new_err(
+                                    format!("Vector column '{}' contains a non-numeric value", col_name)
+                                ))?;
+                                if !f.is_finite() {
+                                    return Err(PyValueError::new_err(format!(
+                                        "Vector column '{}' must contain only finite values", col_name
+                                    )));
+                                }
                                 bytes.extend_from_slice(&f.to_le_bytes());
                             }
                             rows.push(bytes);
@@ -904,9 +938,23 @@ impl ApexStorageImpl {
                         .find(|b| !b.is_empty())
                         .map(|b| b.len() / 4)
                         .unwrap_or(0) as u32;
+                    if dim == 0 {
+                        return Err(PyValueError::new_err(format!(
+                            "Vector column '{}' has no non-null vector dimension", col_name
+                        )));
+                    }
                     let mut data: Vec<u8> = Vec::with_capacity(col_len * dim as usize * 4);
-                    for b in &rows {
-                        data.extend_from_slice(b);
+                    for (row_index, b) in rows.iter().enumerate() {
+                        if b.is_empty() {
+                            data.resize(data.len() + dim as usize * 4, 0);
+                        } else if b.len() == dim as usize * 4 {
+                            data.extend_from_slice(b);
+                        } else {
+                            return Err(PyValueError::new_err(format!(
+                                "Vector column '{}' row {} has dimension {}, expected {}",
+                                col_name, row_index, b.len() / 4, dim
+                            )));
+                        }
                     }
                     columns_map.insert(col_name.clone(), ColumnData::FixedList { data, dim });
                     null_positions.insert(col_name, nulls);
@@ -1605,6 +1653,13 @@ impl ApexStorageImpl {
                         ColumnType::Binary
                             | ColumnType::FixedList
                             | ColumnType::Float16List
+                            | ColumnType::BFloat16List
+                            | ColumnType::Int8Vector
+                            | ColumnType::UInt8Vector
+                            | ColumnType::Bit1Vector
+                            | ColumnType::TurboQuant2Vector
+                            | ColumnType::TurboQuant3Vector
+                            | ColumnType::TurboQuant4Vector
                             | ColumnType::Null
                     )
                 });
@@ -1667,6 +1722,14 @@ impl ApexStorageImpl {
             "float16_vector" | "float16vector" | "f16_vector" => {
                 crate::data::DataType::Float16Vector
             }
+            "float32_vector" | "f32_vector" => crate::data::DataType::Float32Vector,
+            "bfloat16_vector" | "bf16_vector" => crate::data::DataType::BFloat16Vector,
+            "int8_vector" | "i8_vector" => crate::data::DataType::Int8Vector,
+            "uint8_vector" | "u8_vector" => crate::data::DataType::UInt8Vector,
+            "bit1_vector" | "binary1_vector" => crate::data::DataType::Bit1Vector,
+            "turboquant2_vector" | "tq2_vector" => crate::data::DataType::TurboQuant2Vector,
+            "turboquant3_vector" | "tq3_vector" => crate::data::DataType::TurboQuant3Vector,
+            "turboquant4_vector" | "tq4_vector" => crate::data::DataType::TurboQuant4Vector,
             "timestamp" | "datetime" => crate::data::DataType::Timestamp,
             "date" => crate::data::DataType::Date,
             _ => crate::data::DataType::String,
@@ -1696,6 +1759,76 @@ impl ApexStorageImpl {
         // Invalidate local backend cache after operation
         self.invalidate_backend(&table_name);
 
+        result
+    }
+
+    fn create_quantized_column(
+        &self,
+        py: Python<'_>,
+        source_column: &str,
+        target_column: &str,
+        codec: &str,
+    ) -> PyResult<()> {
+        let dtype = match codec.to_ascii_lowercase().replace(['-', '_'], "").as_str() {
+            "float16" | "f16" => crate::data::DataType::Float16Vector,
+            "bfloat16" | "bf16" => crate::data::DataType::BFloat16Vector,
+            "int8" | "i8" => crate::data::DataType::Int8Vector,
+            "uint8" | "u8" => crate::data::DataType::UInt8Vector,
+            "1bit" | "bit1" | "binary1" => crate::data::DataType::Bit1Vector,
+            "turboquant2" | "tq2" => crate::data::DataType::TurboQuant2Vector,
+            "turboquant3" | "tq3" => crate::data::DataType::TurboQuant3Vector,
+            "turboquant4" | "tq4" => crate::data::DataType::TurboQuant4Vector,
+            _ => {
+                return Err(PyValueError::new_err(format!(
+                    "Unsupported vector codec '{}'. Expected float16, bfloat16, int8, uint8, 1bit, or turboquant2/3/4",
+                    codec
+                )))
+            }
+        };
+        let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
+        let durability = self.durability;
+        let source_column = source_column.to_string();
+        let target_column = target_column.to_string();
+
+        self.invalidate_backend(&table_name);
+        let result = py.allow_threads(|| -> PyResult<()> {
+            let lock_file = Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let result = crate::Database::add_quantized_vector_column(
+                &table_path,
+                &source_column,
+                &target_column,
+                dtype,
+                durability,
+            )
+            .map_err(|e| PyIOError::new_err(e.to_string()));
+            Self::release_lock(lock_file);
+            result
+        });
+        self.invalidate_backend(&table_name);
+        result
+    }
+
+    fn drop_quantized_column(&self, py: Python<'_>, target_column: &str) -> PyResult<()> {
+        let table_path = self.get_current_table_path()?;
+        let table_name = self.current_table.read().clone();
+        let durability = self.durability;
+        let target_column = target_column.to_string();
+        self.invalidate_backend(&table_name);
+        let result = py.allow_threads(|| -> PyResult<()> {
+            let lock_file = Self::acquire_write_lock(&table_path)
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let result = crate::Database::drop_quantized_vector_column(
+                &table_path,
+                &target_column,
+                durability,
+            )
+            .map_err(|e| PyIOError::new_err(e.to_string()));
+            Self::release_lock(lock_file);
+            result
+        });
+        self.invalidate_backend(&table_name);
         result
     }
 

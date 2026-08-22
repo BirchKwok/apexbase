@@ -21,7 +21,7 @@
 | **Fast local analytics** | Columnar storage, vectorized execution, SQL aggregations, joins, CTEs, windows, and indexes |
 | **Low-friction Python workflows** | `ApexClient`, Pandas / Polars / PyArrow conversion, file table functions, and simple local persistence |
 | **One engine for mixed workloads** | HTAP design: fast writes, point lookups, analytical scans, transactions, and MVCC |
-| **Search built in** | Full-text search, fuzzy matching, vector TopK search, and float16 embedding storage |
+| **Search built in** | Full-text search, vector TopK, Float16/BFloat16/Int8/UInt8/1Bit/TurboQuant storage, and exact reranking from a retained source vector |
 | **Tool compatibility** | PostgreSQL Wire for database clients and Arrow Flight for fast columnar transfer |
 
 ## Install
@@ -125,7 +125,7 @@ Benchmarks are workload-sensitive. The default benchmark command tracks this pub
 | **Write SQL** | [SQL Guide](https://birchkwok.github.io/apexbase/latest/user-guide/sql/) |
 | **Import files and DataFrames** | [Data Import](https://birchkwok.github.io/apexbase/latest/user-guide/data-import/) |
 | **Use database tools or Arrow clients** | [Server Protocols](https://birchkwok.github.io/apexbase/latest/user-guide/server-protocols/) |
-| **Search text or vectors** | [Full-Text Search](https://birchkwok.github.io/apexbase/latest/FTS_GUIDE/) and [Float16 Vectors](https://birchkwok.github.io/apexbase/latest/FLOAT16_VECTOR_GUIDE/) |
+| **Search text or vectors** | [Full-Text Search](https://birchkwok.github.io/apexbase/latest/FTS_GUIDE/), [Float16 Vectors](https://birchkwok.github.io/apexbase/latest/FLOAT16_VECTOR_GUIDE/), and [Vector Quantization](https://birchkwok.github.io/apexbase/latest/VECTOR_QUANTIZATION_GUIDE/) |
 | **Embed from Rust** | [Rust Embedded API](https://birchkwok.github.io/apexbase/latest/RUST_EMBEDDED_API/) |
 
 ## Interfaces

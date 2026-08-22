@@ -537,6 +537,15 @@ pub struct OnDemandSchema {
     name_to_idx: HashMap<String, usize>,
     /// Per-column constraints (indexed same as columns)
     pub constraints: Vec<ColumnConstraints>,
+    /// Stored vector projections maintained from an authoritative source column.
+    pub vector_derivations: Vec<VectorDerivation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VectorDerivation {
+    pub source: String,
+    pub target: String,
+    pub codec_version: u16,
 }
 
 impl OnDemandSchema {
@@ -545,6 +554,7 @@ impl OnDemandSchema {
             columns: Vec::new(),
             name_to_idx: HashMap::new(),
             constraints: Vec::new(),
+            vector_derivations: Vec::new(),
         }
     }
 
@@ -583,6 +593,88 @@ impl OnDemandSchema {
         self.name_to_idx.get(name).copied()
     }
 
+    pub fn add_vector_derivation(
+        &mut self,
+        source: &str,
+        target: &str,
+        codec_version: u16,
+    ) -> io::Result<()> {
+        if source == target {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "quantized vector source and target columns must differ",
+            ));
+        }
+        let source_idx = self.get_index(source).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("source vector column '{}' not found", source),
+            )
+        })?;
+        let target_idx = self.get_index(target).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("quantized vector target column '{}' not found", target),
+            )
+        })?;
+        if !matches!(
+            self.columns[source_idx].1,
+            ColumnType::FixedList | ColumnType::Float16List | ColumnType::BFloat16List
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("column '{}' is not a rescore-capable vector source", source),
+            ));
+        }
+        if !matches!(
+            self.columns[target_idx].1,
+            ColumnType::Float16List
+                | ColumnType::BFloat16List
+                | ColumnType::Int8Vector
+                | ColumnType::UInt8Vector
+                | ColumnType::Bit1Vector
+                | ColumnType::TurboQuant2Vector
+                | ColumnType::TurboQuant3Vector
+                | ColumnType::TurboQuant4Vector
+        ) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("column '{}' is not a quantized vector target", target),
+            ));
+        }
+        if self
+            .vector_derivations
+            .iter()
+            .any(|derivation| derivation.target == target)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("quantized vector target '{}' is already registered", target),
+            ));
+        }
+        self.vector_derivations.push(VectorDerivation {
+            source: source.to_string(),
+            target: target.to_string(),
+            codec_version,
+        });
+        Ok(())
+    }
+
+    pub fn remove_vector_derivation(&mut self, target: &str) -> bool {
+        let before = self.vector_derivations.len();
+        self.vector_derivations
+            .retain(|derivation| derivation.target != target);
+        before != self.vector_derivations.len()
+    }
+
+    pub fn vector_dependents(&self, source: &str) -> Vec<String> {
+        self.vector_derivations
+            .iter()
+            .filter(|derivation| derivation.source == source)
+            .map(|derivation| derivation.target.clone())
+            .collect()
+    }
+
     /// Rename a column in-place. Returns `true` if the column was found and renamed.
     pub fn rename_column(&mut self, old_name: &str, new_name: &str) -> bool {
         if let Some(&idx) = self.name_to_idx.get(old_name) {
@@ -590,6 +682,14 @@ impl OnDemandSchema {
             let old_idx = self.name_to_idx.remove(old_name);
             if let Some(i) = old_idx {
                 self.name_to_idx.insert(new_name.to_string(), i);
+            }
+            for derivation in &mut self.vector_derivations {
+                if derivation.source == old_name {
+                    derivation.source = new_name.to_string();
+                }
+                if derivation.target == old_name {
+                    derivation.target = new_name.to_string();
+                }
             }
             true
         } else {
@@ -725,7 +825,14 @@ impl OnDemandSchema {
                 }
             }
         }
-        
+
+        // Optional stored-vector derivation section. Appended after all legacy
+        // constraint sections so schemas written before this feature remain
+        // byte-for-byte readable.
+        if !self.vector_derivations.is_empty() {
+            self.append_vector_derivations(&mut buf);
+        }
+
         buf
     }
 
@@ -889,7 +996,67 @@ impl OnDemandSchema {
                 }
             }
         }
+
+        if pos < bytes.len() && bytes[pos] == 0xA7 {
+            Self::parse_vector_derivations(bytes, pos + 1, &mut schema)?;
+        }
         
         Ok(schema)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn append_vector_derivations(&self, buf: &mut Vec<u8>) {
+        buf.push(0xA7);
+        buf.extend_from_slice(&(self.vector_derivations.len() as u16).to_le_bytes());
+        for derivation in &self.vector_derivations {
+            for value in [&derivation.source, &derivation.target] {
+                let bytes = value.as_bytes();
+                buf.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                buf.extend_from_slice(bytes);
+            }
+            buf.extend_from_slice(&derivation.codec_version.to_le_bytes());
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn parse_vector_derivations(
+        bytes: &[u8],
+        mut pos: usize,
+        schema: &mut Self,
+    ) -> io::Result<()> {
+        if pos + 2 > bytes.len() {
+            return Err(err_data("Truncated vector derivation count"));
+        }
+        let count = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+        pos += 2;
+        for _ in 0..count {
+            let mut read_name = || -> io::Result<String> {
+                if pos + 2 > bytes.len() {
+                    return Err(err_data("Truncated vector derivation name"));
+                }
+                let len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+                pos += 2;
+                if pos + len > bytes.len() {
+                    return Err(err_data("Truncated vector derivation value"));
+                }
+                let value = std::str::from_utf8(&bytes[pos..pos + len])
+                    .map_err(|e| err_data(e.to_string()))?
+                    .to_string();
+                pos += len;
+                Ok(value)
+            };
+            let source = read_name()?;
+            let target = read_name()?;
+            drop(read_name);
+            if pos + 2 > bytes.len() {
+                return Err(err_data("Truncated vector codec version"));
+            }
+            let codec_version = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
+            pos += 2;
+            schema.add_vector_derivation(&source, &target, codec_version)?;
+        }
+        Ok(())
     }
 }

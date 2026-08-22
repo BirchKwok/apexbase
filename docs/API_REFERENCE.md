@@ -1812,6 +1812,44 @@ print(f"relative error: {abs(exact - f16_dist) / exact:.2e}")  # typically < 2e-
 
 ---
 
+### Quantized Vector Storage and Exact Rescore
+
+ApexBase supports `FLOAT32_VECTOR`, `FLOAT16_VECTOR`, `BFLOAT16_VECTOR`,
+`INT8_VECTOR`, `UINT8_VECTOR`, `BIT1_VECTOR`, and
+`TURBOQUANT2_VECTOR` / `TURBOQUANT3_VECTOR` / `TURBOQUANT4_VECTOR`.
+For retrieval systems, keep the source vector and create a separate stored
+accelerator so the compressed scan can be followed by source-vector reranking:
+
+```python
+client.create_quantized_column(
+    source="vec",
+    target="vec_tq4",
+    codec="turboquant4",
+)
+
+results = client.topk_distance(
+    "vec",
+    query,
+    k=10,
+    accelerator="vec_tq4",
+    candidate_k=80,
+    rescore=True,
+)
+
+# Physically removes vec_tq4 and its dependency metadata; vec is preserved.
+client.drop_quantized_column("vec_tq4")
+```
+
+The accelerator is backfilled for existing rows and automatically regenerated
+for later inserts and source replacements. Direct accelerator writes are
+rejected. A source column cannot be dropped while an accelerator depends on it,
+and `drop_quantized_column()` rejects ordinary, non-derived columns.
+
+See the [Vector Quantization Guide](VECTOR_QUANTIZATION_GUIDE.md) for codec sizes,
+tradeoffs, standalone quantized columns, and lifecycle details.
+
+---
+
 ### topk_distance
 
 ```python
@@ -1822,6 +1860,9 @@ topk_distance(
     metric: str = 'l2',
     id_col: str = '_id',
     dist_col: str = 'dist',
+    accelerator: str | None = None,
+    candidate_k: int | None = None,
+    rescore: bool = True,
 ) -> ResultView
 ```
 
@@ -1835,6 +1876,9 @@ Heap-based nearest-neighbour search: O(n log k), significantly faster than `ORDE
 - `metric`: Distance metric (see table below).
 - `id_col`: Column name for the returned row IDs (default `'_id'`).
 - `dist_col`: Column name for the returned distances (default `'dist'`).
+- `accelerator`: Optional system-maintained quantized column for candidate generation.
+- `candidate_k`: Approximate candidate count before reranking; defaults to `max(8 * k, 64)` and must be at least `k`.
+- `rescore`: If `True`, recompute candidate distances from `col`; if `False`, return the accelerator's approximate TopK.
 
 **Supported metrics:**
 

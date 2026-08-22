@@ -1847,3 +1847,55 @@ fn dict_encoded_string_column_roundtrips_via_arrow() {
     }
     assert_eq!(uniq.len(), 10, "distinct cities = {uniq:?}");
 }
+
+#[test]
+fn quantized_vector_column_data_roundtrips_and_rejects_truncation() {
+    use crate::compute::vector_quantization::{encode_vector, VectorCodec};
+    let values = [0.25, -0.5, 1.0, 2.0, -3.0];
+    for (column_type, codec) in [
+        (ColumnType::BFloat16List, VectorCodec::BFloat16),
+        (ColumnType::Int8Vector, VectorCodec::Int8),
+        (ColumnType::UInt8Vector, VectorCodec::UInt8),
+        (ColumnType::Bit1Vector, VectorCodec::Bit1),
+        (ColumnType::TurboQuant2Vector, VectorCodec::TurboQuant2),
+        (ColumnType::TurboQuant3Vector, VectorCodec::TurboQuant3),
+        (ColumnType::TurboQuant4Vector, VectorCodec::TurboQuant4),
+    ] {
+        let mut data = Vec::new();
+        encode_vector(codec, &values, &mut data).unwrap();
+        encode_vector(codec, &values, &mut data).unwrap();
+        let column = ColumnData::QuantizedList { data, dim: values.len() as u32, codec };
+        let bytes = column.to_bytes();
+        let (decoded, consumed) = ColumnData::from_bytes_typed(&bytes, column_type).unwrap();
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded.column_type(), column_type);
+        assert!(ColumnData::from_bytes_typed(&bytes[..bytes.len() - 1], column_type).is_err());
+    }
+}
+
+#[test]
+fn vector_derivation_schema_roundtrips_and_validates_dependencies() {
+    let mut schema = OnDemandSchema::new();
+    schema.add_column("embedding", ColumnType::FixedList);
+    schema.add_column("embedding_tq4", ColumnType::TurboQuant4Vector);
+    schema
+        .add_vector_derivation("embedding", "embedding_tq4", 1)
+        .unwrap();
+
+    let restored = OnDemandSchema::from_bytes(&schema.to_bytes()).unwrap();
+    assert_eq!(restored.vector_derivations.len(), 1);
+    assert_eq!(restored.vector_derivations[0].source, "embedding");
+    assert_eq!(restored.vector_derivations[0].target, "embedding_tq4");
+    assert_eq!(restored.vector_derivations[0].codec_version, 1);
+    assert_eq!(restored.vector_dependents("embedding"), ["embedding_tq4"]);
+
+    assert!(schema
+        .add_vector_derivation("embedding", "embedding_tq4", 1)
+        .is_err());
+    assert!(schema
+        .add_vector_derivation("embedding_tq4", "embedding", 1)
+        .is_err());
+    assert!(schema.remove_vector_derivation("embedding_tq4"));
+    assert!(schema.vector_derivations.is_empty());
+}

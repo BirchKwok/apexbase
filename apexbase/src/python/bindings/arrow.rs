@@ -604,6 +604,200 @@ impl ApexStorageImpl {
         Ok((schema_ptr, array_ptr))
     }
 
+    #[pyo3(name = "_topk_rescore_ffi")]
+    fn topk_rescore_ffi(
+        &self,
+        py: Python<'_>,
+        source_col: &str,
+        accelerator_col: &str,
+        query_bytes: &[u8],
+        k: usize,
+        candidate_k: usize,
+        metric: &str,
+    ) -> PyResult<(usize, usize)> {
+        use crate::compute::vector_ops::{bytes_to_query_vec_f32, DistanceComputer, DistanceMetric};
+        use arrow::array::{ArrayRef, Float64Array, Int64Array, StructArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+
+        if k == 0 || candidate_k < k {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "candidate_k must be greater than or equal to k",
+            ));
+        }
+        let query = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "query_bytes must be raw little-endian float32 bytes",
+            )
+        })?;
+        if query.is_empty() || query.iter().any(|value| !value.is_finite()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "query vector must be non-empty and contain only finite values",
+            ));
+        }
+        let metric = DistanceMetric::from_str(metric).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("unknown vector distance metric")
+        })?;
+        let table_path = self
+            .get_current_table_path()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let source_col = source_col.to_string();
+        let accelerator_col = accelerator_col.to_string();
+
+        let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
+            let backend = crate::Database::cached_backend(&table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let derivation = backend
+                .storage
+                .vector_derivations()
+                .into_iter()
+                .find(|item| item.target == accelerator_col)
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "column '{}' is not a registered quantized accelerator",
+                        accelerator_col
+                    ))
+                })?;
+            if derivation.source != source_col {
+                return Err(PyRuntimeError::new_err(format!(
+                    "quantized column '{}' derives from '{}', not '{}'",
+                    accelerator_col, derivation.source, source_col
+                )));
+            }
+            if derivation.codec_version
+                != crate::compute::vector_quantization::TURBOQUANT_CODEC_VERSION as u16
+            {
+                return Err(PyRuntimeError::new_err(format!(
+                    "quantized column '{}' uses unsupported codec version {}",
+                    accelerator_col, derivation.codec_version
+                )));
+            }
+            if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+                return Err(PyRuntimeError::new_err(
+                    "quantized rescore requires pending writes to be flushed",
+                ));
+            }
+
+            let computer = DistanceComputer::new(metric, query);
+            let candidates = backend
+                .topk_fixedlist_direct(&accelerator_col, &computer, candidate_k)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let candidates = if let Some(candidates) = candidates {
+                candidates
+            } else {
+                // Compressed/legacy row groups cannot expose a fixed-width mmap
+                // slice. Preserve correctness by decoding the accelerator via
+                // Arrow; uncompressed V4 tables stay on the bounded-memory path.
+                let coarse_batch = backend
+                    .read_columns_to_arrow(Some(&[&accelerator_col, "_id"]), 0, None)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                let coarse = coarse_batch
+                    .column_by_name(&accelerator_col)
+                    .and_then(|array| {
+                        array
+                            .as_any()
+                            .downcast_ref::<arrow::array::FixedSizeListArray>()
+                    })
+                    .ok_or_else(|| {
+                        PyRuntimeError::new_err(format!(
+                            "quantized accelerator '{}' is not a fixed-size vector",
+                            accelerator_col
+                        ))
+                    })?;
+                if coarse.value_length() as usize != computer.query.len() {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "query dimension {} does not match accelerator dimension {}",
+                        computer.query.len(),
+                        coarse.value_length()
+                    )));
+                }
+                crate::compute::vector_ops::topk_heap_direct_parallel_fixed(
+                    coarse,
+                    &computer,
+                    candidate_k,
+                )
+            };
+
+            let out_schema = std::sync::Arc::new(Schema::new(vec![
+                Field::new("_id", ArrowDataType::Int64, false),
+                Field::new("dist", ArrowDataType::Float64, false),
+            ]));
+            if candidates.is_empty() {
+                return RecordBatch::try_new(
+                    out_schema,
+                    vec![
+                        std::sync::Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
+                        std::sync::Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
+                    ],
+                )
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+            }
+
+            let candidate_rows = candidates
+                .iter()
+                .map(|(row, _)| *row)
+                .collect::<Vec<_>>();
+            let exact_batch = backend
+                .read_columns_by_indices_to_arrow(&candidate_rows, Some(&[&source_col, "_id"]))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let source = exact_batch
+                .column_by_name(&source_col)
+                .and_then(|array| {
+                    array
+                        .as_any()
+                        .downcast_ref::<arrow::array::FixedSizeListArray>()
+                })
+                .ok_or_else(|| {
+                    PyRuntimeError::new_err(format!(
+                        "source column '{}' is not a fixed-size vector",
+                        source_col
+                    ))
+                })?;
+            if source.value_length() as usize != computer.query.len() {
+                return Err(PyRuntimeError::new_err(format!(
+                    "query dimension {} does not match source dimension {}",
+                    computer.query.len(),
+                    source.value_length()
+                )));
+            }
+            let exact = crate::compute::vector_ops::topk_heap_direct_parallel_fixed(
+                source,
+                &computer,
+                k,
+            );
+            let ids = exact_batch
+                .column_by_name("_id")
+                .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| PyRuntimeError::new_err("candidate ID column is missing"))?;
+            let result_ids = exact
+                .iter()
+                .map(|(candidate_index, _)| ids.value(*candidate_index))
+                .collect::<Vec<_>>();
+            let distances = exact
+                .iter()
+                .map(|(_, distance)| *distance as f64)
+                .collect::<Vec<_>>();
+            RecordBatch::try_new(
+                out_schema,
+                vec![
+                    std::sync::Arc::new(Int64Array::from(result_ids)) as ArrayRef,
+                    std::sync::Arc::new(Float64Array::from(distances)) as ArrayRef,
+                ],
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+
+        if batch.num_rows() == 0 {
+            return Ok((0, 0));
+        }
+        let struct_array: StructArray = batch.into();
+        let (ffi_array, ffi_schema) = arrow::ffi::to_ffi(&struct_array.to_data())
+            .map_err(|e| PyRuntimeError::new_err(format!("FFI export failed: {}", e)))?;
+        Ok((
+            Box::into_raw(Box::new(ffi_schema)) as usize,
+            Box::into_raw(Box::new(ffi_array)) as usize,
+        ))
+    }
+
     #[pyo3(name = "_batch_topk_ffi")]
     fn batch_topk_ffi(
         &self,

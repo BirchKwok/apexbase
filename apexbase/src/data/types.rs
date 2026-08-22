@@ -27,6 +27,14 @@ pub enum DataType {
     Decimal = 18,
     Float16Vector = 19,
     Blob = 20,
+    Float32Vector = 21,
+    BFloat16Vector = 22,
+    Int8Vector = 23,
+    UInt8Vector = 24,
+    Bit1Vector = 25,
+    TurboQuant2Vector = 26,
+    TurboQuant3Vector = 27,
+    TurboQuant4Vector = 28,
 }
 
 impl DataType {
@@ -46,7 +54,15 @@ impl DataType {
             | DataType::Json
             | DataType::Array
             | DataType::Blob => None,
-            DataType::Float16Vector => None,
+            DataType::Float16Vector
+            | DataType::Float32Vector
+            | DataType::BFloat16Vector
+            | DataType::Int8Vector
+            | DataType::UInt8Vector
+            | DataType::Bit1Vector
+            | DataType::TurboQuant2Vector
+            | DataType::TurboQuant3Vector
+            | DataType::TurboQuant4Vector => None,
         }
     }
 
@@ -103,6 +119,15 @@ impl DataType {
             "DECIMAL" | "NUMERIC" => DataType::Decimal,
             "TIMESTAMP" | "DATETIME" => DataType::Timestamp,
             "DATE" => DataType::Date,
+            "FLOAT32_VECTOR" | "F32_VECTOR" => DataType::Float32Vector,
+            "FLOAT16_VECTOR" | "FLOAT16VECTOR" | "F16_VECTOR" => DataType::Float16Vector,
+            "BFLOAT16_VECTOR" | "BF16_VECTOR" => DataType::BFloat16Vector,
+            "INT8_VECTOR" | "I8_VECTOR" => DataType::Int8Vector,
+            "UINT8_VECTOR" | "U8_VECTOR" => DataType::UInt8Vector,
+            "BIT1_VECTOR" | "BINARY1_VECTOR" => DataType::Bit1Vector,
+            "TURBOQUANT2_VECTOR" | "TQ2_VECTOR" => DataType::TurboQuant2Vector,
+            "TURBOQUANT3_VECTOR" | "TQ3_VECTOR" => DataType::TurboQuant3Vector,
+            "TURBOQUANT4_VECTOR" | "TQ4_VECTOR" => DataType::TurboQuant4Vector,
             _ => DataType::String, // Default to String for unknown types
         }
     }
@@ -131,6 +156,14 @@ impl DataType {
             DataType::Array => "ARRAY",
             DataType::Decimal => "DECIMAL",
             DataType::Float16Vector => "FLOAT16_VECTOR",
+            DataType::Float32Vector => "FLOAT32_VECTOR",
+            DataType::BFloat16Vector => "BFLOAT16_VECTOR",
+            DataType::Int8Vector => "INT8_VECTOR",
+            DataType::UInt8Vector => "UINT8_VECTOR",
+            DataType::Bit1Vector => "BIT1_VECTOR",
+            DataType::TurboQuant2Vector => "TURBOQUANT2_VECTOR",
+            DataType::TurboQuant3Vector => "TURBOQUANT3_VECTOR",
+            DataType::TurboQuant4Vector => "TURBOQUANT4_VECTOR",
         }
     }
 }

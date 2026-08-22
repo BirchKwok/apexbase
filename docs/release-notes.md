@@ -3,6 +3,23 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.30.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.30.0)
+*2026-08-21*
+
+[Compare with v1.29.0](https://github.com/BirchKwok/ApexBase/compare/v1.29.0...v1.30.0)
+
+- Add native vector storage and search for Float32, Float16, BFloat16, Int8, UInt8, 1Bit, and deterministic TurboQuant-MSE-style 2/3/4-bit codecs, including SQL type aliases, persistence, Arrow projection, mmap reads, and single/batch TopK execution
+- Add system-maintained quantized accelerator columns with streaming row-group backfill, automatic maintenance on append and source-vector replacement, persisted source/target dependency metadata, and rejection of direct writes that could make the projection stale
+- Preserve the authoritative Float32, Float16, or BFloat16 source column for exact reranking: `topk_distance(..., accelerator=..., candidate_k=..., rescore=True)` performs a compressed coarse scan and reads only the selected source rows for exact-distance rescore
+- Add `create_quantized_column()` and safe `drop_quantized_column()` lifecycle APIs; accelerators can be physically removed without deleting their source, while dropping a source with active dependants or using the quantized-drop API on an ordinary column is rejected
+- Add Rust and Python regression coverage for all nine codecs, aliases, invalid/ragged inputs, persistence, compressed row groups, backfill, append/replace synchronization, rescore, recall trends, and safe source/accelerator deletion
+- Add a dedicated vector-quantization benchmark and public API memory cases for accelerator creation/deletion, plus a complete quantization design and usage guide
+- Let same-machine performance reports compare different ApexBase release versions while continuing to require identical runtime dependencies and build toolchains
+- Update the Rust crate and Python package version metadata to 1.30.0
+
+---
+
+
 ## [v1.29.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.29.0)
 *2026-08-08*
 

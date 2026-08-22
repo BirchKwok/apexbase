@@ -1385,7 +1385,10 @@ class ApexClient:
                 Pre-defining schema avoids type inference on the first insert.
                 Supported types include: ``int8``/``int16``/``int32``/``int64``,
                 ``uint8``/``uint16``/``uint32``/``uint64``, ``float32``/``float64``,
-                ``bool``, ``string``, ``binary``, ``blob``.
+                ``bool``, ``string``, ``binary``, ``blob``, ``float32_vector``,
+                ``float16_vector``, ``bfloat16_vector``, ``int8_vector``,
+                ``uint8_vector``, ``bit1_vector``, and ``turboquant2_vector`` /
+                ``turboquant3_vector`` / ``turboquant4_vector``.
                 Example: ``{"name": "string", "age": "int64"}``.
 
         Returns:
@@ -1412,6 +1415,49 @@ class ApexClient:
             self._schemaless_tables.add(table_name)
         else:
             self._schemaless_tables.discard(table_name)
+
+    def create_quantized_column(
+        self,
+        source: str,
+        target: str = None,
+        codec: str = "turboquant4",
+    ) -> str:
+        """Create a stored quantized projection of an authoritative vector column.
+
+        The target column is maintained by ApexBase and must not be supplied in
+        subsequent writes. The original source column remains available for
+        exact rescore/rerank.
+
+        Returns:
+            The created target column name.
+        """
+        self._check_connection()
+        self._ensure_table_selected()
+        if not isinstance(source, str) or not source:
+            raise ValueError("source must be a non-empty column name")
+        if not isinstance(codec, str) or not codec:
+            raise ValueError("codec must be a non-empty string")
+        normalized = codec.lower().replace("-", "").replace("_", "")
+        if target is None:
+            target = f"{source}_{normalized}"
+        if not isinstance(target, str) or not target:
+            raise ValueError("target must be a non-empty column name")
+        self.flush_buffered_writes()
+        self._storage.create_quantized_column(source, target, codec)
+        self._has_writes = True
+        self._invalidate_replace_cache()
+        return target
+
+    def drop_quantized_column(self, target: str) -> None:
+        """Delete a stored quantized projection while preserving its source column."""
+        self._check_connection()
+        self._ensure_table_selected()
+        if not isinstance(target, str) or not target:
+            raise ValueError("target must be a non-empty column name")
+        self.flush_buffered_writes()
+        self._storage.drop_quantized_column(target)
+        self._has_writes = True
+        self._invalidate_replace_cache()
 
     def drop_table(self, table_name: str):
         """
@@ -2241,7 +2287,10 @@ class ApexClient:
                 converted[name] = values.to_list()
             else:
                 converted[name] = list(values) if not isinstance(values, list) else values
-            if _is_vector_column(converted[name]):
+            if (
+                self._current_table in self._schemaless_tables
+                and _is_vector_column(converted[name])
+            ):
                 dims = {
                     len(v)
                     for v in converted[name]
@@ -4113,6 +4162,9 @@ class ApexClient:
         metric: str = 'l2',
         id_col: str = '_id',
         dist_col: str = 'dist',
+        accelerator: str = None,
+        candidate_k: int = None,
+        rescore: bool = True,
     ) -> 'ResultView':
         """Heap-based TopK vector distance search: O(n log k), faster than ORDER BY + LIMIT.
 
@@ -4142,6 +4194,12 @@ class ApexClient:
                 ``'dot'`` / ``'inner_product'``.
             id_col: Name for the output ``_id`` column (default ``'_id'``).
             dist_col: Name for the output distance column (default ``'dist'``).
+            accelerator: Optional system-maintained quantized column used for
+                candidate generation.
+            candidate_k: Number of approximate candidates to rescore. Defaults
+                to ``max(8 * k, 64)`` when an accelerator is supplied.
+            rescore: Recompute candidate distances from ``col``. Set to False
+                only when approximate distances are explicitly desired.
 
         Returns:
             ResultView with ``id_col`` and ``dist_col`` columns, sorted nearest first.
@@ -4157,9 +4215,34 @@ class ApexClient:
             raise ValueError("topk_distance: query must not be empty")
         if not np.isfinite(query_array).all():
             raise ValueError("topk_distance: query must contain only finite values")
-        schema_ptr, array_ptr = self._storage._topk_distance_ffi(
-            col, query_array.tobytes(), k, metric
-        )
+        if accelerator is not None:
+            if not isinstance(accelerator, str) or not accelerator:
+                raise ValueError("topk_distance: accelerator must be a non-empty column name")
+            if candidate_k is None:
+                candidate_k = max(8 * int(k), 64)
+            if (
+                not isinstance(candidate_k, (int, np.integer))
+                or isinstance(candidate_k, (bool, np.bool_))
+                or candidate_k < k
+            ):
+                raise ValueError("topk_distance: candidate_k must be an integer >= k")
+            if rescore:
+                schema_ptr, array_ptr = self._storage._topk_rescore_ffi(
+                    col,
+                    accelerator,
+                    query_array.tobytes(),
+                    k,
+                    int(candidate_k),
+                    metric,
+                )
+            else:
+                schema_ptr, array_ptr = self._storage._topk_distance_ffi(
+                    accelerator, query_array.tobytes(), k, metric
+                )
+        else:
+            schema_ptr, array_ptr = self._storage._topk_distance_ffi(
+                col, query_array.tobytes(), k, metric
+            )
         if schema_ptr == 0 or array_ptr == 0:
             rv = ResultView(lazy_pydict={id_col: [], dist_col: []})
             rv._show_internal_id = True

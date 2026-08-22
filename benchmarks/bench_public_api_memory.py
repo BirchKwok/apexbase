@@ -78,6 +78,8 @@ PUBLIC_API_CASES = (
     "ApexClient.use_table",
     "ApexClient.current_table",
     "ApexClient.create_table",
+    "ApexClient.create_quantized_column",
+    "ApexClient.drop_quantized_column",
     "ApexClient.drop_table",
     "ApexClient.list_tables",
     "ApexClient.register_temp_table",
@@ -332,6 +334,19 @@ class Fixture:
             self._fresh_table("durable", {"value": "int64"})
         elif name in {"topk_distance", "batch_topk_distance"}:
             self.prepared["vectors"] = self._vector_ready()
+        elif name in {"create_quantized_column", "drop_quantized_column"}:
+            table = self._fresh_table(
+                "quantized",
+                {"value": "int64", "vec": "float32_vector"},
+            )
+            rng = self.np.random.default_rng(43)
+            vectors = rng.random((ROWS, 16), dtype=self.np.float32)
+            c.store({"value": list(range(ROWS)), "vec": [row for row in vectors]})
+            c.flush()
+            self.prepared["quantized_table"] = table
+            self.prepared["quantized_target"] = "vec_tq4"
+            if name == "drop_quantized_column":
+                c.create_quantized_column("vec", "vec_tq4", "turboquant4")
         elif name.startswith("read_blob"):
             self.prepared["payload"] = self._blob_ready()
         elif name in {"retrieve", "retrieve_many", "retrieve_all", "list_fields", "delete", "replace", "batch_replace", "execute", "execute_batch", "execute_batch_parallel", "query", "count_rows"}:
@@ -444,6 +459,16 @@ class Fixture:
         if name == "create_table":
             self.repeatable = False
             return c.create_table("created", {"value": "int64"})
+        if name in {"create_quantized_column", "drop_quantized_column"}:
+            self.repeatable = False
+            c.use_table(self.prepared["quantized_table"])
+            if name == "create_quantized_column":
+                return c.create_quantized_column(
+                    "vec",
+                    self.prepared["quantized_target"],
+                    "turboquant4",
+                )
+            return c.drop_quantized_column(self.prepared["quantized_target"])
         if name == "drop_table":
             self.repeatable = False
             return c.drop_table(c.current_table)

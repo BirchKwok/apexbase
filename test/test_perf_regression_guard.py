@@ -185,6 +185,27 @@ def test_system_match_rejects_dependency_or_build_drift(guard):
     assert errors == ["dependencies differs", "build differs"]
 
 
+def test_system_match_allows_apexbase_release_version_change(guard):
+    baseline = _report({"scan": 10.0})
+    baseline.update({
+        "system": {"machine": "arm64"},
+        "dependencies": {"apexbase": "1.29.0", "numpy": "2.4.3"},
+        "build": {"rustc": "1.92.0"},
+    })
+    current = _report({"scan": 10.0})
+    current.update({
+        "system": {"machine": "arm64"},
+        "dependencies": {"apexbase": "1.30.0", "numpy": "2.4.3"},
+        "build": {"rustc": "1.92.0"},
+    })
+
+    assert guard.compatibility_errors(
+        baseline,
+        current,
+        require_system_match=True,
+    ) == []
+
+
 def test_vector_metrics_are_included(guard):
     report = _report({"scan": 10.0})
     report["vector_similarity"] = {

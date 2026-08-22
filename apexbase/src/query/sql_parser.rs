@@ -6128,6 +6128,14 @@ impl SqlParser {
                     "FLOAT16_VECTOR" | "FLOAT16VECTOR" | "F16_VECTOR" => {
                         Ok(DataType::Float16Vector)
                     }
+                    "FLOAT32_VECTOR" | "F32_VECTOR" => Ok(DataType::Float32Vector),
+                    "BFLOAT16_VECTOR" | "BF16_VECTOR" => Ok(DataType::BFloat16Vector),
+                    "INT8_VECTOR" | "I8_VECTOR" => Ok(DataType::Int8Vector),
+                    "UINT8_VECTOR" | "U8_VECTOR" => Ok(DataType::UInt8Vector),
+                    "BIT1_VECTOR" | "BINARY1_VECTOR" => Ok(DataType::Bit1Vector),
+                    "TURBOQUANT2_VECTOR" | "TQ2_VECTOR" => Ok(DataType::TurboQuant2Vector),
+                    "TURBOQUANT3_VECTOR" | "TQ3_VECTOR" => Ok(DataType::TurboQuant3Vector),
+                    "TURBOQUANT4_VECTOR" | "TQ4_VECTOR" => Ok(DataType::TurboQuant4Vector),
                     "FLOAT_VECTOR" | "FLOATVECTOR" | "VECTOR" => Ok(DataType::Binary),
                     _ => {
                         let (start, _) = self.current_span();

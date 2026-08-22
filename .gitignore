@@ -78,3 +78,5 @@ AGENTS.md
 *.stats
 
 *.apex_tables
+
+*.log

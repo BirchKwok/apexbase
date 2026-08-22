@@ -285,6 +285,23 @@ impl Database {
     }
 
     #[inline]
+    pub fn add_quantized_vector_column(
+        table_path: &Path,
+        source_column: &str,
+        target_column: &str,
+        target_dtype: crate::data::DataType,
+        durability: DurabilityLevel,
+    ) -> io::Result<()> {
+        engine().add_quantized_vector_column(
+            table_path,
+            source_column,
+            target_column,
+            target_dtype,
+            durability,
+        )
+    }
+
+    #[inline]
     pub fn replace(
         table_path: &Path,
         id: u64,
@@ -350,6 +367,15 @@ impl Database {
         durability: DurabilityLevel,
     ) -> io::Result<()> {
         engine().drop_column(table_path, name, durability)
+    }
+
+    #[inline]
+    pub fn drop_quantized_vector_column(
+        table_path: &Path,
+        target: &str,
+        durability: DurabilityLevel,
+    ) -> io::Result<()> {
+        engine().drop_quantized_vector_column(table_path, target, durability)
     }
 
     #[inline]

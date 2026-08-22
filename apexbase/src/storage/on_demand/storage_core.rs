@@ -193,6 +193,13 @@ fn push_default_value(col: &mut ColumnData) {
                 data.extend(std::iter::repeat(0u8).take(*dim as usize * 2));
             }
         }
+        ColumnData::QuantizedList { data, dim, codec } => {
+            if *dim > 0 {
+                let zero = vec![0.0f32; *dim as usize];
+                crate::compute::vector_quantization::encode_vector(*codec, &zero, data)
+                    .expect("validated vector dimension");
+            }
+        }
     }
 }
 
@@ -297,8 +304,107 @@ fn push_source_value(dst: &mut ColumnData, src: &ColumnData, row: usize, is_null
                 }
             }
         }
+        (
+            ColumnData::QuantizedList { data, dim, codec },
+            ColumnData::QuantizedList { data: sd, dim: sdim, codec: scodec },
+        ) if codec == scodec => {
+            if *dim == 0 { *dim = *sdim; }
+            if *dim > 0 {
+                let stride = codec.row_width(*dim as usize).expect("validated vector dimension");
+                let start = row * stride;
+                if start + stride <= sd.len() { data.extend_from_slice(&sd[start..start + stride]); }
+                else { push_null_value(dst); }
+            }
+        }
         _ => push_default_value(dst),
     }
+}
+
+fn push_derived_vector_value(
+    dst: &mut ColumnData,
+    src: &ColumnData,
+    row: usize,
+    is_null: bool,
+) -> io::Result<()> {
+    let dim = match src {
+        ColumnData::FixedList { dim, .. }
+        | ColumnData::Float16List { dim, .. }
+        | ColumnData::QuantizedList { dim, .. } => *dim as usize,
+        _ => 0,
+    };
+    if dim == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "derived vector source has zero dimension",
+        ));
+    }
+    match dst {
+        ColumnData::Float16List { dim: target_dim, .. }
+        | ColumnData::QuantizedList { dim: target_dim, .. } => {
+            if *target_dim == 0 {
+                *target_dim = dim as u32;
+            }
+        }
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "derived vector target has an invalid storage type",
+            ))
+        }
+    }
+    if is_null {
+        push_null_value(dst);
+        return Ok(());
+    }
+
+    let mut values = vec![0.0f32; dim];
+    match src {
+        ColumnData::FixedList { data, .. } => {
+            let start = row * dim * 4;
+            let bytes = data
+                .get(start..start + dim * 4)
+                .ok_or_else(|| err_data("derived Float32 source row is truncated"))?;
+            for (index, chunk) in bytes.chunks_exact(4).enumerate() {
+                values[index] = f32::from_le_bytes(chunk.try_into().unwrap());
+            }
+        }
+        ColumnData::Float16List { data, .. } => {
+            let start = row * dim * 2;
+            let bytes = data
+                .get(start..start + dim * 2)
+                .ok_or_else(|| err_data("derived Float16 source row is truncated"))?;
+            for (index, chunk) in bytes.chunks_exact(2).enumerate() {
+                values[index] = f16_to_f32(u16::from_le_bytes(chunk.try_into().unwrap()));
+            }
+        }
+        ColumnData::QuantizedList { data, codec, .. } => {
+            let stride = codec.row_width(dim)?;
+            let start = row * stride;
+            let bytes = data
+                .get(start..start + stride)
+                .ok_or_else(|| err_data("derived BFloat16 source row is truncated"))?;
+            crate::compute::vector_quantization::decode_vector(
+                *codec,
+                bytes,
+                dim,
+                &mut values,
+            )?;
+        }
+        _ => unreachable!(),
+    }
+
+    match dst {
+        ColumnData::Float16List { data, .. } => {
+            for value in values {
+                data.extend_from_slice(&f32_to_f16(value).to_le_bytes());
+            }
+        }
+        ColumnData::QuantizedList { data, codec, .. } => {
+            crate::compute::vector_quantization::encode_vector(*codec, &values, data)?;
+        }
+        _ => unreachable!(),
+    }
+    Ok(())
 }
 
 /// Apply a DeltaStore update value to a destination column. Returns `Some(())`
@@ -2220,6 +2326,7 @@ impl OnDemandStorage {
                         ColumnData::StringDict { indices, .. } => indices.push(0),
                         ColumnData::FixedList { .. } => {} // pads implicitly
                         ColumnData::Float16List { .. } => {} // pads implicitly
+                        ColumnData::QuantizedList { .. } => {} // dimension is not known yet
                     }
                 }
 
@@ -2444,7 +2551,15 @@ impl OnDemandStorage {
                 ColumnType::Binary | ColumnType::Blob => {
                     binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
-                ColumnType::FixedList | ColumnType::Float16List => {
+                ColumnType::FixedList
+                | ColumnType::Float16List
+                | ColumnType::BFloat16List
+                | ColumnType::Int8Vector
+                | ColumnType::UInt8Vector
+                | ColumnType::Bit1Vector
+                | ColumnType::TurboQuant2Vector
+                | ColumnType::TurboQuant3Vector
+                | ColumnType::TurboQuant4Vector => {
                     binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
                 ColumnType::Bool => {
@@ -2518,7 +2633,15 @@ impl OnDemandStorage {
                             .unwrap_or_default();
                         binary_columns.get_mut(col_name).unwrap().push(v);
                     }
-                    ColumnType::FixedList | ColumnType::Float16List => {
+                    ColumnType::FixedList
+                    | ColumnType::Float16List
+                    | ColumnType::BFloat16List
+                    | ColumnType::Int8Vector
+                    | ColumnType::UInt8Vector
+                    | ColumnType::Bit1Vector
+                    | ColumnType::TurboQuant2Vector
+                    | ColumnType::TurboQuant3Vector
+                    | ColumnType::TurboQuant4Vector => {
                         let v = val
                             .and_then(|v| match v.as_delta_column_value_ref() {
                                 ColumnValueRef::FixedList(b) | ColumnValueRef::Binary(b) => {
@@ -3079,7 +3202,14 @@ impl OnDemandStorage {
                 ColumnType::Binary
                 | ColumnType::Blob
                 | ColumnType::FixedList
-                | ColumnType::Float16List => {
+                | ColumnType::Float16List
+                | ColumnType::BFloat16List
+                | ColumnType::Int8Vector
+                | ColumnType::UInt8Vector
+                | ColumnType::Bit1Vector
+                | ColumnType::TurboQuant2Vector
+                | ColumnType::TurboQuant3Vector
+                | ColumnType::TurboQuant4Vector => {
                     return Ok(false);
                 }
             }
@@ -3442,6 +3572,7 @@ impl OnDemandStorage {
                 ms.add_column(name, actual_col_types[col_idx]);
             }
             ms.constraints = schema.constraints.clone();
+            ms.vector_derivations = schema.vector_derivations.clone();
             ms
         } else {
             schema.clone()
@@ -3753,11 +3884,11 @@ impl OnDemandStorage {
     /// Streaming physical rewrite that drops columns from the V4 base file
     /// without loading the table into memory.
     ///
-    /// `drop_column` is a logical schema change; because RG column layout is
-    /// positional, dropped columns must be physically removed from every Row
-    /// Group. This rewrites RG-by-RG via mmap (peak memory O(RG size)) and
-    /// atomically replaces the file, then updates the footer schema from the
-    /// current in-memory schema (which `drop_column` already updated).
+    /// Rewrite V4 Row Groups after a physical schema projection change.
+    ///
+    /// Existing columns are copied by name. New stored-vector derivation
+    /// targets are encoded from their source column one Row Group at a time;
+    /// removed columns are omitted. Peak memory remains O(largest Row Group).
     pub fn rewrite_v4_drop_columns(&self) -> io::Result<()> {
         let header = self.header.read();
         if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
@@ -3773,20 +3904,39 @@ impl OnDemandStorage {
         let old_schema = footer.schema.clone();
         let old_col_count = old_schema.column_count();
 
-        // New schema: current in-memory schema (already had the column removed).
+        // New schema: current in-memory schema after add/drop metadata changes.
         let new_schema = self.schema.read().clone();
-        if new_schema.column_count() >= old_col_count {
+        if new_schema.columns == old_schema.columns
+            && new_schema.vector_derivations == old_schema.vector_derivations
+        {
             return Ok(());
-        }
-        // Map old column index -> kept output index (old order, minus dropped).
-        let mut kept_cols: Vec<usize> = Vec::new();
-        for (i, (name, _)) in old_schema.columns.iter().enumerate() {
-            if new_schema.get_index(name).is_some() {
-                kept_cols.push(i);
-            }
         }
         let new_col_count = new_schema.column_count();
         let new_schema_cols: Vec<(String, ColumnType)> = new_schema.columns.clone();
+        let mut output_sources = Vec::with_capacity(new_col_count);
+        for (name, _) in &new_schema_cols {
+            if let Some(old_idx) = old_schema.get_index(name) {
+                output_sources.push((Some(old_idx), None));
+                continue;
+            }
+            let derivation = new_schema
+                .vector_derivations
+                .iter()
+                .find(|derivation| derivation.target == *name)
+                .ok_or_else(|| {
+                    err_data(format!(
+                        "new physical column '{}' is not a stored vector derivation",
+                        name
+                    ))
+                })?;
+            let source_idx = old_schema.get_index(&derivation.source).ok_or_else(|| {
+                err_data(format!(
+                    "stored vector source '{}' is missing from the original schema",
+                    derivation.source
+                ))
+            })?;
+            output_sources.push((None, Some(source_idx)));
+        }
 
         let mut out_ids: Vec<u64> = Vec::new();
         let mut out_columns: Vec<ColumnData> = new_schema_cols
@@ -3867,15 +4017,28 @@ impl OnDemandStorage {
                 if id > max_id_seen {
                     max_id_seen = id;
                 }
-                for (out_idx, &src_idx) in kept_cols.iter().enumerate() {
-                    let is_null =
-                        ((parsed.nulls[src_idx][row / 8] >> (row % 8)) & 1) == 1;
-                    push_source_value(
-                        &mut out_columns[out_idx],
-                        &parsed.columns[src_idx],
-                        row,
-                        is_null,
-                    );
+                for (out_idx, (copied_source, derived_source)) in
+                    output_sources.iter().enumerate()
+                {
+                    let src_idx = copied_source.or(*derived_source).ok_or_else(|| {
+                        err_data("schema rewrite output has no source column")
+                    })?;
+                    let is_null = ((parsed.nulls[src_idx][row / 8] >> (row % 8)) & 1) == 1;
+                    if copied_source.is_some() {
+                        push_source_value(
+                            &mut out_columns[out_idx],
+                            &parsed.columns[src_idx],
+                            row,
+                            is_null,
+                        );
+                    } else {
+                        push_derived_vector_value(
+                            &mut out_columns[out_idx],
+                            &parsed.columns[src_idx],
+                            row,
+                            is_null,
+                        )?;
+                    }
                     if is_null {
                         set_null_bit(&mut out_nulls[out_idx], out_row_count, true);
                     }
@@ -3917,6 +4080,7 @@ impl OnDemandStorage {
                 ms.add_column(name, actual_col_types[col_idx]);
             }
             ms.constraints = new_schema.constraints.clone();
+            ms.vector_derivations = new_schema.vector_derivations.clone();
             ms
         } else {
             new_schema.clone()
@@ -4123,6 +4287,17 @@ impl OnDemandStorage {
             ColumnType::Float16List => ColumnData::Float16List {
                 data: Vec::new(),
                 dim: 0,
+            },
+            dtype @ (ColumnType::BFloat16List
+            | ColumnType::Int8Vector
+            | ColumnType::UInt8Vector
+            | ColumnType::Bit1Vector
+            | ColumnType::TurboQuant2Vector
+            | ColumnType::TurboQuant3Vector
+            | ColumnType::TurboQuant4Vector) => ColumnData::QuantizedList {
+                data: Vec::new(),
+                dim: 0,
+                codec: dtype.vector_codec().unwrap(),
             },
             ColumnType::Null => ColumnData::Int64(vec![0i64; count]),
         }

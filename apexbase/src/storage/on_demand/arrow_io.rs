@@ -565,6 +565,27 @@ impl OnDemandStorage {
                     );
                     (list_dt, Arc::new(arr) as ArrayRef)
                 }
+                Some(ColumnData::QuantizedList { data, dim, codec }) => {
+                    use arrow::array::{FixedSizeListArray, Float32Array};
+                    let dim_usize = *dim as usize;
+                    let stride = codec.row_width(dim_usize)?;
+                    let selected: Vec<usize> = active_indices.clone().unwrap_or_else(|| (0..active_count).collect());
+                    let mut values = vec![0.0f32; selected.len() * dim_usize];
+                    for (output_row, &source_row) in selected.iter().enumerate() {
+                        let start = source_row * stride;
+                        if start + stride <= data.len() {
+                            crate::compute::vector_quantization::decode_vector(
+                                *codec, &data[start..start + stride], dim_usize,
+                                &mut values[output_row * dim_usize..(output_row + 1) * dim_usize],
+                            )?;
+                        }
+                    }
+                    let item = Arc::new(Field::new("item", ArrowDataType::Float32, false));
+                    let list_dt = ArrowDataType::FixedSizeList(item.clone(), dim_usize as i32);
+                    let arr = FixedSizeListArray::new(item, dim_usize as i32,
+                        Arc::new(Float32Array::from(values)), null_buf);
+                    (list_dt, Arc::new(arr) as ArrayRef)
+                }
                 Some(ColumnData::FixedList { data, dim }) => {
                     use arrow::array::{FixedSizeListArray, Float32Array};
                     let dim_usize = *dim as usize;
@@ -924,6 +945,29 @@ impl OnDemandStorage {
                             Arc::new(float_arr),
                             null_buf,
                         );
+                        (list_dt, Arc::new(arr) as ArrayRef)
+                    }
+                }
+                Some(ColumnData::QuantizedList { data, dim, codec }) => {
+                    let dim_usize = *dim as usize;
+                    if dim_usize == 0 {
+                        (ArrowDataType::Utf8, arrow::array::new_null_array(&ArrowDataType::Utf8, row_count))
+                    } else {
+                        let stride = codec.row_width(dim_usize)?;
+                        let mut values = vec![0.0f32; row_count * dim_usize];
+                        for row_idx in 0..row_count {
+                            let start = row_idx * stride;
+                            if start + stride <= data.len() {
+                                crate::compute::vector_quantization::decode_vector(
+                                    *codec, &data[start..start + stride], dim_usize,
+                                    &mut values[row_idx * dim_usize..(row_idx + 1) * dim_usize],
+                                )?;
+                            }
+                        }
+                        let item = Arc::new(Field::new("item", ArrowDataType::Float32, false));
+                        let list_dt = ArrowDataType::FixedSizeList(item.clone(), dim_usize as i32);
+                        let arr = FixedSizeListArray::new(item, dim_usize as i32,
+                            Arc::new(Float32Array::from(values)), null_buf);
                         (list_dt, Arc::new(arr) as ArrayRef)
                     }
                 }

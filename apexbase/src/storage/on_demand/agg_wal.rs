@@ -5453,6 +5453,21 @@ impl OnDemandStorage {
         self.schema.read().columns.clone()
     }
 
+    pub fn vector_derivations(&self) -> Vec<VectorDerivation> {
+        self.schema.read().vector_derivations.clone()
+    }
+
+    pub fn register_vector_derivation(
+        &self,
+        source: &str,
+        target: &str,
+        codec_version: u16,
+    ) -> io::Result<()> {
+        self.schema
+            .write()
+            .add_vector_derivation(source, target, codec_version)
+    }
+
     /// Rename a column in the in-memory schema.
     /// Must be called alongside `TableStorageBackend::rename_column` so that
     /// `update_v4_footer_schema()` and `save()` persist the new name.
@@ -5621,7 +5636,15 @@ impl OnDemandStorage {
                     ColumnType::Blob => {
                         blob_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
-                    ColumnType::FixedList | ColumnType::Float16List => {
+                    ColumnType::FixedList
+                    | ColumnType::Float16List
+                    | ColumnType::BFloat16List
+                    | ColumnType::Int8Vector
+                    | ColumnType::UInt8Vector
+                    | ColumnType::Bit1Vector
+                    | ColumnType::TurboQuant2Vector
+                    | ColumnType::TurboQuant3Vector
+                    | ColumnType::TurboQuant4Vector => {
                         fixedlist_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
                     ColumnType::Bool => {

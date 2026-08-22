@@ -1,220 +1,175 @@
 # Performance
 
-This page tracks the latest verified local benchmark snapshot rather than an old best-case run. Benchmarks are meant to be reproducible, not magical; always rerun them on your own workload and hardware.
+This page records the latest complete public cross-engine benchmark. It is a
+reproducible snapshot, not a universal claim: rerun the suite on your own
+hardware and workload.
 
-## Latest Verified Snapshot
+## v1.30.0 Public Snapshot
 
-- **Snapshot date / commit**: 2026-08-07, `08af3b2` on `main`
-- **System**: macOS 26.6, Apple arm (10 cores), 32 GB RAM
-- **Stack**: Python 3.12.2, ApexBase 1.28.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
-- **Dataset**: 1,000,000 rows x 5 columns (`name`, `age`, `score`, `city`, `category`)
-- **Vector dataset**: 1,000,000 vectors x dim=128, `k=10`, batch size 10 queries
-- **Method**: 2 warmup iterations + 5 timed iterations
-- **Layout**: the default benchmark entrypoint tracks the README public scoreboard: 77 fair cross-engine tabular metrics (45 OLAP + 32 OLTP, including the five table-operation metrics added in v1.28.0) plus six competitive vector metrics. Apex-only vector metrics and other extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`.
-- **Fairness rule**: only the default fair OLAP/OLTP cross-engine tables count toward the win/loss summary. Vector similarity uses a separate dataset and its own ApexBase-vs-DuckDB scoreboard.
+- **Date / source**: 2026-08-21, `d8b27a4` plus the v1.30.0 release workspace
+- **System**: macOS 26.6.2, Apple arm64 (10 cores), 32 GB RAM
+- **Stack**: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
+- **Tabular dataset**: 1,000,000 rows x 5 columns
+- **Vector dataset**: 1,000,000 Float32 vectors x 128 dimensions, `k=10`, 10 batch queries
+- **Method**: 2 warmup iterations + 5 timed iterations, materialized results
+- **Report**: `benchmarks/results/v1.30.0-vector-quantization-public-final.json`
 
-## Scoreboard
+The public suite completed all **108/108 metrics**. ApexBase won **106/108**:
+all 70 OLAP metrics, 30 of 32 OLTP metrics, and all 6 vector metrics. The only
+two slower results were `Table DROP` and `Table CREATE+DROP cycle` against
+SQLite's minimal empty-table DDL path; ApexBase remained faster than DuckDB on
+both.
 
 | Scope | Metrics | Apex wins | Ties | Slower |
 | --- | ---: | ---: | ---: | ---: |
-| Default fair (OLAP + OLTP) | 77 | 75 | 0 | 2 |
-| OLAP fair | 45 | 45 | 0 | 0 |
+| OLAP fair | 70 | 70 | 0 | 0 |
 | OLTP fair | 32 | 30 | 0 | 2 |
-| Vector similarity (ApexBase vs DuckDB) | 6 | 6 | 0 | 0 |
+| Exact vector similarity | 6 | 6 | 0 | 0 |
+| **Total** | **108** | **106** | **0** | **2** |
 
-Total verified: **83 metrics** (77 tabular + 6 vector). The two slower tabular
-metrics are `Table DROP` and `Table CREATE+DROP cycle` against SQLite's
-empty-table operations; ApexBase remains faster than DuckDB on both (see
-[Table Ops](#table-ops-new-in-v1280)).
+The six public vector rows use exact Float32 scans; quantization is deliberately
+excluded from the cross-engine scoreboard. SQLite 3.46.0 was below the minimum
+supported by the installed sqlite-vector binary, so those rows compare
+ApexBase and DuckDB. For compressed candidate retrieval with exact reranking,
+see the [Vector Quantization Guide](VECTOR_QUANTIZATION_GUIDE.md).
 
-Stock SQLite is not ranked in the vector table because the built-in `sqlite3`
-used here has no native vector distance/top-k functions in this harness.
+## All 108 Metrics
 
-## Representative OLAP Gaps
+### OLAP Fair Metrics (70)
 
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-| --- | ---: | ---: | ---: | --- |
-| COUNT(*) | 0.087 ms | 7.83 ms | 0.528 ms | 6.1x faster vs DuckDB |
-| SELECT * LIMIT 100 (warm cache) | 0.071 ms | 0.120 ms | 0.235 ms | 1.7x faster vs SQLite |
-| Filtered LIMIT 100 (age>30) | 0.016 ms | 0.122 ms | 0.415 ms | 7.6x faster vs SQLite |
-| GROUP BY city (10 groups) | 1.52 ms | 355.31 ms | 2.92 ms | 1.9x faster vs DuckDB |
-| Temp Table (CSV) Query (filter+agg) | 0.429 ms | N/A | 0.668 ms | 1.6x faster vs DuckDB |
-
-## Representative OLTP Gaps
-
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-| --- | ---: | ---: | ---: | --- |
-| Bulk Insert (N rows; default fair) | 225.19 ms | 1.01 s | 178.57 s | 4.5x faster vs SQLite |
-| Point Lookup (SQL by ID) | 2.92 us | 4.38 us | 3.09 ms | 1.5x faster vs SQLite |
-| Retrieve Many (SQL, 100 IDs) | 0.195 ms | 0.435 ms | 5.49 ms | 2.2x faster vs SQLite |
-| FTS Index Build (name,city,category) | 1.50 ms | 1.51 s | 1.32 s | 880x faster vs DuckDB |
-| FTS Search ('Electronics') | 5.38 ms | 29.49 ms | 23.06 ms | 4.3x faster vs DuckDB |
-
-## Table Ops (new in v1.28.0)
-
-v1.28.0 added five cross-engine table-operation metrics to the fair OLTP
-scoreboard: `Table CREATE (1 col)`, `Table DROP`, `Table CREATE+DROP cycle`,
-`List tables (10)`, and `ALTER TABLE ADD COLUMN`. ApexBase wins 3 of 5; the two
-losses are against SQLite's minimal empty-table DDL path, while ApexBase stays
-ahead of DuckDB on every one of them.
-
-| Metric | ApexBase | SQLite | DuckDB | Gap |
-| --- | ---: | ---: | ---: | --- |
-| Table CREATE (1 col) | 0.012 ms | 0.037 ms | 0.139 ms | 3.1x faster vs SQLite |
-| Table DROP | 0.049 ms | 0.030 ms | 0.142 ms | 1.6x slower vs SQLite; 2.9x faster vs DuckDB |
-| Table CREATE+DROP cycle | 0.107 ms | 0.069 ms | 0.346 ms | 1.5x slower vs SQLite; 3.2x faster vs DuckDB |
-| List tables (10) | 5.96 us | 0.031 ms | 2.71 ms | 5.2x faster vs SQLite |
-| ALTER TABLE ADD COLUMN | 0.057 ms | 0.074 ms | 0.128 ms | 1.3x faster vs SQLite |
-
-## Representative Vector Gaps
-
-SQLite is excluded here because stock `sqlite3` in this harness has no native vector distance/top-k support.
-
-Single-query rows compare one materialized TopK result from each engine. Batch rows compare ApexBase's `batch_topk_distance()` with ten DuckDB single-query SQL calls over the same deterministic query batch; every DuckDB result is materialized before the next query runs.
-
-| Metric | ApexBase | DuckDB | Gap to DuckDB |
+| Metric | ApexBase | SQLite | DuckDB |
 | --- | ---: | ---: | ---: |
-| TopK L2 | 7.73 ms | 32.50 ms | 4.2x faster |
-| TopK Cosine | 7.87 ms | 43.32 ms | 5.5x faster |
-| TopK Dot | 7.61 ms | 30.39 ms | 4.0x faster |
-| Batch TopK L2 (10 queries) | 59.37 ms | 357.23 ms | 6.0x faster |
-| Batch TopK Cosine (10 queries) | 70.25 ms | 480.35 ms | 6.8x faster |
-| Batch TopK Dot (10 queries) | 59.35 ms | 475.29 ms | 8.0x faster |
+| COUNT(*) | 0.075 ms | 8.035 ms | 0.519 ms |
+| SELECT * LIMIT 100 (cold reopen) | 0.110 ms | 0.140 ms | 0.602 ms |
+| SELECT * LIMIT 100 (warm cache) | 0.076 ms | 0.121 ms | 0.232 ms |
+| SELECT * LIMIT 10K (cold reopen) | 4.461 ms | 13.626 ms | 8.879 ms |
+| SELECT * LIMIT 10K (warm cache) | 4.303 ms | 12.919 ms | 8.590 ms |
+| Projection full scan (3 cols) | 238.617 ms | 922.001 ms | 698.914 ms |
+| Filtered LIMIT 100 (age>30) | 0.017 ms | 0.141 ms | 0.290 ms |
+| LIMIT 100 OFFSET 10K | 0.049 ms | 0.240 ms | 0.301 ms |
+| Filter (name = 'user_5000') | 0.162 ms | 46.726 ms | 1.727 ms |
+| Filter (age BETWEEN 25 AND 35) | 70.793 ms | 288.977 ms | 165.045 ms |
+| GROUP BY city (10 groups) | 1.507 ms | 364.261 ms | 4.032 ms |
+| GROUP BY category (10 groups) | 1.511 ms | 365.684 ms | 3.358 ms |
+| GROUP BY city ORDER BY count | 0.969 ms | 279.311 ms | 3.416 ms |
+| GROUP BY category ORDER BY count | 1.010 ms | 281.478 ms | 3.149 ms |
+| GROUP BY + HAVING | 1.558 ms | 360.756 ms | 3.857 ms |
+| GROUP BY category + HAVING | 1.556 ms | 356.575 ms | 3.596 ms |
+| Persistent VIEW select | 0.910 ms | 363.288 ms | 2.582 ms |
+| ORDER BY score LIMIT 100 | 2.260 ms | 55.744 ms | 5.601 ms |
+| ORDER BY score ASC LIMIT 100 | 1.981 ms | 55.992 ms | 4.788 ms |
+| Aggregation (5 funcs) | 0.235 ms | 88.328 ms | 1.219 ms |
+| Filtered aggregation (category) | 0.434 ms | 61.952 ms | 1.174 ms |
+| Filtered aggregation (city) | 0.425 ms | 60.457 ms | 1.123 ms |
+| COUNT WHERE category | 0.247 ms | 57.858 ms | 0.841 ms |
+| Complex (Filter+Group+Order) | 1.544 ms | 167.413 ms | 3.037 ms |
+| SELECT * -> pandas (full scan) | 27.275 ms | 1.43 s | 217.250 ms |
+| GROUP BY city,category (100 grp) | 1.164 ms | 681.439 ms | 5.467 ms |
+| LIKE filter (name LIKE user_1%) | 43.767 ms | 210.222 ms | 101.863 ms |
+| Multi-cond (age>30 AND score>50) | 195.705 ms | 619.532 ms | 373.821 ms |
+| ORDER BY city,score DESC LIMIT100 | 3.412 ms | 76.123 ms | 7.217 ms |
+| COUNT(DISTINCT city) | 0.195 ms | 92.387 ms | 4.259 ms |
+| COUNT(DISTINCT category) | 0.192 ms | 94.236 ms | 4.832 ms |
+| IN filter (city IN 3 cities) | 125.114 ms | 514.088 ms | 285.915 ms |
+| Numeric IN (age IN 9 values) | 61.760 ms | 280.557 ms | 144.735 ms |
+| OR cross-col (age=25 OR city=BJ) | 71.940 ms | 226.453 ms | 112.400 ms |
+| Numeric OR (age=20\|30\|40\|50) | 31.485 ms | 150.690 ms | 67.100 ms |
+| Window ROW_NUMBER PARTITION BY city | 0.742 ms | 518.455 ms | 46.636 ms |
+| JOIN GROUP BY ORDER LIMIT | 5.160 ms | 392.784 ms | 7.876 ms |
+| LEFT JOIN COUNT | 0.806 ms | 161.447 ms | 3.966 ms |
+| LEFT JOIN extra ON predicate | 0.812 ms | 145.464 ms | 3.527 ms |
+| FULL OUTER JOIN (bounded) | 0.728 ms | 1.246 ms | 1.771 ms |
+| CROSS JOIN COUNT | 0.598 ms | 48.583 ms | 1.596 ms |
+| UNION ALL (ordered) | 1.468 ms | 81.119 ms | 3.709 ms |
+| UNION DISTINCT (ordered) | 2.644 ms | 84.339 ms | 3.140 ms |
+| INTERSECT (ordered) | 7.846 ms | 177.454 ms | 8.191 ms |
+| EXCEPT (ordered) | 2.882 ms | 175.378 ms | 7.385 ms |
+| IN subquery COUNT | 0.673 ms | 101.201 ms | 3.414 ms |
+| EXISTS subquery COUNT | 5.185 ms | 399.828 ms | 23.765 ms |
+| Derived table GROUP BY | 1.118 ms | 279.524 ms | 4.106 ms |
+| CTE with AVG filter | 1.419 ms | 364.752 ms | 4.786 ms |
+| CASE aggregate GROUP BY | 1.360 ms | 315.547 ms | 5.727 ms |
+| String functions (UPPER/LENGTH/SUBSTR/CONCAT/TRIM) | 0.935 ms | 1.919 ms | 1.663 ms |
+| Numeric functions (ROUND/ABS/FLOOR/CEIL/MOD) | 0.736 ms | 1.344 ms | 1.273 ms |
+| COALESCE/NULLIF filter | 0.381 ms | 137.111 ms | 2.116 ms |
+| NOT filter (age NOT BETWEEN, name NOT LIKE) | 2.062 ms | 63.308 ms | 3.607 ms |
+| Deep offset (LIMIT 100 OFFSET 100K) | 47.073 ms | 255.639 ms | 198.049 ms |
+| ORDER BY expression (LENGTH) | 2.230 ms | 70.825 ms | 5.375 ms |
+| Window SUM OVER (running) | 0.575 ms | 452.769 ms | 42.017 ms |
+| Window RANK (partitioned) | 0.561 ms | 476.528 ms | 43.014 ms |
+| Window LAG (partitioned) | 0.574 ms | 441.836 ms | 35.582 ms |
+| DISTINCT (city, category) | 4.235 ms | 635.642 ms | 5.785 ms |
+| GROUP BY 2 cols + HAVING | 1.145 ms | 481.822 ms | 5.116 ms |
+| CSV Read + COUNT(*) | 13.659 ms | N/A | 46.370 ms |
+| CSV Read + Filter + GROUP BY | 27.802 ms | N/A | 51.477 ms |
+| CSV Read + Full Scan LIMIT 1000 | 14.786 ms | N/A | 22.633 ms |
+| JSON Read + COUNT(*) | 4.652 ms | N/A | 66.710 ms |
+| JSON Read + Filter | 8.690 ms | N/A | 82.001 ms |
+| JSON Read + GROUP BY category | 56.599 ms | N/A | 89.853 ms |
+| Temp Table (CSV) Query (filter+agg) | 0.464 ms | N/A | 0.719 ms |
+| JSON Read + ORDER BY LIMIT 100 | 48.435 ms | N/A | 103.954 ms |
+| CSV Read + ORDER BY LIMIT 100 | 18.192 ms | N/A | 57.492 ms |
 
-## Hot-Path Latency Snapshot
+### OLTP Fair Metrics (32)
 
-The tables below come from the extended diagnostics profile
-(`benchmarks/bench_vs_sqlite_duckdb_extended.py`) and are not part of the fair
-scoreboard. They answer a different question: how fast is the already-loaded
-hot path, and what happens when durability or transaction semantics are made
-explicit?
+| Metric | ApexBase | SQLite | DuckDB |
+| --- | ---: | ---: | ---: |
+| Bulk Insert (N rows; default fair) | 238.079 ms | 1.04 s | 185.68 s |
+| Point Lookup (SQL by ID) | 2.71 us | 4.31 us | 2.847 ms |
+| Retrieve Many (SQL, 100 IDs) | 0.197 ms | 0.335 ms | 4.835 ms |
+| COUNT(*) (direct API) | 6.19 us | 7.895 ms | 0.304 ms |
+| Point lookup (projected SQL) | 2.44 us | 3.32 us | 2.523 ms |
+| Point lookup (direct full row) | 2.05 us | 4.29 us | 2.613 ms |
+| Missing ID lookup | 2.16 us | 2.63 us | 2.918 ms |
+| Retrieve 10 IDs (projected SQL) | 7.88 us | 0.015 ms | 3.759 ms |
+| Retrieve 100 IDs (projected SQL) | 0.036 ms | 0.107 ms | 5.151 ms |
+| SELECT 3 cols LIMIT 100 | 0.045 ms | 0.078 ms | 0.176 ms |
+| String equality (projected) | 0.049 ms | 47.056 ms | 1.462 ms |
+| City filter LIMIT 100 | 0.020 ms | 0.109 ms | 0.216 ms |
+| Insert 1 row (default fair) | 0.011 ms | 0.015 ms | 0.319 ms |
+| Insert+Read own row | 0.014 ms | 0.019 ms | 4.150 ms |
+| Insert+COUNT visible | 0.017 ms | 8.230 ms | 0.678 ms |
+| UPDATE by ID | 3.04 us | 4.34 us | 0.891 ms |
+| UPDATE missing ID | 3.01 us | 3.90 us | 0.907 ms |
+| UPDATE+Read by ID | 5.11 us | 7.32 us | 1.852 ms |
+| Replace row by ID | 0.62 us | 4.44 us | 1.007 ms |
+| Insert+DELETE by ID | 0.023 ms | 0.027 ms | 1.385 ms |
+| DELETE missing ID | 0.41 us | 3.97 us | 0.684 ms |
+| Insert 1K rows (default fair) | 0.682 ms | 1.702 ms | 185.861 ms |
+| UPDATE rows (age=25; idempotent) | 4.144 ms | 43.291 ms | 15.605 ms |
+| Store+DELETE 1K (combined) | 1.076 ms | 40.499 ms | 184.709 ms |
+| DELETE 1K (pure delete; setup rows) | 0.187 ms | 39.612 ms | 0.385 ms |
+| FTS Index Build (name,city,category) | 1.546 ms | 1.57 s | 1.15 s |
+| FTS Search ('Electronics') | 5.437 ms | 30.056 ms | 23.242 ms |
+| Table CREATE (1 col) | 0.016 ms | 0.040 ms | 0.116 ms |
+| Table DROP | 0.056 ms | 0.031 ms | 0.098 ms |
+| Table CREATE+DROP cycle | 0.110 ms | 0.068 ms | 0.276 ms |
+| List tables (10) | 0.011 ms | 0.020 ms | 2.846 ms |
+| ALTER TABLE ADD COLUMN | 0.067 ms | 0.082 ms | 0.107 ms |
 
-Snapshot: 200,000 rows, 2 warmup iterations + 3 timed iterations, median
-per-call hot-path latency, recorded 2026-08-07.
+### Vector Similarity (6)
 
-### Default Microbenchmarks
-
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-| --- | ---: | ---: | ---: | --- |
-| COUNT(*) (direct API) | 4.0 us | 1.259 ms | 0.145 ms | 36x faster vs DuckDB |
-| Point lookup (projected SQL) | 3.0 us | 3.0 us | 1.691 ms | tied with SQLite |
-| Retrieve 100 IDs (projected SQL) | 0.034 ms | 0.112 ms | 4.532 ms | 3.3x faster vs SQLite |
-| Insert 1 row (default fair) | 0.012 ms | 0.015 ms | 0.275 ms | 1.3x faster vs SQLite |
-| UPDATE by ID | 3.0 us | 5.0 us | 0.491 ms | 1.7x faster vs SQLite |
-| DELETE missing ID | 0.4 us | 4.0 us | 0.385 ms | 10x faster vs SQLite |
-
-### Durable Fair Microbenchmarks
-
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-| --- | ---: | ---: | ---: | --- |
-| Insert 1 row (durable fair) | 0.167 ms | 0.121 ms | 33.185 ms | 1.4x slower vs SQLite; 199x faster vs DuckDB |
-| UPDATE by ID (durable fair) | 4.0 us | 7.0 us | 4.479 ms | 1.8x faster vs SQLite |
-
-### Transaction Fair Microbenchmarks
-
-| Metric | ApexBase | SQLite | DuckDB | Gap to best other |
-| --- | ---: | ---: | ---: | --- |
-| TXN empty (BEGIN+COMMIT; durable sync) | 2.0 us | 5.0 us | 0.177 ms | 2.5x faster vs SQLite |
-| TXN read COUNT(*) (COMMIT; durable sync) | 0.023 ms | 1.345 ms | 0.320 ms | 13.9x faster vs DuckDB |
-| TXN backlog string miss (COMMIT; 1500 preseed; durable sync) | 0.063 ms | 9.088 ms | 0.412 ms | 6.5x faster vs DuckDB |
-| TXN backlog COUNT(*) (COMMIT; 1500 preseed; durable sync) | 0.024 ms | 1.459 ms | 0.312 ms | 13.0x faster vs DuckDB |
-| TXN backlog INSERT+read-own-name (COMMIT; 1500 preseed; durable sync) | 0.374 ms | 9.929 ms | 36.439 ms | 26.5x faster vs SQLite |
-
-## OLAP Throughput (Q/s)
-
-The Q/s harness runs a mixed analytical read profile (`COUNT(*)`, two `GROUP BY`
-scans, and a filtered `LIMIT 100`, materialized to Python rows) on a freshly
-loaded copy of the dataset table (200,000 rows, 2026-08-07, extended profile).
-
-| Engine | Single thread Q/s | 4 threads Q/s |
+| Metric | ApexBase | DuckDB |
 | --- | ---: | ---: |
-| ApexBase | 9,216.3 | 15,068.8 |
-| SQLite | 34.8 | 124.5 |
-| DuckDB | 878.4 | 2,633.6 |
+| TopK L2 | 7.789 ms | 32.761 ms |
+| TopK Cosine | 7.577 ms | 39.001 ms |
+| TopK Dot | 7.879 ms | 32.261 ms |
+| Batch TopK L2 (10 queries) | 50.860 ms | 319.979 ms |
+| Batch TopK Cosine (10 queries) | 48.101 ms | 385.503 ms |
+| Batch TopK Dot (10 queries) | 46.407 ms | 331.353 ms |
 
-Measurement notes:
-
-- The harness re-creates each engine on a clean loaded table before sampling
-  (the same mechanism the OLTP microbenchmark sections use), so the profile
-  measures steady-state read throughput rather than a table left in a
-  delta-heavy state by the calibrated single-row DML microbenchmarks.
-- The earlier published throughput snapshot (ApexBase ~123,700 Q/s
-  single-threaded) came from a harness that created fresh engines but never
-  loaded the dataset, so it measured empty-table query overhead and is not
-  comparable to the current real-data numbers.
-
-## OLTP Write Visibility
-
-ApexBase exposes two fast single-row append paths, and the benchmark keeps them out of the fair scoreboard because their visibility rules are Apex-specific:
-
-- **Memtable OLTP** is the default fast single-row path for schema-stable `store({...})` calls with `durability="fast"`. The writing client can read the row immediately, managed clients in the same Python process share the storage instance, and `flush()` / `close()` persists pending rows.
-- **Buffered OLTP** is explicit: call `begin_buffered_writes()`, issue many single-row `store({...})` calls, then call `flush_buffered_writes()` or `end_buffered_writes(flush=True)`. Buffered rows are not visible until flushed.
-
-That separation is deliberate: the fair tables compare committed cross-engine behavior, while Apex-only write modes remain visible as diagnostics instead of being mixed into the competitive summary.
+All vector rows matched the brute-force exact top-k row sets.
 
 ## Reproduce
 
-Use the same command as the snapshot above:
+Run the same default public profile:
 
 ```bash
-python benchmarks/bench_vs_sqlite_duckdb.py
+python benchmarks/bench_vs_sqlite_duckdb.py \
+  --output benchmarks/results/public.json
 ```
 
-Add `--skip-vector` if you want a tabular-only rerun without the separate vector module.
-Run `python benchmarks/bench_vs_sqlite_duckdb_extended.py --rows 200000 --warmup 2 --iterations 3` for the file-format, materialization, Q/s, microbenchmark, durable, transaction, buffered/memtable, and full vector diagnostics. Add `--output path.json` to keep a machine-readable report of any run.
-
-### Out-of-core file comparison
-
-Use the focused harness to compare ApexBase and DuckDB against the exact same
-generated CSV or Parquet source:
-
-```bash
-python benchmarks/bench_out_of_core_import.py --rows 1000000 --format csv
-python benchmarks/bench_out_of_core_import.py --rows 1000000 --format parquet
-```
-
-Each engine runs in an isolated process. The report separates direct file query
-time, disk-backed table materialization time, repeated native-table query time,
-incremental peak RSS, and storage size. Results and filtered row counts are
-cross-checked before ratios are printed. DuckDB defaults to a `1GB` memory limit
-and an explicit spill directory; change it with `--memory-limit 512MB`. Increase
-`--rows` until the generated source exceeds physical memory for a true
-out-of-core stress run. Ratios are reported as ApexBase divided by DuckDB, so a
-value below `1.0x` is better for ApexBase.
-
-On the same Apple Silicon development machine, the focused 1,000,000-row
-Parquet run (21 measured queries after 5 warmups) produced this verification
-snapshot:
-
-| Metric | ApexBase | DuckDB | ApexBase / DuckDB |
-| --- | ---: | ---: | ---: |
-| Direct filtered Parquet count | 1.35 ms | 9.75 ms | 0.138x |
-| Disk-backed materialization | 0.131 s | 0.278 s | 0.469x |
-| Filter + GROUP BY + COUNT/AVG | 1.175 ms | 3.862 ms | 0.304x |
-| Incremental peak RSS | 77.8 MB | 126.9 MB | 0.613x |
-| Native storage size | 9.5 MiB | 6.5 MiB | 1.454x |
-
-The native storage result first decreased from 33.9 MiB to 27.4 MiB by
-selecting string dictionary encoding from its actual serialized size instead
-of a periodic cardinality sample. One-, two-, or four-byte string dictionary
-indices reduced it further to 22.6 MiB. Temp materializations now omit the
-physical `_id` array when a row group's IDs are contiguous, reconstructing IDs
-from `min_id` only in `.apex_tmp` files; this keeps mutable-table storage and
-DML paths on their established format. Lossless low-cardinality `Float64`
-dictionaries then reduce this workload to 9.5 MiB. The float encoding is used
-only for at least 32K rows when sampling shows useful repetition and its
-serialized size is below 70% of plain storage; high-cardinality data retains
-the original encoding. The fused range-filter aggregation evaluates each
-dictionary value once and scans compact row indices without materializing a
-full float vector. Nullable inputs and more complex SQL shapes deliberately
-fall back to the general executor.
-
-Blob storage has a focused Lance comparison harness:
-
-```bash
-python benchmarks/bench_blob_lance.py --rows 200 --reads 200 --iterations 3
-```
-
-The script measures write throughput, non-blob projection scans, descriptor metadata reads, random full blob reads, random range reads, and projected blob materialization. It uses Lance Blob helpers when the installed Lance package exposes them, and reports unavailable or fallback modes explicitly.
-
-For a larger stress run, increase `--rows` to `1000000`.
+Use `--skip-vector` for a tabular-only run. Use
+`benchmarks/bench_vector_quantization.py` to measure compressed storage,
+candidate recall, and exact rescore separately from this public exact-scan
+scoreboard.

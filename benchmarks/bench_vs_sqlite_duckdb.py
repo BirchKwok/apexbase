@@ -14,6 +14,7 @@ import argparse
 import csv as csv_mod
 import gc
 import importlib.metadata as importlib_metadata
+import importlib.resources
 import json
 import math
 import os
@@ -41,17 +42,20 @@ duckdb = None
 ApexClient = None
 pd = None
 pa = None
+sqliteai_vector = None
 HAS_DUCKDB = False
 HAS_APEXBASE = False
 HAS_PANDAS = False
 HAS_PYARROW = False
+HAS_SQLITE_VECTOR = False
 _OPTIONAL_IMPORTS_READY = False
 
 
 def ensure_optional_imports():
     """Load benchmark-only dependencies lazily so profile tests stay cheap."""
-    global duckdb, ApexClient, pd, pa
+    global duckdb, ApexClient, pd, pa, sqliteai_vector
     global HAS_DUCKDB, HAS_APEXBASE, HAS_PANDAS, HAS_PYARROW
+    global HAS_SQLITE_VECTOR
     global _OPTIONAL_IMPORTS_READY
 
     if _OPTIONAL_IMPORTS_READY:
@@ -88,6 +92,14 @@ def ensure_optional_imports():
     except ImportError:
         pa = None
         HAS_PYARROW = False
+
+    try:
+        import sqlite_vector as _sqlite_vector
+        sqliteai_vector = _sqlite_vector
+        HAS_SQLITE_VECTOR = bool(locate_sqliteai_vector_binary())
+    except ImportError:
+        sqliteai_vector = None
+        HAS_SQLITE_VECTOR = False
 
     _OPTIONAL_IMPORTS_READY = True
 
@@ -143,9 +155,16 @@ VECTOR_DUCKDB_FUNCTIONS = {
     "cosine": "array_cosine_distance",
     "dot": "array_negative_inner_product",
 }
+# sqlite-vector vector_init() distance options, one registered table per
+# metric because a table keeps the distance it was first initialized with.
+VECTOR_SQLITE_DISTANCE_OPTIONS = {
+    "l2": "L2",
+    "cosine": "COSINE",
+    "dot": "DOT",
+}
 VECTOR_SQLITE_NOTE = (
-    "Stock SQLite in this harness has no native vector distance/top-k, "
-    "so ranked vector comparisons are ApexBase vs DuckDB only."
+    "SQLite rows use the sqlite-vector extension's exact vector_full_scan() "
+    "top-k; without the extension installed, SQLite shows N/A for ranked vector metrics."
 )
 PROFILE_PUBLIC = "public"
 PROFILE_EXTENDED = "extended"
@@ -343,6 +362,80 @@ def setup_duckdb_vector_bench(vecs: np.ndarray):
     return con
 
 
+SQLITEAI_VECTOR_BINARY_NAMES = ("vector", "vector.dylib", "vector.so", "vector.dll")
+
+
+def locate_sqliteai_vector_binary():
+    """Resolve the prebuilt sqlite-vector extension binary shipped by the package."""
+    try:
+        package_dir = importlib.resources.files("sqlite_vector.binaries")
+    except (ImportError, ModuleNotFoundError):
+        return None
+    for name in SQLITEAI_VECTOR_BINARY_NAMES:
+        candidate = str(package_dir / name)
+        if os.path.exists(candidate):
+            break
+    else:
+        return None
+    if tuple(int(part) for part in sqlite3.sqlite_version_info[:2]) < (3, 50):
+        return None
+    return candidate
+
+
+def setup_sqliteai_vector_bench(vecs: np.ndarray):
+    """Load the same vectors into an in-memory SQLite DB with per-metric tables.
+
+    vector_init() pins a table's distance at first registration, so each head-
+    to-head metric gets its own table; all share one connection and BLOB data.
+    """
+    ensure_optional_imports()
+    import sqlite3
+
+    con = sqlite3.connect(":memory:")
+    con.enable_load_extension(True)
+    con.load_extension(locate_sqliteai_vector_binary())
+    con.enable_load_extension(False)
+    dim = vecs.shape[1]
+    n = len(vecs)
+    con.execute("PRAGMA journal_mode=MEMORY")
+    con.execute("PRAGMA synchronous=OFF")
+    blobs = [vecs[i].tobytes() for i in range(n)]
+    for table in ("vec_l2", "vec_cosine", "vec_dot"):
+        con.execute(f"CREATE TABLE {table} (id INTEGER PRIMARY KEY, embedding BLOB)")
+    rows = list(enumerate(blobs))
+    con.execute("BEGIN")
+    con.executemany("INSERT INTO vec_l2 VALUES (?,?)", rows)
+    con.executemany("INSERT INTO vec_cosine VALUES (?,?)", rows)
+    con.executemany("INSERT INTO vec_dot VALUES (?,?)", rows)
+    con.execute("COMMIT")
+    for metric in ("l2", "cosine", "dot"):
+        table = f"vec_{metric}"
+        distance = VECTOR_SQLITE_DISTANCE_OPTIONS[metric]
+        con.execute(
+            "SELECT vector_init(?, ?, ?)",
+            (table, "embedding", f"type=FLOAT32,dimension={dim},distance={distance}"),
+        )
+    return con
+
+
+def build_sqliteai_vector_sql(metric: str, k: int) -> str:
+    table = f"vec_{metric}"
+    return (
+        f"SELECT t.id, v.distance FROM {table} AS t "
+        f"JOIN vector_full_scan('{table}', 'embedding', ?, {k}) AS v "
+        "ON t.id = v.rowid"
+    )
+
+
+def bench_sqliteai_vector_query(connection, query: np.ndarray, k: int, metric: str):
+    cur = connection.execute(build_sqliteai_vector_sql(metric, k), (query.tobytes(),))
+    if HAS_PYARROW:
+        return pa.Table.from_pylist(
+            rows_to_dicts([d[0] for d in (cur.description or [])], cur.fetchall())
+        )
+    return cur.fetchall()
+
+
 def bench_apex_vector_query(client, query: np.ndarray, k: int, metric: str):
     return materialize_apex_vector_result(
         client.topk_distance("vec", query, k=k, metric=VECTOR_APEX_METRIC_MAP[metric])
@@ -366,6 +459,12 @@ def bench_duckdb_batch_vector_query(connection, queries: np.ndarray, k: int, met
             connection.execute(build_duckdb_vector_sql(query, k, metric))
         )
     return last
+
+
+def bench_sqliteai_batch_vector_query(connection, queries: np.ndarray, k: int, metric: str):
+    """Run the same ten-query workload as DuckDB's repeated single-query loop."""
+    for query in queries:
+        bench_sqliteai_vector_query(connection, query, k, metric)
 
 
 @contextmanager
@@ -4459,7 +4558,7 @@ def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
 
 
 def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, profile=PROFILE_PUBLIC):
-    """Benchmark vector similarity against DuckDB on a separate vector dataset."""
+    """Benchmark vector similarity against DuckDB and SQLite on a separate vector dataset."""
     ensure_optional_imports()
     head_metrics, batch_metrics, apex_only_metrics = vector_metric_sets(profile)
     config = {
@@ -4468,15 +4567,16 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, p
         "k": k,
         "batch_queries": VECTOR_BATCH_QUERY_COUNT,
         "sqlite_note": VECTOR_SQLITE_NOTE,
+        "sqlite_vector_available": HAS_SQLITE_VECTOR,
         "profile": normalize_profile(profile),
     }
 
     reason = None
     if not HAS_APEXBASE:
         reason = "ApexBase is unavailable in this environment."
-    elif not HAS_DUCKDB:
-        reason = "DuckDB is unavailable in this environment."
-    elif not HAS_PANDAS:
+    elif not HAS_DUCKDB and not HAS_SQLITE_VECTOR:
+        reason = "Neither DuckDB nor the sqlite-vector extension is available in this environment."
+    elif HAS_DUCKDB and not HAS_PANDAS:
         reason = "pandas is required to bulk-load the DuckDB vector table."
     elif rows <= 0 or dim <= 0 or k <= 0:
         reason = "rows, dim, and k must all be positive."
@@ -4504,11 +4604,20 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, p
     vector_tmpdir = tempfile.mkdtemp(prefix="apexbase_vector_", dir=tmpdir)
     apex_client = None
     duck_con = None
+    sqlite_con = None
     try:
         print("Setting up vector engines...", end=" ", flush=True)
         apex_client = setup_apex_vector_bench(vector_tmpdir, vecs)
-        duck_con = setup_duckdb_vector_bench(vecs)
+        if HAS_DUCKDB:
+            duck_con = setup_duckdb_vector_bench(vecs)
+        if HAS_SQLITE_VECTOR:
+            sqlite_con = setup_sqliteai_vector_bench(vecs)
         print("done.")
+
+        sqlite_engine_name = "SQLite" if sqlite_con is not None else None
+        vector_engine_names = (["ApexBase", "DuckDB"] if duck_con is not None else ["ApexBase"])
+        if sqlite_engine_name is not None:
+            vector_engine_names.append(sqlite_engine_name)
 
         head_results = {}
         head_rows = []
@@ -4519,12 +4628,19 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, p
                     warmup=warmup,
                     iterations=iterations,
                 ),
-                "DuckDB": run_bench_gc_median(
+            }
+            if duck_con is not None:
+                head_results[label]["DuckDB"] = run_bench_gc_median(
                     lambda con=duck_con, q=query, metric=metric: bench_duckdb_vector_query(con, q, k, metric),
                     warmup=warmup,
                     iterations=iterations,
-                ),
-            }
+                )
+            if sqlite_con is not None:
+                head_results[label]["SQLite"] = run_bench_gc_median(
+                    lambda con=sqlite_con, q=query, metric=metric: bench_sqliteai_vector_query(con, q, k, metric),
+                    warmup=warmup,
+                    iterations=iterations,
+                )
 
         if head_metrics:
             head_rows = print_benchmark_section(
@@ -4532,7 +4648,7 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, p
                 "Single-query TopK similarity on the same vector table; results materialized via Arrow when available.",
                 display_only_specs([label for label, _ in head_metrics]),
                 head_results,
-                ["ApexBase", "DuckDB"],
+                vector_engine_names,
                 16,
             )
 
@@ -4545,20 +4661,27 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, p
                     warmup=warmup,
                     iterations=iterations,
                 ),
-                "DuckDB": run_bench_gc_median(
+            }
+            if duck_con is not None:
+                batch_results[label]["DuckDB"] = run_bench_gc_median(
                     lambda con=duck_con, queries=batch_queries, metric=metric: bench_duckdb_batch_vector_query(con, queries, k, metric),
                     warmup=warmup,
                     iterations=iterations,
-                ),
-            }
+                )
+            if sqlite_con is not None:
+                batch_results[label]["SQLite"] = run_bench_gc_median(
+                    lambda con=sqlite_con, queries=batch_queries, metric=metric: bench_sqliteai_batch_vector_query(con, queries, k, metric),
+                    warmup=warmup,
+                    iterations=iterations,
+                )
 
         if batch_metrics:
             batch_rows = print_benchmark_section(
                 "Vector Head-to-Head (batch queries)",
-                "Ten-query TopK workload: ApexBase batch_topk_distance() vs repeated DuckDB single-query SQL on the same batch.",
+                "Ten-query TopK workload: ApexBase batch_topk_distance() vs repeated single-query SQL per engine on the same batch.",
                 display_only_specs([label for label, _ in batch_metrics]),
                 batch_results,
-                ["ApexBase", "DuckDB"],
+                vector_engine_names,
                 16,
             )
 
@@ -4615,6 +4738,11 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, p
                 duck_con.close()
             except Exception:
                 pass
+        if sqlite_con is not None:
+            try:
+                sqlite_con.close()
+            except Exception:
+                pass
         try:
             shutil.rmtree(vector_tmpdir)
         except Exception:
@@ -4645,6 +4773,11 @@ def get_system_info():
     if HAS_DUCKDB:
         info["duckdb"] = duckdb.__version__
     info["sqlite"] = sqlite3.sqlite_version
+    if HAS_SQLITE_VECTOR:
+        try:
+            info["sqlite_vector"] = importlib_metadata.version("sqliteai-vector")
+        except importlib_metadata.PackageNotFoundError:
+            info["sqlite_vector"] = "unknown"
     if HAS_PYARROW:
         info["pyarrow"] = pa.__version__
     return info
@@ -5022,6 +5155,8 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     if "apexbase" in sys_info:
         print(f"ApexBase: v{sys_info['apexbase']}")
     print(f"SQLite: v{sys_info['sqlite']}")
+    if "sqlite_vector" in sys_info:
+        print(f"sqlite-vector (extension): v{sys_info['sqlite_vector']}")
     if HAS_DUCKDB:
         print(f"DuckDB: v{sys_info['duckdb']}")
     if HAS_PYARROW:

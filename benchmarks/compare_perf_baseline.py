@@ -21,6 +21,7 @@ CONFIG_KEYS = (
 )
 SYSTEM_KEYS = ("platform", "machine", "processor", "cpu_count", "python")
 THROUGHPUT_METRIC_HINTS = ("Q/s",)
+SELF_DEPENDENCY_KEYS = ("apexbase",)
 
 
 def is_throughput_metric(name):
@@ -30,6 +31,19 @@ def is_throughput_metric(name):
 
 class ReportError(ValueError):
     pass
+
+
+def comparable_dependencies(report):
+    """Return environment dependencies, excluding the package under test.
+
+    A release comparison intentionally installs different ApexBase versions on
+    the base and current sides. The surrounding runtime dependencies must still
+    match exactly.
+    """
+    dependencies = dict(report.get("dependencies") or {})
+    for key in SELF_DEPENDENCY_KEYS:
+        dependencies.pop(key, None)
+    return dependencies
 
 
 def load_report(path):
@@ -85,9 +99,10 @@ def compatibility_errors(baseline, current, require_system_match=False):
         for key in SYSTEM_KEYS:
             if base_system.get(key) != current_system.get(key):
                 errors.append(f"system.{key} differs")
-        for section in ("dependencies", "build"):
-            if (baseline.get(section) or {}) != (current.get(section) or {}):
-                errors.append(f"{section} differs")
+        if comparable_dependencies(baseline) != comparable_dependencies(current):
+            errors.append("dependencies differs")
+        if (baseline.get("build") or {}) != (current.get("build") or {}):
+            errors.append("build differs")
     return errors
 
 

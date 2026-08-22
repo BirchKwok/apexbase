@@ -27,6 +27,13 @@ pub enum ColumnType {
     /// Fixed-size list of f16 — stored as contiguous raw bytes (dim * 2 per row, no offset array).
     /// Half the storage of FixedList; decoded to f32 on read/distance computation.
     Float16List = TYPE_FLOAT16_LIST,
+    BFloat16List = TYPE_BFLOAT16_LIST,
+    Int8Vector = TYPE_INT8_VECTOR,
+    UInt8Vector = TYPE_UINT8_VECTOR,
+    Bit1Vector = TYPE_BIT1_VECTOR,
+    TurboQuant2Vector = TYPE_TURBOQUANT2_VECTOR,
+    TurboQuant3Vector = TYPE_TURBOQUANT3_VECTOR,
+    TurboQuant4Vector = TYPE_TURBOQUANT4_VECTOR,
     /// Blob descriptor column. Small payloads may be inline; larger payloads
     /// live in table sidecar files and are resolved only when projected.
     Blob = TYPE_BLOB,
@@ -54,6 +61,13 @@ impl ColumnType {
             TYPE_DATE => Some(ColumnType::Date),
             TYPE_FIXED_LIST => Some(ColumnType::FixedList),
             TYPE_FLOAT16_LIST => Some(ColumnType::Float16List),
+            TYPE_BFLOAT16_LIST => Some(ColumnType::BFloat16List),
+            TYPE_INT8_VECTOR => Some(ColumnType::Int8Vector),
+            TYPE_UINT8_VECTOR => Some(ColumnType::UInt8Vector),
+            TYPE_BIT1_VECTOR => Some(ColumnType::Bit1Vector),
+            TYPE_TURBOQUANT2_VECTOR => Some(ColumnType::TurboQuant2Vector),
+            TYPE_TURBOQUANT3_VECTOR => Some(ColumnType::TurboQuant3Vector),
+            TYPE_TURBOQUANT4_VECTOR => Some(ColumnType::TurboQuant4Vector),
             TYPE_BLOB => Some(ColumnType::Blob),
             _ => None,
         }
@@ -77,6 +91,14 @@ impl ColumnType {
             DataType::Timestamp => ColumnType::Timestamp,
             DataType::Date => ColumnType::Date,
             DataType::Float16Vector => ColumnType::Float16List,
+            DataType::Float32Vector => ColumnType::FixedList,
+            DataType::BFloat16Vector => ColumnType::BFloat16List,
+            DataType::Int8Vector => ColumnType::Int8Vector,
+            DataType::UInt8Vector => ColumnType::UInt8Vector,
+            DataType::Bit1Vector => ColumnType::Bit1Vector,
+            DataType::TurboQuant2Vector => ColumnType::TurboQuant2Vector,
+            DataType::TurboQuant3Vector => ColumnType::TurboQuant3Vector,
+            DataType::TurboQuant4Vector => ColumnType::TurboQuant4Vector,
             _ => ColumnType::String,
         }
     }
@@ -95,6 +117,13 @@ impl ColumnType {
             | ColumnType::StringDict
             | ColumnType::FixedList
             | ColumnType::Float16List
+            | ColumnType::BFloat16List
+            | ColumnType::Int8Vector
+            | ColumnType::UInt8Vector
+            | ColumnType::Bit1Vector
+            | ColumnType::TurboQuant2Vector
+            | ColumnType::TurboQuant3Vector
+            | ColumnType::TurboQuant4Vector
             | ColumnType::Blob => 0,
         }
     }
@@ -107,8 +136,31 @@ impl ColumnType {
                 | ColumnType::StringDict
                 | ColumnType::FixedList
                 | ColumnType::Float16List
+                | ColumnType::BFloat16List
+                | ColumnType::Int8Vector
+                | ColumnType::UInt8Vector
+                | ColumnType::Bit1Vector
+                | ColumnType::TurboQuant2Vector
+                | ColumnType::TurboQuant3Vector
+                | ColumnType::TurboQuant4Vector
                 | ColumnType::Blob
         )
+    }
+
+    pub fn vector_codec(self) -> Option<crate::compute::vector_quantization::VectorCodec> {
+        use crate::compute::vector_quantization::VectorCodec;
+        match self {
+            ColumnType::FixedList => Some(VectorCodec::Float32),
+            ColumnType::Float16List => Some(VectorCodec::Float16),
+            ColumnType::BFloat16List => Some(VectorCodec::BFloat16),
+            ColumnType::Int8Vector => Some(VectorCodec::Int8),
+            ColumnType::UInt8Vector => Some(VectorCodec::UInt8),
+            ColumnType::Bit1Vector => Some(VectorCodec::Bit1),
+            ColumnType::TurboQuant2Vector => Some(VectorCodec::TurboQuant2),
+            ColumnType::TurboQuant3Vector => Some(VectorCodec::TurboQuant3),
+            ColumnType::TurboQuant4Vector => Some(VectorCodec::TurboQuant4),
+            _ => None,
+        }
     }
 }
 
@@ -330,6 +382,13 @@ pub enum ColumnData {
         data: Vec<u8>,  // raw little-endian f16 (u16) bytes
         dim: u32,       // number of f16 elements per row
     },
+    /// Fixed-width encoded vectors. The codec is repeated in memory so generic
+    /// append/merge paths can preserve the schema-selected representation.
+    QuantizedList {
+        data: Vec<u8>,
+        dim: u32,
+        codec: crate::compute::vector_quantization::VectorCodec,
+    },
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -455,6 +514,17 @@ impl ColumnData {
             },
             ColumnType::FixedList => ColumnData::FixedList { data: Vec::new(), dim: 0 },
             ColumnType::Float16List => ColumnData::Float16List { data: Vec::new(), dim: 0 },
+            dtype @ (ColumnType::BFloat16List
+            | ColumnType::Int8Vector
+            | ColumnType::UInt8Vector
+            | ColumnType::Bit1Vector
+            | ColumnType::TurboQuant2Vector
+            | ColumnType::TurboQuant3Vector
+            | ColumnType::TurboQuant4Vector) => ColumnData::QuantizedList {
+                data: Vec::new(),
+                dim: 0,
+                codec: dtype.vector_codec().unwrap(),
+            },
             ColumnType::Null => ColumnData::Int64(Vec::new()),
         }
     }
@@ -470,6 +540,11 @@ impl ColumnData {
             ColumnData::StringDict { indices, .. } => indices.len(),
             ColumnData::FixedList { data, dim } => if *dim == 0 { 0 } else { data.len() / (*dim as usize * 4) },
             ColumnData::Float16List { data, dim } => if *dim == 0 { 0 } else { data.len() / (*dim as usize * 2) },
+            ColumnData::QuantizedList { data, dim, codec } => if *dim == 0 {
+                0
+            } else {
+                data.len() / codec.row_width(*dim as usize).expect("validated vector dimension")
+            },
         }
     }
 
@@ -489,6 +564,17 @@ impl ColumnData {
             ColumnData::StringDict { .. } => ColumnType::StringDict,
             ColumnData::FixedList { .. } => ColumnType::FixedList,
             ColumnData::Float16List { .. } => ColumnType::Float16List,
+            ColumnData::QuantizedList { codec, .. } => match codec {
+                crate::compute::vector_quantization::VectorCodec::BFloat16 => ColumnType::BFloat16List,
+                crate::compute::vector_quantization::VectorCodec::Int8 => ColumnType::Int8Vector,
+                crate::compute::vector_quantization::VectorCodec::UInt8 => ColumnType::UInt8Vector,
+                crate::compute::vector_quantization::VectorCodec::Bit1 => ColumnType::Bit1Vector,
+                crate::compute::vector_quantization::VectorCodec::TurboQuant2 => ColumnType::TurboQuant2Vector,
+                crate::compute::vector_quantization::VectorCodec::TurboQuant3 => ColumnType::TurboQuant3Vector,
+                crate::compute::vector_quantization::VectorCodec::TurboQuant4 => ColumnType::TurboQuant4Vector,
+                crate::compute::vector_quantization::VectorCodec::Float32 => ColumnType::FixedList,
+                crate::compute::vector_quantization::VectorCodec::Float16 => ColumnType::Float16List,
+            },
         }
     }
 
@@ -701,6 +787,16 @@ impl ColumnData {
                 buf.extend_from_slice(data);
                 buf
             }
+            ColumnData::QuantizedList { data, dim, codec } => {
+                let count = if *dim == 0 { 0 } else {
+                    data.len() / codec.row_width(*dim as usize).expect("validated vector dimension")
+                };
+                let mut buf = Vec::with_capacity(12 + data.len());
+                buf.extend_from_slice(&(count as u64).to_le_bytes());
+                buf.extend_from_slice(&dim.to_le_bytes());
+                buf.extend_from_slice(data);
+                buf
+            }
         }
     }
 
@@ -739,6 +835,36 @@ impl ColumnData {
                 data.extend_from_slice(&f32_to_f16(f).to_le_bytes());
             }
         }
+    }
+
+    /// Encode and append one little-endian f32 vector using this column's codec.
+    pub fn push_quantized_list_from_f32(&mut self, f32_bytes: &[u8]) -> io::Result<()> {
+        if let ColumnData::QuantizedList { data, dim, codec } = self {
+            if f32_bytes.is_empty() || f32_bytes.len() % 4 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "quantized vector requires non-empty float32 bytes",
+                ));
+            }
+            let values = f32_bytes
+                .chunks_exact(4)
+                .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            if *dim == 0 {
+                *dim = values.len() as u32;
+            } else if *dim as usize != values.len() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "quantized vector dimension mismatch: expected {}, got {}",
+                        *dim,
+                        values.len()
+                    ),
+                ));
+            }
+            crate::compute::vector_quantization::encode_vector(*codec, &values, data)?;
+        }
+        Ok(())
     }
 
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
@@ -807,6 +933,14 @@ impl ColumnData {
             }
             ColumnData::Float16List { data, dim } => {
                 let count = if *dim == 0 { 0 } else { data.len() / (*dim as usize * 2) };
+                writer.write_all(&(count as u64).to_le_bytes())?;
+                writer.write_all(&dim.to_le_bytes())?;
+                writer.write_all(data)?;
+            }
+            ColumnData::QuantizedList { data, dim, codec } => {
+                let count = if *dim == 0 { 0 } else {
+                    data.len() / codec.row_width(*dim as usize)?
+                };
                 writer.write_all(&(count as u64).to_le_bytes())?;
                 writer.write_all(&dim.to_le_bytes())?;
                 writer.write_all(data)?;
@@ -991,6 +1125,29 @@ impl ColumnData {
                 pos += byte_len;
                 Ok((ColumnData::Float16List { data, dim }, pos))
             }
+            dtype @ (ColumnType::BFloat16List
+            | ColumnType::Int8Vector
+            | ColumnType::UInt8Vector
+            | ColumnType::Bit1Vector
+            | ColumnType::TurboQuant2Vector
+            | ColumnType::TurboQuant3Vector
+            | ColumnType::TurboQuant4Vector) => {
+                let count = read_u64!() as usize;
+                if pos + 4 > bytes.len() {
+                    return Err(err_data("QuantizedList: dim truncated"));
+                }
+                let dim = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                let codec = dtype.vector_codec().unwrap();
+                let byte_len = count.checked_mul(codec.row_width(dim as usize)?)
+                    .ok_or_else(|| err_data("QuantizedList: data length overflow"))?;
+                if pos + byte_len > bytes.len() {
+                    return Err(err_data("QuantizedList: data truncated"));
+                }
+                let data = bytes[pos..pos + byte_len].to_vec();
+                pos += byte_len;
+                Ok((ColumnData::QuantizedList { data, dim, codec }, pos))
+            }
             ColumnType::Null => {
                 let count = read_u64!() as usize;
                 let byte_len = count * 8;
@@ -1066,6 +1223,23 @@ impl ColumnData {
                 pos += 4;
                 pos += count * dim as usize * 2;
             }
+            dtype @ (ColumnType::BFloat16List
+            | ColumnType::Int8Vector
+            | ColumnType::UInt8Vector
+            | ColumnType::Bit1Vector
+            | ColumnType::TurboQuant2Vector
+            | ColumnType::TurboQuant3Vector
+            | ColumnType::TurboQuant4Vector) => {
+                let count = read_u64!() as usize;
+                if pos + 4 > bytes.len() {
+                    return Err(err_data("skip QuantizedList: dim truncated"));
+                }
+                let dim = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+                pos += 4;
+                pos = pos.checked_add(count.checked_mul(dtype.vector_codec().unwrap().row_width(dim as usize)?)
+                    .ok_or_else(|| err_data("skip QuantizedList: data length overflow"))?)
+                    .ok_or_else(|| err_data("skip QuantizedList: position overflow"))?;
+            }
             ColumnType::Null => {
                 let count = read_u64!() as usize;
                 pos += count * 8;
@@ -1093,6 +1267,9 @@ impl ColumnData {
             },
             ColumnData::FixedList { dim, .. } => ColumnData::FixedList { data: Vec::new(), dim: *dim },
             ColumnData::Float16List { dim, .. } => ColumnData::Float16List { data: Vec::new(), dim: *dim },
+            ColumnData::QuantizedList { dim, codec, .. } => ColumnData::QuantizedList {
+                data: Vec::new(), dim: *dim, codec: *codec,
+            },
         }
     }
     
@@ -1166,6 +1343,12 @@ impl ColumnData {
             (ColumnData::Float16List { data, dim }, ColumnData::Float16List { data: other_data, dim: other_dim }) => {
                 if *dim == 0 && *other_dim > 0 { *dim = *other_dim; }
                 data.extend_from_slice(other_data);
+            }
+            (ColumnData::QuantizedList { data, dim, codec },
+             ColumnData::QuantizedList { data: other_data, dim: other_dim, codec: other_codec })
+                if codec == other_codec => {
+                if *dim == 0 && *other_dim > 0 { *dim = *other_dim; }
+                if *dim == *other_dim { data.extend_from_slice(other_data); }
             }
             _ => {} // Type mismatch - ignore
         }
@@ -1293,6 +1476,18 @@ impl ColumnData {
                     }
                 }
                 ColumnData::Float16List { data: new_data, dim: *dim }
+            }
+            ColumnData::QuantizedList { data, dim, codec } => {
+                let stride = codec.row_width(*dim as usize).expect("validated vector dimension");
+                let mut new_data = Vec::with_capacity(indices.len() * stride);
+                for &i in indices {
+                    if stride > 0 && i * stride + stride <= data.len() {
+                        new_data.extend_from_slice(&data[i * stride..i * stride + stride]);
+                    } else {
+                        new_data.resize(new_data.len() + stride, 0);
+                    }
+                }
+                ColumnData::QuantizedList { data: new_data, dim: *dim, codec: *codec }
             }
             ColumnData::Int64(v) => {
                 // OPTIMIZATION: pre-allocate exact size, use unchecked indexing
@@ -1504,6 +1699,17 @@ impl ColumnData {
                     dim: *dim,
                 }
             }
+            ColumnData::QuantizedList { data, dim, codec } => {
+                let stride = codec.row_width(*dim as usize).expect("validated vector dimension");
+                let row_count = if stride == 0 { 0 } else { data.len() / stride };
+                let s = start.min(row_count);
+                let e = end.min(row_count);
+                ColumnData::QuantizedList {
+                    data: data[s * stride..e * stride].to_vec(),
+                    dim: *dim,
+                    codec: *codec,
+                }
+            }
             ColumnData::Bool { data, len } => {
                 let s = start.min(*len);
                 let e = end.min(*len);
@@ -1577,6 +1783,7 @@ impl ColumnData {
             }
             ColumnData::FixedList { data, .. } => data.len(),
             ColumnData::Float16List { data, .. } => data.len(),
+            ColumnData::QuantizedList { data, .. } => data.len(),
         }
     }
 }

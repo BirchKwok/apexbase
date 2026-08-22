@@ -1050,6 +1050,31 @@ impl OnDemandStorage {
                     );
                     (list_dt, Arc::new(arr) as ArrayRef)
                 }
+                ColumnData::QuantizedList { data, dim, codec } => {
+                    use arrow::array::{FixedSizeListArray, Float32Array};
+                    let dim_usize = *dim as usize;
+                    let stride = codec.row_width(dim_usize)?;
+                    let row_count = if stride == 0 { 0 } else { data.len() / stride }
+                        .min(active_count);
+                    let mut values = vec![0.0f32; row_count * dim_usize];
+                    for row_idx in 0..row_count {
+                        crate::compute::vector_quantization::decode_vector(
+                            *codec,
+                            &data[row_idx * stride..(row_idx + 1) * stride],
+                            dim_usize,
+                            &mut values[row_idx * dim_usize..(row_idx + 1) * dim_usize],
+                        )?;
+                    }
+                    let item = Arc::new(Field::new("item", ArrowDataType::Float32, false));
+                    let list_dt = ArrowDataType::FixedSizeList(item.clone(), dim_usize as i32);
+                    let arr = FixedSizeListArray::new(
+                        item,
+                        dim_usize as i32,
+                        Arc::new(Float32Array::from(values)),
+                        null_buf,
+                    );
+                    (list_dt, Arc::new(arr) as ArrayRef)
+                }
                 _ => {
                     // Fallback: null array
                     let arr = arrow::array::new_null_array(&ArrowDataType::Utf8, active_count);
@@ -1813,6 +1838,26 @@ impl OnDemandStorage {
                 }
                 Ok(ColumnData::Float16List { data, dim })
             }
+            dtype @ (ColumnType::BFloat16List
+            | ColumnType::Int8Vector
+            | ColumnType::UInt8Vector
+            | ColumnType::Bit1Vector
+            | ColumnType::TurboQuant2Vector
+            | ColumnType::TurboQuant3Vector
+            | ColumnType::TurboQuant4Vector) => {
+                let mut dim_buf = [0u8; 4];
+                mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8)?;
+                let dim = u32::from_le_bytes(dim_buf);
+                let codec = dtype.vector_codec().unwrap();
+                let stride = codec.row_width(dim as usize)?;
+                let byte_len = row_count.checked_mul(stride)
+                    .ok_or_else(|| err_data("quantized vector range length overflow"))?;
+                let mut data = vec![0u8; byte_len];
+                if byte_len > 0 {
+                    mmap_cache.read_at(file, &mut data, index.data_offset + 12 + (start_row * stride) as u64)?;
+                }
+                Ok(ColumnData::QuantizedList { data, dim, codec })
+            }
             ColumnType::Null => Ok(ColumnData::Int64(vec![0; row_count])),
         }
     }
@@ -2522,6 +2567,27 @@ impl OnDemandStorage {
                 Self::read_fixed_scattered_optimized(mmap_cache, file, index, row_indices, 2)
                     .map(|(data, dim)| ColumnData::Float16List { data, dim })
             }
+            dtype @ (ColumnType::BFloat16List
+            | ColumnType::Int8Vector
+            | ColumnType::UInt8Vector
+            | ColumnType::Bit1Vector
+            | ColumnType::TurboQuant2Vector
+            | ColumnType::TurboQuant3Vector
+            | ColumnType::TurboQuant4Vector) => {
+                let mut dim_buf = [0u8; 4];
+                mmap_cache.read_at(file, &mut dim_buf, index.data_offset + 8)?;
+                let dim = u32::from_le_bytes(dim_buf);
+                let codec = dtype.vector_codec().unwrap();
+                let stride = codec.row_width(dim as usize)?;
+                let mut data = vec![0u8; row_indices.len().checked_mul(stride)
+                    .ok_or_else(|| err_data("quantized scattered length overflow"))?];
+                for (output_row, &source_row) in row_indices.iter().enumerate() {
+                    mmap_cache.read_at(file,
+                        &mut data[output_row * stride..(output_row + 1) * stride],
+                        index.data_offset + 12 + (source_row * stride) as u64)?;
+                }
+                Ok(ColumnData::QuantizedList { data, dim, codec })
+            }
             ColumnType::Null => Ok(ColumnData::Int64(vec![0i64; row_indices.len()])),
         }
     }
@@ -2594,7 +2660,7 @@ impl OnDemandStorage {
             Str(StringBuilder), // String/StringDict: sequential append, zero alloc
             Bool(Vec<Option<bool>>),
             Bin(Vec<Option<Vec<u8>>>), // Binary columns: preserve raw bytes
-            FixedVec(Vec<Option<Vec<u8>>>, u32), // FixedList/Float16List: raw f32 bytes per row + dim
+            FixedVec(Vec<Option<Vec<u8>>>, u32), // vector columns decoded to raw f32 bytes
             Other(Vec<Option<crate::data::Value>>), // rare fallback
         }
         let mut col_bufs: Vec<ColBuf> = schema
@@ -2624,7 +2690,15 @@ impl OnDemandStorage {
                     ColumnType::Binary | ColumnType::Blob => {
                         ColBuf::Bin(vec![None; n_out])
                     }
-                    ColumnType::FixedList | ColumnType::Float16List => {
+                    ColumnType::FixedList
+                    | ColumnType::Float16List
+                    | ColumnType::BFloat16List
+                    | ColumnType::Int8Vector
+                    | ColumnType::UInt8Vector
+                    | ColumnType::Bit1Vector
+                    | ColumnType::TurboQuant2Vector
+                    | ColumnType::TurboQuant3Vector
+                    | ColumnType::TurboQuant4Vector => {
                         ColBuf::FixedVec(vec![None; n_out], 0)
                     }
                     _ => ColBuf::Other(vec![None; n_out]),
@@ -3541,6 +3615,36 @@ impl OnDemandStorage {
                                             })
                                             .collect();
                                         vals[out_idx] = Some(f32_bytes);
+                                    }
+                                }
+                            }
+                            ColumnData::QuantizedList { data, dim, codec } => {
+                                *dim_out = *dim;
+                                let d = *dim as usize;
+                                let row_bytes = codec.row_width(d)?;
+                                let row_count = if row_bytes == 0 {
+                                    0
+                                } else {
+                                    data.len() / row_bytes
+                                };
+                                let mut decoded = vec![0.0f32; d];
+                                for &(out_idx, local_idx) in local_pairs {
+                                    if (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1 {
+                                        continue;
+                                    }
+                                    if local_idx < row_count {
+                                        let start = local_idx * row_bytes;
+                                        crate::compute::vector_quantization::decode_vector(
+                                            *codec,
+                                            &data[start..start + row_bytes],
+                                            d,
+                                            &mut decoded,
+                                        )?;
+                                        let mut bytes = Vec::with_capacity(d * 4);
+                                        for &value in &decoded {
+                                            bytes.extend_from_slice(&value.to_le_bytes());
+                                        }
+                                        vals[out_idx] = Some(bytes);
                                     }
                                 }
                             }

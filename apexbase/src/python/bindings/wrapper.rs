@@ -196,6 +196,13 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
             .and_then(|b| b.extract::<Vec<u8>>())
         {
             if floats.len() % 4 == 0 {
+                if floats.is_empty() || floats.chunks_exact(4).any(|bytes| {
+                    !f32::from_le_bytes(bytes.try_into().unwrap()).is_finite()
+                }) {
+                    return Err(PyValueError::new_err(
+                        "vector must be non-empty and contain only finite values",
+                    ));
+                }
                 return Ok(Value::FixedList(floats));
             }
         }
@@ -208,6 +215,11 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     // Python list/tuple of numbers → FixedList (raw LE f32 bytes), matching numpy vectors.
     if obj.is_instance_of::<PyList>() || obj.is_instance_of::<PyTuple>() {
         if let Ok(values) = obj.extract::<Vec<f32>>() {
+            if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
+                return Err(PyValueError::new_err(
+                    "vector must be non-empty and contain only finite values",
+                ));
+            }
             let mut bytes = Vec::with_capacity(values.len() * 4);
             for value in values {
                 bytes.extend_from_slice(&value.to_le_bytes());
@@ -682,6 +694,13 @@ impl ApexStorageImpl {
                 | ColumnType::StringDict
                 | ColumnType::FixedList
                 | ColumnType::Float16List
+                | ColumnType::BFloat16List
+                | ColumnType::Int8Vector
+                | ColumnType::UInt8Vector
+                | ColumnType::Bit1Vector
+                | ColumnType::TurboQuant2Vector
+                | ColumnType::TurboQuant3Vector
+                | ColumnType::TurboQuant4Vector
                 | ColumnType::Null => return Ok(None),
             }
         }
@@ -828,12 +847,21 @@ impl ApexStorageImpl {
                 "bytes" | "binary" => ColumnType::Binary,
                 "blob" | "large_binary" | "largebinary" => ColumnType::Blob,
                 "float16_vector" | "float16vector" | "f16_vector" => ColumnType::Float16List,
+                "float32_vector" | "f32_vector" => ColumnType::FixedList,
+                "bfloat16_vector" | "bf16_vector" => ColumnType::BFloat16List,
+                "int8_vector" | "i8_vector" => ColumnType::Int8Vector,
+                "uint8_vector" | "u8_vector" => ColumnType::UInt8Vector,
+                "bit1_vector" | "binary1_vector" => ColumnType::Bit1Vector,
+                "turboquant2_vector" | "tq2_vector" => ColumnType::TurboQuant2Vector,
+                "turboquant3_vector" | "tq3_vector" => ColumnType::TurboQuant3Vector,
+                "turboquant4_vector" | "tq4_vector" => ColumnType::TurboQuant4Vector,
                 "timestamp" | "datetime" => ColumnType::Timestamp,
                 "date" => ColumnType::Date,
                 _ => return Err(PyValueError::new_err(format!(
                     "Unknown column type '{}' for column '{}'. Supported: int8, int16, int32, int64, \
                      uint8, uint16, uint32, uint64, float32, float64, bool, string, binary, blob, \
-                     float16_vector, timestamp, date",
+                     float32_vector, float16_vector, bfloat16_vector, int8_vector, uint8_vector, \
+                     bit1_vector, turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, date",
                     type_str, col_name
                 ))),
             };

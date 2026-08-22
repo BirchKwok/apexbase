@@ -185,7 +185,14 @@ FROM explode_rename(
 );
 ```
 
-For Python batch search and float16 vector storage, see the [Float16 Vector Guide](../FLOAT16_VECTOR_GUIDE.md).
+Vector columns can be declared as `FLOAT32_VECTOR`, `FLOAT16_VECTOR`,
+`BFLOAT16_VECTOR`, `INT8_VECTOR`, `UINT8_VECTOR`, `BIT1_VECTOR`, or
+`TURBOQUANT2_VECTOR` / `TURBOQUANT3_VECTOR` / `TURBOQUANT4_VECTOR`.
+Standalone quantized columns are searchable but cannot provide an exact source
+for reranking. For the recommended source-plus-accelerator layout, lifecycle
+rules, and Python rescore API, see the
+[Vector Quantization Guide](../VECTOR_QUANTIZATION_GUIDE.md). Float16 SIMD
+details remain in the [Float16 Vector Guide](../FLOAT16_VECTOR_GUIDE.md).
 
 ## Explain
 

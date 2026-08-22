@@ -296,6 +296,15 @@ pub fn datatype_to_column_type(dt: &DataType) -> ColumnType {
         DataType::Blob => ColumnType::Blob,
         DataType::Timestamp => ColumnType::Timestamp,
         DataType::Date => ColumnType::Date,
+        DataType::Float32Vector => ColumnType::FixedList,
+        DataType::Float16Vector => ColumnType::Float16List,
+        DataType::BFloat16Vector => ColumnType::BFloat16List,
+        DataType::Int8Vector => ColumnType::Int8Vector,
+        DataType::UInt8Vector => ColumnType::UInt8Vector,
+        DataType::Bit1Vector => ColumnType::Bit1Vector,
+        DataType::TurboQuant2Vector => ColumnType::TurboQuant2Vector,
+        DataType::TurboQuant3Vector => ColumnType::TurboQuant3Vector,
+        DataType::TurboQuant4Vector => ColumnType::TurboQuant4Vector,
         _ => ColumnType::String, // Fallback for complex types
     }
 }
@@ -318,6 +327,13 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Blob => DataType::Blob,
         ColumnType::FixedList => DataType::Binary,
         ColumnType::Float16List => DataType::Float16Vector,
+        ColumnType::BFloat16List => DataType::BFloat16Vector,
+        ColumnType::Int8Vector => DataType::Int8Vector,
+        ColumnType::UInt8Vector => DataType::UInt8Vector,
+        ColumnType::Bit1Vector => DataType::Bit1Vector,
+        ColumnType::TurboQuant2Vector => DataType::TurboQuant2Vector,
+        ColumnType::TurboQuant3Vector => DataType::TurboQuant3Vector,
+        ColumnType::TurboQuant4Vector => DataType::TurboQuant4Vector,
         ColumnType::Timestamp => DataType::Timestamp,
         ColumnType::Date => DataType::Date,
         ColumnType::Null => DataType::String,
@@ -509,6 +525,22 @@ pub fn column_data_to_typed_column(cd: &ColumnData, _dtype: DataType) -> TypedCo
                 nulls,
             }
         }
+        ColumnData::QuantizedList { data, dim, codec } => {
+            let dim = *dim as usize;
+            let stride = codec.row_width(dim).expect("validated vector dimension");
+            let mut values = Vec::with_capacity(if stride == 0 { 0 } else { data.len() / stride });
+            let mut nulls = BitVec::new();
+            let mut decoded = vec![0.0f32; dim];
+            for row in data.chunks_exact(stride) {
+                crate::compute::vector_quantization::decode_vector(*codec, row, dim, &mut decoded)
+                    .expect("validated quantized vector payload");
+                let mut bytes = Vec::with_capacity(dim * 4);
+                for &value in &decoded { bytes.extend_from_slice(&value.to_le_bytes()); }
+                values.push(Value::Binary(bytes));
+                nulls.push(false);
+            }
+            TypedColumn::Mixed { data: values, nulls }
+        }
     }
 }
 
@@ -521,6 +553,30 @@ fn float16list_to_arrow_pair(
     std::sync::Arc<dyn arrow::array::Array>,
 ) {
     let values = crate::storage::on_demand::f16_bytes_to_f32_values(data);
+    fixedlist_values_to_arrow_pair(values, dim)
+}
+
+fn quantizedlist_to_arrow_pair(
+    data: &[u8],
+    dim: u32,
+    codec: crate::compute::vector_quantization::VectorCodec,
+) -> (
+    arrow::datatypes::DataType,
+    std::sync::Arc<dyn arrow::array::Array>,
+) {
+    let dim_usize = dim as usize;
+    let stride = codec.row_width(dim_usize).expect("validated vector dimension");
+    let rows = if stride == 0 { 0 } else { data.len() / stride };
+    let mut values = vec![0.0f32; rows * dim_usize];
+    for (row_index, row) in data.chunks_exact(stride).enumerate() {
+        crate::compute::vector_quantization::decode_vector(
+            codec,
+            row,
+            dim_usize,
+            &mut values[row_index * dim_usize..(row_index + 1) * dim_usize],
+        )
+        .expect("validated quantized vector payload");
+    }
     fixedlist_values_to_arrow_pair(values, dim)
 }
 
@@ -1705,6 +1761,7 @@ impl TableStorageBackend {
                     Value::Bool(b) => ColumnValue::Bool(*b),
                     Value::Binary(b) => ColumnValue::Binary(b.clone()),
                     Value::Blob(b) => ColumnValue::Blob(b.clone()),
+                    Value::FixedList(b) => ColumnValue::FixedList(b.clone()),
                     Value::Null => ColumnValue::Null,
                     _ => ColumnValue::String(serde_json::to_string(v).unwrap_or_default()),
                 };
@@ -2540,6 +2597,7 @@ impl TableStorageBackend {
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(&data, dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(&data, dim),
+                    ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(&data, dim, codec),
                 };
 
                 fields.push(Field::new(col_name, arrow_dt, true));
@@ -2756,6 +2814,7 @@ impl TableStorageBackend {
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
+                    ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
 
                 fields.push(Field::new(col_name, arrow_dt, true));
@@ -2985,6 +3044,7 @@ impl TableStorageBackend {
                 }
                 ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(&data, dim),
                 ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(&data, dim),
+                ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(&data, dim, codec),
             };
 
             fields.push(Field::new(col_name, arrow_dt, true));
@@ -3899,6 +3959,7 @@ impl TableStorageBackend {
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
+                    ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
 
                 fields.push(Field::new(col_name, arrow_dt, true));
@@ -4101,6 +4162,7 @@ impl TableStorageBackend {
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
+                    ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
@@ -4262,6 +4324,7 @@ impl TableStorageBackend {
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
+                    ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
@@ -4676,6 +4739,7 @@ impl TableStorageBackend {
                     }
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
+                    ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);

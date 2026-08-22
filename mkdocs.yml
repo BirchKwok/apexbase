@@ -103,6 +103,7 @@ nav:
   - Features:
       - Full-Text Search: FTS_GUIDE.md
       - Float16 Vectors: FLOAT16_VECTOR_GUIDE.md
+      - Vector Quantization: VECTOR_QUANTIZATION_GUIDE.md
   - Internals:
       - Storage Architecture: STORAGE_ARCHITECTURE.md
       - Engineering Guidelines: ENGINEERING_GUIDELINES.md
