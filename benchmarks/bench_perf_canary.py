@@ -10,9 +10,12 @@ import tempfile
 import time
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import bench_vs_sqlite_duckdb as full_bench
+from apexbase.client import ApexClient
 
 
 CANARY_SPECS = (
@@ -37,6 +40,17 @@ CANARY_SPECS = (
     ("TopK JOIN with unused BLOB", "bench_topk_join_canary", "median"),
 )
 
+QUANTIZED_CODECS = (
+    "float16",
+    "bfloat16",
+    "int8",
+    "uint8",
+    "bit1",
+    "turboquant2",
+    "turboquant3",
+    "turboquant4",
+)
+
 
 def _run_metric(bench, method_name, mode, warmup, iterations, setup_method=None):
     method = getattr(bench, method_name)
@@ -54,6 +68,44 @@ def _run_metric(bench, method_name, mode, warmup, iterations, setup_method=None)
             iterations,
         )
     return full_bench.run_bench(method, warmup, iterations)
+
+
+def run_quantized_canary(rows, warmup, iterations):
+    """Measure compressed-domain L2 TopK without including column construction."""
+    quant_rows = rows
+    dim = 128
+    rng = np.random.default_rng(20260822)
+    vectors = rng.normal(size=(quant_rows, dim)).astype(np.float32)
+    queries = vectors[:5] + rng.normal(scale=0.02, size=(5, dim)).astype(np.float32)
+    with tempfile.TemporaryDirectory(prefix="apexbase_quant_canary_") as tmpdir:
+        client = ApexClient(tmpdir, drop_if_exists=True)
+        try:
+            client.create_table("vectors", {"embedding": "float32_vector"})
+            client.store([{"embedding": vector} for vector in vectors])
+            targets = {
+                codec: client.create_quantized_column("embedding", codec=codec)
+                for codec in QUANTIZED_CODECS
+            }
+            results = []
+            for codec, target in targets.items():
+                def scan():
+                    client.batch_topk_distance(target, queries, k=10)
+
+                elapsed_ms = full_bench.run_bench_nogc_median(
+                    scan, warmup, iterations
+                ) / len(queries)
+                results.append({
+                    "category": "ApexBase quantized vector",
+                    "query": f"Batch quantized TopK L2 ({codec})",
+                    "ApexBase": round(elapsed_ms, 6),
+                })
+                print(
+                    f"Batch quantized TopK L2 ({codec})".ljust(40)
+                    + f" {elapsed_ms:>12.6f} ms/query"
+                )
+            return results
+        finally:
+            client.close()
 
 
 def run_canary(rows, warmup, iterations, qps_only=False):
@@ -83,6 +135,7 @@ def run_canary(rows, warmup, iterations, qps_only=False):
                     "ApexBase": round(elapsed_ms, 6),
                 })
                 print(f"{name:<34} {elapsed_ms:>12.6f} ms")
+            results.extend(run_quantized_canary(rows, warmup, iterations))
 
         # OLAP Q/s read profile (ApexBase-only). The harness recreates the
         # engine on a clean loaded copy, so the measurement is independent of
@@ -122,13 +175,23 @@ def main(argv=None):
         action="store_true",
         help="Run only the OLAP Q/s read profile instead of the full canary",
     )
+    parser.add_argument(
+        "--quant-only",
+        action="store_true",
+        help="Run only compressed-domain vector TopK metrics",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
 
-    results = run_canary(
-        args.rows, args.warmup, args.iterations, qps_only=args.qps_only
-    )
+    if args.qps_only and args.quant_only:
+        parser.error("--qps-only and --quant-only are mutually exclusive")
+    if args.quant_only:
+        results = run_quantized_canary(args.rows, args.warmup, args.iterations)
+    else:
+        results = run_canary(
+            args.rows, args.warmup, args.iterations, qps_only=args.qps_only
+        )
     report = {
         **full_bench.get_report_metadata("apexbase-canary"),
         "config": {

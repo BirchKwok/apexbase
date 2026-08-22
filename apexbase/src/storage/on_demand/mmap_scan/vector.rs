@@ -325,7 +325,8 @@ impl OnDemandStorage {
                 dim * if is_f16 { 2 } else { 4 }
             };
             let float_abs = data_abs + 13;
-            let byte_len = count.checked_mul(row_width)
+            let byte_len = count
+                .checked_mul(row_width)
                 .ok_or_else(|| err_data("vector block length overflow"))?;
             if float_abs + byte_len > mmap.len() {
                 return Ok(None);
@@ -344,6 +345,19 @@ impl OnDemandStorage {
         }
 
         if let Some(codec) = quant_codec {
+            let mut blocks = rg_descs.iter().filter_map(Option::as_ref);
+            if let Some(desc) = blocks.next() {
+                if blocks.next().is_none() && desc.count == total_active {
+                    return crate::compute::vector_quantization::topk_encoded_rows(
+                        &mmap[desc.float_abs..desc.float_abs + desc.byte_len],
+                        query_dim,
+                        codec,
+                        computer,
+                        k,
+                    )
+                    .map(Some);
+                }
+            }
             let row_width = codec.row_width(query_dim)?;
             let mut encoded = Vec::with_capacity(total_active.saturating_mul(row_width));
             for desc in &rg_descs {
@@ -352,7 +366,8 @@ impl OnDemandStorage {
             }
             return crate::compute::vector_quantization::topk_encoded_rows(
                 &encoded, query_dim, codec, computer, k,
-            ).map(Some);
+            )
+            .map(Some);
         }
 
         let file_size = mmap.len() as u64;
@@ -598,7 +613,8 @@ impl OnDemandStorage {
                 dim * if is_f16_batch { 2 } else { 4 }
             };
             let float_abs = data_abs + 13;
-            let byte_len = count.checked_mul(row_width)
+            let byte_len = count
+                .checked_mul(row_width)
                 .ok_or_else(|| err_data("vector block length overflow"))?;
             if float_abs + byte_len > mmap.len() {
                 return Ok(None);
@@ -616,6 +632,21 @@ impl OnDemandStorage {
         }
 
         if let Some(codec) = quant_codec {
+            let mut blocks = rg_descs.iter().filter_map(Option::as_ref);
+            if let Some(desc) = blocks.next() {
+                if blocks.next().is_none() && desc.count == total_active {
+                    return crate::compute::vector_quantization::batch_topk_encoded_rows(
+                        &mmap[desc.float_abs..desc.float_abs + desc.byte_len],
+                        query_dim,
+                        codec,
+                        queries,
+                        n_queries,
+                        k,
+                        metric,
+                    )
+                    .map(Some);
+                }
+            }
             let row_width = codec.row_width(query_dim)?;
             let mut encoded = Vec::with_capacity(total_active.saturating_mul(row_width));
             for desc in &rg_descs {
@@ -624,7 +655,8 @@ impl OnDemandStorage {
             }
             return crate::compute::vector_quantization::batch_topk_encoded_rows(
                 &encoded, query_dim, codec, queries, n_queries, k, metric,
-            ).map(Some);
+            )
+            .map(Some);
         }
 
         let file_size = mmap.len() as u64;

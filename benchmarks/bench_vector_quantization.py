@@ -17,6 +17,7 @@ import importlib.metadata
 import importlib.resources
 import json
 import platform
+import shutil
 import sqlite3
 import statistics
 import tempfile
@@ -106,6 +107,14 @@ def load_sqlite_vector(connection: sqlite3.Connection) -> dict:
 
 
 def apex_ids(client, column: str, query_vectors, k: int, **kwargs):
+    if not kwargs:
+        batch = client.batch_topk_distance(
+            column, np.asarray(query_vectors, dtype=np.float32), k=k
+        )
+        return [
+            {int(row_id) for row_id in query[:, 0] if row_id >= 0}
+            for query in batch
+        ]
     return [
         {int(row["_id"]) for row in client.topk_distance(
             column, query, k=k, **kwargs
@@ -152,6 +161,7 @@ def benchmark_apexbase(vectors, query_vectors, k, candidate_k, warmup, iteration
             })
         finally:
             client.close()
+            shutil.rmtree(db_dir, ignore_errors=True)
     return results
 
 
@@ -216,10 +226,11 @@ def benchmark_sqlite_vector(vectors, query_vectors, k, warmup, iterations, direc
             })
         finally:
             connection.close()
+            db_path.unlink(missing_ok=True)
     return extension, results
 
 
-def benchmark(rows, dim, queries, k, candidate_k, seed, warmup, iterations):
+def benchmark(rows, dim, queries, k, candidate_k, seed, warmup, iterations, engines="all"):
     rng = np.random.default_rng(seed)
     vectors = rng.normal(size=(rows, dim)).astype(np.float32)
     query_vectors = vectors[:queries] + rng.normal(
@@ -227,12 +238,17 @@ def benchmark(rows, dim, queries, k, candidate_k, seed, warmup, iterations):
     ).astype(np.float32)
     with tempfile.TemporaryDirectory(prefix="apexbase_quant_bench_") as tmp:
         directory = Path(tmp)
-        apexbase = benchmark_apexbase(
-            vectors, query_vectors, k, candidate_k, warmup, iterations, directory
-        )
-        sqlite_extension, sqlite_vector = benchmark_sqlite_vector(
-            vectors, query_vectors, k, warmup, iterations, directory
-        )
+        apexbase = []
+        sqlite_extension = None
+        sqlite_vector = []
+        if engines in ("all", "apexbase"):
+            apexbase = benchmark_apexbase(
+                vectors, query_vectors, k, candidate_k, warmup, iterations, directory
+            )
+        if engines in ("all", "sqlite-vector"):
+            sqlite_extension, sqlite_vector = benchmark_sqlite_vector(
+                vectors, query_vectors, k, warmup, iterations, directory
+            )
     return {
         "system": {
             "platform": platform.platform(),
@@ -258,6 +274,10 @@ def main():
     parser.add_argument("--seed", type=int, default=20260821)
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=5)
+    parser.add_argument(
+        "--engines", choices=("all", "apexbase", "sqlite-vector"), default="all",
+        help="Engines to run (default: all)",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     numeric = (
@@ -272,7 +292,7 @@ def main():
         "config": vars(args) | {"output": str(args.output) if args.output else None},
         **benchmark(
             args.rows, args.dim, args.queries, args.k, args.candidate_k,
-            args.seed, args.warmup, args.iterations,
+            args.seed, args.warmup, args.iterations, args.engines,
         ),
     }
     rendered = json.dumps(payload, indent=2)

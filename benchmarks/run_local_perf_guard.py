@@ -17,6 +17,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_ORDER = ("base", "current", "current", "base", "base", "current")
 CONFIRMATION_SAMPLE_ORDER = ("current", "base", "base", "current")
+FULL_QUANT_ROWS = 1_000_000
 
 
 def run(command, *, cwd=ROOT, env=None, capture=False, check=True):
@@ -64,8 +65,10 @@ def one_wheel(directory):
     return wheels[0]
 
 
-def benchmark_arguments(mode, rows, warmup, iterations, output, qps_only=False):
-    if mode == "canary" or qps_only:
+def benchmark_arguments(
+    mode, rows, warmup, iterations, output, qps_only=False, quant_only=False
+):
+    if mode == "canary" or qps_only or quant_only:
         script = ROOT / "benchmarks" / "bench_perf_canary.py"
         defaults = (200_000, 2, 7)
     else:
@@ -83,8 +86,13 @@ def benchmark_arguments(mode, rows, warmup, iterations, output, qps_only=False):
         "--iterations", str(resolved[2]),
         "--output", output,
     ]
+    if mode == "full" and not qps_only and not quant_only:
+        # Quantized base/current metrics run in the dedicated interleaved phase.
+        command.insert(1, "--skip-quantized-vector")
     if qps_only:
         command.insert(1, "--qps-only")
+    if quant_only:
+        command.insert(1, "--quant-only")
     return tuple(command)
 
 
@@ -289,6 +297,25 @@ def main(argv=None):
                     collect_qps, qps_reports, "qps-comparison"
                 )
                 comparison_status = max(comparison_status, qps_status)
+
+                # Quantized distance scans are a core vector hot path but are
+                # intentionally ApexBase-only here. Compare them base/current
+                # at a bounded scale after the public cross-engine benchmark.
+                quant_counts = {"base": 0, "current": 0}
+                quant_reports = {"base": [], "current": []}
+                collect_quant = make_collect(
+                    "quant",
+                    quant_counts,
+                    quant_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", FULL_QUANT_ROWS, None, None, report, quant_only=True
+                    ),
+                )
+                collect_quant(SAMPLE_ORDER)
+                quant_status = run_comparison(
+                    collect_quant, quant_reports, "quant-comparison"
+                )
+                comparison_status = max(comparison_status, quant_status)
 
             print(f"Reports and comparison saved in {output_dir}")
         finally:

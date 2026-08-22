@@ -8,6 +8,10 @@ Results are printed as formatted tables and optionally saved to JSON.
 
 Usage:
     python benchmarks/bench_vs_sqlite_duckdb.py [--rows N] [--warmup N] [--iterations N] [--output FILE]
+
+The public entrypoint also runs compressed-vector L2 benchmarks against
+sqlite-vector. The implementation remains in ``bench_vector_quantization`` so
+the same measurement code can be reused by focused development runs.
 """
 
 import argparse
@@ -127,6 +131,11 @@ VECTOR_DIM_DEFAULT = 128
 VECTOR_K_DEFAULT = 10
 VECTOR_BATCH_QUERY_COUNT = 10
 VECTOR_ROWS_DEFAULT = 1_000_000
+QUANTIZED_VECTOR_ROWS_DEFAULT = 1_000_000
+QUANTIZED_VECTOR_QUERY_COUNT = 20
+QUANTIZED_VECTOR_CANDIDATE_K = 100
+QUANTIZED_VECTOR_SEED = 20260821
+QUANTIZED_VECTOR_METRIC_COUNT = 8
 VECTOR_HEAD_TO_HEAD_METRICS = [
     ("TopK L2", "l2"),
     ("TopK Cosine", "cosine"),
@@ -297,6 +306,11 @@ def vector_metric_count(profile: str = PROFILE_EXTENDED):
     )
 
 
+def public_vector_metric_count(profile: str = PROFILE_EXTENDED):
+    """Count exact and quantized vector metrics exposed by this entrypoint."""
+    return vector_metric_count(profile) + QUANTIZED_VECTOR_METRIC_COUNT
+
+
 def display_only_specs(labels):
     """Build print_benchmark_section-compatible specs for precomputed rows."""
     return [(label, "", False, False, False, None) for label in labels]
@@ -376,8 +390,6 @@ def locate_sqliteai_vector_binary():
         if os.path.exists(candidate):
             break
     else:
-        return None
-    if tuple(int(part) for part in sqlite3.sqlite_version_info[:2]) < (3, 50):
         return None
     return candidate
 
@@ -3930,7 +3942,7 @@ def module_metric_counts(profile: str = PROFILE_PUBLIC):
             + len(TXN_APEX_DIAGNOSTIC_BENCHMARKS)
             + 2
         )
-    vector_count = vector_metric_count(profile)
+    vector_count = public_vector_metric_count(profile)
     return olap_count, oltp_count, vector_count
 
 
@@ -4749,6 +4761,83 @@ def run_vector_similarity_benchmarks(tmpdir, rows, dim, k, warmup, iterations, p
             pass
 
 
+def _quantization_benchmark_module():
+    """Import the focused implementation only when the public module needs it."""
+    benchmark_dir = str(Path(__file__).resolve().parent)
+    if benchmark_dir not in sys.path:
+        sys.path.insert(0, benchmark_dir)
+    import bench_vector_quantization
+    return bench_vector_quantization
+
+
+def run_quantized_vector_benchmarks(
+    rows, dim, queries, k, candidate_k, seed, warmup, iterations,
+):
+    """Run and render all ApexBase compressed precisions in the public report."""
+    print_module_header("Quantized Vector L2", QUANTIZED_VECTOR_METRIC_COUNT)
+    print(
+        f"  Dedicated dataset: {rows:,} rows x {dim} dims; queries={queries}; "
+        f"TopK k={k}; exact-rescore candidate_k={candidate_k}."
+    )
+    print(
+        "  Latency is median per query across repeated query batches. ApexBase "
+        "uses batch_topk_distance(); sqlite-vector exposes repeated single-query scans."
+    )
+    quantization = _quantization_benchmark_module()
+    payload = quantization.benchmark(
+        rows, dim, queries, k, candidate_k, seed, warmup, iterations, "all"
+    )
+
+    sqlite_by_codec = {
+        result["codec"]: result for result in payload.get("sqlite_vector", [])
+    }
+    name_width = 18
+    col_width = 16
+    header = (
+        f"{'Codec':<{name_width}} | {'ApexBase':>{col_width}} | "
+        f"{'Apex recall':>{col_width}} | {'sqlite-vector':>{col_width}} | "
+        f"{'SQLite recall':>{col_width}} | {'Apex speedup':>{col_width}}"
+    )
+    print(header)
+    print("-" * len(header))
+    wins = ties = slower = 0
+    for result in payload.get("apexbase", []):
+        codec = result["codec"]
+        sqlite_result = sqlite_by_codec.get(codec)
+        apex_ms = result["quantized_ms_per_query"]
+        if sqlite_result is None:
+            sqlite_ms = sqlite_recall = speedup = "N/A"
+        else:
+            sqlite_value = sqlite_result["quantized_ms_per_query"]
+            sqlite_ms = f"{sqlite_value:.3f} ms"
+            sqlite_recall = f"{sqlite_result['recall_at_k']:.3f}"
+            speedup = f"{sqlite_value / apex_ms:.2f}x"
+            if apex_ms < sqlite_value:
+                wins += 1
+            elif apex_ms == sqlite_value:
+                ties += 1
+            else:
+                slower += 1
+        print(
+            f"{codec:<{name_width}} | {apex_ms:>{col_width}.3f} | "
+            f"{result['recall_at_k']:>{col_width}.3f} | {sqlite_ms:>{col_width}} | "
+            f"{sqlite_recall:>{col_width}} | {speedup:>{col_width}}"
+        )
+
+    payload["summary"] = {
+        "wins": wins,
+        "ties": ties,
+        "slower": slower,
+        "total": wins + ties + slower,
+    }
+    print(
+        f"Quantized Competitive Summary: ApexBase wins {wins}/{payload['summary']['total']}, "
+        f"ties {ties}/{payload['summary']['total']}, "
+        f"slower {slower}/{payload['summary']['total']} common codecs"
+    )
+    return payload
+
+
 def get_system_info():
     info = {
         "platform": platform.platform(),
@@ -5125,12 +5214,32 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     parser.add_argument("--low-memory", action="store_true",
                         help="Disable ApexBase arrow_batch_cache (simulate low-memory mode like SQLite/DuckDB)")
     parser.add_argument("--skip-vector", action="store_true", help="Skip the vector similarity benchmark module")
+    parser.add_argument(
+        "--skip-quantized-vector", action="store_true",
+        help="Skip the compressed-vector benchmark module",
+    )
     parser.add_argument("--vector-rows", type=int, default=None,
                         help="Rows for vector similarity module (default: min(rows, 200000))")
     parser.add_argument("--vector-dim", type=int, default=VECTOR_DIM_DEFAULT,
                         help=f"Vector dimensions for similarity module (default: {VECTOR_DIM_DEFAULT})")
     parser.add_argument("--vector-k", type=int, default=VECTOR_K_DEFAULT,
                         help=f"TopK value for vector similarity module (default: {VECTOR_K_DEFAULT})")
+    parser.add_argument(
+        "--quantized-vector-rows", type=int, default=QUANTIZED_VECTOR_ROWS_DEFAULT,
+        help=f"Rows for compressed-vector module (default: {QUANTIZED_VECTOR_ROWS_DEFAULT})",
+    )
+    parser.add_argument(
+        "--quantized-vector-queries", type=int, default=QUANTIZED_VECTOR_QUERY_COUNT,
+        help=f"Queries for compressed-vector module (default: {QUANTIZED_VECTOR_QUERY_COUNT})",
+    )
+    parser.add_argument(
+        "--quantized-vector-candidate-k", type=int, default=QUANTIZED_VECTOR_CANDIDATE_K,
+        help=f"Exact-rescore candidates (default: {QUANTIZED_VECTOR_CANDIDATE_K})",
+    )
+    parser.add_argument(
+        "--quantized-vector-seed", type=int, default=QUANTIZED_VECTOR_SEED,
+        help=f"Compressed-vector dataset seed (default: {QUANTIZED_VECTOR_SEED})",
+    )
     args = parser.parse_args(argv)
     profile = PROFILE_EXTENDED if args.full else normalize_profile(args.profile)
     ensure_optional_imports()
@@ -5141,6 +5250,15 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     VECTOR_ROWS = args.vector_rows if args.vector_rows is not None else default_vector_rows(N)
     VECTOR_DIM = args.vector_dim
     VECTOR_K = args.vector_k
+    QUANT_ROWS = args.quantized_vector_rows
+    QUANT_QUERIES = args.quantized_vector_queries
+    QUANT_CANDIDATE_K = args.quantized_vector_candidate_k
+    if min(N, VECTOR_ROWS, VECTOR_DIM, VECTOR_K, QUANT_ROWS, QUANT_QUERIES, QUANT_CANDIDATE_K) <= 0:
+        parser.error("row, dimension, query, k, and candidate-k values must be positive")
+    if QUANT_QUERIES > QUANT_ROWS:
+        parser.error("--quantized-vector-queries must be <= --quantized-vector-rows")
+    if VECTOR_K > QUANT_CANDIDATE_K:
+        parser.error("--vector-k must be <= --quantized-vector-candidate-k")
     selected_benchmarks = benchmark_specs_for_profile(profile)
 
     print("=" * 80)
@@ -5167,13 +5285,13 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     print(f"Profile: {profile} ({'fair workload scoreboard' if profile == PROFILE_PUBLIC else 'full diagnostics'})")
     print("Fairness mode: default rankings use normal engine APIs, shared input data, and comparable materialized results.")
     print(
-        f"Layout: OLAP, OLTP, and Vector Similarity modules; "
+        f"Layout: OLAP, OLTP, exact vector, and quantized vector modules; "
         f"{olap_metric_count + oltp_metric_count + vector_metric_total} named metrics configured "
         f"({olap_metric_count} OLAP, {oltp_metric_count} OLTP, {vector_metric_total} vector)."
     )
     print("Tunable/fairness options are shown in metric names using parentheses.")
     if args.skip_vector:
-        print("Vector module: skipped by --skip-vector")
+        print("Exact and quantized vector modules: skipped by --skip-vector")
     else:
         print(
             f"Vector dataset: {VECTOR_ROWS:,} rows x {VECTOR_DIM} dims (separate module), "
@@ -5183,6 +5301,13 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
             "Vector results are reported separately and do not change the "
             f"{len(selected_benchmarks)}-metric tabular fair scoreboard."
         )
+        if args.skip_quantized_vector:
+            print("Quantized vector module: skipped by --skip-quantized-vector")
+        else:
+            print(
+                f"Quantized vector dataset: {QUANT_ROWS:,} rows x {VECTOR_DIM} dims, "
+                f"queries={QUANT_QUERIES}, candidate_k={QUANT_CANDIDATE_K}"
+            )
     if args.low_memory:
         print("Mode: LOW-MEMORY (ApexBase-only cache stress mode; not a cross-engine apples-to-apples setting)")
     print()
@@ -5428,6 +5553,44 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
             profile=profile,
         )
 
+    if args.skip_vector or args.skip_quantized_vector:
+        quantized_vector_results = {
+            "config": {
+                "rows": QUANT_ROWS,
+                "dim": VECTOR_DIM,
+                "queries": QUANT_QUERIES,
+                "k": VECTOR_K,
+                "candidate_k": QUANT_CANDIDATE_K,
+                "seed": args.quantized_vector_seed,
+            },
+            "skipped": True,
+            "skip_reason": (
+                "Skipped by --skip-vector" if args.skip_vector
+                else "Skipped by --skip-quantized-vector"
+            ),
+            "apexbase": [],
+            "sqlite_vector": [],
+        }
+    else:
+        quantized_vector_results = {
+            "config": {
+                "rows": QUANT_ROWS,
+                "dim": VECTOR_DIM,
+                "queries": QUANT_QUERIES,
+                "k": VECTOR_K,
+                "candidate_k": QUANT_CANDIDATE_K,
+                "seed": args.quantized_vector_seed,
+                "warmup": WARMUP,
+                "iterations": ITERS,
+            },
+            "skipped": False,
+            "skip_reason": None,
+            **run_quantized_vector_benchmarks(
+                QUANT_ROWS, VECTOR_DIM, QUANT_QUERIES, VECTOR_K,
+                QUANT_CANDIDATE_K, args.quantized_vector_seed, WARMUP, ITERS,
+            ),
+        }
+
     if profile_runs_extended_sections(profile):
         oltp_results = run_oltp_benchmarks(
             engines,
@@ -5494,10 +5657,16 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
                 "vector_dim": VECTOR_DIM,
                 "vector_k": VECTOR_K,
                 "skip_vector": args.skip_vector,
+                "quantized_vector_rows": QUANT_ROWS,
+                "quantized_vector_queries": QUANT_QUERIES,
+                "quantized_vector_candidate_k": QUANT_CANDIDATE_K,
+                "quantized_vector_seed": args.quantized_vector_seed,
+                "skip_quantized_vector": args.skip_quantized_vector,
             },
             "results": json_results,
             "fair_workload_scoreboard": fair_workload_scoreboard,
             "vector_similarity": vector_results,
+            "quantized_vector_similarity": quantized_vector_results,
             "apexbase_materialization": materialization_results,
             "qps": qps_results,
             "oltp_microbenchmarks": oltp_results,

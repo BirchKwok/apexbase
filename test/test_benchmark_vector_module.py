@@ -24,6 +24,7 @@ def test_default_vector_rows_defaults_to_1m_floor():
     assert module.default_vector_rows(200_000) == 1_000_000
     assert module.default_vector_rows(800_000) == 1_000_000
     assert module.default_vector_rows(1_500_000) == 1_500_000
+    assert module.QUANTIZED_VECTOR_ROWS_DEFAULT == 1_000_000
 
 
 def test_generate_vector_data_is_deterministic_and_shaped():
@@ -66,7 +67,7 @@ def test_public_profile_matches_readme_scoreboard_shape():
     assert len(module.PUBLIC_OLAP_BENCHMARK_NAMES) == 70
     assert len(module.OLTP_FAIR_BENCHMARK_NAMES) == 32
     assert len(module.benchmark_specs_for_profile(module.PROFILE_PUBLIC)) == 102
-    assert module.module_metric_counts(module.PROFILE_PUBLIC) == (70, 32, 6)
+    assert module.module_metric_counts(module.PROFILE_PUBLIC) == (70, 32, 14)
     assert module.vector_metric_sets(module.PROFILE_PUBLIC) == (
         [
             ("TopK L2", "l2"),
@@ -81,14 +82,45 @@ def test_public_profile_matches_readme_scoreboard_shape():
         [],
     )
     assert module.vector_metric_count(module.PROFILE_PUBLIC) == 6
+    assert module.public_vector_metric_count(module.PROFILE_PUBLIC) == 14
 
 
 def test_extended_profile_keeps_diagnostics_available():
     module = load_benchmark_module()
 
     assert len(module.benchmark_specs_for_profile(module.PROFILE_EXTENDED)) == 102
-    assert module.module_metric_counts(module.PROFILE_EXTENDED) == (78, 53, 9)
+    assert module.module_metric_counts(module.PROFILE_EXTENDED) == (78, 53, 17)
     assert module.vector_metric_count(module.PROFILE_EXTENDED) == 9
+
+
+def test_public_entrypoint_renders_embedded_quantized_results(monkeypatch, capsys):
+    module = load_benchmark_module()
+
+    class QuantizationStub:
+        @staticmethod
+        def benchmark(*args):
+            assert args == (100, 8, 2, 3, 10, 7, 1, 2, "all")
+            return {
+                "apexbase": [
+                    {"codec": "int8", "quantized_ms_per_query": 0.25,
+                     "recall_at_k": 1.0},
+                    {"codec": "float16", "quantized_ms_per_query": 0.5,
+                     "recall_at_k": 1.0},
+                ],
+                "sqlite_vector": [
+                    {"codec": "int8", "quantized_ms_per_query": 1.0,
+                     "recall_at_k": 0.9},
+                ],
+            }
+
+    monkeypatch.setattr(module, "_quantization_benchmark_module", lambda: QuantizationStub)
+    result = module.run_quantized_vector_benchmarks(100, 8, 2, 3, 10, 7, 1, 2)
+
+    assert result["summary"] == {"wins": 1, "ties": 0, "slower": 0, "total": 1}
+    rendered = capsys.readouterr().out
+    assert "Quantized Vector L2 Module" in rendered
+    assert "int8" in rendered
+    assert "4.00x" in rendered
 
 
 def test_sqliteai_vector_metric_options_cover_head_to_head_metrics():

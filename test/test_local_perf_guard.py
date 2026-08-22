@@ -71,7 +71,9 @@ def test_local_guard_benchmark_defaults(
     command = local_guard.benchmark_arguments(mode, None, None, None, "report.json")
 
     assert Path(command[0]).name == expected_script
-    assert (command[2], command[4], command[6]) == expected_values
+    assert tuple(command[command.index(flag) + 1] for flag in (
+        "--rows", "--warmup", "--iterations"
+    )) == expected_values
     assert command[-2:] == ("--output", "report.json")
 
 
@@ -91,11 +93,24 @@ def test_local_guard_qps_only_uses_canary_script(local_guard):
     assert command[-2:] == ("--output", "report.json")
 
 
+def test_local_guard_quant_only_uses_canary_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json", quant_only=True
+    )
+
+    assert Path(command[0]).name == "bench_perf_canary.py"
+    assert "--quant-only" in command
+    assert command[-2:] == ("--output", "report.json")
+    assert local_guard.FULL_QUANT_ROWS == 1_000_000
+
+
 def test_local_guard_full_mode_keeps_public_benchmark(local_guard):
     command = local_guard.benchmark_arguments("full", None, None, None, "report.json")
 
     assert Path(command[0]).name == "bench_vs_sqlite_duckdb.py"
     assert "--qps-only" not in command
+    assert "--quant-only" not in command
+    assert "--skip-quantized-vector" in command
 
 
 @pytest.mark.parametrize(

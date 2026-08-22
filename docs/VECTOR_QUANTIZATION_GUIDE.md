@@ -37,6 +37,18 @@ distance in Float32, and returns the exact ranking within the candidate set.
 Increasing `candidate_k` improves recall at the cost of more source reads and
 exact distance calculations.
 
+Compressed L2 scans operate directly on the stored representation. Float16
+and BFloat16 decode inside the scan; Int8 and UInt8 reuse a query
+quantization and integer dot/norm terms for dimensions of 64 or more; 1Bit
+uses a Hamming candidate pass followed by a small magnitude-aware rerank; and
+TurboQuant reuses one rotated query plus byte lookup tables. Batch search
+shares the encoded query state across rows and parallelizes across queries.
+
+The exact Int8/UInt8 kernels use runtime-selected SIMD on both major desktop
+architectures: AVX2/FMA on x86_64 and NEON on AArch64. Unsupported CPUs retain
+the scalar implementation, so stored formats and query results do not depend
+on the instruction set available at write time.
+
 ## Stored formats
 
 | Type | Approximate bytes per vector of dimension D | Notes |
@@ -97,3 +109,9 @@ future re-quantization, or model migration matters.
 
 Quantization rejects empty, ragged, NaN, and infinite vectors. Vector dimension
 is fixed by the first valid batch and must remain consistent.
+
+Int8/UInt8 compressed scans at dimensions of 64 or more use an approximate
+query-once integer score; exact source reranking is the appropriate path when
+the final ordering must match Float32. Likewise, very compact 1Bit and
+TurboQuant codecs trade candidate recall for storage and scan speed. Always
+measure recall and tune `candidate_k` on representative embeddings.
