@@ -3,6 +3,21 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.31.1](https://github.com/BirchKwok/ApexBase/releases/tag/v1.31.1)
+*2026-08-23*
+
+[Compare with v1.31.0](https://github.com/BirchKwok/ApexBase/compare/v1.31.0...v1.31.1)
+
+- Reduce full serial pytest runtime by reusing the read-only 20,000-row ApexBase, SQLite, and DuckDB parity dataset across all 44 cross-engine assertions instead of rebuilding it for every test
+- Remove all pytest ignore filters from the repository and release workflow so the memory comparison tests run as part of the complete suite
+- Install DuckDB, Lance, and sqliteai-vector in the release test matrix and fail the release job if pytest reports any skipped test
+- Run the complete Rust test suite for both tag-triggered and manually dispatched releases instead of substituting `cargo check` during manual backfills
+- Add release-workflow regression tests that prevent test selectors, missing optional test dependencies, skipped pytest cases, or manual-dispatch Rust-test bypasses from returning
+- Update the Rust crate and Python package version metadata to 1.31.1
+
+---
+
+
 ## [v1.31.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.31.0)
 *2026-08-22*
 

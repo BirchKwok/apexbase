@@ -6,6 +6,7 @@ ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = (ROOT / ".github" / "workflows" / "build_release.yml").read_text(
     encoding="utf-8"
 )
+PYTEST_CONFIG = (ROOT / "pytest.ini").read_text(encoding="utf-8")
 
 
 def _job_block(name):
@@ -33,6 +34,30 @@ def test_package_publication_waits_for_all_tests_and_artifacts():
         "build-wheels",
         "build-sdist",
     }
+
+
+def test_release_workflow_runs_every_rust_test_even_for_manual_dispatch():
+    block = _job_block("rust-test")
+    assert "cargo test --no-default-features" in block
+    assert "cargo check" not in block
+
+
+def test_release_workflow_does_not_filter_or_silently_skip_python_tests():
+    block = _job_block("test")
+    configured_addopts = PYTEST_CONFIG.split("# Markers", 1)[0]
+    for selector in ("--ignore", "--deselect"):
+        assert selector not in block
+        assert selector not in configured_addopts
+    assert re.search(r"(?m)^\s+-[km]\s", block) is None
+    assert re.search(r"(?m)^\s+-[km]\s", configured_addopts) is None
+    for dependency in (
+        "duckdb==1.1.3",
+        "pylance==0.32.0",
+        "sqliteai-vector==1.0.0",
+    ):
+        assert dependency in block
+    assert "--junitxml=pytest-results.xml" in block
+    assert 'findall(".//skipped")' in block
 
 
 def test_cargo_and_pypi_publish_from_the_same_job_step():

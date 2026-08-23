@@ -201,7 +201,9 @@ PARITY_QUERIES = [
 ]
 
 
-@pytest.fixture()
+# Every test in this module is read-only, so build the identical 20K-row
+# cross-engine dataset once instead of rebuilding it for every assertion.
+@pytest.fixture(scope="module")
 def engines():
     if duckdb is None:
         pytest.skip("duckdb is required for parity tests")
