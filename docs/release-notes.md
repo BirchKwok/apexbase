@@ -3,6 +3,27 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.31.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.31.0)
+*2026-08-22*
+
+[Compare with v1.30.0](https://github.com/BirchKwok/ApexBase/compare/v1.30.0...v1.31.0)
+
+- Accelerate compressed-vector TopK distance scans by scoring encoded rows directly, precomputing query-side state once, and retaining only a fixed-capacity candidate set instead of decoding every vector
+- Add explicit AArch64 NEON and x86_64 AVX2/FMA kernels with runtime feature detection and a portable scalar fallback for supported hosts
+- Optimize all stored precisions: Float16, BFloat16, Int8, UInt8, 1Bit, and deterministic TurboQuant 2/3/4-bit, including batch-query execution and exact source-vector reranking
+- Add zero-copy mmap access for eligible single-row-group quantized scans, avoiding intermediate encoded-column materialization on the hot path
+- Integrate quantized-vector measurements into `benchmarks/bench_vs_sqlite_duckdb.py`, covering all eight compressed precisions alongside exact ApexBase, sqlite-vector, and DuckDB vector metrics
+- Standardize public quantized-vector measurements on 1,000,000 vectors with 128 dimensions and retain latency, recall, exact-rescore, storage, and cross-engine comparison data in the public report
+- Expand local same-machine performance guards so full acceptance includes the 1M x 128D quantized-vector phase for all stored precisions
+- Reduce GROUP BY and HAVING planning overhead for every key type, key count, aggregate combination, and predicate shape by borrowing the parsed statement unless HAVING truly requires an implicit aggregate column
+- Accelerate multi-column `SELECT DISTINCT` for any bounded low-cardinality dictionary-key combination with an exact mixed-radix bitmap, while retaining the generic path for high-cardinality and mixed-type projections
+- Reduce lazy-table `ALTER TABLE ADD COLUMN` metadata overhead by validating and replacing the schema under one catalog lock and one registry scan
+- Refresh the performance and vector-quantization documentation with measured 1M x 128D results, SIMD architecture coverage, approximate-search semantics, and reproducible benchmark commands
+- Update the Rust crate and Python package version metadata to 1.31.0
+
+---
+
+
 ## [v1.30.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.30.0)
 *2026-08-21*
 

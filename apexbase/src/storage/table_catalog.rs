@@ -618,10 +618,27 @@ impl CatalogLock {
     /// sequence is serialized against other writers. Readers validate CRCs and
     /// observe the published `next_offset` only after the record is complete.
     pub fn set_schema(&self, name: &str, schema_bytes: &[u8]) -> io::Result<()> {
+        self.update_schema(name, |_| Ok(schema_bytes.to_vec()))
+    }
+
+    /// Read and replace one lazy schema while retaining the registry lock.
+    ///
+    /// Schema-altering DDL can deserialize, validate, and serialize the target
+    /// record after one registry scan instead of performing a separate read
+    /// followed by another scan during `set_schema`.
+    pub fn update_schema<F>(&self, name: &str, update: F) -> io::Result<()>
+    where
+        F: FnOnce(Option<&[u8]>) -> io::Result<Vec<u8>>,
+    {
         let schemas = ensure_schemas(&self.catalog.base_dir)?;
         let mut records = schemas.scan_records()?;
-        records.retain(|(existing, _)| existing != name);
-        records.push((name.to_string(), schema_bytes.to_vec()));
+        let position = records.iter().position(|(existing, _)| existing == name);
+        let schema_bytes = update(position.map(|index| records[index].1.as_slice()))?;
+        if let Some(index) = position {
+            records[index].1 = schema_bytes;
+        } else {
+            records.push((name.to_string(), schema_bytes));
+        }
         schemas.rewrite(&records)
     }
 
@@ -1072,6 +1089,17 @@ mod tests {
             registry.set_schema("t", b"schema-v2").unwrap();
         }
         assert_eq!(schema_bytes(&dir, "t").unwrap().as_deref(), Some(&b"schema-v2"[..]));
+
+        {
+            let registry = lock(&dir).unwrap();
+            registry
+                .update_schema("t", |current| {
+                    assert_eq!(current, Some(&b"schema-v2"[..]));
+                    Ok(b"schema-v3".to_vec())
+                })
+                .unwrap();
+        }
+        assert_eq!(schema_bytes(&dir, "t").unwrap().as_deref(), Some(&b"schema-v3"[..]));
 
         {
             let registry = lock(&dir).unwrap();

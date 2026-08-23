@@ -614,6 +614,60 @@ impl ApexExecutor {
         }
 
         let num_cols = batch.num_columns();
+
+        // Multi-column dictionary projection is the common SELECT DISTINCT
+        // shape for low-cardinality string columns. Each column's dictionary
+        // key is its exact value identity within this batch, so a mixed-radix
+        // index can mark combinations in a compact bitmap without hashing or
+        // Rayon scheduling. This applies to any number of dictionary-encoded
+        // string columns whose combined key space is reasonably small;
+        // high-cardinality and mixed-type projections keep the generic path.
+        if num_cols > 1 {
+            const MAX_DENSE_DISTINCT_KEYS: usize = 1 << 20;
+            let dict_columns: Option<Vec<_>> = batch
+                .columns()
+                .iter()
+                .map(|col| {
+                    let dict = col
+                        .as_any()
+                        .downcast_ref::<DictionaryArray<UInt32Type>>()?;
+                    dict.values().as_any().downcast_ref::<StringArray>()?;
+                    Some((dict.keys(), dict.values().len() + 1))
+                })
+                .collect();
+
+            if let Some(dict_columns) = dict_columns {
+                let key_space = dict_columns.iter().try_fold(1usize, |size, (_, radix)| {
+                    size.checked_mul(*radix)
+                        .filter(|&next| next <= MAX_DENSE_DISTINCT_KEYS)
+                });
+                if let Some(key_space) = key_space {
+                    let mut seen = vec![false; key_space];
+                    let mut keep_indices = Vec::with_capacity(key_space.min(num_rows));
+
+                    for row_idx in 0..num_rows {
+                        let mut key = 0usize;
+                        for (keys, radix) in &dict_columns {
+                            let value = if keys.is_null(row_idx) {
+                                0
+                            } else {
+                                keys.value(row_idx) as usize + 1
+                            };
+                            key = key * *radix + value;
+                        }
+                        if !seen[key] {
+                            seen[key] = true;
+                            keep_indices.push(row_idx as u32);
+                        }
+                    }
+
+                    if keep_indices.len() == num_rows {
+                        return Ok(batch.clone());
+                    }
+                    return Self::take_rows(batch, &keep_indices);
+                }
+            }
+        }
         
         // FAST PATH: Single column DISTINCT - use direct dictionary indexing
         if num_cols == 1 {

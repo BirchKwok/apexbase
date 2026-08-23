@@ -662,6 +662,10 @@ fn create_olap_storage(path: &Path) {
         "dept".to_string(),
         (0..n).map(|i| depts[i % 5].to_string()).collect(),
     );
+    string_cols.insert(
+        "team".to_string(),
+        (0..n).map(|i| format!("Team{}", i % 3)).collect(),
+    );
     bool_cols.insert(
         "is_manager".to_string(),
         (0..n).map(|i| i % 10 == 0).collect(),
@@ -1012,6 +1016,27 @@ fn test_olap_count_distinct() {
         .unwrap()
         .value(0);
     assert_eq!(count, 10);
+}
+
+#[test]
+fn test_olap_multi_column_distinct_dictionary_projection() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_multi_distinct.apex");
+    create_olap_storage(&path);
+
+    // Both columns remain dictionary encoded through the raw DISTINCT path.
+    // There are ten repeating (city, dept) pairs across the 5,000 source rows.
+    let result = ApexExecutor::execute("SELECT DISTINCT city, dept FROM default", &path).unwrap();
+    let batch = result.to_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 10);
+
+    // The same generic path supports more than two dictionary columns too.
+    // The independently-cycled third key expands the result to 30 combinations.
+    invalidate_storage_cache(&path);
+    let result =
+        ApexExecutor::execute("SELECT DISTINCT city, dept, team FROM default", &path).unwrap();
+    let batch = result.to_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 30);
 }
 
 #[test]

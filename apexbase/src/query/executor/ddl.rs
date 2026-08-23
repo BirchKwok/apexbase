@@ -334,25 +334,25 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         use crate::query::sql_parser::AlterTableOp;
 
-        if !crate::storage::table_catalog::file_exists_or_registered(table_path)? {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Table '{}' does not exist", table),
-            ));
-        }
-
         // A registered table whose file has not been materialized yet only
         // needs its catalog schema record updated for ADD COLUMN; the `.apex`
         // file (with the final schema) is created on first real access.
-        if !table_path.exists() {
-            if matches!(operation, AlterTableOp::AddColumn { .. }) {
-                let table_name = crate::storage::table_catalog::bare_name(table);
-                let base_dir = table_path.parent().unwrap_or(table_path);
-                let registry_lock = crate::storage::table_catalog::lock(base_dir)?;
-                let bytes = crate::storage::table_catalog::schema_bytes(base_dir, table_name)?
-                    .unwrap_or_else(|| crate::storage::OnDemandSchema::new().to_bytes());
-                let mut schema = crate::storage::OnDemandSchema::from_bytes(&bytes)?;
-                if let AlterTableOp::AddColumn { name, data_type } = operation {
+        if !table_path.exists() && matches!(operation, AlterTableOp::AddColumn { .. }) {
+            let table_name = crate::storage::table_catalog::bare_name(table);
+            let base_dir = table_path.parent().unwrap_or(table_path);
+            let registry_lock = crate::storage::table_catalog::lock(base_dir)?;
+            if !registry_lock.snapshot()?.contains_key(table_name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Table '{}' does not exist", table),
+                ));
+            }
+            if let AlterTableOp::AddColumn { name, data_type } = operation {
+                registry_lock.update_schema(table_name, |bytes| {
+                    let mut schema = match bytes {
+                        Some(bytes) => crate::storage::OnDemandSchema::from_bytes(bytes)?,
+                        None => crate::storage::OnDemandSchema::new(),
+                    };
                     if schema.get_index(name).is_some() {
                         return Err(io::Error::new(
                             io::ErrorKind::AlreadyExists,
@@ -360,10 +360,20 @@ impl ApexExecutor {
                         ));
                     }
                     schema.add_column(name, crate::storage::ColumnType::from_data_type(*data_type));
-                }
-                registry_lock.set_schema(table_name, &schema.to_bytes())?;
-                return Ok(ApexResult::Scalar(0));
+                    Ok(schema.to_bytes())
+                })?;
             }
+            return Ok(ApexResult::Scalar(0));
+        }
+
+        if !crate::storage::table_catalog::file_exists_or_registered(table_path)? {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' does not exist", table),
+            ));
+        }
+
+        if !table_path.exists() {
             // Other schema changes on a lazy table materialize the file first
             // and then run the normal rewrite path.
             crate::storage::table_catalog::materialize_table_backend(

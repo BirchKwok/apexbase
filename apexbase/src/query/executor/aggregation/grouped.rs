@@ -31,13 +31,11 @@ impl ApexExecutor {
         // so every GROUP-BY sub-path can materialise the value for filter evaluation.
         // We strip the extra columns from the final result after HAVING is applied.
         let select_col_count = stmt.columns.len();
-        let extra_agg_count;
-        let owned_stmt: SelectStatement;
-        let effective_stmt: &SelectStatement;
-        if let Some(having_expr) = &stmt.having {
+        let mut owned_stmt = None;
+        let extra_agg_count = if let Some(having_expr) = &stmt.having {
             let extras = Self::collect_having_extra_aggs(having_expr, &stmt.columns);
             if !extras.is_empty() {
-                extra_agg_count = extras.len();
+                let count = extras.len();
                 let mut s = stmt.clone();
                 for (func, col) in extras {
                     use crate::query::AggregateFunc;
@@ -56,18 +54,15 @@ impl ApexExecutor {
                         alias: Some(alias),
                     });
                 }
-                owned_stmt = s;
-                effective_stmt = &owned_stmt;
+                owned_stmt = Some(s);
+                count
             } else {
-                extra_agg_count = 0;
-                effective_stmt = stmt;
-                owned_stmt = stmt.clone(); // unused but required for lifetime
+                0
             }
         } else {
-            extra_agg_count = 0;
-            effective_stmt = stmt;
-            owned_stmt = stmt.clone(); // unused but required for lifetime
-        }
+            0
+        };
+        let effective_stmt = owned_stmt.as_ref().unwrap_or(stmt);
 
         if let Some(result) =
             Self::try_execute_single_key_streaming_group_by(&batch, effective_stmt, &group_cols)?
