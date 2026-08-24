@@ -1927,6 +1927,7 @@
 <ul>
 <li>Reduce full serial pytest runtime by reusing the read-only 20,000-row ApexBase, SQLite, and DuckDB parity dataset across all 44 cross-engine assertions instead of rebuilding it for every test</li>
 <li>Keep the cross-engine parity suite compatible with SQLite versions before 3.46 while retaining dedicated ApexBase coverage for numeric literals with digit separators</li>
+<li>Preserve the full Python 3.9 Windows parity and memory suites by supplying standard SQLite math functions when the bundled SQLite omits them and by using correctly typed 64-bit Windows process handles for RSS measurement</li>
 <li>Keep sqliteai-vector tests active on Python builds whose standard-library SQLite disables extension loading by falling back to an extension-capable APSW connection</li>
 <li>Fuse the two predicate-side dictionary scans used by UNION, INTERSECT, and EXCEPT into one mmap pass with separate side counts, improving distinct and multiplicity-preserving set operations without query-specific cases</li>
 <li>Parallelize cached dictionary-filtered numeric aggregation by row group for all string equality filters, reducing long-tail latency across COUNT, SUM, AVG, MIN, and MAX combinations</li>
