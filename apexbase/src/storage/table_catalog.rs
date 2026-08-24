@@ -549,6 +549,10 @@ impl CatalogLock {
         Ok(Self { catalog })
     }
 
+    fn already_locked(catalog: Arc<MappedCatalog>) -> Self {
+        Self { catalog }
+    }
+
     /// Current registry contents (generation-cached).
     pub fn snapshot(&self) -> io::Result<BTreeMap<String, PathBuf>> {
         snapshot_from_catalog(&self.catalog)
@@ -745,8 +749,31 @@ pub fn release(base_dir: &Path) {
 
 /// Acquire the exclusive registry lock for a database directory.
 pub fn lock(base_dir: &Path) -> io::Result<CatalogLock> {
-    let catalog = ensure_mapped(base_dir)?;
-    CatalogLock::new(catalog)
+    fs::create_dir_all(base_dir)?;
+    if let Some(entry) = CATALOGS.get(base_dir) {
+        if !entry.value().is_stale() {
+            let catalog = Arc::clone(entry.value());
+            drop(entry);
+            return CatalogLock::new(catalog);
+        }
+    }
+
+    let lock_file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(base_dir.join(TABLE_CATALOG_LOCK))?;
+    lock_file.lock_exclusive()?;
+    if let Some(entry) = CATALOGS.get(base_dir) {
+        if !entry.value().is_stale() {
+            let catalog = Arc::clone(entry.value());
+            drop(entry);
+            lock_file.unlock()?;
+            return CatalogLock::new(catalog);
+        }
+    }
+    let catalog = ensure_mapped(base_dir, lock_file)?;
+    Ok(CatalogLock::already_locked(catalog))
 }
 
 /// Current registry contents (metadata, or a directory backfill when the
@@ -757,8 +784,10 @@ pub fn snapshot(base_dir: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
         return scan_apex_files(base_dir);
     }
 
-    let catalog = ensure_mapped(base_dir)?;
-    snapshot_from_catalog(&catalog)
+    // A creator may have made the path visible but still be writing the
+    // initial fixed-size catalog. Wait for that transaction before mapping,
+    // otherwise a concurrent reader could mmap a partially initialized file.
+    lock(base_dir)?.snapshot()
 }
 
 /// Resolve a registry snapshot from an already-mapped catalog.
@@ -919,7 +948,7 @@ pub fn bare_name(name: &str) -> &str {
     trimmed.rsplit('.').next().unwrap_or(trimmed)
 }
 
-fn ensure_mapped(base_dir: &Path) -> io::Result<Arc<MappedCatalog>> {
+fn ensure_mapped(base_dir: &Path, lock_file: fs::File) -> io::Result<Arc<MappedCatalog>> {
     if let Some(entry) = CATALOGS.get(base_dir) {
         if !entry.value().is_stale() {
             return Ok(Arc::clone(entry.value()));
@@ -967,12 +996,6 @@ fn ensure_mapped(base_dir: &Path) -> io::Result<Arc<MappedCatalog>> {
         u32::from_le_bytes(bytes[12..16].try_into().unwrap())
     };
     let modified = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
-    let lock_path = base_dir.join(TABLE_CATALOG_LOCK);
-    let lock_file = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&lock_path)?;
     let catalog = Arc::new(MappedCatalog {
         base_dir: base_dir.to_path_buf(),
         file,

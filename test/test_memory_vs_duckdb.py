@@ -7,11 +7,15 @@ This is critical for low-resource machine deployments.
 
 import gc
 import os
-import resource
 import sys
 import subprocess
 import tempfile
 import shutil
+
+try:
+    import resource
+except ImportError:  # Windows
+    resource = None
 
 import pytest
 import pyarrow as pa
@@ -20,6 +24,33 @@ import duckdb
 
 def get_rss_mb():
     """Get current RSS (Resident Set Size) in MB via resource module."""
+    if resource is None:
+        import ctypes
+        from ctypes import wintypes
+
+        class ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        counters = ProcessMemoryCounters()
+        counters.cb = ctypes.sizeof(counters)
+        process = ctypes.windll.kernel32.GetCurrentProcess()
+        if not ctypes.windll.psapi.GetProcessMemoryInfo(
+            process, ctypes.byref(counters), counters.cb
+        ):
+            raise ctypes.WinError()
+        return counters.WorkingSetSize / (1024 * 1024)
+
     # On macOS, ru_maxrss is in bytes; on Linux it's in KB
     usage = resource.getrusage(resource.RUSAGE_SELF)
     import sys
