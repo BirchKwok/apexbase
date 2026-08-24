@@ -213,6 +213,7 @@ jobs:
             "duckdb==1.1.3",
             "pylance==0.32.0",
             "sqliteai-vector==1.0.0",
+            "apsw==3.53.1.0",
         ]
         if sys.version_info < (3, 10):
             test_deps.extend([

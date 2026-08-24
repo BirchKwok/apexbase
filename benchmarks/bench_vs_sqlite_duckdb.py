@@ -394,6 +394,42 @@ def locate_sqliteai_vector_binary():
     return candidate
 
 
+def connect_extension_capable_sqlite():
+    """Open an in-memory SQLite connection that can load native extensions."""
+    import sqlite3
+
+    con = sqlite3.connect(":memory:")
+    if hasattr(con, "enable_load_extension"):
+        return con
+    con.close()
+
+    try:
+        import apsw
+    except ImportError as exc:
+        raise RuntimeError(
+            "This Python's sqlite3 module cannot load extensions; install APSW "
+            "to run sqliteai-vector benchmarks"
+        ) from exc
+    return apsw.Connection(":memory:")
+
+
+def load_sqlite_extension(connection, path: str):
+    """Load a native extension through either sqlite3 or APSW."""
+    if hasattr(connection, "enable_load_extension"):
+        connection.enable_load_extension(True)
+        try:
+            connection.load_extension(path)
+        finally:
+            connection.enable_load_extension(False)
+        return
+
+    connection.enableloadextension(True)
+    try:
+        connection.loadextension(path)
+    finally:
+        connection.enableloadextension(False)
+
+
 def setup_sqliteai_vector_bench(vecs: np.ndarray):
     """Load the same vectors into an in-memory SQLite DB with per-metric tables.
 
@@ -401,12 +437,8 @@ def setup_sqliteai_vector_bench(vecs: np.ndarray):
     to-head metric gets its own table; all share one connection and BLOB data.
     """
     ensure_optional_imports()
-    import sqlite3
-
-    con = sqlite3.connect(":memory:")
-    con.enable_load_extension(True)
-    con.load_extension(locate_sqliteai_vector_binary())
-    con.enable_load_extension(False)
+    con = connect_extension_capable_sqlite()
+    load_sqlite_extension(con, locate_sqliteai_vector_binary())
     dim = vecs.shape[1]
     n = len(vecs)
     con.execute("PRAGMA journal_mode=MEMORY")

@@ -150,6 +150,32 @@ def _require_sqliteai_vector(module):
         pytest.skip("sqliteai-vector is not installed in this environment")
 
 
+def test_sqliteai_connection_falls_back_to_apsw_without_stdlib_extension_support(
+    monkeypatch,
+):
+    import sqlite3
+    import sys
+    import types
+
+    module = load_benchmark_module()
+    closed = []
+
+    class LimitedConnection:
+        def close(self):
+            closed.append(True)
+
+    fallback = object()
+    monkeypatch.setattr(sqlite3, "connect", lambda _: LimitedConnection())
+    monkeypatch.setitem(
+        sys.modules,
+        "apsw",
+        types.SimpleNamespace(Connection=lambda _: fallback),
+    )
+
+    assert module.connect_extension_capable_sqlite() is fallback
+    assert closed == [True]
+
+
 def test_sqliteai_vector_topk_matches_bruteforce():
     module = load_benchmark_module()
     _require_sqliteai_vector(module)

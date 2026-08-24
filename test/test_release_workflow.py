@@ -54,6 +54,7 @@ def test_release_workflow_does_not_filter_or_silently_skip_python_tests():
         "duckdb==1.1.3",
         "pylance==0.32.0",
         "sqliteai-vector==1.0.0",
+        "apsw==3.53.1.0",
     ):
         assert dependency in block
     assert "--junitxml=pytest-results.xml" in block
