@@ -1633,11 +1633,10 @@ impl OnDemandStorage {
         Ok(Some(merged))
     }
 
-    /// Counts rows of `dict_col` whose `num_col` falls in either of two ranges
-    /// (e.g. `age = 25` or `age = 26`) in a single pass over the column, and
-    /// returns the per-value combined counts as `(value, count)` sorted by
-    /// value. Used by UNION ALL … ORDER BY <dict_col> LIMIT k to construct the
-    /// top-k rows directly instead of materializing both side row sets.
+    /// Counts rows of `dict_col` whose `num_col` falls in each of two ranges in
+    /// a single pass, returning `(value, left_count, right_count)` sorted by
+    /// value. Keeping the side counts separate lets UNION, INTERSECT, and EXCEPT
+    /// share the same scan while preserving ALL and DISTINCT semantics.
     pub fn count_dict_values_two_ranges(
         &self,
         num_col: &str,
@@ -1646,7 +1645,7 @@ impl OnDemandStorage {
         lo2: f64,
         hi2: f64,
         dict_col: &str,
-    ) -> io::Result<Option<Vec<(String, i64)>>> {
+    ) -> io::Result<Option<Vec<(String, i64, i64)>>> {
         use rayon::prelude::*;
 
         let footer = match self.get_or_load_footer()? {
@@ -1748,7 +1747,7 @@ impl OnDemandStorage {
         let high1 = hi1.floor() as i64;
         let low2 = lo2.ceil() as i64;
         let high2 = hi2.floor() as i64;
-        let results: Vec<io::Result<Option<Vec<(String, i64)>>>> = rg_descs
+        let results: Vec<io::Result<Option<Vec<(String, i64, i64)>>>> = rg_descs
             .par_iter()
             .map(|desc| {
                 let mmap =
@@ -1812,7 +1811,8 @@ impl OnDemandStorage {
                 };
 
                 let n = rg_rows;
-                let mut counts: Vec<i64> = vec![0; values.len()];
+                let mut left_counts: Vec<i64> = vec![0; values.len()];
+                let mut right_counts: Vec<i64> = vec![0; values.len()];
                 match &num_col_data {
                     ColumnData::Int64(v) => {
                         if v.len() < n {
@@ -1831,19 +1831,15 @@ impl OnDemandStorage {
                                 continue;
                             }
                             let vv = v[i];
-                            let mut c = 0i64;
-                            if vv >= low1 && vv <= high1 {
-                                c += 1;
-                            }
-                            if vv >= low2 && vv <= high2 {
-                                c += 1;
-                            }
-                            if c == 0 {
+                            let in_left = vv >= low1 && vv <= high1;
+                            let in_right = vv >= low2 && vv <= high2;
+                            if !in_left && !in_right {
                                 continue;
                             }
                             if let Some(idx) = view.index(i).and_then(value_index) {
-                                if idx < counts.len() {
-                                    counts[idx] += c;
+                                if idx < left_counts.len() {
+                                    left_counts[idx] += i64::from(in_left);
+                                    right_counts[idx] += i64::from(in_right);
                                 }
                             }
                         }
@@ -1865,19 +1861,15 @@ impl OnDemandStorage {
                                 continue;
                             }
                             let vv = v[i];
-                            let mut c = 0i64;
-                            if vv >= lo1 && vv <= hi1 {
-                                c += 1;
-                            }
-                            if vv >= lo2 && vv <= hi2 {
-                                c += 1;
-                            }
-                            if c == 0 {
+                            let in_left = vv >= lo1 && vv <= hi1;
+                            let in_right = vv >= lo2 && vv <= hi2;
+                            if !in_left && !in_right {
                                 continue;
                             }
                             if let Some(idx) = view.index(i).and_then(value_index) {
-                                if idx < counts.len() {
-                                    counts[idx] += c;
+                                if idx < left_counts.len() {
+                                    left_counts[idx] += i64::from(in_left);
+                                    right_counts[idx] += i64::from(in_right);
                                 }
                             }
                         }
@@ -1885,10 +1877,11 @@ impl OnDemandStorage {
                     _ => return Ok(None),
                 }
                 Ok(Some(
-                    values
-                        .into_iter()
-                        .zip(counts.into_iter())
-                        .filter(|(_, c)| *c > 0)
+                    values.into_iter()
+                        .zip(left_counts.into_iter().zip(right_counts))
+                        .filter_map(|(value, (left, right))| {
+                            (left > 0 || right > 0).then_some((value, left, right))
+                        })
                         .collect(),
                 ))
             })
@@ -1897,18 +1890,24 @@ impl OnDemandStorage {
         drop(mmap_guard);
         drop(file_guard);
 
-        let mut merged: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+        let mut merged: std::collections::HashMap<String, (i64, i64)> =
+            std::collections::HashMap::new();
         for r in results {
             match r? {
                 Some(pairs) => {
-                    for (v, c) in pairs {
-                        *merged.entry(v).or_insert(0) += c;
+                    for (value, left, right) in pairs {
+                        let counts = merged.entry(value).or_insert((0, 0));
+                        counts.0 += left;
+                        counts.1 += right;
                     }
                 }
                 None => return Ok(None),
             }
         }
-        let mut out: Vec<(String, i64)> = merged.into_iter().collect();
+        let mut out: Vec<(String, i64, i64)> = merged
+            .into_iter()
+            .map(|(value, (left, right))| (value, left, right))
+            .collect();
         out.sort_by(|a, b| a.0.cmp(&b.0));
         Ok(Some(out))
     }

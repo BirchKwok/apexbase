@@ -160,31 +160,24 @@ impl ApexExecutor {
         let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
         let backend = crate::query::executor::get_cached_backend(&table_path)?;
 
-        let left_vals = match backend.scan_distinct_dict_values_in_range(&num_col, lo1, hi1, &dict_col)? {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let right_vals = match backend.scan_distinct_dict_values_in_range(&num_col, lo2, hi2, &dict_col)? {
+        let counts = match backend.count_dict_values_two_ranges(
+            &num_col, lo1, hi1, lo2, hi2, &dict_col,
+        )? {
             Some(v) => v,
             None => return Ok(None),
         };
 
-        let right_set: std::collections::HashSet<&str> =
-            right_vals.iter().map(|s| s.as_str()).collect();
-        let mut result_vals: Vec<String> = match union.set_op {
-            SetOpType::Intersect => left_vals
+        let result_vals: Vec<String> = match union.set_op {
+            SetOpType::Intersect => counts
                 .into_iter()
-                .filter(|v| right_set.contains(v.as_str()))
+                .filter_map(|(value, left, right)| (left > 0 && right > 0).then_some(value))
                 .collect(),
-            SetOpType::Except => left_vals
+            SetOpType::Except => counts
                 .into_iter()
-                .filter(|v| !right_set.contains(v.as_str()))
+                .filter_map(|(value, left, right)| (left > 0 && right == 0).then_some(value))
                 .collect(),
             SetOpType::Union => return Ok(None),
         };
-        // `left_vals` is already sorted by the storage scan; a stable filter
-        // preserves that order, so no extra sort is needed for ORDER BY.
-        result_vals.dedup();
 
         let arr: ArrayRef = Arc::new(arrow::array::StringArray::from(result_vals));
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -320,7 +313,7 @@ impl ApexExecutor {
             None => return Ok(None),
         };
 
-        let iter: Box<dyn Iterator<Item = &(String, i64)>> = if ob.descending {
+        let iter: Box<dyn Iterator<Item = &(String, i64, i64)>> = if ob.descending {
             Box::new(counts.iter().rev())
         } else {
             Box::new(counts.iter())
@@ -328,8 +321,8 @@ impl ApexExecutor {
         let mut vals: Vec<String> = Vec::new();
         if union.all {
             let total_need = limit.unwrap() + offset;
-            for (v, c) in iter {
-                for _ in 0..(*c).max(0) as usize {
+            for (v, left, right) in iter {
+                for _ in 0..(*left + *right).max(0) as usize {
                     vals.push(v.clone());
                     if vals.len() >= total_need {
                         break;
@@ -346,8 +339,8 @@ impl ApexExecutor {
             };
         } else {
             // UNION DISTINCT: one row per value that appears on either side.
-            for (v, c) in iter {
-                if *c > 0 {
+            for (v, left, right) in iter {
+                if *left > 0 || *right > 0 {
                     vals.push(v.clone());
                 }
             }

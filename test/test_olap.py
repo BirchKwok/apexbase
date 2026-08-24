@@ -398,6 +398,40 @@ class TestOlapUnionAllTopk:
         finally:
             shutil.rmtree(tmp, ignore_errors=True)
 
+    def test_two_side_counts_preserve_set_operation_semantics(self):
+        tmp, client, n, cities = self._client()
+        try:
+            duplicated = client.execute(
+                "SELECT city FROM default WHERE age = 25 "
+                "UNION ALL SELECT city FROM default WHERE age = 25 "
+                "ORDER BY city LIMIT 20"
+            )
+            left = [cities[i % 10] for i in range(n) if 22 + (i % 40) == 25]
+            assert [row["city"] for row in duplicated] == sorted(left + left)[:20]
+
+            union = client.execute(
+                "SELECT city FROM default WHERE age BETWEEN 25 AND 26 "
+                "UNION SELECT city FROM default WHERE age BETWEEN 26 AND 27 "
+                "ORDER BY city"
+            )
+            assert [row["city"] for row in union] == sorted({cities[3], cities[4], cities[5]})
+
+            intersect = client.execute(
+                "SELECT city FROM default WHERE age BETWEEN 25 AND 26 "
+                "INTERSECT SELECT city FROM default WHERE age BETWEEN 26 AND 27 "
+                "ORDER BY city"
+            )
+            assert [row["city"] for row in intersect] == [cities[4]]
+
+            except_result = client.execute(
+                "SELECT city FROM default WHERE age BETWEEN 25 AND 26 "
+                "EXCEPT SELECT city FROM default WHERE age BETWEEN 26 AND 27 "
+                "ORDER BY city"
+            )
+            assert [row["city"] for row in except_result] == [cities[3]]
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
 
 class TestOlapMultiCondition:
     def test_and_condition(self, olap_client):

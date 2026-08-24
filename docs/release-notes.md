@@ -9,6 +9,9 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 [Compare with v1.31.0](https://github.com/BirchKwok/ApexBase/compare/v1.31.0...v1.31.1)
 
 - Reduce full serial pytest runtime by reusing the read-only 20,000-row ApexBase, SQLite, and DuckDB parity dataset across all 44 cross-engine assertions instead of rebuilding it for every test
+- Keep the cross-engine parity suite compatible with SQLite versions before 3.46 while retaining dedicated ApexBase coverage for numeric literals with digit separators
+- Fuse the two predicate-side dictionary scans used by UNION, INTERSECT, and EXCEPT into one mmap pass with separate side counts, improving distinct and multiplicity-preserving set operations without query-specific cases
+- Parallelize cached dictionary-filtered numeric aggregation by row group for all string equality filters, reducing long-tail latency across COUNT, SUM, AVG, MIN, and MAX combinations
 - Remove all pytest ignore filters from the repository and release workflow so the memory comparison tests run as part of the complete suite
 - Install DuckDB, Lance, and sqliteai-vector in the release test matrix and fail the release job if pytest reports any skipped test
 - Run the complete Rust test suite for both tag-triggered and manually dispatched releases instead of substituting `cargo check` during manual backfills

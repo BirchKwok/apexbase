@@ -192,8 +192,9 @@ PARITY_QUERIES = [
     "SELECT DISTINCT city, category FROM t ORDER BY city, category LIMIT 50",
     "SELECT COUNT(*) AS c FROM t WHERE age NOT BETWEEN 20 AND 40 AND name NOT LIKE 'user_5%'",
     "SELECT city FROM t GROUP BY city HAVING AVG(score) > 50 AND COUNT(*) > 1000 ORDER BY city",
-    # Parser features: digit separators and comma cross join.
-    "SELECT id FROM t WHERE id > 10_000 ORDER BY id LIMIT 5",
+    # Keep the parity query portable to SQLite versions before 3.46. The
+    # ApexBase-specific digit-separator regression remains covered below.
+    "SELECT id FROM t WHERE id > 10000 ORDER BY id LIMIT 5",
     "SELECT t.id, m.city FROM t, meta m WHERE t.id <= 10 ORDER BY t.id, m.city LIMIT 50",
     "SELECT COUNT(*) AS c FROM t, meta m WHERE t.age < 21",
     "SELECT COUNT(*) AS c FROM t, meta m WHERE m.pop < 10000000",

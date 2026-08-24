@@ -1674,11 +1674,15 @@ impl OnDemandStorage {
             .ok_or_else(|| err_not_conn("File not open for filtered aggregation"))?;
         let mut mmap_guard = self.mmap_cache.write();
         let mmap_ref = mmap_guard.get_or_create(file)?;
+        #[derive(Clone, Copy)]
+        struct NumericRg {
+            row_offset: usize,
+            rows: usize,
+            values: usize,
+        }
+
         let mut row_offset = 0usize;
-        let mut count = 0i64;
-        let mut sum = 0.0f64;
-        let mut min = f64::INFINITY;
-        let mut max = f64::NEG_INFINITY;
+        let mut row_groups = Vec::with_capacity(footer.row_groups.len());
 
         for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
             let rg_rows = rg_meta.row_count as usize;
@@ -1714,9 +1718,32 @@ impl OnDemandStorage {
                 .min(rg_rows)
                 .min(group_ids.len().saturating_sub(row_offset))
                 .min((payload.len() - 8) / 8);
-            let values = unsafe { payload.as_ptr().add(8) };
-            for local_row in 0..rows {
-                if unsafe { *group_ids.get_unchecked(row_offset + local_row) } != target_gid {
+            row_groups.push(NumericRg {
+                row_offset,
+                rows,
+                values: unsafe { payload.as_ptr().add(8) } as usize,
+            });
+            row_offset += rg_rows;
+        }
+
+        #[derive(Clone, Copy)]
+        struct Part {
+            count: i64,
+            sum: f64,
+            min: f64,
+            max: f64,
+        }
+
+        let scan = |rg: &NumericRg| {
+            let mut part = Part {
+                count: 0,
+                sum: 0.0,
+                min: f64::INFINITY,
+                max: f64::NEG_INFINITY,
+            };
+            let values = rg.values as *const u8;
+            for local_row in 0..rg.rows {
+                if unsafe { *group_ids.get_unchecked(rg.row_offset + local_row) } != target_gid {
                     continue;
                 }
                 let value = if is_int {
@@ -1728,12 +1755,29 @@ impl OnDemandStorage {
                         std::ptr::read_unaligned(values.add(local_row * 8) as *const f64)
                     }
                 };
-                count += 1;
-                sum += value;
-                min = min.min(value);
-                max = max.max(value);
+                part.count += 1;
+                part.sum += value;
+                part.min = part.min.min(value);
+                part.max = part.max.max(value);
             }
-            row_offset += rg_rows;
+            part
+        };
+
+        let parts: Vec<Part> = if row_groups.len() > 1 && group_ids.len() >= 131_072 {
+            use rayon::prelude::*;
+            row_groups.par_iter().map(scan).collect()
+        } else {
+            row_groups.iter().map(scan).collect()
+        };
+        let mut count = 0i64;
+        let mut sum = 0.0f64;
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        for part in parts {
+            count += part.count;
+            sum += part.sum;
+            min = min.min(part.min);
+            max = max.max(part.max);
         }
 
         Ok(Some((
