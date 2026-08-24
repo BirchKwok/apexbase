@@ -17,6 +17,7 @@ benchmark:
   * Comma cross-join syntax (FROM a, b) was rejected.
 """
 
+import math
 import os
 import random
 import shutil
@@ -91,6 +92,9 @@ def setup_sqlite(tmp, data):
         -1,
         lambda *values: "".join("" if value is None else str(value) for value in values),
     )
+    # Python 3.9's bundled SQLite may predate the optional math functions.
+    con.create_function("FLOOR", 1, lambda value: None if value is None else math.floor(value))
+    con.create_function("CEIL", 1, lambda value: None if value is None else math.ceil(value))
     con.execute(
         "CREATE TABLE t (id INTEGER, name TEXT, age INTEGER, score REAL, "
         "city TEXT, category TEXT)"

@@ -10,6 +10,7 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 
 - Reduce full serial pytest runtime by reusing the read-only 20,000-row ApexBase, SQLite, and DuckDB parity dataset across all 44 cross-engine assertions instead of rebuilding it for every test
 - Keep the cross-engine parity suite compatible with SQLite versions before 3.46 while retaining dedicated ApexBase coverage for numeric literals with digit separators
+- Preserve the full Python 3.9 Windows parity and memory suites by supplying standard SQLite math functions when the bundled SQLite omits them and by using correctly typed 64-bit Windows process handles for RSS measurement
 - Keep sqliteai-vector tests active on Python builds whose standard-library SQLite disables extension loading by falling back to an extension-capable APSW connection
 - Fuse the two predicate-side dictionary scans used by UNION, INTERSECT, and EXCEPT into one mmap pass with separate side counts, improving distinct and multiplicity-preserving set operations without query-specific cases
 - Parallelize cached dictionary-filtered numeric aggregation by row group for all string equality filters, reducing long-tail latency across COUNT, SUM, AVG, MIN, and MAX combinations

@@ -42,13 +42,24 @@ def get_rss_mb():
                 ("PeakPagefileUsage", ctypes.c_size_t),
             ]
 
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.argtypes = []
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(ProcessMemoryCounters),
+            wintypes.DWORD,
+        ]
+        psapi.GetProcessMemoryInfo.restype = wintypes.BOOL
+
         counters = ProcessMemoryCounters()
         counters.cb = ctypes.sizeof(counters)
-        process = ctypes.windll.kernel32.GetCurrentProcess()
-        if not ctypes.windll.psapi.GetProcessMemoryInfo(
+        process = kernel32.GetCurrentProcess()
+        if not psapi.GetProcessMemoryInfo(
             process, ctypes.byref(counters), counters.cb
         ):
-            raise ctypes.WinError()
+            raise ctypes.WinError(ctypes.get_last_error())
         return counters.WorkingSetSize / (1024 * 1024)
 
     # On macOS, ru_maxrss is in bytes; on Linux it's in KB
@@ -72,7 +83,7 @@ def get_current_rss_mb():
             return int(out.strip()) / 1024  # KB -> MB
         except Exception:
             return get_rss_mb()
-    else:
+    elif sys.platform.startswith('linux'):
         # Linux: read from /proc
         try:
             with open(f'/proc/{pid}/status') as f:
@@ -81,6 +92,8 @@ def get_current_rss_mb():
                         return int(line.split()[1]) / 1024  # KB -> MB
         except Exception:
             return get_rss_mb()
+    else:
+        return get_rss_mb()
 
 
 NUM_ROWS = 10_000
