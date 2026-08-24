@@ -17,8 +17,8 @@ the same measurement code can be reused by focused development runs.
 import argparse
 import csv as csv_mod
 import gc
+import importlib
 import importlib.metadata as importlib_metadata
-import importlib.resources
 import json
 import math
 import os
@@ -382,16 +382,15 @@ SQLITEAI_VECTOR_BINARY_NAMES = ("vector", "vector.dylib", "vector.so", "vector.d
 def locate_sqliteai_vector_binary():
     """Resolve the prebuilt sqlite-vector extension binary shipped by the package."""
     try:
-        package_dir = importlib.resources.files("sqlite_vector.binaries")
+        binaries = importlib.import_module("sqlite_vector.binaries")
     except (ImportError, ModuleNotFoundError):
         return None
-    for name in SQLITEAI_VECTOR_BINARY_NAMES:
-        candidate = str(package_dir / name)
-        if os.path.exists(candidate):
-            break
-    else:
-        return None
-    return candidate
+    for package_dir in getattr(binaries, "__path__", ()):
+        for name in SQLITEAI_VECTOR_BINARY_NAMES:
+            candidate = os.path.join(package_dir, name)
+            if os.path.exists(candidate):
+                return candidate
+    return None
 
 
 def connect_extension_capable_sqlite():

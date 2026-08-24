@@ -86,6 +86,11 @@ def setup_apex(tmp, data):
 
 def setup_sqlite(tmp, data):
     con = sqlite3.connect(os.path.join(tmp, "sqlite.db"))
+    con.create_function(
+        "CONCAT",
+        -1,
+        lambda *values: "".join("" if value is None else str(value) for value in values),
+    )
     con.execute(
         "CREATE TABLE t (id INTEGER, name TEXT, age INTEGER, score REAL, "
         "city TEXT, category TEXT)"

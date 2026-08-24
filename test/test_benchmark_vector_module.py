@@ -176,6 +176,18 @@ def test_sqliteai_connection_falls_back_to_apsw_without_stdlib_extension_support
     assert closed == [True]
 
 
+def test_sqliteai_binary_lookup_supports_namespace_packages(monkeypatch, tmp_path):
+    import types
+
+    module = load_benchmark_module()
+    binary = tmp_path / "vector.dylib"
+    binary.write_bytes(b"test")
+    namespace = types.SimpleNamespace(__path__=[str(tmp_path)], __spec__=None)
+    monkeypatch.setattr(module.importlib, "import_module", lambda _: namespace)
+
+    assert module.locate_sqliteai_vector_binary() == str(binary)
+
+
 def test_sqliteai_vector_topk_matches_bruteforce():
     module = load_benchmark_module()
     _require_sqliteai_vector(module)
