@@ -63,7 +63,9 @@ impl ApexExecutor {
         if !from_is_table_fn && Self::is_pure_count_star(&stmt) {
             let count = if let Some(batch) = get_cached_cte_batch(storage_path) {
                 batch.num_rows() as i64
-            } else if !crate::storage::table_catalog::file_exists_or_registered(storage_path)? {
+            } else if !crate::storage::engine::engine().table_exists(storage_path)
+                && !crate::storage::table_catalog::file_exists_or_registered(storage_path)?
+            {
                 let tbl = storage_path
                     .file_stem()
                     .unwrap_or_default()
@@ -205,7 +207,9 @@ impl ApexExecutor {
                 }
                 Some(FromItem::Table { .. }) => {
                     // Normal table - read from storage
-                    if !crate::storage::table_catalog::file_exists_or_registered(storage_path)? {
+                    if !crate::storage::engine::engine().table_exists(storage_path)
+                        && !crate::storage::table_catalog::file_exists_or_registered(storage_path)?
+                    {
                         let tbl = storage_path
                             .file_stem()
                             .unwrap_or_default()

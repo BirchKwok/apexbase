@@ -8,10 +8,12 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         use std::collections::HashMap as StdHashMap;
 
-        crate::storage::table_catalog::ensure_table_file(
-            storage_path,
-            crate::storage::DurabilityLevel::Fast,
-        )?;
+        if !crate::storage::is_memory_path(storage_path) {
+            crate::storage::table_catalog::ensure_table_file(
+                storage_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+        }
         let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         // Invalidate cache before write
@@ -37,7 +39,11 @@ impl ApexExecutor {
         // DeltaStore updates are applied lazily at read time (DeltaMerger) and
         // merged into the base file via apply_pending_deltas_in_place() on next
         // open_for_write (e.g., DELETE), which is safe because of Fix B.
-        let storage = TableStorageBackend::open(storage_path)?;
+        let storage = if crate::storage::is_memory_path(storage_path) {
+            crate::Database::read_backend(storage_path)?
+        } else {
+            Arc::new(TableStorageBackend::open(storage_path)?)
+        };
         let schema_types: StdHashMap<String, crate::data::DataType> =
             storage.get_schema().into_iter().collect();
         let mut normalized_assignments = Vec::with_capacity(assignments.len());
@@ -99,6 +105,7 @@ impl ApexExecutor {
         // large DeltaStore overlay that would penalize subsequent reads.
         if indexed_cols.is_empty()
             && !fts_enabled
+            && !crate::storage::is_memory_path(storage_path)
             && !storage.storage.has_constraints()
             && !storage.has_delta()
             && storage.pending_v4_in_memory_rows() == 0
@@ -666,7 +673,9 @@ impl ApexExecutor {
                     }
 
                     let ref_path = base_dir.join(format!("{}.apex", ref_table));
-                    if !crate::storage::table_catalog::file_exists_or_registered(&ref_path)? {
+                    if !crate::storage::engine::engine().table_exists(&ref_path)
+                        && !crate::storage::table_catalog::file_exists_or_registered(&ref_path)?
+                    {
                         return Err(io::Error::new(
                             io::ErrorKind::NotFound,
                             format!(
@@ -675,11 +684,15 @@ impl ApexExecutor {
                             ),
                         ));
                     }
-                    crate::storage::table_catalog::ensure_table_file(
-                        &ref_path,
-                        crate::storage::DurabilityLevel::Fast,
-                    )?;
-                    let ref_storage = TableStorageBackend::open(&ref_path)?;
+                    let ref_storage = if crate::storage::is_memory_path(&ref_path) {
+                        crate::Database::read_backend(&ref_path)?
+                    } else {
+                        crate::storage::table_catalog::ensure_table_file(
+                            &ref_path,
+                            crate::storage::DurabilityLevel::Fast,
+                        )?;
+                        Arc::new(TableStorageBackend::open(&ref_path)?)
+                    };
                     let ref_batch =
                         ref_storage.read_columns_to_arrow(Some(&[ref_column.as_str()]), 0, None)?;
                     let ref_col_arr = ref_batch.column_by_name(ref_column);
@@ -754,7 +767,9 @@ impl ApexExecutor {
         // DeltaMerger, and baked into the base file via apply_pending_deltas_in_place()
         // on the next open_for_write (e.g., DELETE). Safe because of Fix B.
         if updated > 0 {
-            storage.save_delta_store()?;
+            if !crate::storage::is_memory_path(storage_path) {
+                storage.save_delta_store()?;
+            }
 
             // Index maintenance: update indexed values
             if !indexed_cols.is_empty() {

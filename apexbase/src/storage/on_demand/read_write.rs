@@ -3733,7 +3733,9 @@ impl OnDemandStorage {
         }
 
         // Loaded-base / legacy path: materialize and pad in memory.
-        self.load_all_columns_into_memory()?;
+        if !self.in_memory {
+            self.load_all_columns_into_memory()?;
+        }
 
         let col_type = ColumnType::from_data_type(dtype);
 
@@ -4135,6 +4137,10 @@ impl OnDemandStorage {
     ///
     /// Automatically converts low-cardinality string columns to dictionary encoding.
     pub fn save(&self) -> io::Result<()> {
+        if self.in_memory {
+            self.pending_rows.store(0, Ordering::SeqCst);
+            return Ok(());
+        }
         // OPTIMIZATION: For existing V4 files with only deletions (no new rows,
         // no schema changes), update deletion vectors in-place instead of full rewrite.
         // All other cases use the proven save_v4() full-rewrite path.
@@ -4253,6 +4259,10 @@ impl OnDemandStorage {
     /// SQL DML paths use this when later statements in the same call must observe a
     /// fully materialized base table instead of append-only spill sidecars.
     pub fn save_full(&self) -> io::Result<()> {
+        if self.in_memory {
+            self.pending_rows.store(0, Ordering::SeqCst);
+            return Ok(());
+        }
         self.pending_rows.store(0, Ordering::SeqCst);
         let result = self.save_v4();
         if result.is_ok() {
@@ -5423,6 +5433,9 @@ impl OnDemandStorage {
     /// For compressed files (where deletion vectors are embedded in the compressed body),
     /// falls back to loading all data + `save_v4()`.
     pub fn save_delete_only(&self) -> io::Result<()> {
+        if self.in_memory {
+            return Ok(());
+        }
         let header = self.header.read();
         let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
         drop(header);

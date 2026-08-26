@@ -806,7 +806,8 @@ class ApexClient:
         cache_size: int = 10000,
         prefer_arrow_format: bool = True,
         durability: DurabilityLevel = 'fast',
-        _auto_manage: bool = True
+        _auto_manage: bool = True,
+        _in_memory: bool = False,
     ):
         """
         Create an ApexClient bound to a directory-backed ``.apex`` database.
@@ -824,6 +825,8 @@ class ApexClient:
                 ``'max'`` (default ``'fast'``).
             _auto_manage: Internal flag. When ``True`` (default), register with
                 the process-wide client/storage registry for sharing and cleanup.
+            _in_memory: Internal flag selecting process-local storage with no
+                database-file I/O.
 
         Returns:
             None
@@ -831,11 +834,18 @@ class ApexClient:
         Raises:
             ValueError: If *durability* is not a recognised level.
         """
-        if dirpath is None:
+        self._in_memory = _in_memory or str(dirpath) == ":memory:"
+        if self._in_memory:
+            import uuid
+
+            dirpath = f"apexbase_memory:{uuid.uuid4().hex}"
+            _auto_manage = False
+        elif dirpath is None:
             dirpath = "."
         
         self._dirpath = Path(dirpath)
-        self._dirpath.mkdir(parents=True, exist_ok=True)
+        if not self._in_memory:
+            self._dirpath.mkdir(parents=True, exist_ok=True)
         
         # Use .apex file format for V3 storage
         self._db_path = self._dirpath / "apexbase.apex"
@@ -964,6 +974,8 @@ class ApexClient:
         Returns:
             None
         """
+        if self._in_memory:
+            return
         try:
             try:
                 stat = self._fts_config_path.stat()
@@ -1001,6 +1013,8 @@ class ApexClient:
         Returns:
             None
         """
+        if self._in_memory:
+            return
         try:
             temp_path = self._fts_config_path.with_suffix('.json.tmp')
             with open(temp_path, 'w', encoding='utf-8') as f:
@@ -4326,6 +4340,11 @@ class ApexClient:
         Raises:
             ValueError: If a referenced local table/view cannot be found.
         """
+        # The in-memory engine registry is authoritative and has no filesystem
+        # entry for this disk-oriented best-effort validation.
+        if self._in_memory:
+            return
+
         # Skip validation for multi-statement SQL (contains CREATE TABLE/VIEW)
         if _RE_CREATE_TABLE.search(sql):
             return
@@ -4377,6 +4396,8 @@ class ApexClient:
             Mapping of lower-cased view name to catalog payload. Empty dict on
             missing/corrupt catalog.
         """
+        if self._in_memory:
+            return self._view_catalog_views
         try:
             try:
                 stat = self._view_catalog_path.stat()

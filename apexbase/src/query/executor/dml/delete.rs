@@ -5,10 +5,12 @@ impl ApexExecutor {
         storage_path: &Path,
         where_clause: Option<&SqlExpr>,
     ) -> io::Result<ApexResult> {
-        crate::storage::table_catalog::ensure_table_file(
-            storage_path,
-            crate::storage::DurabilityLevel::Fast,
-        )?;
+        if !crate::storage::is_memory_path(storage_path) {
+            crate::storage::table_catalog::ensure_table_file(
+                storage_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+        }
         let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         // Collect indexed column names for this table (for index maintenance)
@@ -90,9 +92,13 @@ impl ApexExecutor {
             }
             // Preserve genuinely in-memory state, but otherwise use the narrow
             // delete opener instead of populating the general read cache.
-            let storage = get_pending_cached_backend(storage_path).unwrap_or(Arc::new(
-                TableStorageBackend::open_for_delete(storage_path)?,
-            ));
+            let storage = crate::storage::engine::engine()
+                .memory_backend(storage_path)
+                .or_else(|| get_pending_cached_backend(storage_path))
+                .map(Ok)
+                .unwrap_or_else(|| {
+                    TableStorageBackend::open_for_delete(storage_path).map(Arc::new)
+                })?;
             let count = storage.active_row_count() as i64;
 
             // Read _id + indexed columns for index maintenance
@@ -151,9 +157,11 @@ impl ApexExecutor {
         // Python flushes pending overlays before SQL writes, so the common path
         // uses the mmap-only delete opener. Embedded callers with true
         // in-memory rows retain their authoritative cached backend.
-        let storage = get_pending_cached_backend(storage_path).unwrap_or(Arc::new(
-            TableStorageBackend::open_for_delete(storage_path)?,
-        ));
+        let storage = crate::storage::engine::engine()
+            .memory_backend(storage_path)
+            .or_else(|| get_pending_cached_backend(storage_path))
+            .map(Ok)
+            .unwrap_or_else(|| TableStorageBackend::open_for_delete(storage_path).map(Arc::new))?;
 
         // ── Fast scan path: simple numeric/string predicate, no FK, no indexes ──
         // Numeric: delete_where_numeric_range_inplace — single pass, no id_to_idx HashMap.

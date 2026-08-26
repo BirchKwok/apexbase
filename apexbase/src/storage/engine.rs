@@ -234,6 +234,9 @@ pub struct StorageEngine {
     schema_cache: RwLock<AHashMap<PathBuf, SchemaCache>>,
     /// Cache for insert-mode backends (for delta writes) - avoids repeated file I/O
     insert_cache: RwLock<AHashMap<PathBuf, InsertCacheEntry>>,
+    /// Authoritative process-local tables. Unlike the bounded disk caches,
+    /// these entries are pinned until their memory database is dropped.
+    memory_tables: RwLock<AHashMap<PathBuf, Arc<TableStorageBackend>>>,
 }
 
 impl StorageEngine {
@@ -243,6 +246,7 @@ impl StorageEngine {
             cache: RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES)),
             schema_cache: RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES * 2)),
             insert_cache: RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES)),
+            memory_tables: RwLock::new(AHashMap::new()),
         }
     }
 
@@ -324,6 +328,42 @@ impl StorageEngine {
             .retain(|path, _| !path.starts_with(dir));
     }
 
+    #[inline]
+    pub fn memory_backend(&self, table_path: &Path) -> Option<Arc<TableStorageBackend>> {
+        self.memory_tables.read().get(table_path).cloned()
+    }
+
+    #[inline]
+    pub fn table_exists(&self, table_path: &Path) -> bool {
+        table_path.exists() || self.memory_tables.read().contains_key(table_path)
+    }
+
+    pub fn list_memory_tables(&self, base_dir: &Path) -> Vec<String> {
+        let mut tables: Vec<String> = self
+            .memory_tables
+            .read()
+            .keys()
+            .filter(|path| path.parent() == Some(base_dir))
+            .filter_map(|path| path.file_stem()?.to_str().map(str::to_owned))
+            .collect();
+        tables.sort_unstable();
+        tables
+    }
+
+    pub fn drop_memory_table(&self, table_path: &Path) -> bool {
+        self.cache.write().remove(table_path);
+        self.insert_cache.write().remove(table_path);
+        self.schema_cache.write().remove(table_path);
+        self.memory_tables.write().remove(table_path).is_some()
+    }
+
+    pub fn drop_memory_database(&self, base_dir: &Path) {
+        self.invalidate_dir(base_dir);
+        self.memory_tables
+            .write()
+            .retain(|path, _| !path.starts_with(base_dir));
+    }
+
     // ========================================================================
     // Backend Access
     // ========================================================================
@@ -340,6 +380,9 @@ impl StorageEngine {
         table_path: &Path,
         durability: DurabilityLevel,
     ) -> io::Result<Arc<TableStorageBackend>> {
+        if let Some(backend) = self.memory_backend(table_path) {
+            return Ok(backend);
+        }
         // Use path directly - avoid expensive canonicalize
         let cache_key = table_path.to_path_buf();
         let epoch = crate::storage::epoch::current(table_path);
@@ -423,6 +466,9 @@ impl StorageEngine {
 
     /// Get backend for read-only operations (may use cached version)
     pub fn get_read_backend(&self, table_path: &Path) -> io::Result<Arc<TableStorageBackend>> {
+        if let Some(backend) = self.memory_backend(table_path) {
+            return Ok(backend);
+        }
         // Use path directly - avoid expensive canonicalize
         let cache_key = table_path.to_path_buf();
         let epoch = crate::storage::epoch::current(table_path);
@@ -505,6 +551,9 @@ impl StorageEngine {
         table_path: &Path,
         durability: DurabilityLevel,
     ) -> io::Result<Arc<TableStorageBackend>> {
+        if let Some(backend) = self.memory_backend(table_path) {
+            return Ok(backend);
+        }
         let cache_key = table_path.to_path_buf();
         let epoch = crate::storage::epoch::current(table_path);
 
@@ -568,7 +617,7 @@ impl StorageEngine {
         // writes before routing so the delta/full-write classifier sees the
         // physical target columns and callers cannot write stale accelerators.
         let mut expanded_rows = None;
-        if table_path.exists() {
+        if self.table_exists(table_path) {
             let derivations = self.get_read_backend(table_path)?.storage.vector_derivations();
             if !derivations.is_empty() {
                 let mut expanded = Vec::with_capacity(rows.len());
@@ -660,6 +709,9 @@ impl StorageEngine {
     /// Check if a file is V4 format by reading the header version field.
     #[inline]
     fn is_v4_file(table_path: &Path) -> bool {
+        if crate::storage::is_memory_path(table_path) {
+            return false;
+        }
         // Header: 8-byte magic + 4-byte version
         let mut buf = [0u8; 12];
         if let Ok(mut f) = std::fs::File::open(table_path) {
@@ -679,6 +731,9 @@ impl StorageEngine {
     #[inline]
     fn classify_write(&self, table_path: &Path, rows: &[HashMap<String, Value>]) -> (bool, bool) {
         if rows.is_empty() {
+            return (false, false);
+        }
+        if crate::storage::is_memory_path(table_path) {
             return (false, false);
         }
 
@@ -862,7 +917,15 @@ impl StorageEngine {
     /// Pre-defining schema avoids schema inference on the first insert.
     pub fn create_table(&self, table_path: &Path, durability: DurabilityLevel) -> io::Result<()> {
         let epoch_write = crate::storage::epoch::logical_write(table_path);
-        let _backend = TableStorageBackend::create_with_durability(table_path, durability)?;
+        let backend = Arc::new(TableStorageBackend::create_with_durability(
+            table_path,
+            durability,
+        )?);
+        if crate::storage::is_memory_path(table_path) {
+            self.memory_tables
+                .write()
+                .insert(table_path.to_path_buf(), backend);
+        }
         epoch_write.commit();
         Ok(())
     }
@@ -877,12 +940,34 @@ impl StorageEngine {
         schema_cols: &[(String, ColumnType)],
     ) -> io::Result<()> {
         let epoch_write = crate::storage::epoch::logical_write(table_path);
-        let _backend = TableStorageBackend::create_with_schema_and_durability(
+        let backend = Arc::new(TableStorageBackend::create_with_schema_and_durability(
             table_path,
             durability,
             schema_cols,
-        )?;
+        )?);
+        if crate::storage::is_memory_path(table_path) {
+            self.memory_tables
+                .write()
+                .insert(table_path.to_path_buf(), backend);
+        }
         epoch_write.commit();
+        Ok(())
+    }
+
+    pub fn create_table_with_schema_object(
+        &self,
+        table_path: &Path,
+        durability: DurabilityLevel,
+        schema: crate::storage::OnDemandSchema,
+    ) -> io::Result<()> {
+        let backend = Arc::new(
+            TableStorageBackend::create_with_schema_object_and_durability(
+                table_path, durability, schema,
+            )?,
+        );
+        self.memory_tables
+            .write()
+            .insert(table_path.to_path_buf(), backend);
         Ok(())
     }
 
@@ -1226,7 +1311,7 @@ impl StorageEngine {
 
         // FAST PATH: V4 append for existing tables with matching schema
         // Check if file exists, is V4, and schema matches
-        if row_count > 0 && table_path.exists() {
+        if row_count > 0 && self.table_exists(table_path) {
             if let Ok(meta) = std::fs::metadata(table_path) {
                 if meta.len() >= 256 {
                     // Reuse the insert backend so repeated small appends avoid reopening
@@ -1584,7 +1669,7 @@ impl StorageEngine {
             return Ok(Vec::new());
         }
 
-        if table_path.exists() {
+        if self.table_exists(table_path) {
             let backend = self.get_insert_backend(table_path, durability)?;
             let derivations = backend.storage.vector_derivations();
             if !derivations.is_empty() {
@@ -2136,6 +2221,64 @@ mod tests {
         assert!(engine.exists(&table_path, ids[0]).unwrap());
         assert!(engine.exists(&table_path, ids[1]).unwrap());
         assert!(!engine.exists(&table_path, 999).unwrap());
+    }
+
+    #[test]
+    fn memory_table_keeps_rows_without_creating_files() {
+        let table_path = PathBuf::from("apexbase_memory:test/rows.apex");
+        let engine = StorageEngine::global();
+        engine.drop_memory_database(Path::new("apexbase_memory:test"));
+        engine
+            .create_table_with_schema(
+                &table_path,
+                DurabilityLevel::Fast,
+                &[("value".to_string(), ColumnType::Int64)],
+            )
+            .unwrap();
+
+        let rows = [HashMap::from([("value".to_string(), Value::Int64(42))])];
+        let ids = engine
+            .write(&table_path, &rows, DurabilityLevel::Fast)
+            .unwrap();
+
+        assert_eq!(ids, vec![crate::storage::FIRST_ROW_ID]);
+        assert_eq!(engine.row_count(&table_path).unwrap(), 1);
+        assert!(!table_path.exists());
+        engine.drop_memory_database(Path::new("apexbase_memory:test"));
+    }
+
+    #[test]
+    fn memory_table_runs_sql_without_files() {
+        let base_dir = PathBuf::from("apexbase_memory:sql");
+        let default_path = base_dir.join("apexbase.apex");
+        let table_path = base_dir.join("items.apex");
+        let engine = StorageEngine::global();
+        engine.drop_memory_database(&base_dir);
+
+        crate::Database::execute(
+            "CREATE TABLE items (value BIGINT, label TEXT)",
+            &base_dir,
+            &default_path,
+        )
+        .unwrap();
+        crate::Database::execute(
+            "INSERT INTO items (value, label) VALUES (7, 'seven')",
+            &base_dir,
+            &default_path,
+        )
+        .unwrap();
+        let result = crate::Database::execute(
+            "SELECT value, label FROM items",
+            &base_dir,
+            &default_path,
+        )
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+
+        assert_eq!(result.num_rows(), 1);
+        assert!(!table_path.exists());
+        engine.drop_memory_database(&base_dir);
     }
 
     #[test]

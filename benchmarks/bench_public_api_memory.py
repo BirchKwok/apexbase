@@ -70,6 +70,7 @@ OPTIONAL_LANCE_APIS = {
 # below are the documented sequence/context protocols; implementation helpers
 # beginning with an underscore are intentionally outside this SDK benchmark.
 PUBLIC_API_CASES = (
+    "execute",
     "ApexClient.__init__",
     "ApexClient.use_database",
     "ApexClient.use",
@@ -176,7 +177,13 @@ def discover_public_api_names():
     from apexbase import ResultView
     from apexbase.client import ApexClient
 
-    names = {"ApexClient.__init__", "ResultView.__init__", "encode_vector", "decode_vector"}
+    names = {
+        "execute",
+        "ApexClient.__init__",
+        "ResultView.__init__",
+        "encode_vector",
+        "decode_vector",
+    }
     for cls in (ApexClient, ResultView):
         for name, value in inspect.getmembers(cls):
             if name.startswith("_"):
@@ -253,6 +260,15 @@ class Fixture:
         self.expected_error = False
         self._counter = 0
         self.prepared = {}
+
+        if api == "execute":
+            import apexbase
+
+            self.apexbase = apexbase
+            apexbase._close_default_connection()
+            apexbase.execute("CREATE TABLE module_api (value BIGINT)")
+            apexbase.execute("INSERT INTO module_api VALUES (1), (2), (3)")
+            return
 
         if api in {"encode_vector", "decode_vector"} or api.startswith("ResultView."):
             self.arrow = pa.table(
@@ -398,6 +414,8 @@ class Fixture:
 
     def call(self):
         api = self.api
+        if api == "execute":
+            return self.apexbase.execute("SELECT COUNT(*) FROM module_api")
         if api == "encode_vector":
             from apexbase.client import encode_vector
             return encode_vector(self.np.arange(4096, dtype=self.np.float32))
@@ -625,6 +643,8 @@ class Fixture:
         raise KeyError(f"No benchmark invocation for {self.api}")
 
     def cleanup(self):
+        if self.api == "execute":
+            self.apexbase._close_default_connection()
         for client in self.extra_clients:
             try:
                 client.close()

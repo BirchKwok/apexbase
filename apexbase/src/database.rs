@@ -173,6 +173,9 @@ impl Database {
         table_path: &Path,
         durability: DurabilityLevel,
     ) -> io::Result<Arc<TableStorageBackend>> {
+        if let Some(backend) = engine().memory_backend(table_path) {
+            return Ok(backend);
+        }
         TableStorageBackend::open_with_durability(table_path, durability).map(Arc::new)
     }
 
@@ -181,6 +184,9 @@ impl Database {
         table_path: &Path,
         durability: DurabilityLevel,
     ) -> io::Result<Arc<TableStorageBackend>> {
+        if let Some(backend) = engine().memory_backend(table_path) {
+            return Ok(backend);
+        }
         TableStorageBackend::open_for_insert_with_durability(table_path, durability).map(Arc::new)
     }
 
@@ -189,6 +195,9 @@ impl Database {
         table_path: &Path,
         durability: DurabilityLevel,
     ) -> io::Result<Arc<TableStorageBackend>> {
+        if let Some(backend) = engine().memory_backend(table_path) {
+            return Ok(backend);
+        }
         TableStorageBackend::open_for_write_with_durability(table_path, durability).map(Arc::new)
     }
 
@@ -197,6 +206,13 @@ impl Database {
         table_path: &Path,
         durability: DurabilityLevel,
     ) -> io::Result<Arc<TableStorageBackend>> {
+        if let Some(backend) = engine().memory_backend(table_path) {
+            return Ok(backend);
+        }
+        if crate::storage::is_memory_path(table_path) {
+            engine().create_table(table_path, durability)?;
+            return engine().get_read_backend(table_path);
+        }
         crate::storage::table_catalog::materialize_table_backend(table_path, durability)
             .map(Arc::new)
     }
@@ -282,6 +298,41 @@ impl Database {
         schema: &[(String, ColumnType)],
     ) -> io::Result<()> {
         engine().create_table_with_schema(table_path, durability, schema)
+    }
+
+    #[inline]
+    pub fn create_table_with_schema_object(
+        table_path: &Path,
+        durability: DurabilityLevel,
+        schema: crate::storage::OnDemandSchema,
+    ) -> io::Result<()> {
+        engine().create_table_with_schema_object(table_path, durability, schema)
+    }
+
+    /// True when a table exists as a file on disk or as a process-local
+    /// in-memory table. This is the storage-facade equivalent of
+    /// `table_catalog::file_exists_or_registered` that also sees memory tables.
+    #[inline]
+    pub fn table_exists(table_path: &Path) -> bool {
+        engine().table_exists(table_path)
+    }
+
+    /// Remove a process-local in-memory table. Returns false when absent.
+    #[inline]
+    pub fn drop_memory_table(table_path: &Path) -> bool {
+        engine().drop_memory_table(table_path)
+    }
+
+    /// List table names in a process-local in-memory database directory.
+    #[inline]
+    pub fn list_memory_tables(base_dir: &Path) -> Vec<String> {
+        engine().list_memory_tables(base_dir)
+    }
+
+    /// Release every process-local in-memory table under a database directory.
+    #[inline]
+    pub fn drop_memory_database(base_dir: &Path) {
+        engine().drop_memory_database(base_dir)
     }
 
     #[inline]

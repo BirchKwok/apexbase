@@ -517,6 +517,9 @@ fn flush_streamed_out_rg<W: std::io::Write + std::io::Seek>(
 /// - Update via delete + insert
 pub struct OnDemandStorage {
     path: PathBuf,
+    /// Process-local mode keeps the authoritative column state in this object
+    /// and turns persistence operations into no-ops.
+    in_memory: bool,
     file: RwLock<Option<File>>,
     write_file: RwLock<Option<File>>,
     delta_file: RwLock<Option<File>>,
@@ -678,20 +681,30 @@ impl OnDemandStorage {
         durability: super::DurabilityLevel,
         schema_cols: &[(String, ColumnType)],
     ) -> io::Result<Self> {
-        let header = OnDemandHeader::new();
         let mut schema = OnDemandSchema::new();
-        let mut columns = Vec::with_capacity(schema_cols.len());
-        let mut nulls = Vec::with_capacity(schema_cols.len());
-
-        // Pre-populate schema and empty column vectors
         for (name, dtype) in schema_cols {
             schema.add_column(name, *dtype);
-            columns.push(ColumnData::new(*dtype));
-            nulls.push(Vec::new());
         }
+        Self::create_with_schema_object_and_durability(path, durability, schema)
+    }
 
-        // Initialize WAL for safe/max durability modes
-        let wal_writer = if durability != super::DurabilityLevel::Fast {
+    pub fn create_with_schema_object_and_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+        schema: OnDemandSchema,
+    ) -> io::Result<Self> {
+        let header = OnDemandHeader::new();
+        let columns = schema
+            .columns
+            .iter()
+            .map(|(_, dtype)| ColumnData::new(*dtype))
+            .collect();
+        let nulls = vec![Vec::new(); schema.columns.len()];
+
+        let in_memory = crate::storage::is_memory_path(path);
+
+        // Memory databases have no WAL: their lifetime is the owning process.
+        let wal_writer = if !in_memory && durability != super::DurabilityLevel::Fast {
             let wal_path = Self::wal_path(path);
             Some(super::incremental::WalWriter::create(
                 &wal_path,
@@ -703,6 +716,7 @@ impl OnDemandStorage {
 
         let storage = Self {
             path: path.to_path_buf(),
+            in_memory,
             file: RwLock::new(None),
             write_file: RwLock::new(None),
             delta_file: RwLock::new(None),
@@ -740,8 +754,10 @@ impl OnDemandStorage {
             global_lock: parking_lot::RwLock::new(()),
         };
 
-        // Write initial file (single-shot empty-file writer).
-        storage.save_initial_file()?;
+        if !in_memory {
+            // Write initial file (single-shot empty-file writer).
+            storage.save_initial_file()?;
+        }
 
         Ok(storage)
     }
@@ -939,6 +955,7 @@ impl OnDemandStorage {
 
         Ok(Self {
             path: path.to_path_buf(),
+            in_memory: false,
             file: RwLock::new(Some(file)),
             write_file: RwLock::new(None),
             delta_file: RwLock::new(None),
@@ -1046,6 +1063,7 @@ impl OnDemandStorage {
 
         Ok(Self {
             path: path.to_path_buf(),
+            in_memory: false,
             file: RwLock::new(Some(file)),
             write_file: RwLock::new(None),
             delta_file: RwLock::new(None),
@@ -1820,6 +1838,10 @@ impl OnDemandStorage {
     pub fn delta_batch_update_rows(&self, batch: &[(u64, &str, crate::data::Value)]) {
         if !batch.is_empty() {
             self.delta_store.write().batch_update_rows(batch);
+            if self.in_memory {
+                self.apply_pending_deltas_in_place();
+                self.delta_store.write().clear();
+            }
             crate::storage::epoch::bump(&self.path);
         }
     }
@@ -1864,6 +1886,11 @@ impl OnDemandStorage {
 
     /// Save the delta store to disk (called during save path).
     pub fn save_delta_store(&self) -> io::Result<()> {
+        if self.in_memory {
+            // In-memory tables apply deltas in-place as they are recorded; the
+            // delta store exists only for persistence and has no on-disk sidecar.
+            return Ok(());
+        }
         let mut delta_store = self.delta_store.write();
         let was_dirty = delta_store.is_dirty();
         delta_store.save()?;
@@ -1888,6 +1915,40 @@ impl OnDemandStorage {
         ds.remove_file()?;
         self.clear_deltastore_sync_pending();
         Ok(())
+    }
+
+    pub fn truncate_in_memory(&self) -> io::Result<()> {
+        if !self.in_memory {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "in-memory truncate called for a persistent table",
+            ));
+        }
+        let schema = self.schema.read();
+        *self.columns.write() = schema
+            .columns
+            .iter()
+            .map(|(_, dtype)| ColumnData::new(*dtype))
+            .collect();
+        *self.nulls.write() = vec![Vec::new(); schema.columns.len()];
+        drop(schema);
+        self.ids.write().clear();
+        self.deleted.write().clear();
+        *self.id_to_idx.write() = Some(ahash::AHashMap::new());
+        *self.delta_store.write() = DeltaStore::new(&self.path);
+        self.next_id
+            .store(crate::storage::FIRST_ROW_ID, Ordering::SeqCst);
+        self.active_count.store(0, Ordering::SeqCst);
+        self.pending_rows.store(0, Ordering::SeqCst);
+        self.persisted_row_count.store(0, Ordering::SeqCst);
+        self.page_cache.write().clear();
+        Ok(())
+    }
+
+    /// True when this storage is process-local and never touches the filesystem.
+    #[inline]
+    pub fn is_in_memory(&self) -> bool {
+        self.in_memory
     }
 
     /// Get a read reference to the delta store (for DeltaMerger on read path).
@@ -2057,6 +2118,7 @@ impl OnDemandStorage {
             let ids = self.ids.read();
             let schema = self.schema.read();
             let mut columns = self.columns.write();
+            let mut nulls = self.nulls.write();
 
             let id_to_idx: ahash::AHashMap<u64, usize> =
                 ids.iter().enumerate().map(|(i, &id)| (id, i)).collect();
@@ -2066,6 +2128,7 @@ impl OnDemandStorage {
                     for (col_name, record) in col_updates {
                         if let Some(col_idx) = schema.get_index(col_name) {
                             if col_idx < columns.len() {
+                                let is_null = matches!(&record.new_value, crate::data::Value::Null);
                                 match &record.new_value {
                                     crate::data::Value::Int64(v) => {
                                         if let ColumnData::Int64(ref mut data) = columns[col_idx] {
@@ -2124,6 +2187,33 @@ impl OnDemandStorage {
                                         }
                                     }
                                     _ => {}
+                                }
+
+                                // Keep the null bitmap consistent with the in-place
+                                // write: a non-NULL value clears the NULL marker, and
+                                // writing NULL sets it. Unsupported value types are
+                                // not written, so their null bits are left untouched.
+                                let writes_cell = matches!(
+                                    &record.new_value,
+                                    crate::data::Value::Int64(_)
+                                        | crate::data::Value::Float64(_)
+                                        | crate::data::Value::String(_)
+                                        | crate::data::Value::Bool(_)
+                                );
+                                if writes_cell || is_null {
+                                    if col_idx < nulls.len() {
+                                        let byte_idx = row_idx / 8;
+                                        let bit_idx = row_idx % 8;
+                                        let bitmap = &mut nulls[col_idx];
+                                        if byte_idx >= bitmap.len() {
+                                            bitmap.resize(byte_idx + 1, 0);
+                                        }
+                                        if is_null {
+                                            bitmap[byte_idx] |= 1 << bit_idx;
+                                        } else {
+                                            bitmap[byte_idx] &= !(1 << bit_idx);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -2873,6 +2963,9 @@ impl OnDemandStorage {
     /// bursts fast while preserving cross-process visibility through the
     /// existing delta merge path.
     pub fn spill_pending_v4_rows_to_delta(&self) -> io::Result<bool> {
+        if self.in_memory {
+            return Ok(false);
+        }
         if !self.is_v4_format() {
             return Ok(false);
         }

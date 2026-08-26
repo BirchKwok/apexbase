@@ -220,6 +220,7 @@ pub struct IndexLookupResult {
 /// - Keep indexes in sync with data changes
 /// - Persist index catalog
 pub struct IndexManager {
+    in_memory: bool,
     /// Table name
     table_name: String,
     /// Base directory for index files
@@ -239,6 +240,7 @@ impl IndexManager {
     pub fn new(table_name: &str, base_dir: &Path) -> Self {
         let idx_dir = base_dir.join("indexes");
         Self {
+            in_memory: crate::storage::is_memory_path(base_dir),
             table_name: table_name.to_string(),
             base_dir: idx_dir,
             catalog: HashMap::new(),
@@ -250,6 +252,9 @@ impl IndexManager {
 
     /// Load existing index catalog from disk
     pub fn load(table_name: &str, base_dir: &Path) -> io::Result<Self> {
+        if crate::storage::is_memory_path(base_dir) {
+            return Ok(Self::new(table_name, base_dir));
+        }
         let idx_dir = base_dir.join("indexes");
         let catalog_path = idx_dir.join(format!("{}.idxcat", table_name));
 
@@ -287,6 +292,7 @@ impl IndexManager {
         };
 
         let mut mgr = Self {
+            in_memory: false,
             table_name: table_name.to_string(),
             base_dir: idx_dir,
             catalog: catalog.clone(),
@@ -436,7 +442,9 @@ impl IndexManager {
         }
 
         // Create index directory if needed
-        std::fs::create_dir_all(&self.base_dir)?;
+        if !self.in_memory {
+            std::fs::create_dir_all(&self.base_dir)?;
+        }
 
         let first_col = &columns[0];
         let meta = IndexMeta {
@@ -718,6 +726,10 @@ impl IndexManager {
 
     /// Save catalog and all dirty indexes to disk
     pub fn save(&mut self) -> io::Result<()> {
+        if self.in_memory {
+            self.dirty = false;
+            return Ok(());
+        }
         if self.dirty {
             std::fs::create_dir_all(&self.base_dir)?;
             let catalog_path = self.base_dir.join(format!("{}.idxcat", self.table_name));

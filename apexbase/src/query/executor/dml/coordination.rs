@@ -385,17 +385,23 @@ impl ApexExecutor {
         if rows.is_empty() {
             return Ok(Some(0));
         }
-        if !storage_path.exists()
+        if !crate::storage::engine::engine().table_exists(storage_path)
             && !crate::storage::table_catalog::file_exists_or_registered(storage_path)?
         {
             return Ok(Some(0));
         }
-        crate::storage::table_catalog::ensure_table_file(
-            storage_path,
-            crate::storage::DurabilityLevel::Fast,
-        )?;
+        if !crate::storage::is_memory_path(storage_path) {
+            crate::storage::table_catalog::ensure_table_file(
+                storage_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+        }
 
-        let storage = TableStorageBackend::open_for_insert(storage_path)?;
+        let storage = if crate::storage::is_memory_path(storage_path) {
+            crate::Database::read_backend(storage_path)?
+        } else {
+            std::sync::Arc::new(TableStorageBackend::open_for_insert(storage_path)?)
+        };
         if storage.storage.has_constraints() {
             return Ok(None);
         }
@@ -1102,7 +1108,9 @@ impl ApexExecutor {
         };
 
         let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
-        if !crate::storage::table_catalog::file_exists_or_registered(&table_path)? {
+        if !crate::storage::engine::engine().table_exists(&table_path)
+            && !crate::storage::table_catalog::file_exists_or_registered(&table_path)?
+        {
             return Err(err_not_found(format!("Table '{}' does not exist", table)));
         }
 
@@ -1124,11 +1132,15 @@ impl ApexExecutor {
         // Determine column data type from table schema (use first column's
         // type). A registered lazy table is materialized with its catalog
         // schema before the index build reads it.
-        crate::storage::table_catalog::ensure_table_file(
-            &table_path,
-            crate::storage::DurabilityLevel::Fast,
-        )?;
-        let storage = TableStorageBackend::open(&table_path)?;
+        let storage = if crate::storage::is_memory_path(&table_path) {
+            crate::Database::read_backend(&table_path)?
+        } else {
+            crate::storage::table_catalog::ensure_table_file(
+                &table_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+            Arc::new(TableStorageBackend::open(&table_path)?)
+        };
         let schema = storage.get_schema();
         let first_col = &columns[0];
         let data_type = schema

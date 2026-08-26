@@ -211,7 +211,7 @@ impl OnDemandStorage {
         let checksum = crc32fast::hash(value);
         let len = value.len() as u64;
 
-        if value.len() <= BLOB_INLINE_THRESHOLD {
+        if self.in_memory || value.len() <= BLOB_INLINE_THRESHOLD {
             return Ok(encode_blob_descriptor(BLOB_MODE_INLINE, len, checksum, value));
         }
 
@@ -263,6 +263,19 @@ impl OnDemandStorage {
     }
 
     pub fn write_blob_values(&self, values: &[Vec<u8>]) -> io::Result<Vec<Vec<u8>>> {
+        if self.in_memory {
+            return Ok(values
+                .iter()
+                .map(|value| {
+                    encode_blob_descriptor(
+                        BLOB_MODE_INLINE,
+                        value.len() as u64,
+                        crc32fast::hash(value),
+                        value,
+                    )
+                })
+                .collect());
+        }
         let mut descriptors = Vec::with_capacity(values.len());
         let mut packed_file: Option<File> = None;
         let mut packed_offset = 0u64;

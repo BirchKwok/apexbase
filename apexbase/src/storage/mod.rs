@@ -21,6 +21,14 @@ pub mod table_catalog;
 /// First user-visible row ID. ApexBase uses 1-based `_id` values.
 pub const FIRST_ROW_ID: u64 = 1;
 
+/// URI prefix reserved for process-local databases that never touch storage.
+pub const MEMORY_PATH_PREFIX: &str = "apexbase_memory:";
+
+#[inline]
+pub fn is_memory_path(path: &std::path::Path) -> bool {
+    path.to_string_lossy().starts_with(MEMORY_PATH_PREFIX)
+}
+
 // ============================================================================
 // Durability Level - Controls fsync behavior for ACID guarantees
 // ============================================================================

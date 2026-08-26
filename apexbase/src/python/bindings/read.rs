@@ -310,7 +310,9 @@ impl ApexStorageImpl {
                 }
                 Ok(Some(row_data))
             })();
-            Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
             result
         });
 
@@ -1264,7 +1266,9 @@ impl ApexStorageImpl {
             let result = crate::Database::columns(&table_path)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
-            Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
             result
         })
     }
@@ -1283,7 +1287,9 @@ impl ApexStorageImpl {
                 .map(|dtype| dtype.map(|dt| format!("{:?}", dt)))
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
-            Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
             result
         })
     }

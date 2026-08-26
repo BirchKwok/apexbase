@@ -121,6 +121,10 @@ struct ViewCatalog {
     views: HashMap<String, SelectStatement>,
 }
 
+static MEMORY_VIEW_CATALOGS: once_cell::sync::Lazy<
+    parking_lot::RwLock<AHashMap<PathBuf, AHashMap<String, SelectStatement>>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(AHashMap::new()));
+
 #[inline]
 fn sort_and_dedupe_ids(ids: &[u64]) -> Vec<u64> {
     if ids.len() < 2 {
@@ -875,6 +879,9 @@ fn get_pending_cached_backend(path: &Path) -> Option<Arc<TableStorageBackend>> {
 /// because a small transaction append would otherwise become a full-table rewrite.
 #[inline]
 fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
+    if let Some(backend) = crate::storage::engine::engine().memory_backend(path) {
+        return Ok(backend);
+    }
     let cache_key = path.to_path_buf();
     let current_epoch = crate::storage::epoch::current(path);
 
@@ -1122,6 +1129,13 @@ impl ApexExecutor {
     }
 
     fn read_view_catalog(base_dir: &Path) -> AHashMap<String, SelectStatement> {
+        if crate::storage::is_memory_path(base_dir) {
+            return MEMORY_VIEW_CATALOGS
+                .read()
+                .get(base_dir)
+                .cloned()
+                .unwrap_or_default();
+        }
         let path = Self::view_catalog_path(base_dir);
         let content = match std::fs::read_to_string(&path) {
             Ok(content) => content,
@@ -1139,6 +1153,12 @@ impl ApexExecutor {
         base_dir: &Path,
         views: &AHashMap<String, SelectStatement>,
     ) -> io::Result<()> {
+        if crate::storage::is_memory_path(base_dir) {
+            MEMORY_VIEW_CATALOGS
+                .write()
+                .insert(base_dir.to_path_buf(), views.clone());
+            return Ok(());
+        }
         let path = Self::view_catalog_path(base_dir);
         let mut sorted = std::collections::BTreeMap::new();
         for (name, stmt) in views {
@@ -1162,6 +1182,10 @@ impl ApexExecutor {
         let mut catalog = Self::read_view_catalog(base_dir);
         catalog.remove(&name.to_lowercase());
         if catalog.is_empty() {
+            if crate::storage::is_memory_path(base_dir) {
+                MEMORY_VIEW_CATALOGS.write().remove(base_dir);
+                return Ok(());
+            }
             let path = Self::view_catalog_path(base_dir);
             let _ = std::fs::remove_file(path);
             return Ok(());

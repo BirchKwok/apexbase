@@ -67,7 +67,9 @@ impl ApexExecutor {
         table: &str,
     ) -> io::Result<ApexResult> {
         let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
-        if !crate::storage::table_catalog::file_exists_or_registered(&table_path)? {
+        if !crate::storage::engine::engine().table_exists(&table_path)
+            && !crate::storage::table_catalog::file_exists_or_registered(&table_path)?
+        {
             return Err(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Table '{}' does not exist", table),
@@ -167,6 +169,24 @@ impl ApexExecutor {
         columns: &[crate::query::sql_parser::ColumnDef],
         if_not_exists: bool,
     ) -> io::Result<ApexResult> {
+        if crate::storage::is_memory_path(table_path) {
+            if crate::storage::engine::engine().table_exists(table_path) {
+                if if_not_exists {
+                    return Ok(ApexResult::Scalar(0));
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Table '{}' already exists", table),
+                ));
+            }
+            let schema = Self::build_table_schema(columns)?;
+            crate::Database::create_table_with_schema_object(
+                table_path,
+                crate::storage::DurabilityLevel::Fast,
+                schema,
+            )?;
+            return Ok(ApexResult::Scalar(0));
+        }
         // Ensure parent directory exists (needed for named databases)
         if let Some(parent) = table_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -268,6 +288,74 @@ impl ApexExecutor {
         Ok(ApexResult::Scalar(0))
     }
 
+    fn build_table_schema(
+        columns: &[crate::query::sql_parser::ColumnDef],
+    ) -> io::Result<crate::storage::OnDemandSchema> {
+        use crate::query::sql_parser::{ColumnConstraintKind, DefaultValueFunction};
+        use crate::storage::on_demand::{ColumnConstraints, DefaultValue};
+
+        let mut schema = crate::storage::OnDemandSchema::new();
+        for col_def in columns {
+            if schema.get_index(&col_def.name).is_some() {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Column '{}' already exists", col_def.name),
+                ));
+            }
+            let idx = schema.add_column(
+                &col_def.name,
+                crate::storage::ColumnType::from_data_type(col_def.data_type.clone()),
+            );
+            let default_value = col_def.constraints.iter().find_map(|constraint| match constraint {
+                ColumnConstraintKind::Default(value) => Some(match value {
+                    Value::Int64(value) => DefaultValue::Int64(*value),
+                    Value::Float64(value) => DefaultValue::Float64(*value),
+                    Value::String(value) => DefaultValue::String(value.clone()),
+                    Value::Bool(value) => DefaultValue::Bool(*value),
+                    Value::Date(value) => DefaultValue::Date(*value),
+                    Value::Timestamp(value) => DefaultValue::Timestamp(*value),
+                    _ => DefaultValue::Null,
+                }),
+                ColumnConstraintKind::DefaultFunction(function) => Some(match function {
+                    DefaultValueFunction::CurrentDate => DefaultValue::CurrentDate,
+                    DefaultValueFunction::CurrentTimestamp => DefaultValue::CurrentTimestamp,
+                    DefaultValueFunction::UnixTimestamp => DefaultValue::UnixTimestamp,
+                }),
+                _ => None,
+            });
+            let check_expr_sql = col_def.constraints.iter().find_map(|constraint| {
+                if let ColumnConstraintKind::Check(sql) = constraint {
+                    Some(sql.clone())
+                } else {
+                    None
+                }
+            });
+            let foreign_key = col_def.constraints.iter().find_map(|constraint| {
+                if let ColumnConstraintKind::ForeignKey {
+                    ref_table,
+                    ref_column,
+                } = constraint
+                {
+                    Some((ref_table.clone(), ref_column.clone()))
+                } else {
+                    None
+                }
+            });
+            schema.constraints[idx] = ColumnConstraints {
+                not_null: col_def.constraints.contains(&ColumnConstraintKind::NotNull),
+                primary_key: col_def.constraints.contains(&ColumnConstraintKind::PrimaryKey),
+                unique: col_def.constraints.contains(&ColumnConstraintKind::Unique),
+                default_value,
+                check_expr_sql,
+                foreign_key,
+                autoincrement: col_def
+                    .constraints
+                    .contains(&ColumnConstraintKind::Autoincrement),
+            };
+        }
+        Ok(schema)
+    }
+
     /// Execute DROP TABLE statement
     /// High-performance: O(1) - just deletes file
     fn execute_drop_table(
@@ -275,6 +363,15 @@ impl ApexExecutor {
         table: &str,
         if_exists: bool,
     ) -> io::Result<ApexResult> {
+        if crate::storage::is_memory_path(table_path) {
+            if crate::storage::engine::engine().drop_memory_table(table_path) || if_exists {
+                return Ok(ApexResult::Scalar(0));
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Table '{}' does not exist", table),
+            ));
+        }
         // Invalidate ALL caches to release file handles and mmaps
         invalidate_storage_cache(table_path);
         crate::storage::engine::engine().invalidate(table_path);
@@ -333,6 +430,21 @@ impl ApexExecutor {
         operation: &crate::query::sql_parser::AlterTableOp,
     ) -> io::Result<ApexResult> {
         use crate::query::sql_parser::AlterTableOp;
+
+        if crate::storage::is_memory_path(table_path) {
+            let storage = crate::Database::read_backend(table_path)?;
+            match operation {
+                AlterTableOp::AddColumn { name, data_type } => {
+                    storage.add_column(name, data_type.clone())?;
+                }
+                AlterTableOp::DropColumn { name } => storage.drop_column(name)?,
+                AlterTableOp::RenameColumn { old_name, new_name } => {
+                    storage.rename_column(old_name, new_name)?;
+                }
+            }
+            storage.save()?;
+            return Ok(ApexResult::Scalar(0));
+        }
 
         // A registered table whose file has not been materialized yet only
         // needs its catalog schema record updated for ADD COLUMN; the `.apex`
@@ -432,6 +544,13 @@ impl ApexExecutor {
     /// Execute TRUNCATE TABLE statement
     /// High-performance: recreates empty file
     fn execute_truncate(storage_path: &Path) -> io::Result<ApexResult> {
+        if crate::storage::is_memory_path(storage_path) {
+            let backend = crate::storage::engine::engine()
+                .memory_backend(storage_path)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Table does not exist"))?;
+            backend.truncate_in_memory()?;
+            return Ok(ApexResult::Scalar(0));
+        }
         if !storage_path.exists() {
             if crate::storage::table_catalog::file_exists_or_registered(storage_path)? {
                 // Registered lazy table with no materialized file: nothing to
@@ -2428,10 +2547,20 @@ impl ApexExecutor {
         let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
 
         let table_name = crate::storage::table_catalog::bare_name(table);
-        let table_base_dir = table_path.parent().unwrap_or(base_dir);
-        let registry_lock = crate::storage::table_catalog::lock(table_base_dir)?;
-        let registry = registry_lock.snapshot()?;
-        if registry.contains_key(table_name) || table_path.exists() {
+        let in_memory = crate::storage::is_memory_path(&table_path);
+        let registry_lock = if in_memory {
+            None
+        } else {
+            Some(crate::storage::table_catalog::lock(
+                table_path.parent().unwrap_or(base_dir),
+            )?)
+        };
+        let registered = registry_lock
+            .as_ref()
+            .map(|registry| registry.snapshot().map(|items| items.contains_key(table_name)))
+            .transpose()?
+            .unwrap_or(false);
+        if registered || crate::storage::engine::engine().table_exists(&table_path) {
             if if_not_exists {
                 return Ok(ApexResult::Scalar(0));
             }
@@ -2450,7 +2579,14 @@ impl ApexExecutor {
 
         // Step 2: Create the table with schema from SELECT result
         let schema = select_batch.schema();
-        let backend = TableStorageBackend::create(&table_path)?;
+        let backend = if in_memory {
+            crate::Database::create_table(&table_path, crate::storage::DurabilityLevel::Fast)?;
+            crate::storage::engine::engine()
+                .memory_backend(&table_path)
+                .expect("new in-memory table must be registered")
+        } else {
+            std::sync::Arc::new(TableStorageBackend::create(&table_path)?)
+        };
         for field in schema.fields() {
             if field.name() == "_id" {
                 continue;
@@ -2500,13 +2636,24 @@ impl ApexExecutor {
         backend.save()?;
         invalidate_storage_cache(&table_path);
         invalidate_table_stats(&table_path.to_string_lossy());
-        registry_lock.insert(table_name)?;
+        if let Some(registry_lock) = registry_lock {
+            registry_lock.insert(table_name)?;
+        }
         epoch_write.commit();
 
         Ok(ApexResult::Scalar(inserted as i64))
     }
 
     // ========== FTS DDL Handlers ==========
+
+    fn memory_fts_configs() -> &'static parking_lot::RwLock<
+        ahash::AHashMap<PathBuf, serde_json::Value>,
+    > {
+        static CONFIGS: once_cell::sync::Lazy<
+            parking_lot::RwLock<ahash::AHashMap<PathBuf, serde_json::Value>>,
+        > = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(ahash::AHashMap::new()));
+        &CONFIGS
+    }
 
     /// Path of the FTS config JSON file for a given database directory.
     fn fts_config_path(base_dir: &Path) -> PathBuf {
@@ -2515,6 +2662,13 @@ impl ApexExecutor {
 
     /// Read the fts_config.json as a serde_json::Value (object).  Returns empty object if missing.
     pub(in crate::query::executor) fn read_fts_config(base_dir: &Path) -> serde_json::Value {
+        if crate::storage::is_memory_path(base_dir) {
+            return Self::memory_fts_configs()
+                .read()
+                .get(base_dir)
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        }
         let path = Self::fts_config_path(base_dir);
         if !path.exists() {
             return serde_json::Value::Object(serde_json::Map::new());
@@ -2528,6 +2682,12 @@ impl ApexExecutor {
 
     /// Write the fts_config.json from a serde_json::Value.
     fn write_fts_config(base_dir: &Path, cfg: &serde_json::Value) {
+        if crate::storage::is_memory_path(base_dir) {
+            Self::memory_fts_configs()
+                .write()
+                .insert(base_dir.to_path_buf(), cfg.clone());
+            return;
+        }
         let path = Self::fts_config_path(base_dir);
         if let Ok(s) = serde_json::to_string(cfg) {
             let temp = path.with_extension("json.tmp");
@@ -2650,14 +2810,15 @@ impl ApexExecutor {
         use arrow::compute;
 
         let table_path = base_dir.join(format!("{}.apex", table));
-        if !table_path.exists() {
+        let memory_backend = crate::storage::engine::engine().memory_backend(&table_path);
+        if !table_path.exists() && memory_backend.is_none() {
             return Ok(0);
         }
 
         // Scheduling a large initial build must not first pay the cost of
         // opening the full table/footer. Read only the fixed-size header here;
         // the worker performs the authoritative open and active-row scan.
-        if allow_async {
+        if allow_async && memory_backend.is_none() {
             let estimated_count =
                 crate::storage::TableStorageBackend::persisted_row_count_hint(&table_path)?
                     as usize;
@@ -2685,7 +2846,11 @@ impl ApexExecutor {
         let engine = mgr.get_engine(table).map_err(|e| err_data(e.to_string()))?;
         let persist_empty = || engine.compact().map_err(|e| err_data(e.to_string()));
 
-        let storage = crate::storage::TableStorageBackend::open(&table_path)?;
+        let storage = if let Some(storage) = memory_backend {
+            storage
+        } else {
+            std::sync::Arc::new(crate::storage::TableStorageBackend::open(&table_path)?)
+        };
         let schema = storage.get_schema();
 
         // Determine which string columns to index

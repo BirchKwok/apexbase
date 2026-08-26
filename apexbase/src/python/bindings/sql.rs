@@ -1159,6 +1159,15 @@ impl ApexStorageImpl {
         // Table not in cache - check if it exists on disk (lazy discovery)
         let base_dir = self.current_base_dir();
         let table_path = base_dir.join(format!("{}.apex", name));
+        if self.in_memory
+            && crate::Database::table_exists(&table_path)
+        {
+            self.table_paths
+                .write()
+                .insert(name.to_string(), table_path);
+            *self.current_table.write() = name.to_string();
+            return Ok(());
+        }
         let found = py.allow_threads(|| {
             let path = crate::storage::table_catalog::resolve(&base_dir, name)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -1195,6 +1204,29 @@ impl ApexStorageImpl {
 
         let base_dir = self.current_base_dir();
         let table_path = base_dir.join(format!("{}.apex", name));
+        if self.in_memory {
+            if crate::Database::table_exists(&table_path) {
+                return Err(PyValueError::new_err(format!(
+                    "Table already exists: {}",
+                    name
+                )));
+            }
+            let result = if let Some(schema_cols) = schema_cols.as_ref() {
+                crate::Database::create_table_with_schema(
+                    &table_path,
+                    self.durability,
+                    schema_cols,
+                )
+            } else {
+                crate::Database::create_table(&table_path, self.durability)
+            };
+            result.map_err(|e| PyIOError::new_err(format!("Failed to create table: {}", e)))?;
+            self.table_paths
+                .write()
+                .insert(name.to_string(), table_path);
+            *self.current_table.write() = name.to_string();
+            return Ok(());
+        }
         py.allow_threads(|| {
             // The per-database table registry is authoritative: it prevents a
             // fresh process from silently rebuilding a table that another
@@ -1263,6 +1295,17 @@ impl ApexStorageImpl {
         self.invalidate_backend(name);
 
         let base_dir = self.current_base_dir();
+        if self.in_memory {
+            let path = base_dir.join(format!("{}.apex", name));
+            if !crate::Database::drop_memory_table(&path) {
+                return Err(PyValueError::new_err(format!("Table not found: {}", name)));
+            }
+            self.table_paths.write().remove(name);
+            if *self.current_table.read() == name {
+                *self.current_table.write() = String::new();
+            }
+            return Ok(());
+        }
         let path = py.allow_threads(|| {
             let registry_lock = crate::storage::table_catalog::lock(&base_dir)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -1358,6 +1401,9 @@ impl ApexStorageImpl {
         // The per-database registry is authoritative; legacy databases without
         // metadata are backfilled from `.apex` files by the catalog module.
         let base_dir = self.current_base_dir();
+        if self.in_memory {
+            return Ok(crate::Database::list_memory_tables(&base_dir));
+        }
         py.allow_threads(|| {
             crate::storage::table_catalog::list(&base_dir)
                 .map(|mut tables| {
@@ -1374,11 +1420,15 @@ impl ApexStorageImpl {
             self.root_dir.clone()
         } else {
             let db_dir = self.root_dir.join(db_name);
-            py.allow_threads(|| {
-                fs::create_dir_all(&db_dir).map_err(|e| {
-                    PyIOError::new_err(format!("Cannot create database '{}': {}", db_name, e))
-                })
-            })?;
+            if self.in_memory {
+                self.memory_databases.write().insert(db_name.to_string());
+            } else {
+                py.allow_threads(|| {
+                    fs::create_dir_all(&db_dir).map_err(|e| {
+                        PyIOError::new_err(format!("Cannot create database '{}': {}", db_name, e))
+                    })
+                })?;
+            }
             db_dir
         };
 
@@ -1404,6 +1454,11 @@ impl ApexStorageImpl {
 
     #[pyo3(name = "list_databases_")]
     fn list_databases_(&self, py: Python<'_>) -> Vec<String> {
+        if self.in_memory {
+            let mut databases: Vec<String> = self.memory_databases.read().iter().cloned().collect();
+            databases.sort_unstable();
+            return databases;
+        }
         let root_dir = self.root_dir.clone();
         py.allow_threads(|| {
             let mut dbs = vec!["default".to_string()];

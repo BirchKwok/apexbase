@@ -9,6 +9,7 @@ from __future__ import annotations
 import importlib.util
 import weakref
 import atexit
+import threading
 from typing import List, Optional, Literal
 
 import numpy as np
@@ -277,6 +278,33 @@ class _InstanceRegistry:
 
 _registry = _InstanceRegistry()
 atexit.register(_registry.close_all)
+
+
+_default_connection = None
+_default_connection_lock = threading.RLock()
+
+
+def _get_default_connection():
+    """Return the lazily initialized process-local memory connection."""
+    global _default_connection
+    with _default_connection_lock:
+        if _default_connection is None or _default_connection._is_closed:
+            from .client import ApexClient
+
+            _default_connection = ApexClient(_in_memory=True)
+        return _default_connection
+
+
+def _close_default_connection():
+    """Release the process-local default connection and all of its tables."""
+    global _default_connection
+    with _default_connection_lock:
+        if _default_connection is not None:
+            _default_connection.close()
+            _default_connection = None
+
+
+atexit.register(_close_default_connection)
 
 
 class ResultView:
@@ -699,6 +727,27 @@ def _empty_result_view() -> ResultView:
 DurabilityLevel = Literal['fast', 'safe', 'max']
 
 
+def execute(
+    sql: str,
+    params=None,
+    *,
+    show_internal_id: bool = None,
+) -> ResultView:
+    """Execute SQL on ApexBase's process-local default memory database.
+
+    The connection is created on first use and shared by later calls, so no
+    explicit :class:`ApexClient` initialization is required. Its tables use
+    the same query and storage implementation as a disk database, but never
+    create database, catalog, WAL, delta, or index files.
+    """
+    with _default_connection_lock:
+        return _get_default_connection().execute(
+            sql,
+            show_internal_id=show_internal_id,
+            params=params,
+        )
+
+
 def __getattr__(name: str):
     """Lazy-load ApexClient so `from apexbase._core import ApexStorage` does not
     pull pyarrow/pandas/polars into the process before the native extension is used."""
@@ -714,4 +763,4 @@ def __dir__():
 
 
 # Exports
-__all__ = ['ApexClient', 'ApexStorage', 'ResultView', 'DurabilityLevel', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE', 'PANDAS_AVAILABLE']
+__all__ = ['ApexClient', 'ApexStorage', 'ResultView', 'DurabilityLevel', 'execute', '__version__', 'FTS_AVAILABLE', 'ARROW_AVAILABLE', 'POLARS_AVAILABLE', 'PANDAS_AVAILABLE']

@@ -20,12 +20,8 @@ impl ApexStorageImpl {
         let id = py.allow_threads(|| -> PyResult<i64> {
             // The in-process locks do not protect independent Python workers.
             // Every durability mode therefore participates in the same OS lock.
-            let lock_file = {
-                Some(
-                    Self::acquire_write_lock(&table_path)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
-                )
-            };
+            let lock_file = Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             let result = crate::Database::write(&table_path, &[fields], durability)
                 .map(|ids| ids.first().copied().unwrap_or(0) as i64)
@@ -68,12 +64,8 @@ impl ApexStorageImpl {
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
-            let lock_file = {
-                Some(
-                    Self::acquire_write_lock(&table_path)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
-                )
-            };
+            let lock_file = Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             let result = crate::Database::write(&table_path, &rows, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
@@ -520,12 +512,8 @@ impl ApexStorageImpl {
 
         let durability = self.durability;
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
-            let lock_file = {
-                Some(
-                    Self::acquire_write_lock(&table_path)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
-                )
-            };
+            let lock_file = Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             let result = backend
                 .insert_column_rows_to_delta(&[fields])
@@ -607,12 +595,8 @@ impl ApexStorageImpl {
 
         let durability = self.durability;
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
-            let lock_file = {
-                Some(
-                    Self::acquire_write_lock(&table_path)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
-                )
-            };
+            let lock_file = Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             let result = backend
                 .insert_column_rows_to_delta(&all_fields)
@@ -1051,12 +1035,8 @@ impl ApexStorageImpl {
 
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
             // Skip file lock for 'fast' durability
-            let lock_file = {
-                Some(
-                    Self::acquire_write_lock(&table_path)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
-                )
-            };
+            let lock_file = Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             let result = crate::Database::write_typed_columns(
                 &table_path,
@@ -1253,12 +1233,8 @@ impl ApexStorageImpl {
 
         let result = py.allow_threads(|| -> PyResult<bool> {
             // Skip file lock for 'fast' durability
-            let lock_file = {
-                Some(
-                    Self::acquire_write_lock(&table_path)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
-                )
-            };
+            let lock_file = Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             // Use StorageEngine for unified delete
             let result = crate::Database::delete_one(&table_path, id as u64, durability)
@@ -1333,12 +1309,8 @@ impl ApexStorageImpl {
         let ids_u64: Vec<u64> = ids.into_iter().map(|id| id as u64).collect();
         let deleted = py.allow_threads(|| -> PyResult<usize> {
             // Skip file lock for 'fast' durability
-            let lock_file = {
-                Some(
-                    Self::acquire_write_lock(&table_path)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
-                )
-            };
+            let lock_file = Self::acquire_write_lock(&table_path)
+                        .map_err(|e| PyIOError::new_err(e.to_string()))?;
 
             // Use StorageEngine for unified delete
             let deleted = crate::Database::delete(&table_path, &ids_u64, durability)
@@ -1697,7 +1669,9 @@ impl ApexStorageImpl {
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             let result = crate::Database::replace(&table_path, id as u64, &fields, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
-            Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
             result
         });
 
@@ -1752,7 +1726,9 @@ impl ApexStorageImpl {
             let result = crate::Database::add_column(&table_path, &column_name, dtype, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
-            Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
             result
         });
 
@@ -1803,7 +1779,9 @@ impl ApexStorageImpl {
                 durability,
             )
             .map_err(|e| PyIOError::new_err(e.to_string()));
-            Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
             result
         });
         self.invalidate_backend(&table_name);
@@ -1825,7 +1803,9 @@ impl ApexStorageImpl {
                 durability,
             )
             .map_err(|e| PyIOError::new_err(e.to_string()));
-            Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
             result
         });
         self.invalidate_backend(&table_name);
@@ -1850,7 +1830,9 @@ impl ApexStorageImpl {
             let result = crate::Database::drop_column(&table_path, &column_name, durability)
                 .map_err(|e| PyIOError::new_err(e.to_string()));
 
-            Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
             result
         });
 
@@ -1877,7 +1859,9 @@ impl ApexStorageImpl {
                 crate::Database::rename_column(&table_path, &old_name, &new_name, durability)
                     .map_err(|e| PyIOError::new_err(e.to_string()));
 
-            Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
+            }
             result
         });
 
@@ -1931,10 +1915,8 @@ impl ApexStorageImpl {
 
             let any_needs_save = actions.iter().any(|(_, needs_save)| *needs_save);
             let lock_file = if any_needs_save {
-                Some(
-                    Self::acquire_write_lock(&table_path)
-                        .map_err(|e| PyIOError::new_err(e.to_string()))?,
-                )
+                Self::acquire_write_lock(&table_path)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?
             } else {
                 None
             };
@@ -1955,8 +1937,8 @@ impl ApexStorageImpl {
                 Ok(())
             })();
 
-            if let Some(lock_file) = lock_file {
-                Self::release_lock(lock_file);
+            if let Some(lf) = lock_file {
+                Self::release_lock(lf);
             }
             result.map(|_| any_needs_save)
         })?;
@@ -2036,6 +2018,9 @@ impl ApexStorageImpl {
                     let _ = backend.save();
                 }
             }
+            if self.in_memory {
+                crate::Database::drop_memory_database(&self.root_dir);
+            }
         });
 
         // Clear per-instance cached backends (releases per-instance references)
@@ -2049,13 +2034,17 @@ impl ApexStorageImpl {
         // can rewrite or delete `.apex_tables` after the client closes
         // (OS error 1224 otherwise). The default database lives at root_dir;
         // a named database lives at base_dir.
-        crate::storage::table_catalog::release(&self.root_dir);
-        if self.root_dir != base_dir {
-            crate::storage::table_catalog::release(&base_dir);
+        if !self.in_memory {
+            crate::storage::table_catalog::release(&self.root_dir);
+            if self.root_dir != base_dir {
+                crate::storage::table_catalog::release(&base_dir);
+            }
         }
 
         // Clean up temp tables
-        let _ = fs::remove_dir_all(&self.temp_dir);
+        if !self.in_memory {
+            let _ = fs::remove_dir_all(&self.temp_dir);
+        }
 
         // On Windows: release all mmaps so temp directories can be cleaned up.
         // On Unix: mmaps remain valid after atomic rename; keep STORAGE_CACHE alive

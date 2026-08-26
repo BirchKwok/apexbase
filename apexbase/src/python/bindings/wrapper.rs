@@ -561,11 +561,14 @@ impl EpochBackendCache {
 /// - Multi-database support: named databases stored in subdirectories
 #[pyclass(name = "ApexStorage")]
 pub struct ApexStorageImpl {
+    /// True for the process-local backend selected by the reserved memory URI.
+    in_memory: bool,
     /// Root directory (top-level dir; contains both default tables and named-db subdirs)
     root_dir: PathBuf,
     /// Current database name. "" or "default" means root_dir (backward-compat default).
     /// Named databases (e.g. "analytics") reside at root_dir/analytics/.
     current_database: RwLock<String>,
+    memory_databases: RwLock<std::collections::HashSet<String>>,
     /// Current base directory = root_dir (default) or root_dir/db_name (named db).
     /// Updated atomically by use_database_().
     base_dir: RwLock<PathBuf>,
@@ -763,7 +766,12 @@ impl ApexStorageImpl {
     /// Acquire a lock on the table (shared for read, exclusive for write).
     /// Uses retry with exponential backoff (100µs → 200µs → ... → 50ms max total wait).
     /// This avoids spurious "Database is locked" errors under concurrent load.
-    fn acquire_lock(table_path: &Path, exclusive: bool) -> io::Result<File> {
+    fn acquire_lock(table_path: &Path, exclusive: bool) -> io::Result<Option<File>> {
+        // Process-local memory databases have no on-disk file to coordinate;
+        // the in-process locks are sufficient and no lock sidecar may be created.
+        if crate::storage::is_memory_path(table_path) {
+            return Ok(None);
+        }
         let lock_path = Self::get_lock_path(table_path);
         let lock_file = OpenOptions::new()
             .read(true)
@@ -786,7 +794,7 @@ impl ApexStorageImpl {
             };
 
             match result {
-                Ok(()) => return Ok(lock_file),
+                Ok(()) => return Ok(Some(lock_file)),
                 Err(_) if start.elapsed() < max_wait => {
                     std::thread::sleep(backoff);
                     backoff = (backoff * 2).min(std::time::Duration::from_millis(5));
@@ -806,12 +814,12 @@ impl ApexStorageImpl {
     }
 
     #[inline]
-    fn acquire_read_lock(table_path: &Path) -> io::Result<File> {
+    fn acquire_read_lock(table_path: &Path) -> io::Result<Option<File>> {
         Self::acquire_lock(table_path, false)
     }
 
     #[inline]
-    fn acquire_write_lock(table_path: &Path) -> io::Result<File> {
+    fn acquire_write_lock(table_path: &Path) -> io::Result<Option<File>> {
         Self::acquire_lock(table_path, true)
     }
 
@@ -1505,9 +1513,11 @@ impl ApexStorageImpl {
                 durability
             ))
         })?;
-        // Convert to absolute path to avoid issues with relative paths
+        let in_memory = path.starts_with(crate::storage::MEMORY_PATH_PREFIX);
+        // Convert disk paths to absolute paths. Memory URIs are stable logical
+        // cache keys and must never be resolved against the working directory.
         let path_obj = PathBuf::from(path);
-        let abs_path = if path_obj.is_absolute() {
+        let abs_path = if in_memory || path_obj.is_absolute() {
             path_obj
         } else {
             std::env::current_dir()
@@ -1520,7 +1530,9 @@ impl ApexStorageImpl {
             .unwrap_or_else(|| PathBuf::from("."));
 
         // Handle drop_if_exists
-        if drop_if_exists {
+        if drop_if_exists && in_memory {
+            crate::Database::drop_memory_database(&root_dir);
+        } else if drop_if_exists {
             crate::Database::invalidate_dir(&root_dir);
             crate::Database::unregister_fts_manager(&root_dir);
             let _ = crate::storage::table_catalog::clear(&root_dir);
@@ -1547,11 +1559,17 @@ impl ApexStorageImpl {
         // Existing .apex files in the directory are discovered lazily via use_table() or list_tables()
 
         let temp_dir = root_dir.join(".apex_tmp");
-        let _ = fs::create_dir_all(&temp_dir);
+        if !in_memory {
+            let _ = fs::create_dir_all(&temp_dir);
+        }
 
         Ok(Self {
+            in_memory,
             root_dir: root_dir.clone(),
             current_database: RwLock::new(String::new()),
+            memory_databases: RwLock::new(std::collections::HashSet::from([
+                "default".to_string(),
+            ])),
             base_dir: RwLock::new(root_dir),
             table_paths: RwLock::new(HashMap::new()),
             tables_scanned: RwLock::new(false),

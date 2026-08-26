@@ -147,12 +147,18 @@ impl ApexExecutor {
                 .collect());
         }
 
-        crate::storage::table_catalog::ensure_table_file(
-            storage_path,
-            crate::storage::DurabilityLevel::Fast,
-        )?;
+        if !crate::storage::is_memory_path(storage_path) {
+            crate::storage::table_catalog::ensure_table_file(
+                storage_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+        }
 
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        let storage = if crate::storage::is_memory_path(storage_path) {
+            crate::Database::read_backend(storage_path)?
+        } else {
+            std::sync::Arc::new(TableStorageBackend::open_for_write(storage_path)?)
+        };
         let col_names: Vec<String> = if let Some(cols) = columns {
             cols.to_vec()
         } else {
@@ -242,12 +248,18 @@ impl ApexExecutor {
     pub(in crate::query::executor) fn resolve_default_values_insert_for_path(
         storage_path: &Path,
     ) -> io::Result<(Vec<String>, Vec<Vec<Value>>)> {
-        crate::storage::table_catalog::ensure_table_file(
-            storage_path,
-            crate::storage::DurabilityLevel::Fast,
-        )?;
+        if !crate::storage::is_memory_path(storage_path) {
+            crate::storage::table_catalog::ensure_table_file(
+                storage_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+        }
 
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        let storage = if crate::storage::is_memory_path(storage_path) {
+            crate::Database::read_backend(storage_path)?
+        } else {
+            std::sync::Arc::new(TableStorageBackend::open_for_write(storage_path)?)
+        };
         let schema = storage.get_schema();
         let schema_types: std::collections::HashMap<String, crate::storage::on_demand::ColumnType> =
             schema
@@ -301,17 +313,23 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         use std::collections::HashMap;
 
-        crate::storage::table_catalog::ensure_table_file(
-            storage_path,
-            crate::storage::DurabilityLevel::Fast,
-        )?;
+        if !crate::storage::is_memory_path(storage_path) {
+            crate::storage::table_catalog::ensure_table_file(
+                storage_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+        }
         let _epoch_write = crate::storage::epoch::logical_write(storage_path);
 
         // Invalidate cache before write
         invalidate_storage_cache(storage_path);
 
         // Use open_for_write to load all data (needed for correct column alignment)
-        let storage = TableStorageBackend::open_for_write(storage_path)?;
+        let storage = if crate::storage::is_memory_path(storage_path) {
+            crate::Database::read_backend(storage_path)?
+        } else {
+            std::sync::Arc::new(TableStorageBackend::open_for_write(storage_path)?)
+        };
 
         // Get column names from schema or explicit list
         let col_names: Vec<String> = if let Some(cols) = columns {
@@ -726,7 +744,9 @@ impl ApexExecutor {
 
                     // Open referenced table
                     let ref_path = base_dir.join(format!("{}.apex", ref_table));
-                    if !crate::storage::table_catalog::file_exists_or_registered(&ref_path)? {
+                    if !crate::storage::engine::engine().table_exists(&ref_path)
+                        && !crate::storage::table_catalog::file_exists_or_registered(&ref_path)?
+                    {
                         return Err(io::Error::new(
                             io::ErrorKind::NotFound,
                             format!(
@@ -735,11 +755,15 @@ impl ApexExecutor {
                             ),
                         ));
                     }
-                    crate::storage::table_catalog::ensure_table_file(
-                        &ref_path,
-                        crate::storage::DurabilityLevel::Fast,
-                    )?;
-                    let ref_storage = TableStorageBackend::open(&ref_path)?;
+                    let ref_storage = if crate::storage::is_memory_path(&ref_path) {
+                        crate::Database::read_backend(&ref_path)?
+                    } else {
+                        crate::storage::table_catalog::ensure_table_file(
+                            &ref_path,
+                            crate::storage::DurabilityLevel::Fast,
+                        )?;
+                        std::sync::Arc::new(TableStorageBackend::open(&ref_path)?)
+                    };
                     let ref_batch =
                         ref_storage.read_columns_to_arrow(Some(&[ref_column.as_str()]), 0, None)?;
                     let ref_col_arr = ref_batch.column_by_name(ref_column);
@@ -804,9 +828,9 @@ impl ApexExecutor {
             }
         }
 
-        let storage = if storage.has_delta() {
+        let storage = if storage.has_delta() && !crate::storage::is_memory_path(storage_path) {
             storage.compact()?;
-            TableStorageBackend::open_for_write(storage_path)?
+            std::sync::Arc::new(TableStorageBackend::open_for_write(storage_path)?)
         } else {
             storage
         };

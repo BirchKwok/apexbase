@@ -1899,3 +1899,11 @@ fn vector_derivation_schema_roundtrips_and_validates_dependencies() {
     assert!(schema.remove_vector_derivation("embedding_tq4"));
     assert!(schema.vector_derivations.is_empty());
 }
+
+#[test]
+fn filtered_aggregation_parallelism_requires_enough_rows_per_worker() {
+    assert!(!should_parallel_filtered_agg(1_000_000, 16, 10));
+    assert!(should_parallel_filtered_agg(4_000_000, 16, 10));
+    assert!(!should_parallel_filtered_agg(4_000_000, 1, 10));
+    assert!(!should_parallel_filtered_agg(4_000_000, 16, 1));
+}

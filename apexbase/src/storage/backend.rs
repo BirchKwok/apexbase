@@ -18,7 +18,8 @@ use arrow::record_batch::RecordBatch;
 
 use crate::data::{DataType, Value};
 use crate::storage::on_demand::{
-    ColumnData, ColumnType, ColumnValue, CompressionType, OnDemandStorage, SchemaStableValue,
+    ColumnData, ColumnType, ColumnValue, CompressionType, OnDemandSchema, OnDemandStorage,
+    SchemaStableValue,
 };
 use crate::table::arrow_column::ArrowStringColumn;
 use crate::table::column_table::{BitVec, TypedColumn};
@@ -737,6 +738,25 @@ impl TableStorageBackend {
             dict_cache: RwLock::new(HashMap::new()),
             first_string_row_id_cache: RwLock::new(HashMap::new()),
         })
+    }
+
+    pub fn create_with_schema_object_and_durability(
+        path: &Path,
+        durability: super::DurabilityLevel,
+        schema: OnDemandSchema,
+    ) -> io::Result<Self> {
+        let storage = OnDemandStorage::create_with_schema_object_and_durability(
+            path, durability, schema,
+        )?;
+        Ok(Self::from_storage(path, storage))
+    }
+
+    pub fn truncate_in_memory(&self) -> io::Result<()> {
+        self.storage.truncate_in_memory()?;
+        *self.row_count.write() = 0;
+        *self.dirty.write() = true;
+        self.invalidate_read_caches();
+        Ok(())
     }
 
     pub fn open(path: &Path) -> io::Result<Self> {
@@ -2214,7 +2234,11 @@ impl TableStorageBackend {
         let base_rows = self.base_row_count();
         let has_delta =
             self.has_delta() || self.row_count() > base_rows || self.active_row_count() > base_rows;
-        let use_cache = start_row == 0 && row_count.is_none() && !has_delta;
+        // In-memory tables always read from the authoritative `columns` buffers
+        // (deleted bitmap + nulls applied), never from mmap, so the delta-state
+        // gate must not force them onto the file-backed fallback.
+        let in_memory = self.storage.is_in_memory();
+        let use_cache = in_memory || (start_row == 0 && row_count.is_none() && !has_delta);
 
         // OPTIMIZATION: V4 fast path — build Arrow directly from in-memory or mmap columns
         // Bypasses read_columns→HashMap→get_null_mask→Vec<bool> pipeline entirely
@@ -2232,7 +2256,7 @@ impl TableStorageBackend {
         // OPTIMIZATION: V4 fast path for LIMIT reads (start_row=0, row_count=Some)
         // Use to_arrow_batch_with_limit which leverages RCIX for O(1) column seeks —
         // reads only the needed rows instead of loading the full table.
-        if start_row == 0 && row_count.is_some() && !has_delta {
+        if start_row == 0 && row_count.is_some() && (in_memory || !has_delta) {
             let limit = row_count.unwrap();
             if let Ok(batch) = self.storage.to_arrow_batch_with_limit(
                 column_names,

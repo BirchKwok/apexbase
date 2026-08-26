@@ -470,6 +470,7 @@ impl FtsEngine {
 
 pub struct FtsManager {
     base_path: PathBuf,
+    in_memory: bool,
     engines: RwLock<HashMap<String, Arc<FtsEngine>>>,
     table_configs: RwLock<HashMap<String, FtsConfig>>,
     default_config: FtsConfig,
@@ -478,9 +479,13 @@ pub struct FtsManager {
 impl FtsManager {
     pub fn new<P: AsRef<Path>>(base_path: P, config: FtsConfig) -> Self {
         let base_path = base_path.as_ref().to_path_buf();
-        let _ = fs::create_dir_all(&base_path);
+        let in_memory = crate::storage::is_memory_path(&base_path);
+        if !in_memory {
+            let _ = fs::create_dir_all(&base_path);
+        }
         Self {
             base_path,
+            in_memory,
             engines: RwLock::new(HashMap::new()),
             table_configs: RwLock::new(HashMap::new()),
             default_config: config,
@@ -510,8 +515,12 @@ impl FtsManager {
             .get(table_name)
             .cloned()
             .unwrap_or_else(|| self.default_config.clone());
-        let index_path = self.base_path.join(format!("{table_name}.afts"));
-        let engine = Arc::new(FtsEngine::new(index_path, config)?);
+        let engine = if self.in_memory {
+            Arc::new(FtsEngine::memory_only(config)?)
+        } else {
+            let index_path = self.base_path.join(format!("{table_name}.afts"));
+            Arc::new(FtsEngine::new(index_path, config)?)
+        };
         engines.insert(table_name.to_string(), Arc::clone(&engine));
         Ok(engine)
     }

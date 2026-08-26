@@ -9,6 +9,21 @@ pub struct NativeStringGroupAgg {
     pub max_values: Vec<Option<String>>,
 }
 
+// Rayon dispatch is visible at sub-millisecond scale when a filtered numeric
+// aggregation is split into the default 65K-row groups.  Require enough work
+// per participating worker to amortize scheduling and wake-up costs; this keeps
+// moderate tables deterministic under background CPU load while retaining
+// parallel scans for genuinely large tables.
+const FILTERED_AGG_MIN_ROWS_PER_WORKER: usize = 262_144;
+
+#[inline]
+fn should_parallel_filtered_agg(row_count: usize, row_group_count: usize, threads: usize) -> bool {
+    let workers = row_group_count.min(threads);
+    workers > 1
+        && row_count
+            >= workers.saturating_mul(FILTERED_AGG_MIN_ROWS_PER_WORKER)
+}
+
 #[inline(never)]
 unsafe fn aggregate_validated_2col_count_f64(
     group_ids1: &[u16],
@@ -1763,7 +1778,11 @@ impl OnDemandStorage {
             part
         };
 
-        let parts: Vec<Part> = if row_groups.len() > 1 && group_ids.len() >= 131_072 {
+        let parts: Vec<Part> = if should_parallel_filtered_agg(
+            group_ids.len(),
+            row_groups.len(),
+            rayon::current_num_threads(),
+        ) {
             use rayon::prelude::*;
             row_groups.par_iter().map(scan).collect()
         } else {
