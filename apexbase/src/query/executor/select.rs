@@ -31,6 +31,11 @@ impl ApexExecutor {
             }
         }
 
+        // FAST PATH: sparse-read deep OFFSET (ORDER BY low-card numeric, string LIMIT/OFFSET).
+        if let Ok(Some(result)) = Self::try_fast_deep_offset(&stmt, storage_path) {
+            return Ok(result);
+        }
+
         // FAST PATH: explode_rename(topk_distance(col,[q],k,'m'), "name1", "name2") FROM table
         // Single-pass O(n log k) topk that generates k rows with 2 user-named columns.
         if let Some((col, query, k, metric, names)) = Self::detect_topk_explode(&stmt) {
@@ -122,6 +127,11 @@ impl ApexExecutor {
                     {
                         return Ok(ApexResult::Data(count_batch));
                     }
+                    if let Some(count_batch) =
+                        Self::try_fast_csv_count_table_function(&stmt, func, file, options)?
+                    {
+                        return Ok(ApexResult::Data(count_batch));
+                    }
                     let mut opts = options.clone();
                     if let Some(ref wc) = stmt.where_clause {
                         if let Some(pushdown) = Self::try_extract_filter_for_pushdown(wc) {
@@ -131,9 +141,16 @@ impl ApexExecutor {
                     if let Some(columns) = Self::get_col_refs(&stmt) {
                         opts.push(("columns".to_string(), columns.join("\u{1f}")));
                     }
-                    Self::read_table_function(func, file, &opts)?
+                    let row_limit = Self::simple_file_row_limit(&stmt);
+                    Self::read_table_function(func, file, &opts, row_limit)?
                 }
-                Some(FromItem::DirectFile { file, .. }) => Self::read_direct_file(file)?,
+                Some(FromItem::DirectFile { file, .. }) => {
+                    if let Some(count_batch) = Self::try_fast_csv_count_direct_file(&stmt, file)? {
+                        return Ok(ApexResult::Data(count_batch));
+                    }
+                    let row_limit = Self::simple_file_row_limit(&stmt);
+                    Self::read_direct_file(file, row_limit)?
+                }
                 Some(
                     FromItem::LateralExplode { .. }
                     | FromItem::LateralPosExplode { .. }
@@ -331,6 +348,11 @@ impl ApexExecutor {
                                 }
                                 if let Some(result) =
                                     Self::try_fast_dict_scalar_count(&backend, &stmt)?
+                                {
+                                    return Ok(result);
+                                }
+                                if let Some(result) =
+                                    Self::try_fast_exists_count(&backend, &stmt)?
                                 {
                                     return Ok(result);
                                 }
@@ -1395,6 +1417,37 @@ impl ApexExecutor {
         };
 
         Ok(ApexResult::Data(result))
+    }
+
+    /// Rows to read from a direct-file / table-function source when the query is a
+    /// plain `SELECT … LIMIT k [OFFSET o]` with no WHERE, ORDER BY, GROUP BY, HAVING,
+    /// DISTINCT, aggregation, expression or window column.  In that case the LIMIT is
+    /// applied in file order, so only the first `k + o` rows need to be materialized.
+    fn simple_file_row_limit(stmt: &SelectStatement) -> Option<usize> {
+        if stmt.where_clause.is_some()
+            || !stmt.order_by.is_empty()
+            || !stmt.group_by.is_empty()
+            || !stmt.group_by_exprs.is_empty()
+            || stmt.having.is_some()
+            || stmt.distinct
+            || stmt.distinct_on.is_some()
+            || !stmt.joins.is_empty()
+        {
+            return None;
+        }
+        for col in &stmt.columns {
+            match col {
+                SelectColumn::All
+                | SelectColumn::AllExclude(..)
+                | SelectColumn::AllReplace(..)
+                | SelectColumn::Columns(..)
+                | SelectColumn::Column(_)
+                | SelectColumn::ColumnAlias { .. } => {}
+                _ => return None,
+            }
+        }
+        let limit = stmt.limit?;
+        Some(limit + stmt.offset.unwrap_or(0))
     }
 
     /// True when the statement is exactly `SELECT COUNT(*)` / `COUNT(1)` with
@@ -3292,6 +3345,111 @@ impl ApexExecutor {
             .map_err(|e| err_data(e.to_string()))
     }
 
+    /// Fast `COUNT(*)`/`COUNT(1)` over a `READ_CSV(...)` table function.
+    /// Allows a non-trivial `LIMIT`/`OFFSET` only when it is a no-op on the
+    /// single-row COUNT result (no offset, limit == 0 disallowed).
+    fn try_fast_csv_count_table_function(
+        stmt: &SelectStatement,
+        func: &str,
+        file: &str,
+        options: &[(String, String)],
+    ) -> io::Result<Option<RecordBatch>> {
+        if !func.eq_ignore_ascii_case("READ_CSV") || stmt.where_clause.is_some() {
+            return Ok(None);
+        }
+        let Some(output_name) = Self::count_output_name_allowing_limit(stmt) else {
+            return Ok(None);
+        };
+        let Some(count) = Self::try_fast_csv_count(file, options)? else {
+            return Ok(None);
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            &output_name,
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+        RecordBatch::try_new(schema, vec![array])
+            .map(Some)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    /// Fast `COUNT(*)`/`COUNT(1)` over a DuckDB-style direct file `'path.csv'`.
+    fn try_fast_csv_count_direct_file(
+        stmt: &SelectStatement,
+        file: &str,
+    ) -> io::Result<Option<RecordBatch>> {
+        if stmt.where_clause.is_some() {
+            return Ok(None);
+        }
+        let Some(output_name) = Self::count_output_name_allowing_limit(stmt) else {
+            return Ok(None);
+        };
+        let lower = file.to_lowercase();
+        let count = if lower.ends_with(".csv") {
+            Self::try_fast_csv_count(file, &[])?
+        } else if lower.ends_with(".tsv") {
+            Self::try_fast_csv_count(file, &[("delimiter".to_string(), "\t".to_string())])?
+        } else {
+            return Ok(None);
+        };
+        let Some(count) = count else {
+            return Ok(None);
+        };
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            &output_name,
+            ArrowDataType::Int64,
+            false,
+        )]));
+        let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+        RecordBatch::try_new(schema, vec![array])
+            .map(Some)
+            .map_err(|e| err_data(e.to_string()))
+    }
+
+    /// Like `count_star_output_name_for_table_fn`, but permits a `LIMIT>=1`
+    /// with no `OFFSET` — a no-op on the single-row COUNT result — so the fast
+    /// CSV count still applies to `SELECT COUNT(*) FROM file LIMIT 100`.
+    fn count_output_name_allowing_limit(stmt: &SelectStatement) -> Option<String> {
+        if !stmt.group_by.is_empty()
+            || stmt.having.is_some()
+            || !stmt.joins.is_empty()
+            || !stmt.order_by.is_empty()
+            || stmt.limit == Some(0)
+            || stmt.offset.unwrap_or(0) != 0
+        {
+            return None;
+        }
+        match stmt.columns.len() {
+            1 => match &stmt.columns[0] {
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    distinct,
+                    alias,
+                } if matches!(func, AggregateFunc::Count) && !distinct => {
+                    let column_ok = column
+                        .as_ref()
+                        .map(|c| {
+                            c == "*"
+                                || c.chars()
+                                    .next()
+                                    .map(|ch| ch.is_ascii_digit())
+                                    .unwrap_or(false)
+                        })
+                        .unwrap_or(true);
+                    if column_ok {
+                        Some(alias.clone().unwrap_or_else(|| "COUNT(*)".to_string()))
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     /// V4 FAST PATH: Simple aggregation (no GROUP BY, no WHERE)
     /// Handles: SELECT COUNT(*), AVG(col), SUM(col), MIN(col), MAX(col) FROM table
     fn try_fast_simple_agg(
@@ -3778,6 +3936,374 @@ impl ApexExecutor {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
             .map_err(|e| err_data(e.to_string()))?;
         Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// V4 FAST PATH: COUNT(*) WHERE EXISTS (correlated subquery).
+    /// Decorrelates the `inner_col = outer_col` equality (plus any other inner
+    /// predicates) into a single non-correlated subquery, collects the set of
+    /// qualifying inner values once, then counts matching outer rows at the
+    /// storage layer via `count_string_in_set_mmap` — avoiding both the full
+    /// Arrow batch and the 1M-row boolean mask.
+    fn try_fast_exists_count(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use std::sync::Arc;
+
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
+        {
+            return Ok(None);
+        }
+        if !Self::is_simple_count_star(stmt) {
+            return Ok(None);
+        }
+        let where_clause = match &stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+        let sub_stmt = match where_clause {
+            SqlExpr::ExistsSubquery { stmt } => stmt.as_ref(),
+            _ => return Ok(None),
+        };
+        let sub_where = match &sub_stmt.where_clause {
+            Some(w) => w,
+            None => return Ok(None),
+        };
+
+        // Resolve the subquery's table path from its FROM clause.
+        let subquery_path = Self::resolve_subquery_table_path(sub_stmt, backend.path())?;
+
+        // Detect outer column references.  find_outer_column_refs only reads the
+        // outer batch's schema (column names), so a 0-row batch with the main
+        // table's columns is sufficient and avoids materializing any rows.
+        let outer_schema = Arc::new(Schema::new(
+            backend
+                .column_names()
+                .iter()
+                .map(|n| Field::new(n.as_str(), ArrowDataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ));
+        let empty_outer = RecordBatch::new_empty(outer_schema);
+        let outer_cols = Self::find_outer_column_refs(sub_stmt, &empty_outer);
+        if outer_cols.is_empty() {
+            return Ok(None); // non-correlated EXISTS — handled by the generic path
+        }
+
+        let (outer_col, inner_col, remaining_pred) =
+            match Self::extract_correlation_equality(sub_where, &outer_cols) {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+
+        // If the remaining predicate still references outer columns we cannot
+        // decorrelate safely — fall back.
+        if let Some(ref remaining) = remaining_pred {
+            let mut refs = Vec::new();
+            Self::collect_outer_refs_from_expr(remaining, &outer_cols, "", &mut refs);
+            let mut refs2 = Vec::new();
+            let unqualified: Vec<String> = outer_cols
+                .iter()
+                .map(|s| {
+                    if let Some(d) = s.rfind('.') {
+                        s[d + 1..].to_string()
+                    } else {
+                        s.clone()
+                    }
+                })
+                .collect();
+            Self::collect_outer_refs_from_expr(remaining, &unqualified, "", &mut refs2);
+            if !refs.is_empty() || !refs2.is_empty() {
+                return Ok(None);
+            }
+        }
+
+        // Build the decorrelated subquery: SELECT inner_col FROM ... WHERE remaining_pred.
+        let mut decorrelated = sub_stmt.clone();
+        decorrelated.columns = vec![SelectColumn::Column(inner_col.clone())];
+        decorrelated.where_clause = remaining_pred;
+        let sub_result = Self::execute_select(decorrelated, &subquery_path)?;
+        let sub_batch = sub_result.to_record_batch()?;
+        if sub_batch.num_columns() == 0 {
+            let count = 0i64;
+            let mut fields = Vec::with_capacity(stmt.columns.len());
+            let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+            for c in &stmt.columns {
+                if let SelectColumn::Aggregate { alias, column, .. } = c {
+                    let output = alias.clone().unwrap_or_else(|| {
+                        format!("COUNT({})", column.as_deref().unwrap_or("*"))
+                    });
+                    fields.push(Field::new(output, ArrowDataType::Int64, false));
+                    arrays.push(Arc::new(Int64Array::from(vec![count])) as ArrayRef);
+                }
+            }
+            let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                .map_err(|e| err_data(e.to_string()))?;
+            return Ok(Some(ApexResult::Data(batch)));
+        }
+
+        // Collect the inner join-column values.
+        let sub_col = sub_batch.column(0);
+        let mut values: Vec<String> = Vec::with_capacity(sub_batch.num_rows());
+        for i in 0..sub_batch.num_rows() {
+            if sub_col.is_null(i) {
+                continue;
+            }
+            values.push(Self::arrow_value_to_string(sub_col, i));
+        }
+
+        // Resolve the outer column name (strip table prefix) and confirm it is a
+        // string column eligible for the set-count fast path.
+        let outer_col_clean = if let Some(dot_pos) = outer_col.rfind('.') {
+            &outer_col[dot_pos + 1..]
+        } else {
+            &outer_col
+        };
+        if !Self::column_is_string(backend, outer_col_clean) {
+            return Ok(None);
+        }
+
+        let count = match backend.count_string_in_set_mmap(outer_col_clean, &values)? {
+            Some(c) => c,
+            None => return Ok(None),
+        };
+
+        // Mirror execute_aggregation's one-row COUNT output shape.
+        let mut fields = Vec::with_capacity(stmt.columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+        for c in &stmt.columns {
+            if let SelectColumn::Aggregate { alias, column, .. } = c {
+                let output = alias.clone().unwrap_or_else(|| {
+                    format!("COUNT({})", column.as_deref().unwrap_or("*"))
+                });
+                fields.push(Field::new(output, ArrowDataType::Int64, false));
+                arrays.push(Arc::new(Int64Array::from(vec![count])) as ArrayRef);
+            }
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        Ok(Some(ApexResult::Data(batch)))
+    }
+
+    /// Deep OFFSET fast path: `SELECT <cols> ORDER BY <low-card numeric>, <string>
+    /// LIMIT k OFFSET o` with no WHERE / GROUP BY / aggregation.  Reads only the
+    /// leading numeric column, buckets it to find the top-(k+o) boundary, then reads
+    /// the order/projected columns sparsely (only the boundary rows) before sorting —
+    /// avoiding materializing the full high-cardinality string column.
+    fn try_fast_deep_offset(
+        stmt: &SelectStatement,
+        storage_path: &Path,
+    ) -> io::Result<Option<ApexResult>> {
+        use arrow::array::Int64Array;
+
+        if stmt.where_clause.is_some()
+            || !stmt.group_by.is_empty()
+            || stmt.distinct
+            || stmt.having.is_some()
+            || !stmt.joins.is_empty()
+        {
+            return Ok(None);
+        }
+        for c in &stmt.columns {
+            match c {
+                SelectColumn::Column(_) | SelectColumn::ColumnAlias { .. } => {}
+                _ => return Ok(None),
+            }
+        }
+        if stmt.order_by.len() != 2 {
+            return Ok(None);
+        }
+        let o0 = &stmt.order_by[0];
+        let o1 = &stmt.order_by[1];
+        if o0.descending || o1.descending || o0.expr.is_some() || o1.expr.is_some() {
+            return Ok(None);
+        }
+        let c0 = Self::clean_order_col(&o0.column).to_string();
+        let c1 = Self::clean_order_col(&o1.column).to_string();
+        let limit = match stmt.limit {
+            Some(l) => l,
+            None => return Ok(None),
+        };
+        let offset = stmt.offset.unwrap_or(0);
+        let k = limit + offset;
+        if k == 0 {
+            return Ok(None);
+        }
+        if stmt.from.is_none() {
+            return Ok(None);
+        }
+        // Read only the leading numeric column (cheap — no string materialization).
+        let backend = get_cached_backend(storage_path)?;
+        let num_batch = backend.read_columns_to_arrow(Some(&[c0.as_str()]), 0, None)?;
+        if num_batch.num_columns() == 0 {
+            return Ok(None);
+        }
+        let num_arr = num_batch.column(0);
+        let num_arr = match num_arr.as_any().downcast_ref::<Int64Array>() {
+            Some(arr) => arr,
+            None => return Ok(None),
+        };
+        let n = num_arr.len();
+        if k >= n || num_arr.null_count() > 0 {
+            return Ok(None);
+        }
+        let (candidates, before, boundary_only) = match Self::bucket_candidates(num_arr, k, offset)
+        {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+        let order_refs = vec![c0.as_str(), c1.as_str()];
+        let result = backend.read_columns_by_indices_to_arrow(&candidates, Some(&order_refs))?;
+        if result.num_rows() == 0 {
+            return Ok(None);
+        }
+        // When the output lies entirely within the boundary bucket, only that bucket
+        // was read; the in-bucket offset is (offset - before), otherwise it is offset.
+        let partial_offset = if boundary_only { offset - before } else { offset };
+        let needed = partial_offset + limit;
+        let sorted = Self::apply_order_by_topk(&result, &stmt.order_by, Some(needed))?;
+        let limited = sorted.slice(partial_offset.min(sorted.num_rows()), limit.min(sorted.num_rows().saturating_sub(partial_offset)));
+        let projected =
+            Self::apply_projection_with_storage(&limited, &stmt.columns, Some(storage_path))?;
+        Ok(Some(ApexResult::Data(projected)))
+    }
+
+    /// Collect the row indices to materialize for a bucket-based deep OFFSET, plus
+    /// the count of rows strictly below the boundary key.  When `offset >= before`
+    /// the output lies entirely inside the boundary bucket, so only that bucket's
+    /// rows are returned (`boundary_only = true`) — far fewer scattered reads.
+    fn bucket_candidates(
+        num_arr: &Int64Array,
+        k: usize,
+        offset: usize,
+    ) -> Option<(Vec<usize>, usize, bool)> {
+        use ahash::AHashMap;
+        let n = num_arr.len();
+        // For a small bounded integer range, histogram with a direct-indexed count
+        // array (much faster than a HashMap over 1M rows); otherwise fall back.
+        let mut min_v = i64::MAX;
+        let mut max_v = i64::MIN;
+        for i in 0..n {
+            let v = num_arr.value(i);
+            if v < min_v {
+                min_v = v;
+            }
+            if v > max_v {
+                max_v = v;
+            }
+        }
+        if max_v < min_v {
+            return None;
+        }
+        if (max_v - min_v + 1) as u64 <= 4096 {
+            let lo = min_v;
+            let size = (max_v - min_v + 1) as usize;
+            let mut counts = vec![0i64; size];
+            for i in 0..n {
+                counts[(num_arr.value(i) - lo) as usize] += 1;
+            }
+            // Distinct used values, in ascending order.
+            let mut used: Vec<i64> = Vec::new();
+            for i in 0..size {
+                if counts[i] > 0 {
+                    used.push(lo + i as i64);
+                }
+            }
+            let mut cum: i64 = 0;
+            let mut boundary = 0i64;
+            let mut before: i64 = 0;
+            let mut found = false;
+            for &v in &used {
+                let cnt = counts[(v - lo) as usize];
+                if cum + cnt >= k as i64 {
+                    boundary = v;
+                    before = cum;
+                    found = true;
+                    break;
+                }
+                cum += cnt;
+            }
+            if !found {
+                return None;
+            }
+            let before = before as usize;
+            let boundary_count = counts[(boundary - lo) as usize] as usize;
+            let boundary_only = offset >= before;
+            let cap = if boundary_only {
+                boundary_count
+            } else {
+                before + boundary_count
+            };
+            let mut rows = Vec::with_capacity(cap);
+            for i in 0..n {
+                let v = num_arr.value(i);
+                if boundary_only {
+                    if v == boundary {
+                        rows.push(i);
+                    }
+                } else if v <= boundary {
+                    rows.push(i);
+                }
+            }
+            Some((rows, before, boundary_only))
+        } else {
+            // Wide/negative range: HashMap-based histogram.
+            let mut counts: AHashMap<i64, i64> = AHashMap::new();
+            let mut keys: Vec<i64> = Vec::new();
+            for i in 0..n {
+                let v = num_arr.value(i);
+                match counts.get_mut(&v) {
+                    Some(c) => *c += 1,
+                    None => {
+                        counts.insert(v, 1);
+                        keys.push(v);
+                    }
+                }
+            }
+            if keys.is_empty() || keys.len() > 1024 {
+                return None;
+            }
+            keys.sort_unstable();
+            let mut cum: i64 = 0;
+            let mut boundary = 0i64;
+            let mut before: i64 = 0;
+            let mut found = false;
+            for &v in &keys {
+                let cnt = counts[&v];
+                if cum + cnt >= k as i64 {
+                    boundary = v;
+                    before = cum;
+                    found = true;
+                    break;
+                }
+                cum += cnt;
+            }
+            if !found {
+                return None;
+            }
+            let before = before as usize;
+            let boundary_count = counts[&boundary] as usize;
+            let boundary_only = offset >= before;
+            let cap = if boundary_only {
+                boundary_count
+            } else {
+                before + boundary_count
+            };
+            let mut rows = Vec::with_capacity(cap);
+            for i in 0..n {
+                let v = num_arr.value(i);
+                if boundary_only {
+                    if v == boundary {
+                        rows.push(i);
+                    }
+                } else if v <= boundary {
+                    rows.push(i);
+                }
+            }
+            Some((rows, before, boundary_only))
+        }
     }
 
     /// V4 FAST PATH: COUNT(*) WHERE <expr> <op> <literal>, where <expr> is a

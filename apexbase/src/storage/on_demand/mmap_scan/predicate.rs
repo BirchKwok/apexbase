@@ -1813,6 +1813,53 @@ impl OnDemandStorage {
                 let n = rg_rows;
                 let mut left_counts: Vec<i64> = vec![0; values.len()];
                 let mut right_counts: Vec<i64> = vec![0; values.len()];
+                let has_num_nulls = num_nulls.iter().any(|&b| b != 0);
+                let has_dict_nulls = dict_nulls.iter().any(|&b| b != 0);
+                // Tight loop when the row group has no nulls and no deletes:
+                // skip the three per-row bitmap checks that dominate the scan.
+                if !has_num_nulls && !has_dict_nulls && del_bytes.is_none() {
+                    match &num_col_data {
+                        ColumnData::Int64(v) => {
+                            if v.len() < n {
+                                return Ok(None);
+                            }
+                            for i in 0..n {
+                                let vv = v[i];
+                                let in_left = vv >= low1 && vv <= high1;
+                                let in_right = vv >= low2 && vv <= high2;
+                                if !in_left && !in_right {
+                                    continue;
+                                }
+                                if let Some(idx) = view.index(i).and_then(value_index) {
+                                    if idx < left_counts.len() {
+                                        left_counts[idx] += i64::from(in_left);
+                                        right_counts[idx] += i64::from(in_right);
+                                    }
+                                }
+                            }
+                        }
+                        ColumnData::Float64(v) => {
+                            if v.len() < n {
+                                return Ok(None);
+                            }
+                            for i in 0..n {
+                                let vv = v[i];
+                                let in_left = vv >= lo1 && vv <= hi1;
+                                let in_right = vv >= lo2 && vv <= hi2;
+                                if !in_left && !in_right {
+                                    continue;
+                                }
+                                if let Some(idx) = view.index(i).and_then(value_index) {
+                                    if idx < left_counts.len() {
+                                        left_counts[idx] += i64::from(in_left);
+                                        right_counts[idx] += i64::from(in_right);
+                                    }
+                                }
+                            }
+                        }
+                        _ => return Ok(None),
+                    }
+                } else {
                 match &num_col_data {
                     ColumnData::Int64(v) => {
                         if v.len() < n {
@@ -1875,6 +1922,7 @@ impl OnDemandStorage {
                         }
                     }
                     _ => return Ok(None),
+                }
                 }
                 Ok(Some(
                     values.into_iter()

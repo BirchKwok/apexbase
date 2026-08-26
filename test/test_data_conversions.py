@@ -613,6 +613,38 @@ class TestLanceConversions:
 
             client.close()
 
+    def test_to_lance_sanitizes_dotted_field_names(self):
+        """Lance rejects top-level field names containing '.', so writing a
+        result with such a column (e.g. a de-duplicated CSV header like
+        'Fwd Header Length.1') must rename it rather than raise."""
+        import lance
+
+        table = pa.table({
+            "Fwd Header Length.1": [80, 120],
+            "plain": ["a", "b"],
+            "Fwd Header Length_1": [1, 2],
+        })
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=os.path.join(temp_dir, "apex"))
+            result = ResultView(table.to_batches()[0])
+
+            lance_path = os.path.join(temp_dir, "dotted.lance")
+            result.to_lance(lance_path)
+
+            out = lance.dataset(lance_path).to_table()
+            names = out.column_names
+            # Dotted name is renamed to a unique '_' form not colliding with the
+            # pre-existing dotless 'Fwd Header Length_1' column.
+            assert "Fwd Header Length_1_1" in names
+            assert "plain" in names
+            assert "Fwd Header Length_1" in names
+            assert out.to_pylist() == [
+                {"Fwd Header Length_1_1": 80, "plain": "a", "Fwd Header Length_1": 1},
+                {"Fwd Header Length_1_1": 120, "plain": "b", "Fwd Header Length_1": 2},
+            ]
+            client.close()
+
 
 @pytest.mark.skipif(not (PANDAS_AVAILABLE and POLARS_AVAILABLE), reason="Pandas and Polars not available")
 class TestCrossFormatConversions:

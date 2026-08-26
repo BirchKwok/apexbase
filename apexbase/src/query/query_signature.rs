@@ -621,6 +621,7 @@ fn classify_impl(sql: &str) -> QuerySignature {
             if file.ends_with(".PARQUET")
                 || file.ends_with(".CSV")
                 || file.ends_with(".TSV")
+                || file.ends_with(".TXT")
                 || file.ends_with(".JSON")
                 || file.ends_with(".NDJSON")
                 || file.ends_with(".JSONL")

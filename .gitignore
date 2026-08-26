@@ -80,3 +80,5 @@ AGENTS.md
 *.apex_tables
 
 *.log
+
+.cargo-home/

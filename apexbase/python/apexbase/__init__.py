@@ -65,6 +65,32 @@ def _ensure_lance():
     import lance
     return lance
 
+
+def _lance_safe_columns(names):
+    """Return column names Lance can use as top-level field names.
+
+    Lance reserves ``.`` as the nested-struct path separator, so a top-level
+    field name containing ``.`` (e.g. a de-duplicated CSV header such as
+    ``Fwd Header Length.1``) is rejected by ``write_dataset``. Dotless source
+    names are preserved verbatim; dotted names are renamed to a unique ``_``
+    form that never collides with a dotless name.
+    """
+    result = list(names)
+    reserved = {n for n in names if "." not in n}
+    for i, name in enumerate(names):
+        if "." not in name:
+            continue
+        candidate = name.replace(".", "_")
+        if candidate in reserved:
+            base = candidate
+            j = 1
+            while candidate in reserved:
+                candidate = f"{base}_{j}"
+                j += 1
+        reserved.add(candidate)
+        result[i] = candidate
+    return result
+
 __version__ = "1.31.1"
 
 
@@ -510,8 +536,16 @@ class ResultView:
         on-disk columnar format at the destination URI.
         """
         lance_mod = _ensure_lance()
+        table = self.to_arrow()
+        # Lance reserves '.' as its nested-struct path separator, so a
+        # top-level field name containing '.' (e.g. the de-duplicated CSV
+        # header "Fwd Header Length.1") would be rejected. Sanitize such names
+        # before writing; '_' cannot collide with a dotless source name
+        # because _lance_safe_columns de-duplicates the result.
+        if any("." in n for n in table.column_names):
+            table = table.rename_columns(_lance_safe_columns(table.column_names))
         return lance_mod.write_dataset(
-            self.to_arrow(),
+            table,
             uri,
             mode=mode,
             **write_options,

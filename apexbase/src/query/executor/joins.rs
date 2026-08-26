@@ -25,6 +25,13 @@ impl ApexExecutor {
             return Ok(ApexResult::Scalar(count));
         }
 
+        // General INNER-JOIN GROUP BY COUNT(*) pushdown (semi-join on the LEFT key).
+        if let Some(result) =
+            Self::try_groupby_inner_join_count(&stmt, &joins, base_dir, default_table_path)?
+        {
+            return Ok(result);
+        }
+
         // Bounded FULL OUTER JOIN with a single left-side numeric-range WHERE
         // and a LIMIT: scan the left side for the first `limit` matching rows
         // and join only those, instead of reading the whole base table.
@@ -126,7 +133,7 @@ impl ApexExecutor {
                 file,
                 options,
                 ..
-            }) => Self::read_table_function(func, file, options)?,
+            }) => Self::read_table_function(func, file, options, None)?,
             Some(FromItem::TopkDistance {
                 col,
                 query,
@@ -134,7 +141,7 @@ impl ApexExecutor {
                 metric,
                 ..
             }) => Self::execute_topk_distance(default_table_path, col, query, *k, metric)?,
-            Some(FromItem::DirectFile { file, .. }) => Self::read_direct_file(file)?,
+            Some(FromItem::DirectFile { file, .. }) => Self::read_direct_file(file, None)?,
             Some(
                 FromItem::LateralExplode { .. }
                 | FromItem::LateralPosExplode { .. }
@@ -294,7 +301,7 @@ impl ApexExecutor {
                     file,
                     options,
                     ..
-                } => Self::read_table_function(func, file, options)?,
+                } => Self::read_table_function(func, file, options, None)?,
                 FromItem::TopkDistance {
                     col,
                     query,
@@ -302,7 +309,7 @@ impl ApexExecutor {
                     metric,
                     ..
                 } => Self::execute_topk_distance(default_table_path, col, query, *k, metric)?,
-                FromItem::DirectFile { file, .. } => Self::read_direct_file(file)?,
+                FromItem::DirectFile { file, .. } => Self::read_direct_file(file, None)?,
                 FromItem::LateralExplode { .. }
                 | FromItem::LateralPosExplode { .. }
                 | FromItem::LateralStack { .. } => unreachable!(),
@@ -746,8 +753,225 @@ impl ApexExecutor {
         Ok(ApexResult::Data(result))
     }
 
+    /// INNER-JOIN GROUP BY COUNT(*) pushdown: a single inner equijoin that is a
+    /// pure semi-join filter on the LEFT table (SELECT left-key, COUNT(*), no
+    /// right-table column, unique right key) is answered by counting the LEFT
+    /// group-key dict column filtered to the right-key set.
+    fn try_groupby_inner_join_count(
+        stmt: &SelectStatement,
+        joins: &[JoinClause],
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+        use arrow::array::{DictionaryArray, Int64Array, StringArray};
+        use arrow::datatypes::UInt32Type;
+        if joins.len() != 1 {
+            return Ok(None);
+        }
+        let join = &joins[0];
+        if join.join_type != JoinType::Inner {
+            return Ok(None);
+        }
+        if stmt.group_by.len() != 1 {
+            return Ok(None);
+        }
+        if stmt.having.is_some() || stmt.distinct {
+            return Ok(None);
+        }
+        // A WHERE clause filters rows before grouping; this pushdown counts every
+        // matching left row, so it must not apply when one is present.
+        if stmt.where_clause.is_some() {
+            return Ok(None);
+        }
+        let group_col = stmt.group_by[0].trim_matches('"');
+        let group_col_clean = group_col.rsplit('.').next().unwrap_or(group_col).to_string();
+        // SELECT must be [group-key column, COUNT(*)].
+        let mut saw_group_key = false;
+        let mut saw_count = false;
+        for c in &stmt.columns {
+            match c {
+                SelectColumn::Column(name) | SelectColumn::ColumnAlias { column: name, .. } => {
+                    let clean = name
+                        .trim_matches('"')
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(name.trim_matches('"'));
+                    if clean != group_col_clean {
+                        return Ok(None);
+                    }
+                    saw_group_key = true;
+                }
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    distinct,
+                    ..
+                } => {
+                    if *distinct || !matches!(func, AggregateFunc::Count) {
+                        return Ok(None);
+                    }
+                    if let Some(col) = column {
+                        let cl = col
+                            .trim_matches('"')
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(col.trim_matches('"'));
+                        if cl != group_col_clean {
+                            return Ok(None);
+                        }
+                    }
+                    saw_count = true;
+                }
+                _ => return Ok(None),
+            }
+        }
+        if !saw_group_key || !saw_count {
+            return Ok(None);
+        }
+        for o in &stmt.order_by {
+            if o.expr.is_some() || o.nulls_first.is_some() {
+                return Ok(None);
+            }
+        }
+        let (left_key, right_key, _, _, extra_filter) =
+            match Self::extract_join_keys_with_filter(&join.on) {
+                Ok(v) => v,
+                Err(_) => return Ok(None),
+            };
+        if extra_filter.is_some() {
+            return Ok(None);
+        }
+        // Keys are unqualified (e.g. both "city"); determine sides by table.
+        let left_key_clean = left_key
+            .trim_matches('"')
+            .rsplit('.')
+            .next()
+            .unwrap_or(left_key.trim_matches('"'))
+            .to_string();
+        let right_key_clean = right_key
+            .trim_matches('"')
+            .rsplit('.')
+            .next()
+            .unwrap_or(right_key.trim_matches('"'))
+            .to_string();
+        if group_col_clean != left_key_clean {
+            return Ok(None);
+        }
+        let left_path = match &stmt.from {
+            Some(FromItem::Table { table, .. }) => {
+                Self::resolve_table_path(table, base_dir, default_table_path)
+            }
+            _ => return Ok(None),
+        };
+        let right_path = match &join.right {
+            FromItem::Table { table, .. } => {
+                Self::resolve_table_path(table, base_dir, default_table_path)
+            }
+            _ => return Ok(None),
+        };
+        let left_backend = get_cached_backend(&left_path)?;
+        let right_backend = get_cached_backend(&right_path)?;
+        let right_batch = right_backend.read_columns_to_arrow(Some(&[right_key_clean.as_str()]), 0, None)?;
+        if right_batch.num_columns() == 0 {
+            return Ok(None);
+        }
+        let right_arr = right_batch.column(0);
+        use ahash::AHashSet;
+        let mut set: AHashSet<String> = AHashSet::new();
+        for i in 0..right_arr.len() {
+            if right_arr.is_null(i) {
+                continue;
+            }
+            let v = Self::arrow_value_to_string(right_arr, i);
+            if !set.insert(v) {
+                return Ok(None);
+            }
+        }
+        if set.is_empty() || set.len() > 1024 {
+            return Ok(None);
+        }
+        let left_batch = left_backend.read_columns_to_arrow_dict(Some(&[group_col_clean.as_str()]))?;
+        if left_batch.num_columns() == 0 {
+            return Ok(None);
+        }
+        let garr = left_batch.column(0);
+        let num_rows = left_batch.num_rows();
+        let (group_vals, counts) = match garr.as_ref().as_any().downcast_ref::<DictionaryArray<UInt32Type>>() {
+            Some(dict_arr) => {
+                let keys = dict_arr.keys();
+                let values = dict_arr.values();
+                let Some(str_values) = values.as_any().downcast_ref::<StringArray>() else {
+                    return Ok(None);
+                };
+                let dict_size = str_values.len();
+                let in_set: Vec<bool> = (0..dict_size)
+                    .map(|i| !str_values.is_null(i) && set.contains(str_values.value(i)))
+                    .collect();
+                let mut counts = vec![0i64; dict_size];
+                for row in 0..num_rows {
+                    if keys.is_null(row) {
+                        continue;
+                    }
+                    let k = keys.value(row) as usize;
+                    if k < in_set.len() && in_set[k] {
+                        counts[k] += 1;
+                    }
+                }
+                let mut vals: Vec<&str> = Vec::new();
+                let mut cnts: Vec<i64> = Vec::new();
+                for i in 0..dict_size {
+                    if in_set[i] {
+                        vals.push(str_values.value(i));
+                        cnts.push(counts[i]);
+                    }
+                }
+                (vals, cnts)
+            }
+            None => return Ok(None),
+        };
+        // Build result batch (SELECT-list order), sort, limit/offset, project.
+        let mut fields = Vec::new();
+        let mut arrays: Vec<ArrayRef> = Vec::new();
+        for c in &stmt.columns {
+            match c {
+                SelectColumn::Column(_) | SelectColumn::ColumnAlias { .. } => {
+                    fields.push(Field::new(group_col_clean.as_str(), ArrowDataType::Utf8, false));
+                    arrays.push(std::sync::Arc::new(StringArray::from(group_vals.clone())) as ArrayRef);
+                }
+                SelectColumn::Aggregate { alias, .. } => {
+                    let name = alias.clone().unwrap_or_else(|| "COUNT(*)".to_string());
+                    fields.push(Field::new(name.as_str(), ArrowDataType::Int64, false));
+                    arrays.push(std::sync::Arc::new(Int64Array::from(counts.clone())) as ArrayRef);
+                }
+                _ => return Ok(None),
+            }
+        }
+        let result = RecordBatch::try_new(std::sync::Arc::new(Schema::new(fields)), arrays)
+            .map_err(|e| err_data(e.to_string()))?;
+        let k = stmt.limit.map(|l| l + stmt.offset.unwrap_or(0));
+        let sorted = if stmt.order_by.is_empty() {
+            result
+        } else {
+            Self::apply_order_by_topk(&result, &stmt.order_by, k)?
+        };
+        let limited = Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?;
+        Ok(Some(ApexResult::Data(limited)))
+    }
+
+    /// True when `name` is a column reference qualified with `qual`.
+    fn column_is_qualified_by(name: &str, qual: &str) -> bool {
+        let n = name.trim_matches('"');
+        let q = qual.trim_matches('"');
+        if q.is_empty() {
+            return false;
+        }
+        n.starts_with(&format!("{}.", q))
+    }
+
     fn source_names(from: &Option<FromItem>) -> Option<Vec<String>> {        match from.as_ref()? {
-            FromItem::Table { table, alias } => {
+        FromItem::Table { table, alias } => {
+
                 let mut names = vec![table.clone()];
                 if let Some(alias) = alias {
                     names.push(alias.clone());

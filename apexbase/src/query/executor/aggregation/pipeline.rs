@@ -632,6 +632,120 @@ impl ApexExecutor {
         Ok(arrow::array::UInt32Array::from(result))
     }
 
+    /// Strip a table qualifier (e.g. `t.col` -> `col`) and quotes from an ORDER BY column name.
+    pub(crate) fn clean_order_col(col: &str) -> &str {
+        let c = col.trim_matches('"');
+        if let Some(p) = c.rfind('.') {
+            &c[p + 1..]
+        } else {
+            c
+        }
+    }
+
+    /// Bucket-based top-K for `ORDER BY <low-cardinality numeric> ASC, <string> ASC`.
+    /// The leading numeric key is histogrammed (O(n)) and the distinct values walked
+    /// until the boundary bucket is found; only those rows are string-compared and
+    /// sorted, avoiding a full multi-column comparison sort.  Returns the top-k row
+    /// indices (LIMIT/OFFSET is applied by the caller).  `None` when ineligible.
+    fn try_bucket_numeric_string_topk(
+        num_col: &ArrayRef,
+        str_arr: &StringArray,
+        k: usize,
+    ) -> Option<Vec<usize>> {
+        if k == 0 {
+            return Some(Vec::new());
+        }
+        let key_of_i64 = |v: i64| -> u64 {
+            if v >= 0 {
+                (v as u64) | (1u64 << 63)
+            } else {
+                !(v as u64)
+            }
+        };
+        let key_of_f64 = |v: f64| -> u64 {
+            let fb = v.to_bits();
+            if fb >> 63 == 0 {
+                fb ^ (1u64 << 63)
+            } else {
+                !fb
+            }
+        };
+        let n = num_col.len();
+        let mut counts: ahash::AHashMap<u64, i64> = ahash::AHashMap::new();
+        let mut keys: Vec<u64> = Vec::new();
+        if let Some(arr) = num_col.as_any().downcast_ref::<Int64Array>() {
+            for i in 0..n {
+                let key = key_of_i64(arr.value(i));
+                match counts.get_mut(&key) {
+                    Some(c) => *c += 1,
+                    None => {
+                        counts.insert(key, 1);
+                        keys.push(key);
+                    }
+                }
+            }
+        } else if let Some(arr) = num_col.as_any().downcast_ref::<Float64Array>() {
+            for i in 0..n {
+                let key = key_of_f64(arr.value(i));
+                match counts.get_mut(&key) {
+                    Some(c) => *c += 1,
+                    None => {
+                        counts.insert(key, 1);
+                        keys.push(key);
+                    }
+                }
+            }
+        } else {
+            return None;
+        }
+        if keys.is_empty() || keys.len() > 1024 {
+            return None;
+        }
+        keys.sort_unstable();
+        let mut cum: i64 = 0;
+        let mut boundary = 0u64;
+        let mut before: i64 = 0;
+        let mut found = false;
+        for &key in &keys {
+            let cnt = counts[&key];
+            if cum + cnt >= k as i64 {
+                boundary = key;
+                before = cum;
+                found = true;
+                break;
+            }
+            cum += cnt;
+        }
+        if !found {
+            return None;
+        }
+        // Collect rows with key <= boundary (the only rows that can be in the top k).
+        let mut rows: Vec<(u64, usize)> = Vec::with_capacity((before + counts[&boundary]) as usize);
+        if let Some(arr) = num_col.as_any().downcast_ref::<Int64Array>() {
+            for i in 0..n {
+                let key = key_of_i64(arr.value(i));
+                if key <= boundary {
+                    rows.push((key, i));
+                }
+            }
+        } else {
+            let arr = num_col.as_any().downcast_ref::<Float64Array>()?;
+            for i in 0..n {
+                let key = key_of_f64(arr.value(i));
+                if key <= boundary {
+                    rows.push((key, i));
+                }
+            }
+        }
+        rows.sort_by(|a, b| {
+            a.0.cmp(&b.0)
+                .then_with(|| str_arr.value(a.1).cmp(str_arr.value(b.1)))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        let take = k.min(rows.len());
+        Some(rows[..take].iter().map(|&(_, i)| i).collect())
+    }
+
     /// Apply ORDER BY with top-k optimization (heap sort for LIMIT queries)
     /// When k is Some, uses partial sort O(n log k) instead of full sort O(n log n)
     /// OPTIMIZATION: Pre-downcast columns once to avoid repeated dynamic dispatch
@@ -639,8 +753,7 @@ impl ApexExecutor {
         batch: &RecordBatch,
         order_by: &[crate::query::OrderByClause],
         k: Option<usize>,
-    ) -> io::Result<RecordBatch> {
-        use std::cmp::Ordering;
+    ) -> io::Result<RecordBatch> {        use std::cmp::Ordering;
 
         // Pre-evaluate any expression-based ORDER BY columns not yet in the batch.
         // e.g. ORDER BY array_distance(vec, [1,2,3]) — expression not in SELECT output yet.
@@ -742,6 +855,47 @@ impl ApexExecutor {
 
         if typed_sort_cols.is_empty() {
             return Ok(batch.clone());
+        }
+
+        // FAST PATH: `ORDER BY <low-cardinality numeric> ASC, <string> ASC … LIMIT k`.
+        // When the leading numeric key has few distinct values, only the rows in
+        // the boundary bucket need the string comparison — the leading key is
+        // reduced to a bucket walk that avoids sorting the full column set.
+        if order_by.len() == 2 {
+            let o0 = &order_by[0];
+            let o1 = &order_by[1];
+            if !o0.descending && !o1.descending
+                && o0.expr.is_none()
+                && o1.expr.is_none()
+            {
+                let c0 = Self::clean_order_col(&o0.column);
+                let c1 = Self::clean_order_col(&o1.column);
+                if let Some(num_col) = batch.column_by_name(c0) {
+                    if let Some(str_col) = batch.column_by_name(c1) {
+                        if let Some(str_arr) = str_col.as_any().downcast_ref::<StringArray>() {
+                            if num_col.null_count() == 0 && str_col.null_count() == 0 {
+                                if let Some(indices) =
+                                    Self::try_bucket_numeric_string_topk(num_col, str_arr, k)
+                                {
+                                    let indices_array = arrow::array::UInt64Array::from(
+                                        indices.iter().map(|&i| i as u64).collect::<Vec<_>>(),
+                                    );
+                                    let columns = batch
+                                        .columns()
+                                        .iter()
+                                        .map(|col| {
+                                            compute::take(col, &indices_array, None)
+                                                .map_err(|e| err_data(e.to_string()))
+                                        })
+                                        .collect::<io::Result<Vec<_>>>()?;
+                                    return RecordBatch::try_new(batch.schema(), columns)
+                                        .map_err(|e| err_data(e.to_string()));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // Arrow lexsort with limit: radix-based top-k selection is far faster

@@ -1,5 +1,53 @@
 use super::*;
 
+/// File size above which a full sequential scan switches from `mmap` to a
+/// buffered `read`.
+///
+/// Measured on this machine, the per-line field-scan hot loop (what CSV count
+/// and full parse actually run) crosses over around ~500MB: below it a warm
+/// `mmap` is slightly faster (zero copy, no buffer allocation), above it a
+/// sequential `read` wins decisively (2.7x at 9.3GB) because it avoids the
+/// per-page fault overhead of a very large mapping.
+const SEQUENTIAL_READ_THRESHOLD: u64 = 512 * 1024 * 1024;
+
+/// Read an entire CSV file into memory with a single sequential pass.
+///
+/// The buffer is pre-sized from the file length so `read_to_end` performs no
+/// reallocation. Only used for full scans of large files (see
+/// [`SEQUENTIAL_READ_THRESHOLD`]); bounded reads and small files stay on a lazy
+/// `mmap`, which is strictly better there.
+fn read_file_sequential(path: &str) -> io::Result<Vec<u8>> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("Cannot open CSV file '{}': {}", path, e),
+        )
+    })?;
+    let len = file.metadata()?.len() as usize;
+    let mut buf = Vec::with_capacity(len + 1);
+    file.read_to_end(&mut buf).map_err(|e| {
+        io::Error::new(io::ErrorKind::Other, format!("read error: {}", e))
+    })?;
+    Ok(buf)
+}
+
+/// Backing buffer for a CSV scan: a lazily-faulted `mmap` (small files and
+/// bounded reads) or an eagerly-read `Vec` (large full sequential scans).
+enum CsvBuffer {
+    Mmap(memmap2::Mmap),
+    Owned(Vec<u8>),
+}
+
+impl CsvBuffer {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            CsvBuffer::Mmap(m) => m,
+            CsvBuffer::Owned(v) => v,
+        }
+    }
+}
+
 impl ApexExecutor {
     pub(in crate::query::executor) fn execute_copy_to_parquet(
         storage_path: &Path,
@@ -217,11 +265,12 @@ impl ApexExecutor {
         func: &str,
         file: &str,
         options: &[(String, String)],
+        row_limit: Option<usize>,
     ) -> io::Result<RecordBatch> {
         match func.to_uppercase().as_str() {
-            "READ_CSV" => Self::read_csv_to_batch(file, options),
+            "READ_CSV" => Self::read_csv_to_batch(file, options, row_limit),
             "READ_JSON" => Self::read_json_to_batch(file, options),
-            "READ_PARQUET" => Self::read_parquet_to_batch(file, options),
+            "READ_PARQUET" => Self::read_parquet_to_batch(file, options, row_limit),
             other => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!("Unknown table function: {}", other),
@@ -229,27 +278,38 @@ impl ApexExecutor {
         }
     }
 
-    pub(crate) fn read_direct_file(file: &str) -> io::Result<RecordBatch> {
+    pub(crate) fn read_direct_file(file: &str, row_limit: Option<usize>) -> io::Result<RecordBatch> {
         let lower = file.to_lowercase();
         if lower.ends_with(".csv.gz") || lower.ends_with(".csv.gzip") {
-            return Self::read_csv_to_batch(file, &[]);
+            return Self::read_csv_to_batch(file, &[], row_limit);
         }
         if lower.ends_with(".csv") {
-            return Self::read_csv_to_batch(file, &[]);
+            return Self::read_csv_to_batch(file, &[], row_limit);
         }
         if lower.ends_with(".tsv") {
-            return Self::read_csv_to_batch(file, &[("delimiter".to_string(), "\t".to_string())]);
+            return Self::read_csv_to_batch(
+                file,
+                &[("delimiter".to_string(), "\t".to_string())],
+                row_limit,
+            );
+        }
+        if lower.ends_with(".txt") {
+            return Self::read_csv_to_batch(
+                file,
+                &[("delimiter".to_string(), "auto".to_string())],
+                row_limit,
+            );
         }
         if lower.ends_with(".json") || lower.ends_with(".jsonl") || lower.ends_with(".ndjson") {
             return Self::read_json_to_batch(file, &[]);
         }
         if lower.ends_with(".parquet") {
-            return Self::read_parquet_to_batch(file, &[]);
+            return Self::read_parquet_to_batch(file, &[], row_limit);
         }
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "Unsupported file format for '{}'. Supported: .csv, .tsv, .json, .jsonl, .ndjson, .parquet, .csv.gz",
+                "Unsupported file format for '{}'. Supported: .csv, .tsv, .txt, .json, .jsonl, .ndjson, .parquet, .csv.gz",
                 file
             ),
         ))
@@ -258,6 +318,7 @@ impl ApexExecutor {
     pub(in crate::query::executor) fn read_csv_to_batch(
         path: &str,
         options: &[(String, String)],
+        row_limit: Option<usize>,
     ) -> io::Result<RecordBatch> {
         use rayon::prelude::*;
 
@@ -267,23 +328,56 @@ impl ApexExecutor {
             .map(|(_, v)| !matches!(v.to_lowercase().as_str(), "false" | "0"))
             .unwrap_or(true);
 
-        let delimiter: u8 = options
-            .iter()
-            .find(|(k, _)| k == "delimiter" || k == "delim" || k == "sep")
-            .and_then(|(_, v)| v.chars().next())
-            .map(|c| c as u8)
-            .unwrap_or(b',');
-        let bad_line_policy = csv_bad_line_policy(options)?;
-
         let file = std::fs::File::open(path).map_err(|e| {
             io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("Cannot open CSV file '{}': {}", path, e),
             )
         })?;
-        let mmap = unsafe { memmap2::Mmap::map(&file) }
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap error: {}", e)))?;
-        let data: &[u8] = &mmap;
+
+        // Bounded reads (`LIMIT n`) only touch the first few pages: a lazy mmap is
+        // strictly better there. For full scans, choose by size: small files keep
+        // mmap (zero-copy wins on warm cache); large files use a buffered read
+        // (avoids per-page fault overhead of a huge mapping).
+        let buffer = match row_limit {
+            Some(_) => {
+                let mmap = unsafe { memmap2::Mmap::map(&file) }
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap error: {}", e)))?;
+                CsvBuffer::Mmap(mmap)
+            }
+            None => {
+                if file.metadata()?.len() >= SEQUENTIAL_READ_THRESHOLD {
+                    use std::io::Read;
+                    let mut f = file;
+                    let len = f.metadata()?.len() as usize;
+                    let mut buf = Vec::with_capacity(len + 1);
+                    f.read_to_end(&mut buf).map_err(|e| {
+                        io::Error::new(io::ErrorKind::Other, format!("read error: {}", e))
+                    })?;
+                    CsvBuffer::Owned(buf)
+                } else {
+                    let mmap = unsafe { memmap2::Mmap::map(&file) }
+                        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap error: {}", e)))?;
+                    CsvBuffer::Mmap(mmap)
+                }
+            }
+        };
+        let data: &[u8] = buffer.as_slice();
+
+        // Delimiter: explicit option, or "auto" to sniff from the header line (.txt).
+        let delimiter: u8 = options
+            .iter()
+            .find(|(k, _)| k == "delimiter" || k == "delim" || k == "sep")
+            .map(|(_, v)| v.as_str())
+            .map(|v| {
+                if v.eq_ignore_ascii_case("auto") {
+                    Self::sniff_csv_delimiter(data)
+                } else {
+                    v.chars().next().map(|c| c as u8).unwrap_or(b',')
+                }
+            })
+            .unwrap_or(b',');
+        let bad_line_policy = csv_bad_line_policy(options)?;
 
         // Fast schema inference: single-pass over first 100 data rows,
         // bypasses Arrow's CSV reader overhead (extra buffering + allocation layer).
@@ -302,6 +396,29 @@ impl ApexExecutor {
         let data_section = &data[header_end..];
         if data_section.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::clone(&schema)));
+        }
+
+        // Parse filter pushdown option: "col>val" or "col<val" style
+        let filter_info = options
+            .iter()
+            .find(|(k, _)| k == "filter")
+            .and_then(|(_, v)| parse_pushdown_filter(v, &schema));
+
+        // On-demand read: parse only the first `row_limit` data rows.  The parser
+        // exits its newline scan as soon as that many rows are produced, so a large
+        // file is never fully scanned or materialized (memory stays bounded to `n`).
+        if let Some(n) = row_limit {
+            if n == 0 {
+                return Ok(RecordBatch::new_empty(Arc::clone(&schema)));
+            }
+            return Self::parse_csv_chunk_fast(
+                data_section,
+                &schema,
+                delimiter,
+                filter_info.as_ref(),
+                bad_line_policy,
+                Some(n),
+            );
         }
 
         // Compute split offsets — one chunk per core, aligned to newlines (SIMD search)
@@ -338,12 +455,6 @@ impl ApexExecutor {
             })
             .collect();
 
-        // Parse filter pushdown option: "col>val" or "col<val" style
-        let filter_info = options
-            .iter()
-            .find(|(k, _)| k == "filter")
-            .and_then(|(_, v)| parse_pushdown_filter(v, &schema));
-
         let schema_ref = Arc::clone(&schema);
         let batches: Vec<io::Result<RecordBatch>> = chunks
             .par_iter()
@@ -358,6 +469,7 @@ impl ApexExecutor {
                     delimiter,
                     filter_info.as_ref(),
                     bad_line_policy,
+                    None,
                 )
             })
             .collect();
@@ -366,12 +478,31 @@ impl ApexExecutor {
         Self::merge_record_batches(all)
     }
 
+    /// Sniff the most frequent delimiter from the first line of a text file.
+    /// Used for `.txt` files (and `delimiter='auto'`), matching DuckDB's
+    /// `read_csv_auto` behavior for the common `,` / `\t` / `;` / `|` cases.
+    fn sniff_csv_delimiter(data: &[u8]) -> u8 {
+        let end = memchr::memchr(b'\n', data).unwrap_or(data.len());
+        let line = &data[..end];
+        let mut best = b',';
+        let mut best_count = 0usize;
+        for &c in &[b',', b'\t', b';', b'|'] {
+            let count = memchr::memchr_iter(c, line).count();
+            if count > best_count {
+                best = c;
+                best_count = count;
+            }
+        }
+        best
+    }
+
     pub(in crate::query::executor) fn parse_csv_chunk_fast(
         data: &[u8],
         schema: &arrow::datatypes::Schema,
         delimiter: u8,
         filter_info: Option<&PushdownFilter>,
         bad_line_policy: CsvBadLinePolicy,
+        max_rows: Option<usize>,
     ) -> io::Result<RecordBatch> {
         use arrow::array::{BooleanArray, BooleanBuilder};
         use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
@@ -382,12 +513,16 @@ impl ApexExecutor {
             return Ok(RecordBatch::new_empty(Arc::new(schema.clone())));
         }
 
-        // Estimate row count from chunk size — avoids an extra full-scan just for capacity.
-        // Assume ≥20 bytes per line (conservative underestimate ⇒ slight overalloc, no resize).
+        // Exact row-capacity: count line boundaries with SIMD memchr instead of a
+        // bytes/20 heuristic. The heuristic over-allocates ~23x for wide rows
+        // (e.g. 465B/line), blowing up peak memory and causing huge allocator
+        // churn. The newline count is a cheap single pass over the already-cached
+        // bytes and makes `Vec::with_capacity` reserve the true row count.
+        // When max_rows is set (on-demand read), the capacity is bounded to that.
         if data.is_empty() {
             return Ok(RecordBatch::new_empty(Arc::new(schema.clone())));
         }
-        let n_rows = (data.len() / 20).max(1);
+        let n_rows = max_rows.unwrap_or_else(|| memchr::memchr_iter(b'\n', data).count());
 
         // Per-column raw buffers — direct Vec ops, no builder hierarchy.
         // has_null starts false; nulls Vec is only written when a null IS seen.
@@ -530,6 +665,7 @@ impl ApexExecutor {
         // Inner delimiter search also uses SIMD memchr_iter (replaces scalar byte loop).
         let mut line_start = 0usize;
         let mut line_number = 1usize;
+        let mut rows_out = 0usize;
         for nl in memchr::memchr_iter(b'\n', data) {
             let raw = &data[line_start..nl];
             line_start = nl + 1;
@@ -591,9 +727,15 @@ impl ApexExecutor {
                 push_null!(&mut cols[col]);
                 col += 1;
             }
+            rows_out += 1;
+            if let Some(m) = max_rows {
+                if rows_out >= m {
+                    break;
+                }
+            }
             line_number += 1;
         }
-        if line_start < data.len() {
+        if line_start < data.len() && max_rows.map_or(true, |m| rows_out < m) {
             let raw = &data[line_start..];
             let line = if raw.last() == Some(&b'\r') {
                 &raw[..raw.len() - 1]
@@ -1231,6 +1373,215 @@ impl ApexExecutor {
         Ok(Some(count as i64))
     }
 
+    /// Fast `COUNT(*)`/`COUNT(1)` over a CSV/TSV file: counts row boundaries via
+    /// SIMD `memchr` newline scan and per-line field-count validation, WITHOUT
+    /// materialising any typed column buffers. Mirrors `parse_csv_chunk_fast`
+    /// semantics exactly (header skip, empty-line skip, bad-line policy) so the
+    /// result equals the full-parse count for a pure count (*) with no WHERE.
+    ///
+    /// Only a plain (non-gzip) CSV/TSV without a WHERE clause is handled; every
+    /// other shape returns `Ok(None)` so the caller falls back to the regular
+    /// parse (which still raises the proper error for malformed rows).
+    pub(in crate::query::executor) fn try_fast_csv_count(
+        path: &str,
+        options: &[(String, String)],
+    ) -> io::Result<Option<i64>> {
+        use rayon::prelude::*;
+
+        let has_header = options
+            .iter()
+            .find(|(k, _)| k == "header")
+            .map(|(_, v)| !matches!(v.to_lowercase().as_str(), "false" | "0"))
+            .unwrap_or(true);
+
+        let bad_line_policy = csv_bad_line_policy(options)?;
+
+        // A count always scans the whole file. Choose the backing by size: mmap
+        // for small files (zero-copy wins on warm cache), buffered read for large
+        // ones (avoids per-page fault overhead of a huge mapping).
+        let buffer = {
+            let file = std::fs::File::open(path).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Cannot open CSV file '{}': {}", path, e),
+                )
+            })?;
+            if file.metadata()?.len() >= SEQUENTIAL_READ_THRESHOLD {
+                CsvBuffer::Owned(read_file_sequential(path)?)
+            } else {
+                let mmap = unsafe { memmap2::Mmap::map(&file) }
+                    .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap error: {}", e)))?;
+                CsvBuffer::Mmap(mmap)
+            }
+        };
+        let data: &[u8] = buffer.as_slice();
+
+        let delimiter: u8 = {
+            let delim_opt = options
+                .iter()
+                .find(|(k, _)| k == "delimiter" || k == "delim" || k == "sep")
+                .map(|(_, v)| v.as_str());
+            match delim_opt {
+                Some(v) if v.eq_ignore_ascii_case("auto") => Self::sniff_csv_delimiter(data),
+                Some(v) => v.chars().next().map(|c| c as u8).unwrap_or(b','),
+                None => b',',
+            }
+        };
+
+        // Skip the header line (same as read_csv_to_batch: data starts after the
+        // first newline). The count never needs column names for COUNT(*).
+        let data_section = if has_header {
+            memchr::memchr(b'\n', data)
+                .map(|i| i + 1)
+                .unwrap_or(data.len())
+        } else {
+            0
+        };
+        let data = &data[data_section..];
+        if data.is_empty() {
+            return Ok(Some(0));
+        }
+
+        // The full parser's Error-policy field-count check and the actual column
+        // split are quote-naive (memchr over the delimiter), so quoted data can
+        // produce a different count than the quote-aware `csv_field_count`.
+        // Decline the fast path on any quote so the full parser governs.
+        if memchr::memchr(b'"', data).is_some() {
+            return Ok(None);
+        }
+
+        // Column count from the first data row; consistent with schema inference
+        // which assumes rows have identical shape.
+        let first_line_end = memchr::memchr(b'\n', data).unwrap_or(data.len());
+        let first_line = {
+            let raw = &data[..first_line_end];
+            if raw.last() == Some(&b'\r') {
+                &raw[..raw.len() - 1]
+            } else {
+                raw
+            }
+        };
+        if first_line.is_empty() {
+            return Ok(Some(0));
+        }
+        let n_cols = csv_field_count(first_line, delimiter);
+
+        // Compute split offsets — one chunk per core, aligned to newlines.
+        let n_threads = rayon::current_num_threads().min(16).max(1);
+        let mut starts: Vec<usize> = vec![0];
+        if n_threads > 1 {
+            let chunk = (data.len() + n_threads - 1) / n_threads;
+            for t in 1..n_threads {
+                let approx = t * chunk;
+                if approx >= data.len() {
+                    break;
+                }
+                let nl = memchr::memchr(b'\n', &data[approx..])
+                    .map(|p| approx + p + 1)
+                    .unwrap_or(data.len());
+                if nl != *starts.last().unwrap() {
+                    starts.push(nl);
+                }
+            }
+        }
+        starts.push(data.len());
+
+        struct SendSlice(*const u8, usize);
+        unsafe impl Send for SendSlice {}
+        unsafe impl Sync for SendSlice {}
+
+        let chunks: Vec<SendSlice> = starts
+            .windows(2)
+            .map(|w| {
+                let s = &data[w[0]..w[1]];
+                SendSlice(s.as_ptr(), s.len())
+            })
+            .collect();
+
+        let invalid = std::sync::atomic::AtomicBool::new(false);
+        let invalid_ref = &invalid;
+        let count: usize = chunks
+            .par_iter()
+            .map(|ss| {
+                let chunk = unsafe { std::slice::from_raw_parts(ss.0, ss.1) };
+                match Self::count_csv_chunk_rows(chunk, delimiter, n_cols, bad_line_policy) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // Malformed row under the Error policy: fall back to the
+                        // real parser, which will raise the proper error.
+                        invalid_ref.store(true, std::sync::atomic::Ordering::Relaxed);
+                        0
+                    }
+                }
+            })
+            .sum();
+        if invalid.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        Ok(Some(count as i64))
+    }
+
+    /// Count non-empty newline-delimited data rows in *chunk* that match the
+    /// schema shape. Returns an error when a row has the wrong field count and
+    /// the policy is `Error` (mirrors the full parse's error semantics).
+    ///
+    /// The fast path only runs on quote-free data (a prior `memchr('"')` guard
+    /// declines otherwise), so SIMD `memchr_iter` field counting is exact.
+    fn count_csv_chunk_rows(
+        data: &[u8],
+        delimiter: u8,
+        n_cols: usize,
+        bad_line_policy: CsvBadLinePolicy,
+    ) -> io::Result<usize> {
+        let mut count = 0usize;
+        let mut line_start = 0usize;
+        for nl in memchr::memchr_iter(b'\n', data) {
+            let raw = &data[line_start..nl];
+            line_start = nl + 1;
+            let line = if raw.last() == Some(&b'\r') {
+                &raw[..raw.len() - 1]
+            } else {
+                raw
+            };
+            if line.is_empty() {
+                continue;
+            }
+            // SIMD field count: field_count = delimiter_occurrences + 1.
+            if memchr::memchr_iter(delimiter, line).count() + 1 != n_cols {
+                if bad_line_policy == CsvBadLinePolicy::Error {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "CSV row has wrong field count",
+                    ));
+                }
+                continue;
+            }
+            count += 1;
+        }
+        if line_start < data.len() {
+            let raw = &data[line_start..];
+            let line = if raw.last() == Some(&b'\r') {
+                &raw[..raw.len() - 1]
+            } else {
+                raw
+            };
+            if !line.is_empty() {
+                let actual_fields = memchr::memchr_iter(delimiter, line).count() + 1;
+                if actual_fields != n_cols {
+                    if bad_line_policy == CsvBadLinePolicy::Error {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "CSV row has wrong field count",
+                        ));
+                    }
+                } else {
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
     pub(in crate::query::executor) fn looks_like_ndjson(bytes: &[u8]) -> bool {
         let mut checked = 0usize;
         let mut line_start = 0usize;
@@ -1832,6 +2183,7 @@ impl ApexExecutor {
     pub(in crate::query::executor) fn read_parquet_to_batch(
         path: &str,
         options: &[(String, String)],
+        row_limit: Option<usize>,
     ) -> io::Result<RecordBatch> {
         use parquet::arrow::arrow_reader::{
             ArrowPredicateFn, ArrowReaderMetadata, ArrowReaderOptions,
@@ -1888,6 +2240,21 @@ impl ApexExecutor {
                         .iter()
                         .all(|name| arrow_meta.schema().index_of(name).is_ok())
             });
+
+        // On-demand read: stop decoding once `row_limit` rows are collected, so a
+        // multi-row-group file is not fully decoded.  Only valid without a filter —
+        // a filter must observe every row before LIMIT is applied, which is exactly
+        // the simple-LIMIT case that triggers this path.
+        if let Some(n) = row_limit {
+            if filter_info.is_none() {
+                return Self::read_parquet_limited(
+                    shared.as_ref(),
+                    &arrow_meta,
+                    projection_names.as_deref(),
+                    n,
+                );
+            }
+        }
 
         // Query-aware path: decode only referenced columns and evaluate simple numeric
         // predicates inside the Parquet reader. The predicate column is cached by the
@@ -2083,6 +2450,78 @@ impl ApexExecutor {
         Self::merge_record_batches(all)
     }
 
+    /// Sequential on-demand Parquet read: decode only the first `n` rows (bounded
+    /// batch), honoring an optional column projection, then merge and return.
+    fn read_parquet_limited(
+        shared: &bytes::Bytes,
+        arrow_meta: &parquet::arrow::arrow_reader::ArrowReaderMetadata,
+        projection_names: Option<&[String]>,
+        n: usize,
+    ) -> io::Result<RecordBatch> {
+        use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+        use parquet::arrow::ProjectionMask;
+
+        let schema: arrow::datatypes::SchemaRef = match projection_names {
+            Some(names) if !names.is_empty() => {
+                let full = arrow_meta.schema();
+                let fields: Vec<arrow::datatypes::Field> = names
+                    .iter()
+                    .filter_map(|name| {
+                        full.index_of(name)
+                            .ok()
+                            .map(|i| full.field(i).as_ref().clone())
+                    })
+                    .collect();
+                if fields.is_empty() {
+                    full.clone()
+                } else {
+                    Arc::new(arrow::datatypes::Schema::new(fields))
+                }
+            }
+            _ => arrow_meta.schema().clone(),
+        };
+
+        if n == 0 {
+            return Ok(RecordBatch::new_empty(schema));
+        }
+
+        let parquet_schema = arrow_meta.parquet_schema().clone();
+        let batch_size = n.min(8192).max(1);
+        let mut builder = ParquetRecordBatchReaderBuilder::new_with_metadata(
+            (*shared).clone(),
+            arrow_meta.clone(),
+        )
+        .with_batch_size(batch_size);
+        if let Some(names) = projection_names {
+            if !names.is_empty() {
+                let mask =
+                    ProjectionMask::columns(&parquet_schema, names.iter().map(String::as_str));
+                builder = builder.with_projection(mask);
+            }
+        }
+        let reader = builder
+            .build()
+            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+        let mut collected: Vec<RecordBatch> = Vec::new();
+        let mut remaining = n;
+        for batch in reader {
+            let batch =
+                batch.map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            if batch.num_rows() >= remaining {
+                collected.push(batch.slice(0, remaining));
+                remaining = 0;
+                break;
+            }
+            remaining -= batch.num_rows();
+            collected.push(batch);
+        }
+        Self::merge_record_batches(collected)
+    }
+
     pub(in crate::query::executor) fn try_fast_parquet_count(
         path: &str,
         filter: Option<&str>,
@@ -2233,7 +2672,7 @@ impl ApexExecutor {
         match format.to_uppercase().as_str() {
             "CSV" | "TSV" => {
                 if csv_bad_line_policy(options)? != CsvBadLinePolicy::Error {
-                    let batch = Self::read_csv_to_batch(file_path, options)?;
+                    let batch = Self::read_csv_to_batch(file_path, options, None)?;
                     if batch.num_rows() > 0 {
                         visit(batch)?;
                     }
@@ -2462,5 +2901,131 @@ impl ApexExecutor {
             Ok(())
         })?;
         Ok(ApexResult::Scalar(num_rows as i64))
+    }
+}
+
+#[cfg(test)]
+mod csv_fast_count_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn write(path: &std::path::Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+    }
+
+    /// Full-parse row count = truth for comparison, with matching options.
+    fn full_count(path: &str, options: &[(String, String)]) -> i64 {
+        let batch = ApexExecutor::read_csv_to_batch(path, options, None).unwrap();
+        batch.num_rows() as i64
+    }
+
+    fn fast_count(path: &str, options: &[(String, String)]) -> Option<i64> {
+        ApexExecutor::try_fast_csv_count(path, options).unwrap()
+    }
+
+    #[test]
+    fn fast_count_matches_full_parse_basic() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("a.csv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "a,b,c\n1,2,3\n4,5,6\n7,8,9\n");
+        assert_eq!(fast_count(&path, &[]), Some(3));
+        assert_eq!(full_count(&path, &[]), 3);
+    }
+
+    #[test]
+    fn fast_count_no_trailing_newline() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("b.csv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "a,b\n1,2\n3,4");
+        assert_eq!(fast_count(&path, &[]), Some(2));
+        assert_eq!(full_count(&path, &[]), 2);
+    }
+
+    #[test]
+    fn fast_count_skips_empty_lines() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("c.csv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "a,b\n1,2\n\n3,4\n\n");
+        assert_eq!(fast_count(&path, &[]), Some(2));
+        assert_eq!(full_count(&path, &[]), 2);
+    }
+
+    #[test]
+    fn fast_count_no_header() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("d.csv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "1,2\n3,4\n5,6\n");
+        let opt = vec![("header".to_string(), "false".to_string())];
+        assert_eq!(fast_count(&path, &opt), Some(3));
+        assert_eq!(full_count(&path, &opt), 3);
+    }
+
+    #[test]
+    fn fast_count_tsv_delimiter() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("e.tsv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "a\tb\n1\t2\n3\t4\n5\t6\n");
+        let opt = vec![("delimiter".to_string(), "\t".to_string())];
+        assert_eq!(fast_count(&path, &opt), Some(3));
+        assert_eq!(full_count(&path, &opt), 3);
+    }
+
+    #[test]
+    fn fast_count_empty_file() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("f.csv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "a,b\n");
+        assert_eq!(fast_count(&path, &[]), Some(0));
+        assert_eq!(full_count(&path, &[]), 0);
+    }
+
+    #[test]
+    fn fast_count_declines_quoted_data() {
+        // Quoted CN fields make the full parser's count differ from the
+        // quote-aware fast path, so the fast path must decline.
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("g.csv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "a,b\n\"x,y\",1\n\"z\",2\n");
+        assert_eq!(fast_count(&path, &[]), None);
+    }
+
+    #[test]
+    fn fast_count_skip_bad_lines_policy() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("h.csv");
+        let path = p.to_str().unwrap().to_string();
+        // One malformed row (3 fields vs 2).
+        write(&p, "a,b\n1,2\n3,4,5\n5,6\n");
+        let opt = vec![("on_bad_lines".to_string(), "skip".to_string())];
+        assert_eq!(fast_count(&path, &opt), Some(2));
+        assert_eq!(full_count(&path, &opt), 2);
+    }
+
+    #[test]
+    fn fast_count_errors_on_bad_lines_with_error_policy() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("i.csv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "a,b\n1,2\n3,4,5\n5,6\n");
+        // Default policy is Error -> fast count must decline (None) so the full
+        // parse raises the error.
+        assert_eq!(fast_count(&path, &[]), None);
+    }
+
+    #[test]
+    fn fast_count_crlf_lines() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("j.csv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "a,b\r\n1,2\r\n3,4\r\n");
+        assert_eq!(fast_count(&path, &[]), Some(2));
+        assert_eq!(full_count(&path, &[]), 2);
     }
 }

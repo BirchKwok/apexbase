@@ -105,6 +105,25 @@ class TestReadCsv:
         rv = self.c.execute(f"SELECT COUNT(*) AS cnt FROM read_csv('{self.csv}')")
         assert rv.first()['cnt'] == 5
 
+    def test_count_star_direct_file(self):
+        # DuckDB-style direct file path as the FROM source.
+        rv = self.c.execute(f"SELECT COUNT(*) AS cnt FROM '{self.csv}'")
+        assert rv.first()['cnt'] == 5
+
+    def test_count_star_direct_file_with_limit_noop(self):
+        # LIMIT (>=1) with no OFFSET is a no-op on the single-row COUNT result.
+        rv = self.c.execute(f"SELECT COUNT(1) AS cnt FROM '{self.csv}' LIMIT 100")
+        assert rv.first()['cnt'] == 5
+
+    def test_count_star_direct_file_tsv(self):
+        rv = self.c.execute(f"SELECT COUNT(*) AS cnt FROM '{self.tsv}'")
+        assert rv.first()['cnt'] == 5
+
+    def test_count_star_direct_file_skips_when_where(self):
+        # A WHERE clause disables the fast count; full parse handles it.
+        rv = self.c.execute(f"SELECT COUNT(*) AS cnt FROM '{self.csv}' WHERE city='Beijing'")
+        assert rv.first()['cnt'] == 2
+
     def test_group_by(self):
         rv = self.c.execute(
             f"SELECT city, COUNT(*) AS cnt FROM read_csv('{self.csv}') GROUP BY city ORDER BY city"
@@ -530,3 +549,113 @@ class TestReadFileCombined:
             ORDER BY name
         """)
         assert [r['name'] for r in rv] == ['Hank', 'Ivy']
+
+
+# ============================================================
+# DuckDB-style direct file reading: SELECT * FROM 'path' — on-demand LIMIT
+# ============================================================
+
+class TestDirectFileRead:
+    def setup_method(self):
+        self.d = tempfile.mkdtemp()
+        self.c = ApexClient(dirpath=self.d)
+        self.csv = os.path.join(self.d, 'data.csv')
+        self.tsv = os.path.join(self.d, 'data.tsv')
+        self.comma_txt = os.path.join(self.d, 'comma.txt')
+        self.tab_txt = os.path.join(self.d, 'tab.txt')
+        _write_csv(self.csv, ROWS)
+        _write_csv(self.tsv, ROWS, delimiter='\t')
+        _write_csv(self.comma_txt, ROWS, delimiter=',')
+        _write_csv(self.tab_txt, ROWS, delimiter='\t')
+
+    def teardown_method(self):
+        self.c.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_csv_limit_1(self):
+        rv = self.c.execute(f"SELECT * FROM '{self.csv}' LIMIT 1")
+        assert len(rv) == 1
+        assert rv.first()['name'] == 'Alice'
+
+    def test_csv_limit_1_to_pandas(self):
+        # Mirrors the reported use case: `select * from 'file.csv' limit 1` → pandas.
+        pytest.importorskip('pandas')
+        df = self.c.execute(f"SELECT * FROM '{self.csv}' LIMIT 1").to_pandas()
+        assert len(df) == 1
+        assert df.iloc[0]['name'] == 'Alice'
+
+    def test_csv_limit_offset(self):
+        rv = self.c.execute(f"SELECT * FROM '{self.csv}' LIMIT 2 OFFSET 1").to_dict()
+        assert [r['name'] for r in rv] == ['Bob', 'Carol']
+
+    def test_csv_limit_does_not_parse_tail(self):
+        # A malformed row later in the file errors on a full read, but a LIMIT 1
+        # only reads the first data row — proving the tail is never parsed.
+        path = os.path.join(self.d, 'dirty_tail.csv')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write("name,age\nAlice,30\nbroken,40,extra\nBob,25\n")
+        with pytest.raises(Exception, match="fields; expected"):
+            self.c.execute(f"SELECT * FROM '{path}'")
+        rows = self.c.execute(f"SELECT * FROM '{path}' LIMIT 1").to_dict()
+        assert rows == [{'name': 'Alice', 'age': 30}]
+
+    def test_tsv_limit_1(self):
+        rv = self.c.execute(f"SELECT * FROM '{self.tsv}' LIMIT 1")
+        assert len(rv) == 1
+        assert rv.first()['name'] == 'Alice'
+
+    def test_txt_comma_sniff_limit_1(self):
+        rv = self.c.execute(f"SELECT * FROM '{self.comma_txt}' LIMIT 1")
+        assert len(rv) == 1
+        assert rv.first()['name'] == 'Alice'
+
+    def test_txt_tab_sniff_limit_1(self):
+        rv = self.c.execute(f"SELECT * FROM '{self.tab_txt}' LIMIT 1")
+        assert len(rv) == 1
+        assert rv.first()['name'] == 'Alice'
+
+    def test_projection_limit_1(self):
+        rv = self.c.execute(f"SELECT name, city FROM '{self.csv}' LIMIT 1").to_dict()
+        assert rv == [{'name': 'Alice', 'city': 'Beijing'}]
+
+    def test_limit_0(self):
+        rv = self.c.execute(f"SELECT * FROM '{self.csv}' LIMIT 0")
+        assert len(rv) == 0
+        assert {'name', 'age', 'score', 'city'}.issubset(set(rv.columns))
+
+
+class TestDirectFileReadParquet:
+    def setup_method(self):
+        self.d = tempfile.mkdtemp()
+        self.c = ApexClient(dirpath=self.d)
+        self.pq = os.path.join(self.d, 'data.parquet')
+        _write_parquet(self.pq, ROWS)
+
+    def teardown_method(self):
+        self.c.close()
+        shutil.rmtree(self.d, ignore_errors=True)
+
+    def test_parquet_limit_1(self):
+        rv = self.c.execute(f"SELECT * FROM '{self.pq}' LIMIT 1")
+        assert len(rv) == 1
+        assert rv.first()['name'] == 'Alice'
+
+    def test_parquet_limit_offset(self):
+        rv = self.c.execute(f"SELECT * FROM '{self.pq}' LIMIT 2 OFFSET 1").to_dict()
+        assert [r['name'] for r in rv] == ['Bob', 'Carol']
+
+    def test_parquet_multi_row_group_limit_1(self):
+        pa = pytest.importorskip("pyarrow")
+        pq = pytest.importorskip("pyarrow.parquet")
+        rows = 20_000
+        path = os.path.join(self.d, 'many_groups.parquet')
+        pq.write_table(
+            pa.table({
+                'id': pa.array(range(rows), type=pa.int64()),
+                'payload': pa.array([f'p_{i}' for i in range(rows)]),
+            }),
+            path,
+            row_group_size=1000,
+        )
+        rv = self.c.execute(f"SELECT * FROM '{path}' LIMIT 3").to_dict()
+        assert [r['id'] for r in rv] == [0, 1, 2]
