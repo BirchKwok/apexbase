@@ -82,6 +82,10 @@ def setup_apex(tmp, data):
                 for i in range(2000)],
         "val": [(i * 7) % 500 for i in range(2000)],
     })
+    _store(client, "codes", {
+        "code": list(range(18, 81)),
+        "label": ["younger" if age < 40 else "older" for age in range(18, 81)],
+    })
     return client
 
 
@@ -111,6 +115,11 @@ def setup_sqlite(tmp, data):
         "INSERT INTO extra VALUES (?,?,?)",
         [(i + 1, "T" if i % 3 == 0 else ("U" if i % 3 == 1 else "V"),
           (i * 7) % 500) for i in range(2000)])
+    con.execute("CREATE TABLE codes (code INTEGER, label TEXT)")
+    con.executemany(
+        "INSERT INTO codes VALUES (?,?)",
+        [(age, "younger" if age < 40 else "older") for age in range(18, 81)],
+    )
     con.commit()
     return con
 
@@ -133,6 +142,11 @@ def setup_duckdb(data):
         "INSERT INTO extra VALUES (?,?,?)",
         [(i + 1, "T" if i % 3 == 0 else ("U" if i % 3 == 1 else "V"),
           (i * 7) % 500) for i in range(2000)])
+    con.execute("CREATE TABLE codes (code INTEGER, label VARCHAR)")
+    con.executemany(
+        "INSERT INTO codes VALUES (?,?)",
+        [(age, "younger" if age < 40 else "older") for age in range(18, 81)],
+    )
     return con
 
 
@@ -172,9 +186,40 @@ PARITY_QUERIES = [
     "SELECT city, MAX(score) AS mx, SUM(score) AS s FROM t GROUP BY city ORDER BY city",
     "SELECT city, MIN(age) AS mn, MAX(age) AS mx FROM t GROUP BY city ORDER BY city",
     "SELECT city, COUNT(CASE WHEN age > 40 THEN 1 END) AS c FROM t GROUP BY city ORDER BY city",
+    "SELECT age, COUNT(*) AS n, AVG(score) AS av, MIN(score) AS lo, MAX(score) AS hi "
+    "FROM t GROUP BY age HAVING COUNT(*) > 100 ORDER BY age",
+    "SELECT COUNT(*) AS n, AVG(score) AS av FROM t WHERE age=25",
+    "SELECT COUNT(*) AS n, AVG(score) AS av, SUM(id) AS total FROM t "
+    "WHERE age BETWEEN 25 AND 35 AND score BETWEEN 20 AND 80",
+    "SELECT COUNT(*) AS n, AVG(score) AS av FROM t WHERE city LIKE 'Bei%'",
+    "SELECT id, score FROM t WHERE score IS NOT NULL "
+    "ORDER BY score DESC, id LIMIT 100",
+    "SELECT id, age, score FROM t WHERE age BETWEEN 25 AND 35 "
+    "ORDER BY score DESC, id LIMIT 100",
     # GROUP BY + ORDER BY + LIMIT on join and non-join paths.
     "SELECT city, COUNT(*) AS c FROM t GROUP BY city ORDER BY c DESC LIMIT 5",
+    "SELECT city, COUNT(*) AS c FROM t GROUP BY city HAVING COUNT(*) > 1000 "
+    "ORDER BY c DESC, city LIMIT 5",
+    "SELECT city, age, COUNT(*) AS c, AVG(id) AS av FROM t "
+    "GROUP BY city, age ORDER BY city, age",
+    "SELECT city, age, COUNT(*) AS n, SUM(id) AS total, AVG(id) AS av, "
+    "MIN(score) AS lo, MAX(score) AS hi FROM t "
+    "GROUP BY city, age ORDER BY city, age",
+    "SELECT city, SUM(CASE WHEN age > 40 THEN 1 ELSE 0 END) AS older, "
+    "SUM(CASE WHEN score > 50 THEN 1 ELSE 0 END) AS high_score, AVG(score) AS av "
+    "FROM t GROUP BY city ORDER BY city",
+    "SELECT city, AVG(score/(age+1.0)) AS normalized_score FROM t "
+    "GROUP BY city ORDER BY city",
+    "SELECT SUBSTR(city, 1, 3) AS prefix, COUNT(*) AS c, AVG(id) AS av "
+    "FROM t GROUP BY SUBSTR(city, 1, 3) ORDER BY prefix",
+    "SELECT MOD(id, 5) AS fold, COUNT(*) AS n, AVG(score) AS av FROM t "
+    "GROUP BY MOD(id, 5) ORDER BY fold",
+    "SELECT band, COUNT(*) AS n, AVG(score) AS av FROM "
+    "(SELECT CASE WHEN age < 30 THEN 'young' WHEN age < 60 THEN 'mid' "
+    "ELSE 'senior' END AS band, score FROM t) s GROUP BY band ORDER BY band",
     "SELECT t.city, COUNT(*) AS c FROM t JOIN meta m ON t.city = m.city GROUP BY t.city ORDER BY c DESC LIMIT 5",
+    "SELECT c.label, COUNT(*) AS n, AVG(t.score) AS av FROM t "
+    "JOIN codes c ON t.age=c.code GROUP BY c.label ORDER BY c.label",
     # Joins, including extra ON predicates on outer joins.
     "SELECT COUNT(*) AS c FROM t LEFT JOIN meta m ON t.city = m.city AND m.pop > 5000000",
     "SELECT t.id, m.city FROM t LEFT JOIN meta m ON t.city = m.city AND m.pop > 15000000 WHERE t.id <= 20 ORDER BY t.id",
@@ -198,7 +243,16 @@ PARITY_QUERIES = [
     "CONCAT(city, '-', category) AS cc, TRIM(category) AS tr FROM t WHERE id <= 100 ORDER BY id",
     "SELECT ROUND(score, 0) AS r, ABS(age - 40) AS a, FLOOR(score) AS f, CEIL(score) AS c FROM t WHERE id <= 100 ORDER BY id",
     "SELECT COUNT(*) AS c FROM t WHERE COALESCE(NULLIF(category, 'Books'), 'none') = 'Books'",
+    "SELECT COUNT(DISTINCT city) AS cities, COUNT(DISTINCT category) AS categories, "
+    "COUNT(DISTINCT age) AS ages FROM t",
+    "SELECT city, COUNT(*) AS n, COUNT(DISTINCT age) AS ages FROM t "
+    "GROUP BY city ORDER BY city",
+    "SELECT SUM(CASE WHEN age IS NULL THEN 1 ELSE 0 END) AS null_age, "
+    "SUM(CASE WHEN name IS NOT NULL THEN 1 ELSE 0 END) AS present_names FROM t",
+    "SELECT SUM(CASE WHEN age = 25 THEN 1 ELSE 0 END) AS age_25, "
+    "SUM(CASE WHEN score BETWEEN 20 AND 40 THEN 1 ELSE 0 END) AS mid_scores FROM t",
     "SELECT DISTINCT city, category FROM t ORDER BY city, category LIMIT 50",
+    "SELECT DISTINCT city, age, category FROM t ORDER BY city, age, category LIMIT 100",
     "SELECT COUNT(*) AS c FROM t WHERE age NOT BETWEEN 20 AND 40 AND name NOT LIKE 'user_5%'",
     "SELECT city FROM t GROUP BY city HAVING AVG(score) > 50 AND COUNT(*) > 1000 ORDER BY city",
     # Keep the parity query portable to SQLite versions before 3.46. The
@@ -370,3 +424,32 @@ class TestParserRegressions:
         assert len(rows) == 50
         cities = {row["city"] for row in rows}
         assert cities == set(CITIES)
+
+
+def test_streaming_append_keeps_scalar_aggregate_stats_current(tmp_path):
+    db_path = tmp_path / "streaming_stats"
+    client = ApexClient(db_path)
+    try:
+        client.create_table("facts")
+        client.store({"value": [10, None, 30], "label": ["a", None, "c"]})
+        client.flush()
+        client.store({"value": [40, 50], "label": ["d", "e"]})
+        client.flush()
+    finally:
+        client.close()
+
+    reopened = ApexClient(db_path)
+    try:
+        reopened.use_table("facts")
+        row = reopened.execute(
+            "SELECT COUNT(label) AS labels, MIN(value) AS lo, MAX(value) AS hi, "
+            "SUM(value) AS total, AVG(value) AS av FROM facts"
+        ).to_dict()[0]
+        assert row == {"labels": 4, "lo": 10, "hi": 50, "total": 130, "av": 32.5}
+        nulls = reopened.execute(
+            "SELECT SUM(CASE WHEN value IS NULL THEN 1 ELSE 0 END) AS null_values, "
+            "SUM(CASE WHEN label IS NOT NULL THEN 1 ELSE 0 END) AS present_labels FROM facts"
+        ).to_dict()[0]
+        assert nulls == {"null_values": 1.0, "present_labels": 4.0}
+    finally:
+        reopened.close()

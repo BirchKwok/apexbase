@@ -6694,6 +6694,32 @@ impl OnDemandStorage {
         let _ = std::fs::write(self.stats_sidecar_path(), &buf);
     }
 
+    pub(super) fn write_col_stats_map_sidecar(
+        &self,
+        schema: &OnDemandSchema,
+        stats: &std::collections::HashMap<String, (i64, f64, f64, f64, bool)>,
+    ) -> io::Result<()> {
+        let entries: Vec<_> = schema
+            .columns
+            .iter()
+            .filter_map(|(name, _)| stats.get(name).map(|stat| (name, stat)))
+            .collect();
+        let mut buf = Vec::with_capacity(12 + entries.len() * 48);
+        buf.extend_from_slice(b"APEXSTAT");
+        buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+        for (name, &(count, sum, min, max, is_int)) in entries {
+            let name = name.as_bytes();
+            buf.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name);
+            buf.extend_from_slice(&count.to_le_bytes());
+            buf.extend_from_slice(&sum.to_bits().to_le_bytes());
+            buf.extend_from_slice(&min.to_bits().to_le_bytes());
+            buf.extend_from_slice(&max.to_bits().to_le_bytes());
+            buf.push(is_int as u8);
+        }
+        std::fs::write(self.stats_sidecar_path(), buf)
+    }
+
     fn delete_col_stats_sidecar(&self) -> io::Result<()> {
         let p = self.stats_sidecar_path();
         match std::fs::remove_file(&p) {

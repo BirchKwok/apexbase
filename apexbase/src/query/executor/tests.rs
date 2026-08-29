@@ -848,6 +848,316 @@ fn test_olap_group_by_two_cols() {
 }
 
 #[test]
+fn test_olap_group_by_two_cols_full_aggregate_family() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_gb2_full_stats.apex");
+    create_olap_storage(&path);
+
+    let result = ApexExecutor::execute(
+        "SELECT city, years, COUNT(*) AS n, SUM(age) AS total, AVG(salary) AS av, \
+         MIN(salary) AS lo, MAX(salary) AS hi FROM default \
+         GROUP BY city, years ORDER BY city, years",
+        &path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 20);
+    let counts = batch
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!((0..counts.len()).map(|row| counts.value(row)).sum::<i64>(), 5000);
+    assert!((0..counts.len()).all(|row| counts.value(row) == 250));
+    let lows = batch
+        .column_by_name("lo")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let highs = batch
+        .column_by_name("hi")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert!((0..batch.num_rows()).all(|row| lows.value(row) <= highs.value(row)));
+}
+
+#[test]
+fn test_olap_cached_numeric_equality_and_prefix_aggregates() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_cached_filtered_aggregates.apex");
+    create_olap_storage(&path);
+
+    let numeric = ApexExecutor::execute(
+        "SELECT COUNT(*) AS n, AVG(salary) AS av FROM default WHERE age=25",
+        &path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap();
+    assert_eq!(
+        numeric
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        125
+    );
+    assert_eq!(
+        numeric
+            .column_by_name("av")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0),
+        93000.0
+    );
+
+    let prefix = ApexExecutor::execute(
+        "SELECT COUNT(*) AS n, AVG(salary) AS av FROM default WHERE city LIKE 'Bei%'",
+        &path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap();
+    assert_eq!(
+        prefix
+            .column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        500
+    );
+    assert_eq!(
+        prefix
+            .column_by_name("av")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0),
+        95000.0
+    );
+}
+
+#[test]
+fn test_olap_cached_numeric_analytics_shapes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_cached_numeric_shapes.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    let mut ints = HashMap::new();
+    let mut strings = HashMap::new();
+    ints.insert("x".to_string(), (0..200).collect());
+    ints.insert("d".to_string(), (0..200).map(|value| value % 10).collect());
+    ints.insert("n".to_string(), (0..200).map(|value| value * 2).collect());
+    strings.insert(
+        "g".to_string(),
+        (0..200)
+            .map(|value| if value % 2 == 0 { "A" } else { "B" }.to_string())
+            .collect(),
+    );
+    storage
+        .insert_typed(ints, HashMap::new(), strings, HashMap::new(), HashMap::new())
+        .unwrap();
+    storage.save().unwrap();
+
+    let grouped = ApexExecutor::execute(
+        "SELECT d, COUNT(*) AS c, SUM(n) AS s, AVG(n) AS a, MIN(n) AS lo, MAX(n) AS hi \
+         FROM default GROUP BY d ORDER BY d",
+        &path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap();
+    assert_eq!(grouped.num_rows(), 10);
+    let counts = grouped
+        .column_by_name("c")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert!((0..10).all(|row| counts.value(row) == 20));
+
+    let ratios = ApexExecutor::execute(
+        "SELECT g, AVG(n/(d+1.0)) AS ratio FROM default GROUP BY g ORDER BY g",
+        &path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap();
+    assert_eq!(ratios.num_rows(), 2);
+    let ratio_values = ratios
+        .column_by_name("ratio")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    for group in 0..2 {
+        let expected = (0..200)
+            .filter(|value| value % 2 == group)
+            .map(|value| (value * 2) as f64 / ((value % 10) as f64 + 1.0))
+            .sum::<f64>()
+            / 100.0;
+        assert!((ratio_values.value(group) - expected).abs() < 1e-9);
+    }
+
+    let filtered = ApexExecutor::execute(
+        "SELECT COUNT(*) AS c, AVG(n) AS a, SUM(x) AS s FROM default \
+         WHERE d=3 AND x BETWEEN 20 AND 150",
+        &path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap();
+    let expected = (20..=150)
+        .filter(|value| value % 10 == 3)
+        .collect::<Vec<i64>>();
+    assert_eq!(
+        filtered
+            .column_by_name("c")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        expected.len() as i64
+    );
+    assert_eq!(
+        filtered
+            .column_by_name("s")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        expected.iter().sum::<i64>()
+    );
+
+    let topk = ApexExecutor::execute(
+        "SELECT x, d, n FROM default WHERE d>=3 AND d<=6 \
+         ORDER BY n DESC, x, d LIMIT 10",
+        &path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap();
+    let xs = topk
+        .column_by_name("x")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let expected_top = (0..200)
+        .rev()
+        .filter(|value| (3..=6).contains(&(value % 10)))
+        .take(10)
+        .collect::<Vec<i64>>();
+    assert_eq!(
+        (0..10).map(|row| xs.value(row)).collect::<Vec<_>>(),
+        expected_top
+    );
+}
+
+#[test]
+fn test_nested_subquery_from_chained_ctes_uses_general_executor() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("orders.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    let mut ints = HashMap::new();
+    let mut strings = HashMap::new();
+    ints.insert("amount".to_string(), vec![100, 200, 300, 50, 400, 80]);
+    strings.insert(
+        "customer".to_string(),
+        ["Alice", "Alice", "Bob", "Bob", "Carol", "Carol"]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    );
+    storage
+        .insert_typed(ints, HashMap::new(), strings, HashMap::new(), HashMap::new())
+        .unwrap();
+    storage.save().unwrap();
+
+    let result = ApexExecutor::execute(
+        "WITH totals AS (\
+             SELECT customer, SUM(amount) AS total FROM orders GROUP BY customer\
+         ), big AS (\
+             SELECT customer, total FROM totals WHERE total > 200\
+         ) SELECT customer FROM big ORDER BY total DESC",
+        &path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap();
+    let customers = result
+        .column_by_name("customer")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    assert_eq!(
+        (0..customers.len()).map(|row| customers.value(row)).collect::<Vec<_>>(),
+        vec!["Carol", "Bob", "Alice"]
+    );
+}
+
+#[test]
+fn test_olap_not_null_numeric_topk_late_materialization() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_not_null_topk.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    let mut ints = HashMap::new();
+    let mut floats = HashMap::new();
+    ints.insert("row_id".to_string(), (0..5000).collect());
+    floats.insert(
+        "score".to_string(),
+        (0..5000).map(|value| value as f64 + 0.25).collect(),
+    );
+    storage
+        .insert_typed(ints, floats, HashMap::new(), HashMap::new(), HashMap::new())
+        .unwrap();
+    storage.save().unwrap();
+
+    let result = ApexExecutor::execute(
+        "SELECT row_id, score FROM default WHERE score IS NOT NULL \
+         ORDER BY score DESC, row_id LIMIT 25",
+        &path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap();
+    assert_eq!(result.num_rows(), 25);
+    assert_eq!(
+        result
+            .column_by_name("row_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        4999
+    );
+    assert_eq!(
+        result
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(24),
+        4975.25
+    );
+}
+
+#[test]
 fn test_olap_group_by_with_having() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("olap_having.apex");
@@ -1019,6 +1329,283 @@ fn test_olap_count_distinct() {
 }
 
 #[test]
+fn test_olap_multiple_count_distinct_dictionary_columns() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_multi_count_distinct.apex");
+    create_olap_storage(&path);
+
+    let result = ApexExecutor::execute(
+        "SELECT COUNT(DISTINCT city) AS cities, COUNT(DISTINCT dept) AS depts, \
+         COUNT(DISTINCT team) AS teams, COUNT(DISTINCT years) AS years FROM default",
+        &path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let value = |name| {
+        batch
+            .column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(value("cities"), 10);
+    assert_eq!(value("depts"), 5);
+    assert_eq!(value("teams"), 3);
+    assert_eq!(value("years"), 20);
+}
+
+#[test]
+fn test_olap_numeric_group_full_aggregate_family() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_numeric_group.apex");
+    create_olap_storage(&path);
+
+    let result = ApexExecutor::execute(
+        "SELECT years, COUNT(*) AS n, SUM(age) AS total, AVG(age) AS av, \
+         MIN(age) AS lo, MAX(age) AS hi FROM default \
+         GROUP BY years HAVING COUNT(*) > 100 ORDER BY years",
+        &path,
+    )
+    .unwrap();
+    let rows = result.to_record_batch().unwrap();
+    assert_eq!(rows.num_rows(), 20);
+    assert_eq!(
+        rows.column_by_name("years")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        0
+    );
+    assert_eq!(
+        rows.column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        250
+    );
+    assert_eq!(
+        rows.column_by_name("total")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        8000
+    );
+    assert_eq!(
+        rows.column_by_name("av")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0),
+        32.0
+    );
+}
+
+#[test]
+fn test_olap_numeric_mod_group() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_numeric_mod_group.apex");
+    create_olap_storage(&path);
+
+    let result = ApexExecutor::execute(
+        "SELECT MOD(emp_id, 5) AS fold, COUNT(*) AS n, AVG(age) AS av \
+         FROM default GROUP BY MOD(emp_id, 5) ORDER BY fold",
+        &path,
+    )
+    .unwrap();
+    let rows = result.to_record_batch().unwrap();
+    assert_eq!(rows.num_rows(), 5);
+    let folds = rows
+        .column_by_name("fold")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = rows
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    for row in 0..5 {
+        assert_eq!(folds.value(row), row as i64);
+        assert_eq!(counts.value(row), 1000);
+    }
+}
+
+#[test]
+fn test_olap_high_cardinality_substr_group() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_high_card_substr_group.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    let mut ints = HashMap::new();
+    let mut floats = HashMap::new();
+    let mut strings = HashMap::new();
+    ints.insert("id".to_string(), (0..5000).collect());
+    floats.insert(
+        "value".to_string(),
+        (0..5000).map(|value| value as f64).collect(),
+    );
+    strings.insert(
+        "event_time".to_string(),
+        (0..5000)
+            .map(|value| format!("2026-08-27 {:02}:{:02}:{:02}", value % 24, value % 60, value % 60))
+            .collect(),
+    );
+    storage
+        .insert_typed(ints, floats, strings, HashMap::new(), HashMap::new())
+        .unwrap();
+    storage.save().unwrap();
+
+    let result = ApexExecutor::execute(
+        "SELECT SUBSTR(event_time, 12, 2) AS hour, COUNT(*) AS n, AVG(value) AS av \
+         FROM default GROUP BY SUBSTR(event_time, 12, 2) ORDER BY hour",
+        &path,
+    )
+    .unwrap();
+    let rows = result.to_record_batch().unwrap();
+    assert_eq!(rows.num_rows(), 24);
+    assert_eq!(
+        rows.column_by_name("hour")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "00"
+    );
+}
+
+#[test]
+fn test_olap_derived_numeric_case_bucket_group() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_derived_case_bucket_group.apex");
+    create_olap_storage(&path);
+
+    let result = ApexExecutor::execute(
+        "SELECT band, COUNT(*) AS n, AVG(salary) AS av FROM \
+         (SELECT CASE WHEN age < 30 THEN 'young' WHEN age < 50 THEN 'mid' \
+          ELSE 'senior' END AS band, salary FROM default) s \
+         GROUP BY band ORDER BY band",
+        &path,
+    )
+    .unwrap();
+    let rows = result.to_record_batch().unwrap();
+    assert_eq!(rows.num_rows(), 3);
+    let bands = rows
+        .column_by_name("band")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let counts = rows
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let actual: Vec<(&str, i64)> = (0..rows.num_rows())
+        .map(|row| (bands.value(row), counts.value(row)))
+        .collect();
+    assert_eq!(actual, vec![("mid", 2500), ("senior", 1500), ("young", 1000)]);
+}
+
+#[test]
+fn test_olap_string_group_numeric_count_distinct() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_group_numeric_distinct.apex");
+    create_olap_storage(&path);
+
+    let result = ApexExecutor::execute(
+        "SELECT city, COUNT(*) AS n, COUNT(DISTINCT age) AS ages \
+         FROM default GROUP BY city ORDER BY city",
+        &path,
+    )
+    .unwrap();
+    let rows = result.to_record_batch().unwrap();
+    assert_eq!(rows.num_rows(), 10);
+    let ages = rows
+        .column_by_name("ages")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let actual: Vec<i64> = (0..ages.len()).map(|row| ages.value(row)).collect();
+    assert!(
+        actual.iter().all(|&value| value == 4),
+        "expected four distinct ages per city, got {actual:?}"
+    );
+}
+
+#[test]
+fn test_olap_scalar_numeric_case_counts() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_numeric_case.apex");
+    create_olap_storage(&path);
+
+    let result = ApexExecutor::execute(
+        "SELECT SUM(CASE WHEN age = 22 THEN 1 ELSE 0 END) AS age_22, \
+         SUM(CASE WHEN years BETWEEN 5 AND 9 THEN 1 ELSE 0 END) AS years_5_9 \
+         FROM default",
+        &path,
+    )
+    .unwrap();
+    let row = result.to_record_batch().unwrap();
+    let value = |name| {
+        row.column_by_name(name)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Float64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(value("age_22"), 125.0);
+    assert_eq!(value("years_5_9"), 1250.0);
+}
+
+#[test]
+fn test_olap_cached_numeric_case_group() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_cached_numeric_case_group.apex");
+    create_olap_storage(&path);
+
+    let result = ApexExecutor::execute(
+        "SELECT city, SUM(CASE WHEN age > 40 THEN 1 ELSE 0 END) AS older, \
+         SUM(CASE WHEN years > 10 THEN 1 ELSE 0 END) AS experienced, \
+         AVG(salary) AS av FROM default GROUP BY city ORDER BY city",
+        &path,
+    )
+    .unwrap();
+    let rows = result.to_record_batch().unwrap();
+    assert_eq!(rows.num_rows(), 10);
+    let older = rows
+        .column_by_name("older")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    let experienced = rows
+        .column_by_name("experienced")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!((0..10).map(|row| older.value(row)).sum::<f64>(), 2625.0);
+    assert_eq!(
+        (0..10).map(|row| experienced.value(row)).sum::<f64>(),
+        2250.0
+    );
+}
+
+#[test]
 fn test_olap_multi_column_distinct_dictionary_projection() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("olap_multi_distinct.apex");
@@ -1037,6 +1624,30 @@ fn test_olap_multi_column_distinct_dictionary_projection() {
         ApexExecutor::execute("SELECT DISTINCT city, dept, team FROM default", &path).unwrap();
     let batch = result.to_record_batch().unwrap();
     assert_eq!(batch.num_rows(), 30);
+}
+
+#[test]
+fn test_olap_mixed_cached_distinct_projection() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("olap_mixed_cached_distinct.apex");
+    create_olap_storage(&path);
+
+    let result = ApexExecutor::execute(
+        "SELECT DISTINCT city, years, dept FROM default ORDER BY city, years, dept",
+        &path,
+    )
+    .unwrap();
+    let rows = result.to_record_batch().unwrap();
+    assert_eq!(rows.num_rows(), 20);
+    assert_eq!(
+        rows.column_by_name("years")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        0
+    );
 }
 
 #[test]
@@ -1583,6 +2194,58 @@ fn test_ctas_empty_result() {
 }
 
 // ========== P1: RIGHT / FULL OUTER / CROSS JOIN Tests ==========
+
+#[test]
+fn test_preaggregated_dimension_join_group() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    exec_multi("CREATE TABLE facts (code INT, value REAL)", base).unwrap();
+    exec_multi("CREATE TABLE dims (code INT, label TEXT)", base).unwrap();
+    exec_multi(
+        "INSERT INTO facts (code, value) VALUES \
+         (1, 10.0), (1, 20.0), (2, 30.0), (2, 50.0), (3, 70.0), (9, 99.0)",
+        base,
+    )
+    .unwrap();
+    exec_multi(
+        "INSERT INTO dims (code, label) VALUES (1, 'A'), (2, 'B'), (3, 'B')",
+        base,
+    )
+    .unwrap();
+    let result = exec_multi(
+        "SELECT d.label, COUNT(*) AS n, AVG(f.value) AS av \
+         FROM facts f JOIN dims d ON f.code=d.code \
+         GROUP BY d.label ORDER BY d.label",
+        base,
+    )
+    .unwrap();
+    let rows = result.to_record_batch().unwrap();
+    assert_eq!(rows.num_rows(), 2);
+    let labels = rows
+        .column_by_name("label")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let counts = rows
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let averages = rows
+        .column_by_name("av")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Float64Array>()
+        .unwrap();
+    assert_eq!(labels.value(0), "A");
+    assert_eq!(counts.value(0), 2);
+    assert_eq!(averages.value(0), 15.0);
+    assert_eq!(labels.value(1), "B");
+    assert_eq!(counts.value(1), 3);
+    assert_eq!(averages.value(1), 50.0);
+}
 
 #[test]
 fn test_right_join() {

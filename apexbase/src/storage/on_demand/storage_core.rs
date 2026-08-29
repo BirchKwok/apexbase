@@ -457,6 +457,153 @@ fn set_null_bit(bitmap: &mut Vec<u8>, row: usize, is_null: bool) {
     }
 }
 
+#[derive(Clone, Copy)]
+struct StreamingColumnStats {
+    count: i64,
+    sum: f64,
+    min: f64,
+    max: f64,
+    is_int: bool,
+    is_numeric: bool,
+}
+
+impl StreamingColumnStats {
+    fn new(column_type: ColumnType) -> Self {
+        let is_int = matches!(
+            column_type,
+            ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date
+                | ColumnType::Bool
+        );
+        Self {
+            count: 0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            is_int,
+            is_numeric: is_int
+                || matches!(column_type, ColumnType::Float64 | ColumnType::Float32),
+        }
+    }
+}
+
+fn update_streaming_column_stats(
+    columns: &[ColumnData],
+    nulls: &[Vec<u8>],
+    rows: usize,
+    stats: &mut [StreamingColumnStats],
+) {
+    #[inline]
+    fn is_null(bitmap: &[u8], row: usize) -> bool {
+        bitmap
+            .get(row / 8)
+            .is_some_and(|byte| ((byte >> (row % 8)) & 1) != 0)
+    }
+
+    for (col_idx, stat) in stats.iter_mut().enumerate() {
+        let Some(column) = columns.get(col_idx) else {
+            continue;
+        };
+        let null_bitmap = nulls.get(col_idx).map(Vec::as_slice).unwrap_or(&[]);
+        let has_nulls = null_bitmap.iter().any(|&byte| byte != 0);
+        if !stat.is_numeric {
+            stat.count += if has_nulls {
+                (0..rows).filter(|&row| !is_null(null_bitmap, row)).count() as i64
+            } else {
+                rows as i64
+            };
+            continue;
+        }
+
+        match column {
+            ColumnData::Int64(values) => {
+                for (row, &value) in values.iter().take(rows).enumerate() {
+                    if has_nulls && is_null(null_bitmap, row) {
+                        continue;
+                    }
+                    let value_f64 = value as f64;
+                    stat.count += 1;
+                    stat.sum += value_f64;
+                    stat.min = stat.min.min(value_f64);
+                    stat.max = stat.max.max(value_f64);
+                }
+            }
+            ColumnData::Float64(values) => {
+                for (row, &value) in values.iter().take(rows).enumerate() {
+                    if has_nulls && is_null(null_bitmap, row) {
+                        continue;
+                    }
+                    stat.count += 1;
+                    stat.sum += value;
+                    stat.min = stat.min.min(value);
+                    stat.max = stat.max.max(value);
+                }
+            }
+            ColumnData::Bool { data, len } => {
+                let limit = rows.min(*len);
+                for row in 0..limit {
+                    if has_nulls && is_null(null_bitmap, row) {
+                        continue;
+                    }
+                    let value = data
+                        .get(row / 8)
+                        .map_or(0.0, |byte| ((byte >> (row % 8)) & 1) as f64);
+                    stat.count += 1;
+                    stat.sum += value;
+                    stat.min = stat.min.min(value);
+                    stat.max = stat.max.max(value);
+                }
+            }
+            _ => {
+                stat.count += if has_nulls {
+                    (0..rows).filter(|&row| !is_null(null_bitmap, row)).count() as i64
+                } else {
+                    rows as i64
+                };
+            }
+        }
+    }
+}
+
+fn write_streaming_column_stats(
+    path: &Path,
+    schema_cols: &[(String, ColumnType)],
+    stats: &[StreamingColumnStats],
+) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(12 + schema_cols.len() * 48);
+    buf.extend_from_slice(b"APEXSTAT");
+    buf.extend_from_slice(&(schema_cols.len() as u32).to_le_bytes());
+    for ((name, _), stat) in schema_cols.iter().zip(stats) {
+        let name_bytes = name.as_bytes();
+        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(name_bytes);
+        buf.extend_from_slice(&stat.count.to_le_bytes());
+        buf.extend_from_slice(&stat.sum.to_bits().to_le_bytes());
+        let min = if stat.count == 0 || !stat.is_numeric {
+            0.0
+        } else {
+            stat.min
+        };
+        let max = if stat.count == 0 || !stat.is_numeric {
+            0.0
+        } else {
+            stat.max
+        };
+        buf.extend_from_slice(&min.to_bits().to_le_bytes());
+        buf.extend_from_slice(&max.to_bits().to_le_bytes());
+        buf.push(stat.is_int as u8);
+    }
+    std::fs::write(PathBuf::from(format!("{}.stats", path.display())), buf)
+}
+
 /// Flush the current output Row Group buffer to the streaming writer and reset
 /// the buffer. No-op when the buffer is empty.
 #[allow(clippy::too_many_arguments)]
@@ -474,11 +621,13 @@ fn flush_streamed_out_rg<W: std::io::Write + std::io::Seek>(
     compression: CompressionType,
     implicit_ids_ok: bool,
     written_rows: &mut u64,
+    stats: &mut [StreamingColumnStats],
 ) -> io::Result<()> {
     let n = ids.len();
     if n == 0 {
         return Ok(());
     }
+    update_streaming_column_stats(columns, nulls, n, stats);
     OnDemandStorage::write_streamed_v4_row_group(
         writer,
         schema_cols,
@@ -583,6 +732,15 @@ pub struct OnDemandStorage {
     /// On-demand: only pages actually accessed are cached (~13 pages = ~52KB per backend).
     /// Invalidated after every write (save_v4).
     pub(crate) page_cache: RwLock<HashMap<u64, Box<[u8; 4096]>>>,
+    /// Bounded cache of decoded, NULL-free numeric columns used by repeated
+    /// analytical scans. Entries are shared by Arc so GROUP BY, filtered
+    /// aggregation, and TopK paths can rescan values without copying them.
+    /// Cleared together with the page cache on every write.
+    pub(crate) numeric_scan_cache:
+        RwLock<Vec<(usize, std::sync::Arc<ColumnData>, usize)>>,
+    /// Avoid taking the numeric-cache write lock on the common append path
+    /// before any analytical query has populated that cache.
+    pub(crate) numeric_scan_cache_populated: AtomicBool,
     /// Reusable scratch buffer for vector TopK scans.
     /// Pre-allocated on first use; grown as needed; reused to avoid per-query
     /// 512MB allocation + soft-page-fault overhead on the destination pages.
@@ -745,6 +903,8 @@ impl OnDemandStorage {
             sync_pending: AtomicU8::new(0),
             compression: std::sync::atomic::AtomicU8::new(CompressionType::None as u8),
             page_cache: RwLock::new(HashMap::new()),
+            numeric_scan_cache: RwLock::new(Vec::new()),
+            numeric_scan_cache_populated: AtomicBool::new(false),
             scan_buf: std::sync::Mutex::new(Vec::new()),
             scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_col: std::sync::Mutex::new(String::new()),
@@ -996,6 +1156,8 @@ impl OnDemandStorage {
             sync_pending: AtomicU8::new(0),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             page_cache: RwLock::new(HashMap::new()),
+            numeric_scan_cache: RwLock::new(Vec::new()),
+            numeric_scan_cache_populated: AtomicBool::new(false),
             scan_buf: std::sync::Mutex::new(Vec::new()),
             scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_col: std::sync::Mutex::new(String::new()),
@@ -1101,6 +1263,8 @@ impl OnDemandStorage {
             sync_pending: AtomicU8::new(0),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             page_cache: RwLock::new(HashMap::new()),
+            numeric_scan_cache: RwLock::new(Vec::new()),
+            numeric_scan_cache_populated: AtomicBool::new(false),
             scan_buf: std::sync::Mutex::new(Vec::new()),
             scan_buf_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_col: std::sync::Mutex::new(String::new()),
@@ -1298,6 +1462,12 @@ impl OnDemandStorage {
     /// Called after every write (save_v4, append_row_group, open_v4_data).
     pub(crate) fn invalidate_page_cache(&self) {
         self.page_cache.write().clear();
+        if self
+            .numeric_scan_cache_populated
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.numeric_scan_cache.write().clear();
+        }
         self.scan_buf_file_size
             .store(0, std::sync::atomic::Ordering::Release);
         self.scan_buf_f16_file_size
@@ -3486,6 +3656,10 @@ impl OnDemandStorage {
         let mut written_rows: u64 = 0;
         let mut first_rg = true;
         let mut out_row_count: usize = 0;
+        let mut column_stats: Vec<StreamingColumnStats> = schema_cols
+            .iter()
+            .map(|(_, column_type)| StreamingColumnStats::new(*column_type))
+            .collect();
         let implicit_ids_ok = self
             .path
             .components()
@@ -3508,6 +3682,7 @@ impl OnDemandStorage {
                     compression,
                     implicit_ids_ok,
                     &mut written_rows,
+                    &mut column_stats,
                 )?;
                 out_row_count = out_ids.len();
             };
@@ -3741,7 +3916,7 @@ impl OnDemandStorage {
             DELTA_ROW_COUNT_CACHE.write().remove(&delta_path);
             DELTA_STRING_INDEX_CACHE.write().remove(&delta_path);
         }
-        self.delete_col_stats_sidecar()?;
+        write_streaming_column_stats(&self.path, &schema_cols, &column_stats)?;
         self.clear_delta_store()?;
 
         // Restore mmap-only in-memory state (empty write buffer, updated counts).
@@ -4066,6 +4241,10 @@ impl OnDemandStorage {
         let mut written_rows: u64 = 0;
         let mut first_rg = true;
         let mut out_row_count: usize = 0;
+        let mut column_stats: Vec<StreamingColumnStats> = new_schema_cols
+            .iter()
+            .map(|(_, column_type)| StreamingColumnStats::new(*column_type))
+            .collect();
         let implicit_ids_ok = self
             .path
             .components()
@@ -4088,6 +4267,7 @@ impl OnDemandStorage {
                     compression,
                     implicit_ids_ok,
                     &mut written_rows,
+                    &mut column_stats,
                 )?;
                 out_row_count = out_ids.len();
             };
@@ -4238,7 +4418,7 @@ impl OnDemandStorage {
         #[cfg(not(windows))]
         std::fs::rename(&tmp_path, &self.path)?;
 
-        self.delete_col_stats_sidecar()?;
+        write_streaming_column_stats(&self.path, &new_schema_cols, &column_stats)?;
         *self.column_index.write() = Vec::new();
         *self.ids.write() = Vec::new();
         *self.columns.write() = new_schema_cols

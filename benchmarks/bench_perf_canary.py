@@ -25,9 +25,32 @@ CANARY_SPECS = (
     ("Projection full scan (3 cols)", "bench_projected_full_scan", "mean"),
     ("String equality filter", "bench_filter_string", "mean"),
     ("Numeric range filter", "bench_filter_range", "mean"),
+    ("Numeric equality aggregation", "bench_numeric_equality_aggregation", "mean"),
+    ("Numeric conjunction aggregation", "bench_numeric_conjunction_aggregation", "mean"),
+    ("Prefix LIKE aggregation", "bench_prefix_like_aggregation", "mean"),
     ("GROUP BY city", "bench_group_by", "mean"),
     ("ORDER BY score LIMIT 100", "bench_order_limit", "mean"),
+    ("IS NOT NULL numeric TopK", "bench_not_null_numeric_topk", "mean"),
+    ("Filtered numeric TopK", "bench_filtered_numeric_topk", "mean"),
     ("Aggregation (5 funcs)", "bench_aggregation", "mean"),
+    ("Numeric GROUP BY (5 funcs)", "bench_numeric_group_aggregation", "mean"),
+    ("Two-key GROUP BY (5 funcs)", "bench_two_key_group_aggregation", "mean"),
+    ("Cached analytical CTE", "bench_cached_analytical_cte", "mean"),
+    ("Numeric MOD GROUP BY", "bench_numeric_mod_group", "mean"),
+    ("High-card SUBSTR GROUP BY", "bench_high_card_substr_group", "mean"),
+    ("Derived CASE bucket GROUP BY", "bench_derived_case_bucket_group", "mean"),
+    ("Derived ratio GROUP BY", "bench_derived_ratio_group", "mean"),
+    ("Mixed cached DISTINCT", "bench_mixed_cached_distinct", "mean"),
+    ("Multiple COUNT DISTINCT", "bench_multiple_count_distinct", "mean"),
+    ("Dimension JOIN aggregation", "bench_dimension_join_aggregation", "mean"),
+    ("Conditional aggregation (2 CASE)", "bench_conditional_aggregation", "mean"),
+    ("NULL profile (2 cols)", "bench_null_profile", "mean"),
+    ("CSV scalar MAX (direct file)", "bench_csv_scalar_aggregation", "mean"),
+    ("CSV filtered scalar aggregation", "bench_csv_filtered_scalar_aggregation", "mean"),
+    ("CSV string GROUP BY numeric agg", "bench_csv_string_group_numeric_aggregation", "mean"),
+    ("CSV filtered GROUP BY + HAVING", "bench_csv_filtered_group_numeric_aggregation", "mean"),
+    ("CSV integer GROUP BY numeric agg", "bench_csv_integer_group_numeric_aggregation", "mean"),
+    ("CSV multiple COUNT DISTINCT", "bench_csv_multi_count_distinct", "mean"),
     ("Point lookup (SQL)", "bench_point_lookup", "median"),
     ("Point lookup (direct)", "bench_oltp_direct_point_lookup", "median"),
     ("Projected string equality", "bench_oltp_projected_string_eq", "median"),
@@ -115,7 +138,19 @@ def run_canary(rows, warmup, iterations, qps_only=False):
 
     data = full_bench.generate_data(rows)
     tmpdir = tempfile.mkdtemp(prefix="apexbase_canary_")
-    bench = full_bench.ApexBaseBench(tmpdir, data)
+    csv_path = Path(tmpdir) / "canary_data.csv"
+    with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = full_bench.csv_mod.writer(csv_file)
+        writer.writerow(["name", "age", "score", "city", "category"])
+        for index in range(rows):
+            writer.writerow([
+                data["name"][index],
+                data["age"][index],
+                data["score"][index],
+                data["city"][index],
+                data["category"][index],
+            ])
+    bench = full_bench.ApexBaseBench(tmpdir, data, csv_path=str(csv_path))
     bench.shared_inputs = full_bench.build_shared_inputs(rows)
     results = []
     try:
@@ -126,6 +161,8 @@ def run_canary(rows, warmup, iterations, qps_only=False):
                 setup_method = spec[3] if len(spec) > 3 else None
                 if method_name == "bench_topk_join_canary":
                     bench.setup_topk_join_canary()
+                elif method_name == "bench_dimension_join_aggregation":
+                    bench.setup_dimension_join_aggregation()
                 elapsed_ms = _run_metric(
                     bench, method_name, mode, warmup, iterations, setup_method
                 )

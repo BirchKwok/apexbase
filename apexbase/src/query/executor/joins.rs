@@ -25,6 +25,15 @@ impl ApexExecutor {
             return Ok(ApexResult::Scalar(count));
         }
 
+        if let Some(result) = Self::try_preaggregated_dimension_join(
+            &stmt,
+            &joins,
+            base_dir,
+            default_table_path,
+        )? {
+            return Ok(result);
+        }
+
         // General INNER-JOIN GROUP BY COUNT(*) pushdown (semi-join on the LEFT key).
         if let Some(result) =
             Self::try_groupby_inner_join_count(&stmt, &joins, base_dir, default_table_path)?
@@ -751,6 +760,273 @@ impl ApexExecutor {
         };
 
         Ok(ApexResult::Data(result))
+    }
+
+    /// Pre-aggregate a large numeric fact table by its INNER JOIN key, then
+    /// attach a unique small dimension label. This preserves join semantics
+    /// while avoiding a materialized fact-sized joined batch.
+    fn try_preaggregated_dimension_join(
+        stmt: &SelectStatement,
+        joins: &[JoinClause],
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+        use ahash::AHashMap;
+
+        if joins.len() != 1
+            || joins[0].join_type != JoinType::Inner
+            || stmt.group_by.len() != 1
+            || stmt.where_clause.is_some()
+            || stmt.having.is_some()
+            || stmt.distinct
+            || stmt.distinct_on.is_some()
+        {
+            return Ok(None);
+        }
+        let (left_key, right_key, _, _, extra_filter) =
+            match Self::extract_join_keys_with_filter(&joins[0].on) {
+                Ok(keys) => keys,
+                Err(_) => return Ok(None),
+            };
+        if extra_filter.is_some() {
+            return Ok(None);
+        }
+        fn clean(name: &str) -> &str {
+            let trimmed = name.trim_matches('"');
+            trimmed
+                .rsplit('.')
+                .next()
+                .unwrap_or(trimmed)
+                .trim_matches('"')
+        }
+        let left_key = clean(&left_key).to_string();
+        let right_key = clean(&right_key).to_string();
+        let dimension_label = clean(&stmt.group_by[0]).to_string();
+        if dimension_label == left_key || dimension_label == right_key {
+            return Ok(None);
+        }
+
+        let left_path = match &stmt.from {
+            Some(FromItem::Table { table, .. }) => {
+                Self::resolve_table_path(table, base_dir, default_table_path)
+            }
+            _ => return Ok(None),
+        };
+        let right_path = match &joins[0].right {
+            FromItem::Table { table, .. } => {
+                Self::resolve_table_path(table, base_dir, default_table_path)
+            }
+            _ => return Ok(None),
+        };
+        let left_backend = get_cached_backend(&left_path)?;
+        let right_backend = get_cached_backend(&right_path)?;
+        if !matches!(
+            right_backend.get_column_type(&dimension_label),
+            Some(crate::data::DataType::String)
+        ) {
+            return Ok(None);
+        }
+        if left_backend.column_has_nulls(&left_key)
+            || left_backend.pending_v4_in_memory_rows() > 0
+            || left_backend.has_pending_deltas()
+            || left_backend.has_delta()
+        {
+            return Ok(None);
+        }
+
+        enum Output {
+            Key(String),
+            Aggregate(String, AggregateFunc, usize),
+        }
+        let mut outputs = Vec::with_capacity(stmt.columns.len());
+        let mut aggregate_specs: Vec<(String, bool)> = Vec::new();
+        let mut aggregate_ops = Vec::new();
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(name) if clean(name) == dimension_label => {
+                    outputs.push(Output::Key(dimension_label.clone()));
+                }
+                SelectColumn::ColumnAlias { column, alias }
+                    if clean(column) == dimension_label =>
+                {
+                    outputs.push(Output::Key(alias.clone()));
+                }
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    distinct: false,
+                    alias,
+                } => {
+                    let count_star = matches!(func, AggregateFunc::Count)
+                        && column.as_ref().map_or(true, |column| {
+                            column == "*"
+                                || column.chars().next().is_some_and(|c| c.is_ascii_digit())
+                        });
+                    let source = if count_star {
+                        "*".to_string()
+                    } else {
+                        let Some(column) = column else {
+                            return Ok(None);
+                        };
+                        clean(column).to_string()
+                    };
+                    let slot = aggregate_specs.len();
+                    aggregate_specs.push((source.clone(), count_star));
+                    aggregate_ops.push(match func {
+                        AggregateFunc::Count => 0,
+                        AggregateFunc::Sum | AggregateFunc::Avg => 1,
+                        AggregateFunc::Min => 2,
+                        AggregateFunc::Max => 4,
+                    });
+                    let function = match func {
+                        AggregateFunc::Count => "COUNT",
+                        AggregateFunc::Sum => "SUM",
+                        AggregateFunc::Avg => "AVG",
+                        AggregateFunc::Min => "MIN",
+                        AggregateFunc::Max => "MAX",
+                    };
+                    outputs.push(Output::Aggregate(
+                        alias
+                            .clone()
+                            .unwrap_or_else(|| format!("{}({})", function, source)),
+                        func.clone(),
+                        slot,
+                    ));
+                }
+                _ => return Ok(None),
+            }
+        }
+        if aggregate_specs.is_empty() {
+            return Ok(None);
+        }
+        let aggregate_refs: Vec<(&str, bool)> = aggregate_specs
+            .iter()
+            .map(|(column, count_star)| (column.as_str(), *count_star))
+            .collect();
+        let Some(fact_rows) = left_backend.execute_numeric_group_agg_mmap(
+            &left_key,
+            &aggregate_refs,
+            &aggregate_ops,
+        )?
+        else {
+            return Ok(None);
+        };
+
+        let dimension = right_backend.read_columns_to_arrow(
+            Some(&[right_key.as_str(), dimension_label.as_str()]),
+            0,
+            None,
+        )?;
+        let Some(keys) = dimension
+            .column_by_name(&right_key)
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+        else {
+            return Ok(None);
+        };
+        let Some(labels) = dimension.column_by_name(&dimension_label) else {
+            return Ok(None);
+        };
+        let mut label_by_key = AHashMap::with_capacity(dimension.num_rows());
+        for row in 0..dimension.num_rows() {
+            if keys.is_null(row) || labels.is_null(row) {
+                continue;
+            }
+            if label_by_key
+                .insert(keys.value(row), Self::arrow_value_to_string(labels, row))
+                .is_some()
+            {
+                return Ok(None);
+            }
+        }
+
+        let mut grouped: AHashMap<String, Vec<(i64, f64, f64, f64, bool)>> =
+            AHashMap::new();
+        for fact in fact_rows {
+            let Some(label) = label_by_key.get(&fact.key) else {
+                continue;
+            };
+            let target = grouped.entry(label.clone()).or_insert_with(|| {
+                aggregate_specs
+                    .iter()
+                    .map(|_| (0, 0.0, f64::INFINITY, f64::NEG_INFINITY, false))
+                    .collect()
+            });
+            for (target, source) in target.iter_mut().zip(fact.stats) {
+                target.0 += source.0;
+                target.1 += source.1;
+                if source.0 > 0 {
+                    target.2 = target.2.min(source.2);
+                    target.3 = target.3.max(source.3);
+                }
+                target.4 |= source.4;
+            }
+        }
+        let grouped: Vec<_> = grouped.into_iter().collect();
+        let mut fields = Vec::with_capacity(outputs.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(outputs.len());
+        for output in outputs {
+            match output {
+                Output::Key(name) => {
+                    fields.push(Field::new(name, ArrowDataType::Utf8, false));
+                    arrays.push(Arc::new(StringArray::from(
+                        grouped.iter().map(|(label, _)| label.as_str()).collect::<Vec<_>>(),
+                    )));
+                }
+                Output::Aggregate(name, func, slot) => match func {
+                    AggregateFunc::Count => {
+                        fields.push(Field::new(name, ArrowDataType::Int64, false));
+                        arrays.push(Arc::new(Int64Array::from(
+                            grouped.iter().map(|(_, stats)| stats[slot].0).collect::<Vec<_>>(),
+                        )));
+                    }
+                    AggregateFunc::Avg => {
+                        fields.push(Field::new(name, ArrowDataType::Float64, true));
+                        arrays.push(Arc::new(Float64Array::from(
+                            grouped
+                                .iter()
+                                .map(|(_, stats)| {
+                                    let stat = stats[slot];
+                                    (stat.0 > 0).then_some(stat.1 / stat.0 as f64)
+                                })
+                                .collect::<Vec<_>>(),
+                        )));
+                    }
+                    AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => {
+                        fields.push(Field::new(name, ArrowDataType::Float64, true));
+                        arrays.push(Arc::new(Float64Array::from(
+                            grouped
+                                .iter()
+                                .map(|(_, stats)| {
+                                    let stat = stats[slot];
+                                    (stat.0 > 0).then_some(match func {
+                                        AggregateFunc::Sum => stat.1,
+                                        AggregateFunc::Min => stat.2,
+                                        AggregateFunc::Max => stat.3,
+                                        _ => unreachable!(),
+                                    })
+                                })
+                                .collect::<Vec<_>>(),
+                        )));
+                    }
+                },
+            }
+        }
+        let mut batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+            .map_err(|error| err_data(error.to_string()))?;
+        if !stmt.order_by.is_empty() {
+            let order_by = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            let top_k = stmt.limit.map(|limit| limit + stmt.offset.unwrap_or(0));
+            batch = Self::apply_order_by_topk(&batch, &order_by, top_k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            batch = Self::apply_limit_offset(&batch, stmt.limit, stmt.offset)?;
+        }
+        Ok(Some(if batch.num_rows() == 0 {
+            ApexResult::Empty(batch.schema())
+        } else {
+            ApexResult::Data(batch)
+        }))
     }
 
     /// INNER-JOIN GROUP BY COUNT(*) pushdown: a single inner equijoin that is a

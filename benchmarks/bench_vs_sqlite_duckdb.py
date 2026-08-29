@@ -2351,6 +2351,24 @@ class ApexBaseBench:
             "SELECT * FROM default WHERE age BETWEEN 25 AND 35"
         )
 
+    def bench_numeric_equality_aggregation(self):
+        return self._query_all(
+            "SELECT COUNT(*) AS n, AVG(score) AS av FROM default WHERE age=25"
+        )
+
+    def bench_numeric_conjunction_aggregation(self):
+        return self._query_all(
+            "SELECT COUNT(*) AS n, AVG(score) AS av, SUM(age) AS total "
+            "FROM default WHERE age BETWEEN 25 AND 35 "
+            "AND score BETWEEN 20 AND 80"
+        )
+
+    def bench_prefix_like_aggregation(self):
+        return self._query_all(
+            "SELECT COUNT(*) AS n, AVG(score) AS av "
+            "FROM default WHERE city LIKE 'Bei%'"
+        )
+
     def bench_group_by(self):
         return self._query_all(
             "SELECT city, COUNT(*), AVG(score) FROM default GROUP BY city"
@@ -2402,6 +2420,18 @@ class ApexBaseBench:
             "SELECT * FROM default ORDER BY score DESC LIMIT 100"
         )
 
+    def bench_not_null_numeric_topk(self):
+        return self._query_all(
+            "SELECT name, age, score FROM default WHERE score IS NOT NULL "
+            "ORDER BY score DESC, age LIMIT 100"
+        )
+
+    def bench_filtered_numeric_topk(self):
+        return self._query_all(
+            "SELECT name, age, score FROM default WHERE age BETWEEN 25 AND 35 "
+            "ORDER BY score DESC, age LIMIT 100"
+        )
+
     def bench_order_limit_asc(self):
         return self._query_all(
             "SELECT * FROM default ORDER BY score ASC LIMIT 100"
@@ -2410,6 +2440,142 @@ class ApexBaseBench:
     def bench_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*), AVG(age), SUM(score), MIN(age), MAX(age) FROM default"
+        )
+
+    def bench_numeric_group_aggregation(self):
+        return self._query_all(
+            "SELECT age, COUNT(*) AS n, AVG(score) AS av, MIN(score) AS lo, "
+            "MAX(score) AS hi FROM default GROUP BY age ORDER BY age"
+        )
+
+    def bench_two_key_group_aggregation(self):
+        return self._query_all(
+            "SELECT city, age, COUNT(*) AS n, SUM(score) AS total, "
+            "AVG(score) AS av, MIN(score) AS lo, MAX(score) AS hi "
+            "FROM default GROUP BY city, age ORDER BY city, age"
+        )
+
+    def bench_cached_analytical_cte(self):
+        return self._query_all(
+            "WITH stats AS (SELECT city, age, COUNT(*) AS n, AVG(score) AS av "
+            "FROM default GROUP BY city, age) "
+            "SELECT city, age, n, av FROM stats WHERE n > 0 "
+            "ORDER BY av DESC, city, age LIMIT 1000"
+        )
+
+    def bench_numeric_mod_group(self):
+        return self._query_all(
+            "SELECT MOD(age, 5) AS fold, COUNT(*) AS n, AVG(score) AS av "
+            "FROM default GROUP BY MOD(age, 5) ORDER BY fold"
+        )
+
+    def bench_high_card_substr_group(self):
+        return self._query_all(
+            "SELECT SUBSTR(name, 1, 6) AS prefix, COUNT(*) AS n, AVG(score) AS av "
+            "FROM default GROUP BY SUBSTR(name, 1, 6) ORDER BY prefix"
+        )
+
+    def bench_derived_case_bucket_group(self):
+        return self._query_all(
+            "SELECT band, COUNT(*) AS n, AVG(score) AS av FROM "
+            "(SELECT CASE WHEN age < 30 THEN 'young' WHEN age < 60 THEN 'mid' "
+            "ELSE 'senior' END AS band, score FROM default) s "
+            "GROUP BY band ORDER BY band"
+        )
+
+    def bench_derived_ratio_group(self):
+        return self._query_all(
+            "SELECT city, AVG(score/(age+1.0)) AS normalized_score "
+            "FROM default GROUP BY city ORDER BY city"
+        )
+
+    def bench_mixed_cached_distinct(self):
+        return self._query_all(
+            "SELECT DISTINCT city, age, category FROM default "
+            "ORDER BY city, age, category"
+        )
+
+    def bench_multiple_count_distinct(self):
+        return self._query_all(
+            "SELECT COUNT(DISTINCT city) AS cities, "
+            "COUNT(DISTINCT category) AS categories, "
+            "COUNT(DISTINCT age) AS ages FROM default"
+        )
+
+    def setup_dimension_join_aggregation(self):
+        self.client.create_table("__perf_age_dim")
+        self.client.use_table("__perf_age_dim")
+        ages = list(range(18, 81))
+        self.client.store({
+            "age": ages,
+            "age_band": [
+                "young" if age < 30 else "mid" if age < 60 else "senior"
+                for age in ages
+            ],
+        })
+        self.client.flush()
+        self.client.use_table("default")
+
+    def bench_dimension_join_aggregation(self):
+        return self._query_all(
+            "SELECT d.age_band, COUNT(*) AS n, AVG(f.score) AS av "
+            "FROM default f JOIN __perf_age_dim d ON f.age=d.age "
+            "GROUP BY d.age_band ORDER BY d.age_band"
+        )
+
+    def bench_conditional_aggregation(self):
+        return self._query_all(
+            "SELECT SUM(CASE WHEN age = 25 THEN 1 ELSE 0 END) AS age_25, "
+            "SUM(CASE WHEN score BETWEEN 20 AND 40 THEN 1 ELSE 0 END) AS mid_scores "
+            "FROM default"
+        )
+
+    def bench_null_profile(self):
+        return self._query_all(
+            "SELECT SUM(CASE WHEN age IS NULL THEN 1 ELSE 0 END) AS null_age, "
+            "SUM(CASE WHEN name IS NULL THEN 1 ELSE 0 END) AS null_name FROM default"
+        )
+
+    def bench_csv_scalar_aggregation(self):
+        """Measure scalar MAX over a direct CSV file without materializing it."""
+        return self._scalar(
+            f"SELECT MAX(score) AS max_score FROM '{self.csv_path}' LIMIT 100"
+        )
+
+    def bench_csv_filtered_scalar_aggregation(self):
+        """Measure fused numeric filtering and aggregation on a direct CSV."""
+        return self._query_all(
+            f"SELECT COUNT(*) AS n, AVG(score) AS av, MAX(age) AS mx "
+            f"FROM '{self.csv_path}' WHERE age BETWEEN 25 AND 35 AND score >= 20"
+        )
+
+    def bench_csv_string_group_numeric_aggregation(self):
+        """Measure fused string grouping and numeric aggregation on a direct CSV."""
+        return self._query_all(
+            f"SELECT city, COUNT(*) AS n, AVG(score) AS av, MAX(age) AS mx "
+            f"FROM '{self.csv_path}' GROUP BY city ORDER BY n DESC, city"
+        )
+
+    def bench_csv_filtered_group_numeric_aggregation(self):
+        """Measure fused numeric filtering, grouping, HAVING, and aggregation."""
+        return self._query_all(
+            f"SELECT city, COUNT(*) AS n, AVG(score) AS av, MAX(age) AS mx "
+            f"FROM '{self.csv_path}' WHERE age BETWEEN 25 AND 35 AND score >= 20 "
+            f"GROUP BY city HAVING COUNT(*) > 0 ORDER BY n DESC, city"
+        )
+
+    def bench_csv_integer_group_numeric_aggregation(self):
+        """Measure fused integer-key grouping and numeric aggregation."""
+        return self._query_all(
+            f"SELECT age, COUNT(*) AS n, AVG(score) AS av "
+            f"FROM '{self.csv_path}' GROUP BY age ORDER BY n DESC, age LIMIT 20"
+        )
+
+    def bench_csv_multi_count_distinct(self):
+        """Measure a fused mixed string/integer feature-cardinality profile."""
+        return self._query_all(
+            f"SELECT COUNT(DISTINCT age) AS ages, COUNT(DISTINCT city) AS cities, "
+            f"COUNT(DISTINCT category) AS categories FROM '{self.csv_path}'"
         )
 
     def setup_topk_join_canary(self):

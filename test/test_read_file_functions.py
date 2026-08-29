@@ -115,6 +115,46 @@ class TestReadCsv:
         rv = self.c.execute(f"SELECT COUNT(1) AS cnt FROM '{self.csv}' LIMIT 100")
         assert rv.first()['cnt'] == 5
 
+    def test_scalar_numeric_aggregate_direct_file_with_spaced_header(self):
+        # Network-flow CSV exports commonly put a space after delimiters.  The
+        # direct-file aggregate path must normalize the header and avoid
+        # materializing the unrelated wide columns.
+        path = os.path.join(self.d, 'flow.csv')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write('id, Protocol , score\n1,6,10.5\n2,17,20.25\n3,,5.0\n')
+
+        result = self.c.execute(
+            f"SELECT MAX(Protocol) AS cnt FROM '{path}' LIMIT 100"
+        )
+        assert result.first()['cnt'] == 17
+
+        aggregates = self.c.execute(
+            f"SELECT COUNT(*), SUM(Protocol), AVG(score), MIN(Protocol), MAX(score) "
+            f"FROM read_csv('{path}')"
+        ).first()
+        assert aggregates['COUNT(*)'] == 3
+        assert aggregates['SUM(Protocol)'] == 23
+        assert abs(aggregates['AVG(score)'] - (10.5 + 20.25 + 5.0) / 3) < 1e-6
+        assert aggregates['MIN(Protocol)'] == 6
+        assert abs(aggregates['MAX(score)'] - 20.25) < 1e-6
+
+    def test_filtered_numeric_aggregate_direct_file(self):
+        path = os.path.join(self.d, 'filtered_flow.csv')
+        with open(path, 'w', encoding='utf-8') as f:
+            f.write(
+                'id, Protocol , duration, bytes\n'
+                '1,6,10,100\n'
+                '2,17,20,200\n'
+                '3,6,30,300\n'
+                '4,6,,400\n'
+            )
+
+        result = self.c.execute(
+            f"SELECT COUNT(*) AS n, SUM(bytes) AS total, AVG(duration) AS av "
+            f"FROM '{path}' WHERE Protocol = 6 AND duration >= 15"
+        ).first()
+        assert result == {'n': 1, 'total': 300, 'av': 30.0}
+
     def test_count_star_direct_file_tsv(self):
         rv = self.c.execute(f"SELECT COUNT(*) AS cnt FROM '{self.tsv}'")
         assert rv.first()['cnt'] == 5
@@ -130,6 +170,62 @@ class TestReadCsv:
         )
         m = {r['city']: r['cnt'] for r in rv}
         assert m == {'Beijing': 2, 'Shanghai': 2, 'Guangzhou': 1}
+
+    def test_group_by_string_with_numeric_aggregates_direct_file(self):
+        rows = self.c.execute(
+            f"SELECT city, COUNT(*) AS n, SUM(age) AS total, AVG(score) AS av, "
+            f"MIN(age) AS lo, MAX(score) AS hi FROM '{self.csv}' "
+            f"GROUP BY city ORDER BY n DESC, city"
+        ).to_dict()
+        expected = {
+            'Beijing': (2, 65, 91.75, 30, 95.0),
+            'Shanghai': (2, 47, 77.5, 22, 83.0),
+            'Guangzhou': (1, 28, 60.0, 28, 60.0),
+        }
+        for row in rows:
+            assert (
+                row['n'], row['total'], row['av'], row['lo'], row['hi']
+            ) == expected[row['city']]
+
+    def test_filtered_group_by_string_with_numeric_aggregates_direct_file(self):
+        rows = self.c.execute(
+            f"SELECT city, COUNT(*) AS n, AVG(score) AS av, MAX(age) AS hi "
+            f"FROM '{self.csv}' WHERE age >= 25 AND score < 90 "
+            f"GROUP BY city HAVING COUNT(*) > 0 ORDER BY n DESC, city"
+        ).to_dict()
+        assert rows == [
+            {'city': 'Beijing', 'n': 1, 'av': 88.5, 'hi': 30},
+            {'city': 'Guangzhou', 'n': 1, 'av': 60.0, 'hi': 28},
+            {'city': 'Shanghai', 'n': 1, 'av': 72.0, 'hi': 25},
+        ]
+        implicit = self.c.execute(
+            f"SELECT city, AVG(score) AS av FROM '{self.csv}' "
+            f"GROUP BY city HAVING COUNT(*) > 1 ORDER BY city"
+        ).to_dict()
+        assert implicit == [
+            {'city': 'Beijing', 'av': 91.75},
+            {'city': 'Shanghai', 'av': 77.5},
+        ]
+
+    def test_integer_group_by_with_numeric_aggregate_direct_file(self):
+        rows = self.c.execute(
+            f"SELECT age, COUNT(*) AS n, AVG(score) AS av FROM '{self.csv}' "
+            f"GROUP BY age ORDER BY age"
+        ).to_dict()
+        assert rows == [
+            {'age': 22, 'n': 1, 'av': 83.0},
+            {'age': 25, 'n': 1, 'av': 72.0},
+            {'age': 28, 'n': 1, 'av': 60.0},
+            {'age': 30, 'n': 1, 'av': 88.5},
+            {'age': 35, 'n': 1, 'av': 95.0},
+        ]
+
+    def test_multi_count_distinct_direct_file(self):
+        row = self.c.execute(
+            f"SELECT COUNT(DISTINCT age) AS ages, "
+            f"COUNT(DISTINCT city) AS cities FROM '{self.csv}'"
+        ).first()
+        assert row == {'ages': 5, 'cities': 3}
 
     def test_order_by_limit(self):
         rv = self.c.execute(f"SELECT age FROM read_csv('{self.csv}') ORDER BY age DESC LIMIT 3")

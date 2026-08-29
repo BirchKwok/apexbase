@@ -9,6 +9,19 @@ pub struct NativeStringGroupAgg {
     pub max_values: Vec<Option<String>>,
 }
 
+#[derive(Debug, Clone)]
+pub struct NativeNumericGroupAgg {
+    pub key: i64,
+    pub stats: Vec<(i64, f64, f64, f64, bool)>,
+}
+
+#[derive(Clone, Copy)]
+enum NumericGroupKeyTransform<'a> {
+    Identity,
+    Modulo(i64),
+    UpperBounds(&'a [i64]),
+}
+
 // Rayon dispatch is visible at sub-millisecond scale when a filtered numeric
 // aggregation is split into the default 65K-row groups.  Require enough work
 // per participating worker to amortize scheduling and wake-up costs; this keeps
@@ -73,6 +86,920 @@ unsafe fn aggregate_validated_2col_count_i64(
 }
 
 impl OnDemandStorage {
+    /// Exact COUNT(DISTINCT integral_column) for a bounded numeric domain.
+    /// Each Row Group fills a local bitset and the final reduction ORs them,
+    /// avoiding a million-entry hash table for domains such as ports/codes.
+    pub fn execute_numeric_distinct_count_mmap(
+        &self,
+        column: &str,
+    ) -> io::Result<Option<i64>> {
+        use rayon::prelude::*;
+
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let Some(column_index) = footer.schema.get_index(column) else {
+            return Ok(None);
+        };
+        if !matches!(
+            footer.schema.columns[column_index].1,
+            ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date
+                | ColumnType::Bool
+        ) {
+            return Ok(None);
+        }
+        let mut minimum = i64::MAX;
+        let mut maximum = i64::MIN;
+        for zone_maps in &footer.zone_maps {
+            let Some(zone_map) = zone_maps
+                .iter()
+                .find(|zone_map| zone_map.col_idx as usize == column_index && !zone_map.is_float)
+            else {
+                return Ok(None);
+            };
+            minimum = minimum.min(zone_map.min_bits);
+            maximum = maximum.max(zone_map.max_bits);
+        }
+        let width = maximum.saturating_sub(minimum).saturating_add(1);
+        if width <= 0 || width > 1_000_000 {
+            return Ok(None);
+        }
+        let words = (width as usize).div_ceil(64);
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for numeric DISTINCT"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let mmap_ptr = mmap_ref.as_ptr() as usize;
+        let mmap_len = mmap_ref.len();
+        let parts: Option<Vec<Vec<u64>>> = footer
+            .row_groups
+            .par_iter()
+            .enumerate()
+            .map(|(row_group_index, row_group)| {
+                let rows = row_group.row_count as usize;
+                let mut seen = vec![0u64; words];
+                if rows == 0 {
+                    return Some(seen);
+                }
+                let mmap = unsafe {
+                    std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len)
+                };
+                let end = (row_group.offset + row_group.data_size) as usize;
+                if end > mmap.len() || end < row_group.offset as usize + 32 {
+                    return None;
+                }
+                let row_group_bytes = &mmap[row_group.offset as usize..end];
+                let encoded_body = &row_group_bytes[32..];
+                let decompressed =
+                    decompress_rg_body(row_group_bytes[28], encoded_body).ok()?;
+                let body = decompressed.as_deref().unwrap_or(encoded_body);
+                let offsets = footer.col_offsets.get(row_group_index)?;
+                let offset = *offsets.get(column_index)? as usize;
+                let bitmap_bytes = rows.div_ceil(8);
+                if offset + bitmap_bytes >= body.len() {
+                    return None;
+                }
+                let nulls = &body[offset..offset + bitmap_bytes];
+                let deletion_offset = rg_id_section_len(
+                    rows,
+                    row_group_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+                );
+                let deleted = body.get(deletion_offset..deletion_offset + bitmap_bytes)?;
+                let (values, _) = read_column_encoded(
+                    &body[offset + bitmap_bytes..],
+                    footer.schema.columns[column_index].1,
+                )
+                .ok()?;
+                let ColumnData::Int64(values) = values else {
+                    return None;
+                };
+                for (row, &value) in values.iter().take(rows).enumerate() {
+                    if ((nulls[row / 8] | deleted[row / 8]) >> (row % 8)) & 1 != 0 {
+                        continue;
+                    }
+                    let slot = value.saturating_sub(minimum) as usize;
+                    if slot >= width as usize {
+                        return None;
+                    }
+                    seen[slot / 64] |= 1u64 << (slot % 64);
+                }
+                Some(seen)
+            })
+            .collect();
+        drop(mmap_guard);
+        drop(file_guard);
+        let Some(parts) = parts else {
+            return Ok(None);
+        };
+        let mut seen = vec![0u64; words];
+        for part in parts {
+            for (target, source) in seen.iter_mut().zip(part) {
+                *target |= source;
+            }
+        }
+        Ok(Some(seen.into_iter().map(|word| word.count_ones() as i64).sum()))
+    }
+
+    /// Count NULL values for several columns by reading only the per-column
+    /// null bitmaps. Deleted rows are excluded without decoding column values.
+    pub fn execute_null_counts_mmap(
+        &self,
+        columns: &[&str],
+    ) -> io::Result<Option<Vec<i64>>> {
+        use rayon::prelude::*;
+
+        if columns.is_empty() || self.has_pending_deltas() {
+            return Ok(None);
+        }
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let indices: Option<Vec<usize>> = columns
+            .iter()
+            .map(|column| footer.schema.get_index(column))
+            .collect();
+        let Some(indices) = indices else {
+            return Ok(None);
+        };
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for NULL aggregation"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let mmap_ptr = mmap_ref.as_ptr() as usize;
+        let mmap_len = mmap_ref.len();
+
+        let parts: Option<Vec<Vec<i64>>> = footer
+            .row_groups
+            .par_iter()
+            .enumerate()
+            .map(|(row_group_index, row_group)| {
+                let rows = row_group.row_count as usize;
+                let mut counts = vec![0i64; indices.len()];
+                if rows == 0 {
+                    return Some(counts);
+                }
+                let mmap = unsafe {
+                    std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len)
+                };
+                let row_group_end = (row_group.offset + row_group.data_size) as usize;
+                if row_group_end > mmap.len() || row_group_end < row_group.offset as usize + 32 {
+                    return None;
+                }
+                let row_group_bytes = &mmap[row_group.offset as usize..row_group_end];
+                let encoded_body = &row_group_bytes[32..];
+                let decompressed = decompress_rg_body(row_group_bytes[28], encoded_body).ok()?;
+                let body = decompressed.as_deref().unwrap_or(encoded_body);
+                let offsets = footer.col_offsets.get(row_group_index)?;
+                let bitmap_len = rows.div_ceil(8);
+                let deletion_offset = rg_id_section_len(
+                    rows,
+                    row_group_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+                );
+                let deleted = body.get(deletion_offset..deletion_offset + bitmap_len)?;
+
+                for (slot, &column_index) in indices.iter().enumerate() {
+                    let offset = *offsets.get(column_index)? as usize;
+                    let nulls = body.get(offset..offset + bitmap_len)?;
+                    let mut count = 0u32;
+                    for byte_index in 0..bitmap_len {
+                        let mut mask = u8::MAX;
+                        if byte_index + 1 == bitmap_len && rows % 8 != 0 {
+                            mask = (1u16.checked_shl((rows % 8) as u32).unwrap_or(0) - 1) as u8;
+                        }
+                        count += (nulls[byte_index] & !deleted[byte_index] & mask).count_ones();
+                    }
+                    counts[slot] = count as i64;
+                }
+                Some(counts)
+            })
+            .collect();
+        drop(mmap_guard);
+        drop(file_guard);
+        let Some(parts) = parts else {
+            return Ok(None);
+        };
+        let mut counts = vec![0i64; columns.len()];
+        for part in parts {
+            for (total, count) in counts.iter_mut().zip(part) {
+                *total += count;
+            }
+        }
+        Ok(Some(counts))
+    }
+
+    /// Count several simple numeric CASE predicates in one parallel Row Group scan.
+    pub fn execute_numeric_case_counts_mmap(
+        &self,
+        specs: &[(&str, f64, f64)],
+    ) -> io::Result<Option<Vec<i64>>> {
+        use rayon::prelude::*;
+
+        if specs.is_empty() {
+            return Ok(None);
+        }
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        if footer.row_groups.iter().any(|row_group| row_group.deletion_count > 0) {
+            return Ok(None);
+        }
+        let schema = &footer.schema;
+        let mut unique_indices = Vec::new();
+        let mut spec_columns = Vec::with_capacity(specs.len());
+        for &(column, _, _) in specs {
+            let Some(index) = schema.get_index(column) else {
+                return Ok(None);
+            };
+            if !matches!(
+                schema.columns[index].1,
+                ColumnType::Int64
+                    | ColumnType::Int8
+                    | ColumnType::Int16
+                    | ColumnType::Int32
+                    | ColumnType::UInt8
+                    | ColumnType::UInt16
+                    | ColumnType::UInt32
+                    | ColumnType::UInt64
+                    | ColumnType::Timestamp
+                    | ColumnType::Date
+                    | ColumnType::Float64
+                    | ColumnType::Float32
+                    | ColumnType::Bool
+            ) {
+                return Ok(None);
+            }
+            let slot = unique_indices
+                .iter()
+                .position(|&existing| existing == index)
+                .unwrap_or_else(|| {
+                    unique_indices.push(index);
+                    unique_indices.len() - 1
+                });
+            spec_columns.push(slot);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for numeric CASE aggregation"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let mmap_ptr = mmap_ref.as_ptr() as usize;
+        let mmap_len = mmap_ref.len();
+
+        let parts: Option<Vec<Vec<i64>>> = footer
+            .row_groups
+            .par_iter()
+            .enumerate()
+            .map(|(row_group_index, row_group)| {
+                let rows = row_group.row_count as usize;
+                let mut counts = vec![0i64; specs.len()];
+                if rows == 0 {
+                    return Some(counts);
+                }
+                let mmap = unsafe {
+                    std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len)
+                };
+                let row_group_end = (row_group.offset + row_group.data_size) as usize;
+                if row_group_end > mmap.len() || row_group_end < row_group.offset as usize + 32 {
+                    return None;
+                }
+                let row_group_bytes = &mmap[row_group.offset as usize..row_group_end];
+                let encoded_body = &row_group_bytes[32..];
+                let decompressed = decompress_rg_body(row_group_bytes[28], encoded_body).ok()?;
+                let body = decompressed.as_deref().unwrap_or(encoded_body);
+                let offsets = footer.col_offsets.get(row_group_index)?;
+                let null_bytes = rows.div_ceil(8);
+                let decoded: Option<Vec<(ColumnData, &[u8])>> = unique_indices
+                    .iter()
+                    .map(|&index| {
+                        let offset = *offsets.get(index)? as usize;
+                        if offset + null_bytes >= body.len() {
+                            return None;
+                        }
+                        let nulls = &body[offset..offset + null_bytes];
+                        let (column, _) = read_column_encoded(
+                            &body[offset + null_bytes..],
+                            schema.columns[index].1,
+                        )
+                        .ok()?;
+                        Some((column, nulls))
+                    })
+                    .collect();
+                let decoded = decoded?;
+
+                for (spec_index, &(_, low, high)) in specs.iter().enumerate() {
+                    let (column, nulls) = &decoded[spec_columns[spec_index]];
+                    match column {
+                        ColumnData::Int64(values) => {
+                            let low = low.ceil() as i64;
+                            let high = high.floor() as i64;
+                            for (row, &value) in values.iter().take(rows).enumerate() {
+                                if nulls
+                                    .get(row / 8)
+                                    .is_some_and(|byte| ((byte >> (row % 8)) & 1) != 0)
+                                {
+                                    continue;
+                                }
+                                counts[spec_index] += (value >= low && value <= high) as i64;
+                            }
+                        }
+                        ColumnData::Float64(values) => {
+                            for (row, &value) in values.iter().take(rows).enumerate() {
+                                if nulls
+                                    .get(row / 8)
+                                    .is_some_and(|byte| ((byte >> (row % 8)) & 1) != 0)
+                                {
+                                    continue;
+                                }
+                                counts[spec_index] += (value >= low && value <= high) as i64;
+                            }
+                        }
+                        ColumnData::Bool { data, len } => {
+                            for row in 0..rows.min(*len) {
+                                if nulls
+                                    .get(row / 8)
+                                    .is_some_and(|byte| ((byte >> (row % 8)) & 1) != 0)
+                                {
+                                    continue;
+                                }
+                                let value = data
+                                    .get(row / 8)
+                                    .map_or(0.0, |byte| ((byte >> (row % 8)) & 1) as f64);
+                                counts[spec_index] += (value >= low && value <= high) as i64;
+                            }
+                        }
+                        _ => return None,
+                    }
+                }
+                Some(counts)
+            })
+            .collect();
+        drop(mmap_guard);
+        drop(file_guard);
+        let Some(parts) = parts else {
+            return Ok(None);
+        };
+        let mut counts = vec![0i64; specs.len()];
+        for part in parts {
+            for (total, count) in counts.iter_mut().zip(part) {
+                *total += count;
+            }
+        }
+        Ok(Some(counts))
+    }
+
+    /// Parallel Row Group aggregation for an integral GROUP BY key.
+    /// Each requested aggregate receives (non-null count, sum, min, max, is_int).
+    pub fn execute_numeric_group_agg_mmap(
+        &self,
+        group_col: &str,
+        agg_cols: &[(&str, bool)],
+        agg_ops: &[u8],
+    ) -> io::Result<Option<Vec<NativeNumericGroupAgg>>> {
+        self.execute_numeric_group_agg_mmap_impl(
+            group_col,
+            agg_cols,
+            agg_ops,
+            NumericGroupKeyTransform::Identity,
+        )
+    }
+
+    /// GROUP BY MOD(integral_column, positive_modulus) using the same native
+    /// aggregation core as a plain integral key.
+    pub fn execute_numeric_mod_group_agg_mmap(
+        &self,
+        group_col: &str,
+        modulus: i64,
+        agg_cols: &[(&str, bool)],
+        agg_ops: &[u8],
+    ) -> io::Result<Option<Vec<NativeNumericGroupAgg>>> {
+        if modulus <= 0 || modulus > 32_768 {
+            return Ok(None);
+        }
+        self.execute_numeric_group_agg_mmap_impl(
+            group_col,
+            agg_cols,
+            agg_ops,
+            NumericGroupKeyTransform::Modulo(modulus),
+        )
+    }
+
+    /// Build reusable dense group IDs for MOD(integral_column, modulus).
+    /// The dictionary contains the complete Rust/SQL remainder domain so row
+    /// IDs can be generated branch-light and later reused across warm queries.
+    pub fn build_numeric_mod_dict_cache(
+        &self,
+        column: &str,
+        modulus: i64,
+    ) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
+        if modulus <= 0 || modulus > 32_768 || self.has_pending_deltas() {
+            return Ok(None);
+        }
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let Some(index) = footer.schema.get_index(column) else {
+            return Ok(None);
+        };
+        if !matches!(
+            footer.schema.columns[index].1,
+            ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+        ) {
+            return Ok(None);
+        }
+        let (columns, deleted) = self.scan_columns_mmap(&[index], &footer)?;
+        if deleted.iter().any(|&byte| byte != 0) {
+            return Ok(None);
+        }
+        let Some(ColumnData::Int64(values)) = columns.first() else {
+            return Ok(None);
+        };
+        let minimum = 1 - modulus;
+        let labels = (minimum..modulus)
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>();
+        let group_ids = values
+            .iter()
+            .map(|value| (value % modulus - minimum) as u16)
+            .collect();
+        Ok(Some((labels, group_ids)))
+    }
+
+    pub fn execute_numeric_bucket_group_agg_mmap(
+        &self,
+        group_col: &str,
+        upper_bounds: &[i64],
+        agg_cols: &[(&str, bool)],
+        agg_ops: &[u8],
+    ) -> io::Result<Option<Vec<NativeNumericGroupAgg>>> {
+        if upper_bounds.is_empty()
+            || upper_bounds.len() >= 4096
+            || upper_bounds.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Ok(None);
+        }
+        self.execute_numeric_group_agg_mmap_impl(
+            group_col,
+            agg_cols,
+            agg_ops,
+            NumericGroupKeyTransform::UpperBounds(upper_bounds),
+        )
+    }
+
+    fn execute_numeric_group_agg_mmap_impl(
+        &self,
+        group_col: &str,
+        agg_cols: &[(&str, bool)],
+        agg_ops: &[u8],
+        transform: NumericGroupKeyTransform<'_>,
+    ) -> io::Result<Option<Vec<NativeNumericGroupAgg>>> {
+        use rayon::prelude::*;
+
+        if agg_cols.len() != agg_ops.len() {
+            return Ok(None);
+        }
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let Some(group_idx) = schema.get_index(group_col) else {
+            return Ok(None);
+        };
+        if !matches!(
+            schema.columns[group_idx].1,
+            ColumnType::Int64
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Timestamp
+                | ColumnType::Date
+                | ColumnType::Bool
+        ) || footer.row_groups.iter().any(|row_group| row_group.deletion_count > 0)
+        {
+            return Ok(None);
+        }
+
+        let mut logical_indices = Vec::with_capacity(agg_cols.len());
+        for &(name, count_star) in agg_cols {
+            if count_star {
+                logical_indices.push(None);
+                continue;
+            }
+            let Some(index) = schema.get_index(name) else {
+                return Ok(None);
+            };
+            if !matches!(
+                schema.columns[index].1,
+                ColumnType::Int64
+                    | ColumnType::Int8
+                    | ColumnType::Int16
+                    | ColumnType::Int32
+                    | ColumnType::UInt8
+                    | ColumnType::UInt16
+                    | ColumnType::UInt32
+                    | ColumnType::UInt64
+                    | ColumnType::Timestamp
+                    | ColumnType::Date
+                    | ColumnType::Float64
+                    | ColumnType::Float32
+                    | ColumnType::Bool
+            ) {
+                return Ok(None);
+            }
+            logical_indices.push(Some(index));
+        }
+
+        // Multiple SQL aggregates often reuse one source column. Aggregate it
+        // once with a combined operation mask, and map the physical state back
+        // to every logical output. COUNT(*) can share any known non-null source
+        // already being scanned, which halves the state for COUNT+AVG profiles.
+        let mut physical_indices: Vec<Option<usize>> = Vec::new();
+        let mut physical_ops: Vec<u8> = Vec::new();
+        let mut logical_to_physical = vec![usize::MAX; agg_cols.len()];
+        for (logical, index) in logical_indices.iter().copied().enumerate() {
+            let Some(index) = index else {
+                continue;
+            };
+            let physical = physical_indices
+                .iter()
+                .position(|candidate| *candidate == Some(index))
+                .unwrap_or_else(|| {
+                    physical_indices.push(Some(index));
+                    physical_ops.push(0);
+                    physical_indices.len() - 1
+                });
+            physical_ops[physical] |= agg_ops[logical];
+            logical_to_physical[logical] = physical;
+        }
+        for (logical, index) in logical_indices.iter().enumerate() {
+            if index.is_some() {
+                continue;
+            }
+            let reusable = physical_indices.iter().position(|index| {
+                index.is_some_and(|index| {
+                    !self.column_has_nulls(&schema.columns[index].0)
+                })
+            });
+            let physical = reusable.unwrap_or_else(|| {
+                let existing = physical_indices.iter().position(Option::is_none);
+                existing.unwrap_or_else(|| {
+                    physical_indices.push(None);
+                    physical_ops.push(0);
+                    physical_indices.len() - 1
+                })
+            });
+            logical_to_physical[logical] = physical;
+        }
+
+        #[derive(Clone, Copy)]
+        struct Stat {
+            count: i64,
+            sum: f64,
+            min: f64,
+            max: f64,
+            is_int: bool,
+        }
+        impl Stat {
+            fn new(is_int: bool) -> Self {
+                Self {
+                    count: 0,
+                    sum: 0.0,
+                    min: f64::INFINITY,
+                    max: f64::NEG_INFINITY,
+                    is_int,
+                }
+            }
+            fn add(&mut self, value: f64, operations: u8) {
+                self.count += 1;
+                if operations & 1 != 0 {
+                    self.sum += value;
+                }
+                if operations & 2 != 0 {
+                    self.min = self.min.min(value);
+                }
+                if operations & 4 != 0 {
+                    self.max = self.max.max(value);
+                }
+            }
+            fn merge(&mut self, other: Self, operations: u8) {
+                self.count += other.count;
+                if operations & 1 != 0 {
+                    self.sum += other.sum;
+                }
+                if operations & 2 != 0 {
+                    self.min = self.min.min(other.min);
+                }
+                if operations & 4 != 0 {
+                    self.max = self.max.max(other.max);
+                }
+            }
+        }
+
+        let agg_is_int: Vec<bool> = physical_indices
+            .iter()
+            .map(|index| {
+                index.is_none()
+                    || index.is_some_and(|index| {
+                        !matches!(
+                            schema.columns[index].1,
+                            ColumnType::Float64 | ColumnType::Float32
+                        )
+                    })
+            })
+            .collect();
+        let dense_bounds = match transform {
+            NumericGroupKeyTransform::Modulo(modulus) => {
+                Some((1 - modulus, (modulus * 2 - 1) as usize))
+            }
+            NumericGroupKeyTransform::UpperBounds(bounds) => Some((0, bounds.len() + 1)),
+            NumericGroupKeyTransform::Identity => {
+            let mut minimum = i64::MAX;
+            let mut maximum = i64::MIN;
+            let mut complete = true;
+            for zone_maps in &footer.zone_maps {
+                match zone_maps
+                    .iter()
+                    .find(|zone_map| zone_map.col_idx as usize == group_idx && !zone_map.is_float)
+                {
+                    Some(zone_map) => {
+                        minimum = minimum.min(zone_map.min_bits);
+                        maximum = maximum.max(zone_map.max_bits);
+                    }
+                    None => {
+                        complete = false;
+                        break;
+                    }
+                }
+            }
+            let width = maximum.saturating_sub(minimum).saturating_add(1);
+            // Dense integral domains such as ports (0..65535) are much faster
+            // as a flat accumulator than as one hash-map entry and heap Vec
+            // per group. The upper bound keeps per-row-group state bounded.
+                (complete && width > 0 && width <= 65_536)
+                    .then_some((minimum, width as usize))
+            }
+        };
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for numeric GROUP BY"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let mmap_ptr = mmap_ref.as_ptr() as usize;
+        let mmap_len = mmap_ref.len();
+
+        enum Part {
+            Dense {
+                stats: Vec<Stat>,
+                seen: Vec<bool>,
+            },
+            Sparse(ahash::AHashMap<i64, Vec<Stat>>),
+        }
+
+        let new_dense_stats = |width: usize| {
+            (0..width)
+                .flat_map(|_| agg_is_int.iter().map(|&is_int| Stat::new(is_int)))
+                .collect::<Vec<_>>()
+        };
+
+        let parts: Option<Vec<Part>> = footer
+            .row_groups
+            .par_iter()
+            .enumerate()
+            .map(|(row_group_index, row_group)| {
+                let rows = row_group.row_count as usize;
+                let mut groups: ahash::AHashMap<i64, Vec<Stat>> = ahash::AHashMap::new();
+                let mut dense_groups = dense_bounds.map(|(minimum, width)| {
+                    (
+                        minimum,
+                        new_dense_stats(width),
+                        vec![false; width],
+                    )
+                });
+                if rows == 0 {
+                    return Some(match dense_groups {
+                        Some((_, stats, seen)) => Part::Dense { stats, seen },
+                        None => Part::Sparse(groups),
+                    });
+                }
+                let mmap = unsafe {
+                    std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len)
+                };
+                let row_group_end = (row_group.offset + row_group.data_size) as usize;
+                if row_group_end > mmap.len() || row_group_end < row_group.offset as usize + 32 {
+                    return None;
+                }
+                let row_group_bytes = &mmap[row_group.offset as usize..row_group_end];
+                let compression = row_group_bytes[28];
+                let encoded_body = &row_group_bytes[32..];
+                let decompressed = decompress_rg_body(compression, encoded_body).ok()?;
+                let body = decompressed.as_deref().unwrap_or(encoded_body);
+                let offsets = footer.col_offsets.get(row_group_index)?;
+                let null_bytes = rows.div_ceil(8);
+
+                let decode_column = |index: usize| -> Option<(ColumnData, &[u8])> {
+                    let offset = *offsets.get(index)? as usize;
+                    if offset + null_bytes >= body.len() {
+                        return None;
+                    }
+                    let nulls = &body[offset..offset + null_bytes];
+                    let (column, _) =
+                        read_column_encoded(&body[offset + null_bytes..], schema.columns[index].1)
+                            .ok()?;
+                    Some((column, nulls))
+                };
+
+                let (group_column, group_nulls) = decode_column(group_idx)?;
+                let ColumnData::Int64(group_values) = group_column else {
+                    return None;
+                };
+                let decoded_aggs: Option<Vec<Option<(ColumnData, &[u8])>>> = physical_indices
+                    .iter()
+                    .map(|index| match index {
+                        Some(index) => decode_column(*index).map(Some),
+                        None => Some(None),
+                    })
+                    .collect();
+                let decoded_aggs = decoded_aggs?;
+
+                for row in 0..rows.min(group_values.len()) {
+                    if group_nulls
+                        .get(row / 8)
+                        .is_some_and(|byte| ((byte >> (row % 8)) & 1) != 0)
+                    {
+                        continue;
+                    }
+                    let key = match transform {
+                        NumericGroupKeyTransform::Identity => group_values[row],
+                        NumericGroupKeyTransform::Modulo(modulus) => {
+                            group_values[row] % modulus
+                        }
+                        NumericGroupKeyTransform::UpperBounds(bounds) => bounds
+                            .partition_point(|&bound| group_values[row] >= bound)
+                            as i64,
+                    };
+                    let stats = if let Some((minimum, dense, seen)) = &mut dense_groups {
+                        let slot = key.saturating_sub(*minimum) as usize;
+                        if slot >= seen.len() {
+                            return None;
+                        }
+                        seen[slot] = true;
+                        let start = slot * physical_indices.len();
+                        &mut dense[start..start + physical_indices.len()]
+                    } else {
+                        groups.entry(key).or_insert_with(|| {
+                            agg_is_int.iter().map(|&is_int| Stat::new(is_int)).collect()
+                        })
+                    };
+                    for (agg_index, decoded) in decoded_aggs.iter().enumerate() {
+                        let stat = &mut stats[agg_index];
+                        let Some((column, nulls)) = decoded else {
+                            stat.add(0.0, physical_ops[agg_index]);
+                            continue;
+                        };
+                        if nulls
+                            .get(row / 8)
+                            .is_some_and(|byte| ((byte >> (row % 8)) & 1) != 0)
+                        {
+                            continue;
+                        }
+                        match column {
+                            ColumnData::Int64(values) if row < values.len() => {
+                                stat.add(values[row] as f64, physical_ops[agg_index])
+                            }
+                            ColumnData::Float64(values) if row < values.len() => {
+                                stat.add(values[row], physical_ops[agg_index])
+                            }
+                            ColumnData::Bool { data, len } if row < *len => {
+                                let value = data
+                                    .get(row / 8)
+                                    .map_or(0.0, |byte| ((byte >> (row % 8)) & 1) as f64);
+                                stat.add(value, physical_ops[agg_index]);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some(match dense_groups {
+                    Some((_, stats, seen)) => Part::Dense { stats, seen },
+                    None => Part::Sparse(groups),
+                })
+            })
+            .collect();
+        drop(mmap_guard);
+        drop(file_guard);
+        let Some(parts) = parts else {
+            return Ok(None);
+        };
+
+        let merged_rows: Vec<(i64, Vec<Stat>)> = if let Some((minimum, width)) = dense_bounds {
+            let mut merged = new_dense_stats(width);
+            let mut merged_seen = vec![false; width];
+            for part in parts {
+                let Part::Dense { stats, seen, .. } = part else {
+                    return Ok(None);
+                };
+                for (slot, present) in seen.into_iter().enumerate() {
+                    if !present {
+                        continue;
+                    }
+                    merged_seen[slot] = true;
+                    let start = slot * physical_indices.len();
+                    for aggregate in 0..physical_indices.len() {
+                        merged[start + aggregate]
+                            .merge(stats[start + aggregate], physical_ops[aggregate]);
+                    }
+                }
+            }
+            merged_seen
+                .into_iter()
+                .enumerate()
+                .filter_map(|(slot, present)| {
+                    present.then(|| {
+                        let start = slot * physical_indices.len();
+                        (
+                            minimum + slot as i64,
+                            merged[start..start + physical_indices.len()].to_vec(),
+                        )
+                    })
+                })
+                .collect()
+        } else {
+            let mut merged: ahash::AHashMap<i64, Vec<Stat>> = ahash::AHashMap::new();
+            for part in parts {
+                let Part::Sparse(groups) = part else {
+                    return Ok(None);
+                };
+                for (key, source_stats) in groups {
+                    let target_stats = merged.entry(key).or_insert_with(|| {
+                        agg_is_int.iter().map(|&is_int| Stat::new(is_int)).collect()
+                    });
+                    for (aggregate, (target, source)) in target_stats
+                        .iter_mut()
+                        .zip(source_stats)
+                        .enumerate()
+                    {
+                        target.merge(source, physical_ops[aggregate]);
+                    }
+                }
+            }
+            merged.into_iter().collect()
+        };
+        Ok(Some(
+            merged_rows
+                .into_iter()
+                .map(|(key, stats)| NativeNumericGroupAgg {
+                    key,
+                    stats: logical_to_physical
+                        .iter()
+                        .map(|&physical| {
+                            let stat = stats[physical];
+                            (
+                                stat.count,
+                                stat.sum,
+                                if stat.count == 0 { 0.0 } else { stat.min },
+                                if stat.count == 0 { 0.0 } else { stat.max },
+                                stat.is_int,
+                            )
+                        })
+                        .collect(),
+                })
+                .collect(),
+        ))
+    }
+
     /// Execute simple aggregation (no GROUP BY, no WHERE) directly on V4 columns.
     /// Supports both in-memory and mmap-only paths.
     /// Returns (count, sum, min, max, is_int) for each requested column
@@ -84,26 +1011,26 @@ impl OnDemandStorage {
         use arrow::buffer::{Buffer, ScalarBuffer};
         use arrow::datatypes::{Int64Type, Float64Type};
         use std::sync::Arc;
-        
+
         // Check if in-memory data is available for fast path
         let columns = self.columns.read();
         let has_in_memory = !columns.is_empty() && columns.iter().any(|c| c.len() > 0);
-        
+
         if !has_in_memory {
             drop(columns);
             // MMAP PATH: scan columns from disk without loading into memory
             return self.execute_simple_agg_mmap(agg_cols);
         }
-        
+
         let schema = self.schema.read();
         let deleted = self.deleted.read();
         let nulls = self.nulls.read();
         let total_rows = columns.first().map(|c| c.len()).unwrap_or(0);
-        
+
         let has_deleted = deleted.iter().any(|&b| b != 0);
         // Bail to Arrow path if there are deleted rows (need filtered arrays)
         if has_deleted { return Ok(None); }
-        
+
         let active_count = total_rows as i64;
 
         // Helper: check if row i is NULL using the null bitmap (bit=1 means null)
@@ -115,19 +1042,19 @@ impl OnDemandStorage {
         }
 
         let mut results: Vec<(i64, f64, f64, f64, bool)> = Vec::with_capacity(agg_cols.len());
-        
+
         for &col_name in agg_cols {
             if col_name == "*" || col_name == "1" {
                 results.push((active_count, 0.0, 0.0, 0.0, false));
                 continue;
             }
-            
+
             let col_idx = match schema.get_index(col_name) {
                 Some(idx) => idx,
                 None => return Ok(None), // unknown column (e.g. _id) — fall back to Arrow path
             };
             if col_idx >= columns.len() { return Ok(None); }
-            
+
             // Get the null bitmap for this column (empty = no nulls)
             let null_bm: &[u8] = if col_idx < nulls.len() { &nulls[col_idx] } else { &[] };
             let has_nulls = !null_bm.is_empty() && null_bm.iter().any(|&b| b != 0);
@@ -188,7 +1115,7 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         Ok(Some(results))
     }
 
@@ -451,10 +1378,13 @@ impl OnDemandStorage {
                     }
                 } else {
                     const BITPACK: u8 = 2u8;
+                    let null_bm = &body[col_off..col_off + null_bitmap_len];
+                    let has_col_nulls = null_bm.iter().any(|&byte| byte != 0);
                     // BITPACK Int64: accumulate directly without Vec allocation
                     if encoding == BITPACK && matches!(col_type, ColumnType::Int64 | ColumnType::Int8 |
                         ColumnType::Int16 | ColumnType::Int32 | ColumnType::UInt8 | ColumnType::UInt16 |
                         ColumnType::UInt32 | ColumnType::UInt64 | ColumnType::Timestamp | ColumnType::Date)
+                        && !has_deleted && !has_col_nulls
                     {
                         col_is_int[ci] = true;
                         if let Some((sum, mn, mx, n, _)) = bitpack_agg_i64(payload) {
@@ -467,10 +1397,20 @@ impl OnDemandStorage {
                     } else {
                         // RLE or other: decode per-RG, accumulate, drop
                         let (col_data, _) = read_column_encoded(&body[data_start..], col_type)?;
+                        let deleted = if has_deleted {
+                            &body[del_start_body..del_start_body + del_vec_len]
+                        } else {
+                            &[]
+                        };
+                        let is_active = |row: usize| {
+                            !(has_deleted && (deleted[row / 8] >> (row % 8)) & 1 != 0)
+                                && !(has_col_nulls
+                                    && (null_bm[row / 8] >> (row % 8)) & 1 != 0)
+                        };
                         match &col_data {
-                            ColumnData::Int64(v) => { col_is_int[ci] = true; for &x in v { col_counts[ci] += 1; col_sums[ci] += x as f64; let xf = x as f64; if xf < col_mins[ci] { col_mins[ci] = xf; } if xf > col_maxs[ci] { col_maxs[ci] = xf; } } }
-                            ColumnData::Float64(v) => { for &x in v { col_counts[ci] += 1; col_sums[ci] += x; if x < col_mins[ci] { col_mins[ci] = x; } if x > col_maxs[ci] { col_maxs[ci] = x; } } }
-                            _ => { col_counts[ci] += col_data.len() as i64; } // COUNT on non-numeric col
+                            ColumnData::Int64(v) => { col_is_int[ci] = true; for (row, &x) in v.iter().enumerate() { if is_active(row) { col_counts[ci] += 1; col_sums[ci] += x as f64; let xf = x as f64; if xf < col_mins[ci] { col_mins[ci] = xf; } if xf > col_maxs[ci] { col_maxs[ci] = xf; } } } }
+                            ColumnData::Float64(v) => { for (row, &x) in v.iter().enumerate() { if is_active(row) { col_counts[ci] += 1; col_sums[ci] += x; if x < col_mins[ci] { col_mins[ci] = x; } if x > col_maxs[ci] { col_maxs[ci] = x; } } } }
+                            _ => { col_counts[ci] += (0..col_data.len()).filter(|&row| is_active(row)).count() as i64; }
                         }
                     }
                 }
@@ -493,6 +1433,23 @@ impl OnDemandStorage {
                 ci += 1;
             } else {
                 results.push((0, 0.0, 0.0, 0.0, false));
+            }
+        }
+        if !has_any_deletes && !self.has_pending_deltas() {
+            let mut sidecar = self.try_read_col_stats_sidecar().unwrap_or_default();
+            for (&column, &stats) in agg_cols.iter().zip(&results) {
+                if column != "*"
+                    && column != "1"
+                    && !column
+                        .chars()
+                        .next()
+                        .is_some_and(|character| character.is_ascii_digit())
+                {
+                    sidecar.insert(column.to_string(), stats);
+                }
+            }
+            if !sidecar.is_empty() {
+                let _ = self.write_col_stats_map_sidecar(schema, &sidecar);
             }
         }
         Ok(Some(results))
@@ -1450,9 +2407,23 @@ impl OnDemandStorage {
         }
 
         if real_cols.len() == 1 && !self.has_pending_deltas() {
-            if let Some((count, sum, min, max, is_int)) = self
-                .execute_filtered_cached_numeric_mmap(group_ids, target_gid, real_cols[0])?
-            {
+            let direct = self
+                .execute_filtered_cached_numeric_mmap(
+                    group_ids,
+                    target_gid,
+                    None,
+                    real_cols[0],
+                )?;
+            let stats = match direct {
+                Some(stats) => Some(stats),
+                None => self.execute_filtered_cached_numeric_decoded(
+                    group_ids,
+                    target_gid,
+                    None,
+                    real_cols[0],
+                )?,
+            };
+            if let Some((count, sum, min, max, is_int)) = stats {
                 return Ok(Some(
                     agg_cols
                         .iter()
@@ -1648,6 +2619,78 @@ impl OnDemandStorage {
         Ok(Some(results))
     }
 
+    /// Fast prefix-filtered aggregation over an existing string dictionary.
+    /// LIKE `prefix%` is evaluated once per dictionary value, then the compact
+    /// row-wise group IDs drive the same parallel numeric scan as equality.
+    pub fn execute_filtered_string_prefix_agg_cached(
+        &self,
+        filter_col: &str,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        prefix: &str,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        if prefix.is_empty()
+            || dict_strings.is_empty()
+            || group_ids.is_empty()
+            || self.column_has_nulls(filter_col)
+            || self.has_pending_deltas()
+        {
+            return Ok(None);
+        }
+        let matching_groups: Vec<bool> = dict_strings
+            .iter()
+            .map(|value| value.starts_with(prefix))
+            .collect();
+        if !matching_groups.iter().any(|&matches| matches) {
+            return Ok(Some(
+                agg_cols
+                    .iter()
+                    .map(|_| (0, 0.0, 0.0, 0.0, false))
+                    .collect(),
+            ));
+        }
+        let real_cols: Vec<&str> = agg_cols
+            .iter()
+            .copied()
+            .filter(|name| *name != "*" && *name != "1")
+            .collect();
+        if real_cols.len() != 1 || self.column_has_nulls(real_cols[0]) {
+            return Ok(None);
+        }
+        let direct = self
+            .execute_filtered_cached_numeric_mmap(
+                group_ids,
+                0,
+                Some(&matching_groups),
+                real_cols[0],
+            )?;
+        let stats = match direct {
+            Some(stats) => Some(stats),
+            None => self.execute_filtered_cached_numeric_decoded(
+                group_ids,
+                0,
+                Some(&matching_groups),
+                real_cols[0],
+            )?,
+        };
+        let Some((count, sum, min, max, is_int)) = stats else {
+            return Ok(None);
+        };
+        Ok(Some(
+            agg_cols
+                .iter()
+                .map(|name| {
+                    if *name == "*" || *name == "1" {
+                        (count, 0.0, 0.0, 0.0, false)
+                    } else {
+                        (count, sum, min, max, is_int)
+                    }
+                })
+                .collect(),
+        ))
+    }
+
     /// Zero-copy numeric side of a cached string-equality aggregation.
     /// Group IDs already encode the string predicate, so only the numeric
     /// column needs to be streamed from each row group.
@@ -1655,6 +2698,7 @@ impl OnDemandStorage {
         &self,
         group_ids: &[u16],
         target_gid: u16,
+        target_gids: Option<&[bool]>,
         agg_col: &str,
     ) -> io::Result<Option<(i64, f64, f64, f64, bool)>> {
         let footer = match self.get_or_load_footer()? {
@@ -1758,7 +2802,13 @@ impl OnDemandStorage {
             };
             let values = rg.values as *const u8;
             for local_row in 0..rg.rows {
-                if unsafe { *group_ids.get_unchecked(rg.row_offset + local_row) } != target_gid {
+                let group_id =
+                    unsafe { *group_ids.get_unchecked(rg.row_offset + local_row) };
+                let matches = match target_gids {
+                    Some(targets) => targets.get(group_id as usize).copied().unwrap_or(false),
+                    None => group_id == target_gid,
+                };
+                if !matches {
                     continue;
                 }
                 let value = if is_int {
@@ -1806,6 +2856,249 @@ impl OnDemandStorage {
             if max == f64::NEG_INFINITY { 0.0 } else { max },
             is_int,
         )))
+    }
+
+    /// Encoded/compressed fallback for cached categorical filters. The column
+    /// decoder preserves all storage encodings; the aggregation over decoded
+    /// values remains parallel and never materializes matching row indices.
+    fn execute_filtered_cached_numeric_decoded(
+        &self,
+        group_ids: &[u16],
+        target_gid: u16,
+        target_gids: Option<&[bool]>,
+        agg_col: &str,
+    ) -> io::Result<Option<(i64, f64, f64, f64, bool)>> {
+        use rayon::prelude::*;
+
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let Some(column_index) = footer.schema.get_index(agg_col) else {
+            return Ok(None);
+        };
+        let parallel = self.scan_numeric_columns_mmap_parallel(&[column_index], &footer)?;
+        let (columns, deleted) = match parallel {
+            Some(columns) => (columns, Vec::new()),
+            None => {
+                let (columns, deleted) = self.scan_columns_mmap(&[column_index], &footer)?;
+                (
+                    columns.into_iter().map(std::sync::Arc::new).collect(),
+                    deleted,
+                )
+            }
+        };
+        let Some(column) = columns.first() else {
+            return Ok(None);
+        };
+        let (row_count, is_int) = match column.as_ref() {
+            ColumnData::Int64(values) => (values.len().min(group_ids.len()), true),
+            ColumnData::Float64(values) => (values.len().min(group_ids.len()), false),
+            _ => return Ok(None),
+        };
+        #[derive(Clone, Copy)]
+        struct Part {
+            count: i64,
+            sum: f64,
+            min: f64,
+            max: f64,
+        }
+        let empty = || Part {
+            count: 0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+        };
+        let result = (0..row_count)
+            .into_par_iter()
+            .fold(empty, |mut part, row| {
+                if deleted
+                    .get(row / 8)
+                    .is_some_and(|byte| ((byte >> (row % 8)) & 1) != 0)
+                {
+                    return part;
+                }
+                let group_id = unsafe { *group_ids.get_unchecked(row) };
+                let matches = match target_gids {
+                    Some(targets) => targets.get(group_id as usize).copied().unwrap_or(false),
+                    None => group_id == target_gid,
+                };
+                if !matches {
+                    return part;
+                }
+                let value = match column.as_ref() {
+                    ColumnData::Int64(values) => unsafe { *values.get_unchecked(row) as f64 },
+                    ColumnData::Float64(values) => unsafe { *values.get_unchecked(row) },
+                    _ => unreachable!(),
+                };
+                part.count += 1;
+                part.sum += value;
+                part.min = part.min.min(value);
+                part.max = part.max.max(value);
+                part
+            })
+            .reduce(empty, |left, right| Part {
+                count: left.count + right.count,
+                sum: left.sum + right.sum,
+                min: left.min.min(right.min),
+                max: left.max.max(right.max),
+            });
+        Ok(Some((
+            result.count,
+            result.sum,
+            if result.count == 0 { 0.0 } else { result.min },
+            if result.count == 0 { 0.0 } else { result.max },
+            is_int,
+        )))
+    }
+
+    /// Decode independent numeric row groups in parallel, preserving row
+    /// order when their per-group vectors are concatenated. This is the
+    /// encoded/compressed counterpart of the zero-copy mmap fast paths.
+    fn scan_numeric_columns_mmap_parallel(
+        &self,
+        column_indices: &[usize],
+        footer: &V4Footer,
+    ) -> io::Result<Option<Vec<std::sync::Arc<ColumnData>>>> {
+        use rayon::prelude::*;
+
+        if column_indices.is_empty()
+            || footer
+                .row_groups
+                .iter()
+                .any(|row_group| row_group.deletion_count > 0)
+            || column_indices.iter().any(|&index| {
+                !matches!(
+                    footer.schema.columns[index].1,
+                    ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date
+                        | ColumnType::Float64
+                        | ColumnType::Float32
+                )
+            })
+        {
+            return Ok(None);
+        }
+        {
+            let cache = self.numeric_scan_cache.read();
+            let cached: Option<Vec<std::sync::Arc<ColumnData>>> = column_indices
+                .iter()
+                .map(|index| {
+                    cache
+                        .iter()
+                        .find(|(cached_index, _, _)| cached_index == index)
+                        .map(|(_, column, _)| std::sync::Arc::clone(column))
+                })
+                .collect();
+            if let Some(cached) = cached {
+                return Ok(Some(cached));
+            }
+        }
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for parallel numeric decode"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap = mmap_guard.get_or_create(file)?;
+        let mmap_ptr = mmap.as_ptr() as usize;
+        let mmap_len = mmap.len();
+        let parts: Option<Vec<Vec<ColumnData>>> = footer
+            .row_groups
+            .par_iter()
+            .enumerate()
+            .map(|(row_group_index, row_group)| {
+                let rows = row_group.row_count as usize;
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len)
+                };
+                let end = (row_group.offset + row_group.data_size) as usize;
+                if end > bytes.len() || end < row_group.offset as usize + 32 {
+                    return None;
+                }
+                let row_group_bytes = &bytes[row_group.offset as usize..end];
+                let decompressed =
+                    decompress_rg_body(row_group_bytes[28], &row_group_bytes[32..]).ok()?;
+                let body = decompressed
+                    .as_deref()
+                    .unwrap_or(&row_group_bytes[32..]);
+                let offsets = footer.col_offsets.get(row_group_index)?;
+                let null_bytes = rows.div_ceil(8);
+                column_indices
+                    .iter()
+                    .map(|&index| {
+                        let offset = *offsets.get(index)? as usize;
+                        if offset + null_bytes >= body.len()
+                            || body[offset..offset + null_bytes]
+                                .iter()
+                                .any(|&byte| byte != 0)
+                        {
+                            return None;
+                        }
+                        let (column, _) = read_column_encoded(
+                            &body[offset + null_bytes..],
+                            footer.schema.columns[index].1,
+                        )
+                        .ok()?;
+                        matches!(column, ColumnData::Int64(_) | ColumnData::Float64(_))
+                            .then_some(column)
+                    })
+                    .collect()
+            })
+            .collect();
+        drop(mmap_guard);
+        drop(file_guard);
+        let Some(mut parts) = parts else {
+            return Ok(None);
+        };
+        if parts.is_empty() {
+            return Ok(None);
+        }
+        let mut merged = parts.remove(0);
+        for part in parts {
+            for (target, source) in merged.iter_mut().zip(part) {
+                target.append(&source);
+            }
+        }
+        let decoded = merged
+            .into_iter()
+            .map(std::sync::Arc::new)
+            .collect::<Vec<_>>();
+        const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
+        const MAX_CACHE_COLUMNS: usize = 16;
+        let mut cache = self.numeric_scan_cache.write();
+        for (&index, column) in column_indices.iter().zip(&decoded) {
+            if cache.iter().any(|(cached_index, _, _)| *cached_index == index) {
+                continue;
+            }
+            let bytes = match column.as_ref() {
+                ColumnData::Int64(values) => values.len() * std::mem::size_of::<i64>(),
+                ColumnData::Float64(values) => values.len() * std::mem::size_of::<f64>(),
+                _ => 0,
+            };
+            if bytes == 0 || bytes > MAX_CACHE_BYTES {
+                continue;
+            }
+            let mut current_bytes = cache.iter().map(|(_, _, bytes)| *bytes).sum::<usize>();
+            while !cache.is_empty()
+                && (cache.len() >= MAX_CACHE_COLUMNS
+                    || current_bytes.saturating_add(bytes) > MAX_CACHE_BYTES)
+            {
+                let (_, _, removed_bytes) = cache.remove(0);
+                current_bytes = current_bytes.saturating_sub(removed_bytes);
+            }
+            cache.push((index, std::sync::Arc::clone(column), bytes));
+            self.numeric_scan_cache_populated
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+        Ok(Some(decoded))
     }
 
     /// Single-pass filtered numeric aggregation from mmap.
@@ -2018,6 +3311,7 @@ impl OnDemandStorage {
                         None,
                         F64(&'a [u8], usize),
                         I64(&'a [u8], usize),
+                        Bitpack(&'a [u8]),
                     }
 
                     let agg_view = if nc == 0 {
@@ -2029,13 +3323,16 @@ impl OnDemandStorage {
                             return None;
                         }
                         let agg_encoding = body[agg_off + null_bitmap_len];
-                        if agg_encoding != COL_ENCODING_PLAIN {
-                            return None;
-                        }
                         let agg_payload = &body[agg_off + null_bitmap_len + 1..];
                         if agg_payload.len() < 8 {
                             return None;
                         }
+                        if agg_encoding == COL_ENCODING_BITPACK {
+                            part.is_int = true;
+                            AggView::Bitpack(agg_payload)
+                        } else if agg_encoding != COL_ENCODING_PLAIN {
+                            return None;
+                        } else {
                         let agg_count =
                             u64::from_le_bytes(agg_payload[0..8].try_into().ok()?) as usize;
                         let agg_n = agg_count.min(rg_rows).min((agg_payload.len() - 8) / 8);
@@ -2059,6 +3356,7 @@ impl OnDemandStorage {
                                 AggView::I64(agg_values, agg_n)
                             }
                             _ => return None,
+                        }
                         }
                     };
 
@@ -2099,6 +3397,13 @@ impl OnDemandStorage {
                                             part.add_f64(v);
                                         }
                                     }
+                                    AggView::Bitpack(values) => {
+                                        let value = crate::storage::on_demand::bitpack_decode_at_idx(
+                                            values,
+                                            row_idx,
+                                        )?;
+                                        part.add_f64(value as f64);
+                                    }
                                 }
                             }
                         }};
@@ -2129,6 +3434,13 @@ impl OnDemandStorage {
                                             ) as f64;
                                             part.add_f64(v);
                                         }
+                                    }
+                                    AggView::Bitpack(values) => {
+                                        let value = crate::storage::on_demand::bitpack_decode_at_idx(
+                                            values,
+                                            row_idx,
+                                        )?;
+                                        part.add_f64(value as f64);
                                     }
                                 }
                             }
@@ -2176,6 +3488,64 @@ impl OnDemandStorage {
                                             continue;
                                         }
                                         add_int_match!(i, min_val);
+                                    }
+                                } else if bit_width <= 5 {
+                                    // Decode eight small integers from one little-endian
+                                    // word. The generic per-row decoder reloads up to three
+                                    // bytes for every value, which dominates low-cardinality
+                                    // predicates such as protocol/status/category codes.
+                                    let mask = (1u64 << bit_width) - 1;
+                                    let groups = n / 8;
+                                    for group in 0..groups {
+                                        let byte_offset = group * bit_width;
+                                        if byte_offset + bit_width > packed.len() {
+                                            return None;
+                                        }
+                                        let mut word = 0u64;
+                                        for byte in 0..bit_width {
+                                            word |= (packed[byte_offset + byte] as u64) << (byte * 8);
+                                        }
+                                        let base = group * 8;
+                                        for lane in 0..8 {
+                                            let row = base + lane;
+                                            if has_deletes
+                                                && (del_bytes[row / 8] >> (row % 8)) & 1 == 1
+                                            {
+                                                continue;
+                                            }
+                                            if filter_has_nulls
+                                                && (filter_nulls[row / 8] >> (row % 8)) & 1 == 1
+                                            {
+                                                continue;
+                                            }
+                                            let delta = ((word >> (lane * bit_width)) & mask) as i64;
+                                            add_int_match!(row, min_val.wrapping_add(delta));
+                                        }
+                                    }
+                                    for row in (groups * 8)..n {
+                                        if has_deletes
+                                            && (del_bytes[row / 8] >> (row % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        if filter_has_nulls
+                                            && (filter_nulls[row / 8] >> (row % 8)) & 1 == 1
+                                        {
+                                            continue;
+                                        }
+                                        let bit_offset = row * bit_width;
+                                        let byte_idx = bit_offset / 8;
+                                        let shift = bit_offset % 8;
+                                        let mut word = 0u64;
+                                        for byte in 0..=bit_width / 8 {
+                                            word |= (packed
+                                                .get(byte_idx + byte)
+                                                .copied()
+                                                .unwrap_or(0) as u64)
+                                                << (byte * 8);
+                                        }
+                                        let delta = ((word >> shift) & mask) as i64;
+                                        add_int_match!(row, min_val.wrapping_add(delta));
                                     }
                                 } else if bit_width == 6 {
                                     if !has_deletes && !filter_has_nulls {
@@ -2277,7 +3647,7 @@ impl OnDemandStorage {
                                                 }
                                                 return Some(part);
                                             }
-                                            AggView::I64(_, _) => {}
+                                            AggView::I64(_, _) | AggView::Bitpack(_) => {}
                                         }
                                     }
                                     let n_full = n / 8;
@@ -2744,20 +4114,20 @@ impl OnDemandStorage {
     /// Returns (count, sum, min, max) for the specified column.
     pub fn compute_column_stats_inmemory(&self, col_name: &str) -> io::Result<Option<(u64, f64, f64, f64)>> {
         if !self.has_v4_in_memory_data() { return Ok(None); }
-        
+
         let schema = self.schema.read();
         let columns = self.columns.read();
         let deleted = self.deleted.read();
         let total_rows = self.ids.read().len();
-        
+
         let col_idx = match schema.get_index(col_name) {
             Some(idx) => idx,
             None => return Ok(None),
         };
         if col_idx >= columns.len() { return Ok(None); }
-        
+
         let has_deleted = deleted.iter().any(|&b| b != 0);
-        
+
         match &columns[col_idx] {
             ColumnData::Int64(vals) => {
                 let count = vals.len().min(total_rows);
@@ -3123,23 +4493,23 @@ impl OnDemandStorage {
             let schema = self.schema.read();
             let columns = self.columns.read();
             let total_rows = self.ids.read().len();
-            
+
             let col_idx = match schema.get_index(col_name) {
                 Some(idx) => idx,
                 None => return Ok(None),
             };
             if col_idx >= columns.len() { return Ok(None); }
-            
+
             let (offsets, data) = match &columns[col_idx] {
                 ColumnData::String { offsets, data } => (offsets, data),
                 _ => return Ok(None),
             };
             let count = offsets.len().saturating_sub(1).min(total_rows);
-            
+
             let mut dict_map: ahash::AHashMap<&[u8], u16> = ahash::AHashMap::with_capacity(64);
             let mut dict_strings: Vec<String> = Vec::with_capacity(64);
             let mut group_ids: Vec<u16> = Vec::with_capacity(count);
-            
+
             for i in 0..count {
                 let s = offsets[i] as usize;
                 let e = offsets[i + 1] as usize;
@@ -3160,14 +4530,181 @@ impl OnDemandStorage {
                 };
                 group_ids.push(gid);
             }
-            
+
             return Ok(Some((dict_strings, group_ids)));
         }
-        
+
         // MMAP PATH: scan string column from V4 RGs
         self.build_string_dict_cache_mmap(col_name)
     }
-    
+
+    /// Build a compact categorical cache for an integral column without
+    /// changing the string-dictionary cache contract.
+    pub fn build_numeric_dict_cache(
+        &self,
+        col_name: &str,
+    ) -> io::Result<Option<(Vec<i64>, Vec<u16>)>> {
+        let values = if self.has_v4_in_memory_data() {
+            let schema = self.schema.read();
+            let columns = self.columns.read();
+            let Some(column_index) = schema.get_index(col_name) else {
+                return Ok(None);
+            };
+            match columns.get(column_index) {
+                Some(ColumnData::Int64(values)) => values.clone(),
+                _ => return Ok(None),
+            }
+        } else {
+            let footer = match self.get_or_load_footer()? {
+                Some(footer) => footer,
+                None => return Ok(None),
+            };
+            let Some(column_index) = footer.schema.get_index(col_name) else {
+                return Ok(None);
+            };
+            let (columns, _) = self.scan_columns_mmap(&[column_index], &footer)?;
+            match columns.into_iter().next() {
+                Some(ColumnData::Int64(values)) => values,
+                _ => return Ok(None),
+            }
+        };
+
+        let mut dictionary = ahash::AHashMap::with_capacity(64);
+        let mut labels = Vec::with_capacity(64);
+        let mut group_ids = Vec::with_capacity(values.len());
+        for value in values {
+            let group_id = match dictionary.get(&value) {
+                Some(&group_id) => group_id,
+                None => {
+                    if dictionary.len() >= 4096 {
+                        return Ok(None);
+                    }
+                    let group_id = labels.len() as u16;
+                    dictionary.insert(value, group_id);
+                    labels.push(value);
+                    group_id
+                }
+            };
+            group_ids.push(group_id);
+        }
+        Ok(Some((labels, group_ids)))
+    }
+
+    /// Build a compact dictionary for a SQL SUBSTR transform. Unlike the
+    /// source-column dictionary cache, this remains useful when the input is
+    /// high-cardinality but the transformed value is categorical (for example
+    /// an hour extracted from a timestamp).
+    pub fn build_string_substr_dict_cache(
+        &self,
+        col_name: &str,
+        start: i64,
+        length: Option<i64>,
+    ) -> io::Result<Option<(Vec<String>, Vec<u16>)>> {
+        if start == 0 || length.is_some_and(|length| length < 0) {
+            return Ok(None);
+        }
+
+        fn transform(value: &str, start: i64, length: Option<i64>) -> String {
+            let chars: Vec<char> = value.chars().collect();
+            let begin = if start > 0 {
+                (start - 1) as usize
+            } else {
+                chars.len().saturating_sub((-start) as usize)
+            }
+            .min(chars.len());
+            let end = length
+                .map(|length| begin.saturating_add(length as usize).min(chars.len()))
+                .unwrap_or(chars.len());
+            chars[begin..end].iter().collect()
+        }
+
+        let column = if self.has_v4_in_memory_data() {
+            let schema = self.schema.read();
+            let columns = self.columns.read();
+            let Some(index) = schema.get_index(col_name) else {
+                return Ok(None);
+            };
+            let Some(column) = columns.get(index) else {
+                return Ok(None);
+            };
+            column.clone()
+        } else {
+            let footer = match self.get_or_load_footer()? {
+                Some(footer) => footer,
+                None => return Ok(None),
+            };
+            let Some(index) = footer.schema.get_index(col_name) else {
+                return Ok(None);
+            };
+            let (columns, _) = self.scan_columns_mmap(&[index], &footer)?;
+            let Some(column) = columns.into_iter().next() else {
+                return Ok(None);
+            };
+            column
+        };
+
+        let mut labels = Vec::with_capacity(64);
+        let mut label_ids: ahash::AHashMap<String, u16> = ahash::AHashMap::with_capacity(64);
+        let mut intern = |value: String| -> Option<u16> {
+            if let Some(&group_id) = label_ids.get(&value) {
+                return Some(group_id);
+            }
+            if labels.len() >= 4096 {
+                return None;
+            }
+            let group_id = labels.len() as u16;
+            label_ids.insert(value.clone(), group_id);
+            labels.push(value);
+            Some(group_id)
+        };
+
+        let group_ids = match column {
+            ColumnData::String { offsets, data } => {
+                let mut group_ids = Vec::with_capacity(offsets.len().saturating_sub(1));
+                for pair in offsets.windows(2) {
+                    let value = std::str::from_utf8(&data[pair[0] as usize..pair[1] as usize])
+                        .unwrap_or("");
+                    let Some(group_id) = intern(transform(value, start, length)) else {
+                        return Ok(None);
+                    };
+                    group_ids.push(group_id);
+                }
+                group_ids
+            }
+            ColumnData::StringDict {
+                indices,
+                dict_offsets,
+                dict_data,
+            } => {
+                let mut transformed_dictionary = Vec::with_capacity(dict_offsets.len());
+                for pair in dict_offsets.windows(2) {
+                    let value =
+                        std::str::from_utf8(&dict_data[pair[0] as usize..pair[1] as usize])
+                            .unwrap_or("");
+                    let Some(group_id) = intern(transform(value, start, length)) else {
+                        return Ok(None);
+                    };
+                    transformed_dictionary.push(group_id);
+                }
+                indices
+                    .into_iter()
+                    .map(|index| {
+                        if index == 0 {
+                            0
+                        } else {
+                            transformed_dictionary
+                                .get(index as usize - 1)
+                                .copied()
+                                .unwrap_or(0)
+                        }
+                    })
+                    .collect()
+            }
+            _ => return Ok(None),
+        };
+        Ok(Some((labels, group_ids)))
+    }
+
     /// MMAP PATH: build string dict cache by scanning V4 RGs
     fn build_string_dict_cache_mmap(
         &self,
@@ -3181,10 +4718,10 @@ impl OnDemandStorage {
             Some(idx) => idx,
             None => return Ok(None),
         };
-        
+
         let (scanned_cols, _del_bytes) = self.scan_columns_mmap(&[col_idx], &footer)?;
         if scanned_cols.is_empty() { return Ok(None); }
-        
+
         match &scanned_cols[0] {
             ColumnData::StringDict { indices, dict_offsets, dict_data } => {
                 // FAST PATH: column stored as StringDict — decode only the small dict (~10 entries),
@@ -3736,17 +5273,17 @@ impl OnDemandStorage {
             // MMAP PATH: scan agg columns from disk, then aggregate with pre-built dict
             return self.execute_group_agg_cached_mmap(dict_strings, group_ids, agg_cols);
         }
-        
+
         let schema = self.schema.read();
         let columns = self.columns.read();
         let deleted = self.deleted.read();
         let total_rows = self.ids.read().len();
-        
+
         let has_deleted = deleted.iter().any(|&b| b != 0);
         let scan_rows = total_rows.min(group_ids.len());
         let num_groups = dict_strings.len();
         let num_aggs = agg_cols.len();
-        
+
         struct AggSlice<'a> { i64_vals: Option<&'a [i64]>, f64_vals: Option<&'a [f64]>, is_count: bool }
         let agg_slices: Vec<AggSlice> = agg_cols.iter().map(|(name, is_count)| {
             if *is_count {
@@ -3761,11 +5298,11 @@ impl OnDemandStorage {
                 } else { AggSlice { i64_vals: None, f64_vals: None, is_count: true } }
             } else { AggSlice { i64_vals: None, f64_vals: None, is_count: true } }
         }).collect();
-        
+
         let flat_len = num_groups * num_aggs;
         let mut flat_sums = vec![0.0f64; flat_len];
         let mut flat_counts = vec![0i64; flat_len];
-        
+
         // Single-pass aggregation with O(1) group lookup via cached group_ids
         if has_deleted {
             for i in 0..scan_rows {
@@ -3792,7 +5329,7 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         let results: Vec<(String, Vec<(f64, i64)>)> = (0..num_groups)
             .filter(|&gid| flat_counts[gid * num_aggs] > 0)
             .map(|gid| {
@@ -3802,8 +5339,822 @@ impl OnDemandStorage {
                 (dict_strings[gid].clone(), aggs)
             })
             .collect();
-        
+
         Ok(Some(results))
+    }
+
+    /// Full numeric aggregate family over two pre-encoded categorical keys.
+    /// Returns the dense combined key slot and per-aggregate
+    /// (count, sum, min, max, is_integral) state.
+    pub fn execute_group_stats_2col_cached(
+        &self,
+        group_ids1: &[u16],
+        group_ids2: &[u16],
+        dict2_size: usize,
+        agg_cols: &[(&str, bool)],
+    ) -> io::Result<Option<Vec<(usize, Vec<(i64, f64, f64, f64, bool)>)>>> {
+        use rayon::prelude::*;
+
+        if group_ids1.len() != group_ids2.len()
+            || group_ids1.is_empty()
+            || dict2_size == 0
+            || agg_cols.is_empty()
+            || self.has_pending_deltas()
+        {
+            return Ok(None);
+        }
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let mut unique_indices = Vec::new();
+        let mut aggregate_sources = Vec::with_capacity(agg_cols.len());
+        for &(column, count_star) in agg_cols {
+            if count_star {
+                aggregate_sources.push(None);
+                continue;
+            }
+            let Some(index) = footer.schema.get_index(column) else {
+                return Ok(None);
+            };
+            if !matches!(
+                footer.schema.columns[index].1,
+                ColumnType::Int64
+                    | ColumnType::Int8
+                    | ColumnType::Int16
+                    | ColumnType::Int32
+                    | ColumnType::UInt8
+                    | ColumnType::UInt16
+                    | ColumnType::UInt32
+                    | ColumnType::UInt64
+                    | ColumnType::Timestamp
+                    | ColumnType::Date
+                    | ColumnType::Float64
+                    | ColumnType::Float32
+            ) {
+                return Ok(None);
+            }
+            let source = unique_indices
+                .iter()
+                .position(|&existing| existing == index)
+                .unwrap_or_else(|| {
+                    unique_indices.push(index);
+                    unique_indices.len() - 1
+                });
+            aggregate_sources.push(Some(source));
+        }
+        let parallel = self.scan_numeric_columns_mmap_parallel(&unique_indices, &footer)?;
+        let (columns, deleted) = match parallel {
+            Some(columns) => (columns, Vec::new()),
+            None => {
+                let (columns, deleted) = self.scan_columns_mmap(&unique_indices, &footer)?;
+                (
+                    columns.into_iter().map(std::sync::Arc::new).collect(),
+                    deleted,
+                )
+            }
+        };
+        if columns.len() != unique_indices.len() {
+            return Ok(None);
+        }
+        let group_count1 = group_ids1
+            .iter()
+            .copied()
+            .max()
+            .map_or(0, |value| value as usize + 1);
+        let group_count = match group_count1.checked_mul(dict2_size) {
+            Some(count) if count <= 65_536 => count,
+            _ => return Ok(None),
+        };
+        let aggregate_count = agg_cols.len();
+        let row_count = group_ids1.len();
+
+        struct Flat {
+            seen: Vec<bool>,
+            counts: Vec<i64>,
+            sums: Vec<f64>,
+            mins: Vec<f64>,
+            maxs: Vec<f64>,
+        }
+        let empty = || Flat {
+            seen: vec![false; group_count],
+            counts: vec![0; group_count * aggregate_count],
+            sums: vec![0.0; group_count * aggregate_count],
+            mins: vec![f64::INFINITY; group_count * aggregate_count],
+            maxs: vec![f64::NEG_INFINITY; group_count * aggregate_count],
+        };
+        let merged = (0..row_count)
+            .into_par_iter()
+            .fold(empty, |mut part, row| {
+                if deleted
+                    .get(row / 8)
+                    .is_some_and(|byte| ((byte >> (row % 8)) & 1) != 0)
+                {
+                    return part;
+                }
+                let group = group_ids1[row] as usize * dict2_size + group_ids2[row] as usize;
+                if group >= group_count {
+                    return part;
+                }
+                part.seen[group] = true;
+                let base = group * aggregate_count;
+                for (aggregate, source) in aggregate_sources.iter().enumerate() {
+                    let value = match source {
+                        None => Some(0.0),
+                        Some(source) => match columns[*source].as_ref() {
+                            ColumnData::Int64(values) => values.get(row).map(|&value| value as f64),
+                            ColumnData::Float64(values) => values.get(row).copied(),
+                            _ => None,
+                        },
+                    };
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let slot = base + aggregate;
+                    part.counts[slot] += 1;
+                    part.sums[slot] += value;
+                    part.mins[slot] = part.mins[slot].min(value);
+                    part.maxs[slot] = part.maxs[slot].max(value);
+                }
+                part
+            })
+            .reduce(empty, |mut target, source| {
+                for group in 0..group_count {
+                    target.seen[group] |= source.seen[group];
+                }
+                for slot in 0..target.counts.len() {
+                    target.counts[slot] += source.counts[slot];
+                    target.sums[slot] += source.sums[slot];
+                    target.mins[slot] = target.mins[slot].min(source.mins[slot]);
+                    target.maxs[slot] = target.maxs[slot].max(source.maxs[slot]);
+                }
+                target
+            });
+        let aggregate_is_int: Vec<bool> = aggregate_sources
+            .iter()
+            .map(|source| {
+                source.is_none()
+                    || source.is_some_and(|source| {
+                        matches!(columns[source].as_ref(), ColumnData::Int64(_))
+                    })
+            })
+            .collect();
+        Ok(Some(
+            merged
+                .seen
+                .into_iter()
+                .enumerate()
+                .filter_map(|(group, present)| {
+                    present.then(|| {
+                        let base = group * aggregate_count;
+                        let stats = (0..aggregate_count)
+                            .map(|aggregate| {
+                                let slot = base + aggregate;
+                                (
+                                    merged.counts[slot],
+                                    merged.sums[slot],
+                                    merged.mins[slot],
+                                    merged.maxs[slot],
+                                    aggregate_is_int[aggregate],
+                                )
+                            })
+                            .collect();
+                        (group, stats)
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    /// Full numeric aggregate family over one pre-encoded categorical key.
+    /// Decoded numeric columns are shared with other analytical scans, while
+    /// every invocation still performs the GROUP BY reduction over all rows.
+    pub fn execute_group_stats_cached(
+        &self,
+        group_ids: &[u16],
+        group_count: usize,
+        agg_cols: &[(&str, bool)],
+    ) -> io::Result<Option<Vec<(usize, Vec<(i64, f64, f64, f64, bool)>)>>> {
+        use rayon::prelude::*;
+
+        if group_ids.is_empty()
+            || group_count == 0
+            || group_count > 65_536
+            || agg_cols.is_empty()
+            || self.has_pending_deltas()
+        {
+            return Ok(None);
+        }
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let mut unique_indices = Vec::new();
+        let mut aggregate_sources = Vec::with_capacity(agg_cols.len());
+        for &(column, count_star) in agg_cols {
+            if count_star {
+                aggregate_sources.push(None);
+                continue;
+            }
+            let Some(index) = footer.schema.get_index(column) else {
+                return Ok(None);
+            };
+            if self.column_has_nulls(column)
+                || !matches!(
+                    footer.schema.columns[index].1,
+                    ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date
+                        | ColumnType::Float64
+                        | ColumnType::Float32
+                )
+            {
+                return Ok(None);
+            }
+            let source = unique_indices
+                .iter()
+                .position(|&existing| existing == index)
+                .unwrap_or_else(|| {
+                    unique_indices.push(index);
+                    unique_indices.len() - 1
+                });
+            aggregate_sources.push(Some(source));
+        }
+        let columns = match self.scan_numeric_columns_mmap_parallel(&unique_indices, &footer)? {
+            Some(columns) => columns,
+            None => return Ok(None),
+        };
+        if columns.len() != unique_indices.len() {
+            return Ok(None);
+        }
+        let aggregate_count = agg_cols.len();
+        struct Flat {
+            seen: Vec<bool>,
+            counts: Vec<i64>,
+            sums: Vec<f64>,
+            mins: Vec<f64>,
+            maxs: Vec<f64>,
+        }
+        let empty = || Flat {
+            seen: vec![false; group_count],
+            counts: vec![0; group_count * aggregate_count],
+            sums: vec![0.0; group_count * aggregate_count],
+            mins: vec![f64::INFINITY; group_count * aggregate_count],
+            maxs: vec![f64::NEG_INFINITY; group_count * aggregate_count],
+        };
+        let merged = (0..group_ids.len())
+            .into_par_iter()
+            .fold(empty, |mut part, row| {
+                let group = unsafe { *group_ids.get_unchecked(row) } as usize;
+                if group >= group_count {
+                    return part;
+                }
+                part.seen[group] = true;
+                let base = group * aggregate_count;
+                for (aggregate, source) in aggregate_sources.iter().enumerate() {
+                    let value = match source {
+                        None => Some(0.0),
+                        Some(source) => match columns[*source].as_ref() {
+                            ColumnData::Int64(values) => {
+                                values.get(row).map(|&value| value as f64)
+                            }
+                            ColumnData::Float64(values) => values.get(row).copied(),
+                            _ => None,
+                        },
+                    };
+                    let Some(value) = value else {
+                        continue;
+                    };
+                    let slot = base + aggregate;
+                    part.counts[slot] += 1;
+                    part.sums[slot] += value;
+                    part.mins[slot] = part.mins[slot].min(value);
+                    part.maxs[slot] = part.maxs[slot].max(value);
+                }
+                part
+            })
+            .reduce(empty, |mut target, source| {
+                for group in 0..group_count {
+                    target.seen[group] |= source.seen[group];
+                }
+                for slot in 0..target.counts.len() {
+                    target.counts[slot] += source.counts[slot];
+                    target.sums[slot] += source.sums[slot];
+                    target.mins[slot] = target.mins[slot].min(source.mins[slot]);
+                    target.maxs[slot] = target.maxs[slot].max(source.maxs[slot]);
+                }
+                target
+            });
+        let aggregate_is_int = aggregate_sources
+            .iter()
+            .map(|source| {
+                source.is_none()
+                    || source.is_some_and(|source| {
+                        matches!(columns[source].as_ref(), ColumnData::Int64(_))
+                    })
+            })
+            .collect::<Vec<_>>();
+        Ok(Some(
+            merged
+                .seen
+                .into_iter()
+                .enumerate()
+                .filter_map(|(group, present)| {
+                    present.then(|| {
+                        let base = group * aggregate_count;
+                        let stats = (0..aggregate_count)
+                            .map(|aggregate| {
+                                let slot = base + aggregate;
+                                (
+                                    merged.counts[slot],
+                                    merged.sums[slot],
+                                    merged.mins[slot],
+                                    merged.maxs[slot],
+                                    aggregate_is_int[aggregate],
+                                )
+                            })
+                            .collect();
+                        (group, stats)
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    /// AVG(numerator / (denominator + offset)) for one or more derived
+    /// features over a cached categorical key. This is the common feature-
+    /// engineering shape used for ratios and per-event rates.
+    pub fn execute_group_ratio_avg_cached(
+        &self,
+        group_ids: &[u16],
+        group_count: usize,
+        ratios: &[(&str, &str, f64)],
+    ) -> io::Result<Option<Vec<(usize, Vec<(f64, i64)>)>>> {
+        use rayon::prelude::*;
+
+        if group_ids.is_empty()
+            || group_count == 0
+            || group_count > 65_536
+            || ratios.is_empty()
+            || self.has_pending_deltas()
+        {
+            return Ok(None);
+        }
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let mut unique_indices = Vec::new();
+        let mut sources = Vec::with_capacity(ratios.len());
+        for &(numerator, denominator, offset) in ratios {
+            if !offset.is_finite()
+                || self.column_has_nulls(numerator)
+                || self.column_has_nulls(denominator)
+            {
+                return Ok(None);
+            }
+            let Some(numerator_index) = footer.schema.get_index(numerator) else {
+                return Ok(None);
+            };
+            let Some(denominator_index) = footer.schema.get_index(denominator) else {
+                return Ok(None);
+            };
+            let numeric = |index: usize| {
+                matches!(
+                    footer.schema.columns[index].1,
+                    ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date
+                        | ColumnType::Float64
+                        | ColumnType::Float32
+                )
+            };
+            if !numeric(numerator_index) || !numeric(denominator_index) {
+                return Ok(None);
+            }
+            let mut position = |index: usize| {
+                unique_indices
+                    .iter()
+                    .position(|&existing| existing == index)
+                    .unwrap_or_else(|| {
+                        unique_indices.push(index);
+                        unique_indices.len() - 1
+                    })
+            };
+            sources.push((position(numerator_index), position(denominator_index), offset));
+        }
+        let Some(columns) = self.scan_numeric_columns_mmap_parallel(&unique_indices, &footer)? else {
+            return Ok(None);
+        };
+        let value_at = |column: usize, row: usize| match columns[column].as_ref() {
+            ColumnData::Int64(values) => values.get(row).map(|&value| value as f64),
+            ColumnData::Float64(values) => values.get(row).copied(),
+            _ => None,
+        };
+        struct Flat {
+            seen: Vec<bool>,
+            sums: Vec<f64>,
+            counts: Vec<i64>,
+            valid: bool,
+        }
+        let ratio_count = ratios.len();
+        let empty = || Flat {
+            seen: vec![false; group_count],
+            sums: vec![0.0; group_count * ratio_count],
+            counts: vec![0; group_count * ratio_count],
+            valid: true,
+        };
+        let merged = (0..group_ids.len())
+            .into_par_iter()
+            .fold(empty, |mut part, row| {
+                let group = unsafe { *group_ids.get_unchecked(row) } as usize;
+                if group >= group_count {
+                    part.valid = false;
+                    return part;
+                }
+                part.seen[group] = true;
+                let base = group * ratio_count;
+                for (ratio, &(numerator, denominator, offset)) in sources.iter().enumerate() {
+                    let Some(numerator) = value_at(numerator, row) else {
+                        part.valid = false;
+                        continue;
+                    };
+                    let Some(denominator) = value_at(denominator, row) else {
+                        part.valid = false;
+                        continue;
+                    };
+                    let divisor = denominator + offset;
+                    if divisor == 0.0 {
+                        part.valid = false;
+                        continue;
+                    }
+                    let slot = base + ratio;
+                    part.sums[slot] += numerator / divisor;
+                    part.counts[slot] += 1;
+                }
+                part
+            })
+            .reduce(empty, |mut target, source| {
+                target.valid &= source.valid;
+                for group in 0..group_count {
+                    target.seen[group] |= source.seen[group];
+                }
+                for slot in 0..target.sums.len() {
+                    target.sums[slot] += source.sums[slot];
+                    target.counts[slot] += source.counts[slot];
+                }
+                target
+            });
+        if !merged.valid {
+            return Ok(None);
+        }
+        Ok(Some(
+            merged
+                .seen
+                .into_iter()
+                .enumerate()
+                .filter_map(|(group, present)| {
+                    present.then(|| {
+                        let base = group * ratio_count;
+                        (
+                            group,
+                            (0..ratio_count)
+                                .map(|ratio| {
+                                    (merged.sums[base + ratio], merged.counts[base + ratio])
+                                })
+                                .collect(),
+                        )
+                    })
+                })
+                .collect(),
+        ))
+    }
+
+    /// Fused conjunction of numeric ranges with scalar numeric aggregates.
+    /// All referenced columns come from the bounded decoded-column cache, so
+    /// repeated exploratory filters avoid decompression but still scan rows.
+    pub fn execute_filtered_numeric_agg_cached(
+        &self,
+        predicates: &[(&str, f64, f64)],
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        use rayon::prelude::*;
+
+        if predicates.is_empty() || agg_cols.is_empty() || self.has_pending_deltas() {
+            return Ok(None);
+        }
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let mut unique_indices = Vec::new();
+        let mut position_for = |column: &str| -> Option<usize> {
+            let index = footer.schema.get_index(column)?;
+            if self.column_has_nulls(column)
+                || !matches!(
+                    footer.schema.columns[index].1,
+                    ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date
+                        | ColumnType::Float64
+                        | ColumnType::Float32
+                )
+            {
+                return None;
+            }
+            Some(
+                unique_indices
+                    .iter()
+                    .position(|&existing| existing == index)
+                    .unwrap_or_else(|| {
+                        unique_indices.push(index);
+                        unique_indices.len() - 1
+                    }),
+            )
+        };
+        let predicate_sources = predicates
+            .iter()
+            .map(|(column, low, high)| {
+                position_for(column).map(|source| (source, *low, *high))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(predicate_sources) = predicate_sources else {
+            return Ok(None);
+        };
+        let aggregate_sources = agg_cols
+            .iter()
+            .map(|column| {
+                if *column == "*" || *column == "1" {
+                    Some(None)
+                } else {
+                    position_for(column).map(Some)
+                }
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(aggregate_sources) = aggregate_sources else {
+            return Ok(None);
+        };
+        let Some(columns) = self.scan_numeric_columns_mmap_parallel(&unique_indices, &footer)? else {
+            return Ok(None);
+        };
+        let value_at = |column: usize, row: usize| match columns[column].as_ref() {
+            ColumnData::Int64(values) => values.get(row).map(|&value| value as f64),
+            ColumnData::Float64(values) => values.get(row).copied(),
+            _ => None,
+        };
+        let row_count = columns
+            .first()
+            .map(|column| column.len())
+            .unwrap_or_else(|| self.active_row_count() as usize);
+        struct Part {
+            counts: Vec<i64>,
+            sums: Vec<f64>,
+            mins: Vec<f64>,
+            maxs: Vec<f64>,
+            valid: bool,
+        }
+        let empty = || Part {
+            counts: vec![0; agg_cols.len()],
+            sums: vec![0.0; agg_cols.len()],
+            mins: vec![f64::INFINITY; agg_cols.len()],
+            maxs: vec![f64::NEG_INFINITY; agg_cols.len()],
+            valid: true,
+        };
+        let merged = (0..row_count)
+            .into_par_iter()
+            .fold(empty, |mut part, row| {
+                for &(source, low, high) in &predicate_sources {
+                    let Some(value) = value_at(source, row) else {
+                        part.valid = false;
+                        return part;
+                    };
+                    if value < low || value > high {
+                        return part;
+                    }
+                }
+                for (aggregate, source) in aggregate_sources.iter().enumerate() {
+                    let value = match source {
+                        None => Some(0.0),
+                        Some(source) => value_at(*source, row),
+                    };
+                    let Some(value) = value else {
+                        part.valid = false;
+                        continue;
+                    };
+                    part.counts[aggregate] += 1;
+                    part.sums[aggregate] += value;
+                    part.mins[aggregate] = part.mins[aggregate].min(value);
+                    part.maxs[aggregate] = part.maxs[aggregate].max(value);
+                }
+                part
+            })
+            .reduce(empty, |mut target, source| {
+                target.valid &= source.valid;
+                for aggregate in 0..agg_cols.len() {
+                    target.counts[aggregate] += source.counts[aggregate];
+                    target.sums[aggregate] += source.sums[aggregate];
+                    target.mins[aggregate] =
+                        target.mins[aggregate].min(source.mins[aggregate]);
+                    target.maxs[aggregate] =
+                        target.maxs[aggregate].max(source.maxs[aggregate]);
+                }
+                target
+            });
+        if !merged.valid {
+            return Ok(None);
+        }
+        Ok(Some(
+            aggregate_sources
+                .iter()
+                .enumerate()
+                .map(|(aggregate, source)| {
+                    let count = merged.counts[aggregate];
+                    let is_int = source.is_none()
+                        || source.is_some_and(|source| {
+                            matches!(columns[source].as_ref(), ColumnData::Int64(_))
+                        });
+                    (
+                        count,
+                        merged.sums[aggregate],
+                        if count == 0 { 0.0 } else { merged.mins[aggregate] },
+                        if count == 0 { 0.0 } else { merged.maxs[aggregate] },
+                        is_int,
+                    )
+                })
+                .collect(),
+        ))
+    }
+
+    /// Top-K numeric sort after an AND-conjunction of numeric ranges. The
+    /// result contains physical row positions in final sort-key order; callers
+    /// can sparsely materialize secondary keys and projections.
+    pub fn scan_filtered_numeric_top_k_cached(
+        &self,
+        sort_columns: &[(&str, bool)],
+        predicates: &[(&str, f64, f64)],
+        k: usize,
+    ) -> io::Result<Option<Vec<usize>>> {
+        use rayon::prelude::*;
+
+        if k == 0
+            || sort_columns.is_empty()
+            || predicates.is_empty()
+            || self.has_pending_deltas()
+        {
+            return Ok(None);
+        }
+        let footer = match self.get_or_load_footer()? {
+            Some(footer) => footer,
+            None => return Ok(None),
+        };
+        let mut unique_indices = Vec::new();
+        let mut position_for = |column: &str| -> Option<usize> {
+            let index = footer.schema.get_index(column)?;
+            if self.column_has_nulls(column)
+                || !matches!(
+                    footer.schema.columns[index].1,
+                    ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date
+                        | ColumnType::Float64
+                        | ColumnType::Float32
+                )
+            {
+                return None;
+            }
+            Some(
+                unique_indices
+                    .iter()
+                    .position(|&existing| existing == index)
+                    .unwrap_or_else(|| {
+                        unique_indices.push(index);
+                        unique_indices.len() - 1
+                    }),
+            )
+        };
+        let sort_sources = sort_columns
+            .iter()
+            .map(|(column, descending)| {
+                position_for(column).map(|source| (source, *descending))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(sort_sources) = sort_sources else {
+            return Ok(None);
+        };
+        let predicate_sources = predicates
+            .iter()
+            .map(|(column, low, high)| {
+                position_for(column).map(|source| (source, *low, *high))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(predicate_sources) = predicate_sources else {
+            return Ok(None);
+        };
+        let Some(columns) = self.scan_numeric_columns_mmap_parallel(&unique_indices, &footer)? else {
+            return Ok(None);
+        };
+        let value_at = |column: usize, row: usize| match columns[column].as_ref() {
+            ColumnData::Int64(values) => values.get(row).map(|&value| value as f64),
+            ColumnData::Float64(values) => values.get(row).copied(),
+            _ => None,
+        };
+        let row_count = columns[sort_sources[0].0].len();
+        let better = |left: &usize, right: &usize| {
+            for &(source, descending) in &sort_sources {
+                let left_value = value_at(source, *left).unwrap();
+                let right_value = value_at(source, *right).unwrap();
+                let order = left_value.total_cmp(&right_value);
+                let order = if descending { order.reverse() } else { order };
+                if !order.is_eq() {
+                    return order;
+                }
+            }
+            left.cmp(right)
+        };
+        let valid = std::sync::atomic::AtomicBool::new(true);
+        let empty = Vec::<usize>::new;
+        let parts = (0..row_count)
+            .into_par_iter()
+            .fold(empty, |mut rows, row| {
+                for &(source, low, high) in &predicate_sources {
+                    let Some(value) = value_at(source, row) else {
+                        return rows;
+                    };
+                    if value < low || value > high {
+                        return rows;
+                    }
+                }
+                for &(source, _) in &sort_sources {
+                    let Some(value) = value_at(source, row) else {
+                        valid.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return rows;
+                    };
+                    if !value.is_finite() {
+                        valid.store(false, std::sync::atomic::Ordering::Relaxed);
+                        return rows;
+                    }
+                }
+                let candidate = row;
+                let position = rows.partition_point(|existing| {
+                    better(existing, &candidate).is_lt()
+                });
+                if position < k {
+                    rows.insert(position, candidate);
+                    if rows.len() > k {
+                        rows.pop();
+                    }
+                } else if rows.len() < k {
+                    rows.push(candidate);
+                }
+                rows
+            })
+            .collect::<Vec<_>>();
+        if !valid.load(std::sync::atomic::Ordering::Relaxed) {
+            return Ok(None);
+        }
+        let mut merged = Vec::with_capacity(k);
+        for part in parts {
+            for candidate in part {
+                let position = merged.partition_point(|existing| {
+                    better(existing, &candidate).is_lt()
+                });
+                if position < k {
+                    merged.insert(position, candidate);
+                    if merged.len() > k {
+                        merged.pop();
+                    }
+                }
+            }
+        }
+        Ok(Some(merged))
     }
 
     /// MMAP PATH: execute GROUP BY + aggregate using pre-built dict cache.
@@ -3831,6 +6182,184 @@ impl OnDemandStorage {
         let mut flat_sums = vec![0.0f64; flat_len];
         let mut flat_counts = vec![0i64; flat_len];
 
+        // Common analytical shape: COUNT(*) plus one AVG/SUM over a cached
+        // categorical key. Build zero-copy row-group descriptors once and let
+        // Rayon scan independent mmap ranges into tiny thread-local states.
+        // The older generic loop below copies every row-group payload and then
+        // updates one shared state sequentially.
+        let count_slot = agg_cols.iter().position(|(_, count_star)| *count_star);
+        let numeric_slot = agg_cols.iter().position(|(_, count_star)| !*count_star);
+        if num_aggs == 2
+            && count_slot.is_some()
+            && numeric_slot.is_some()
+            && agg_cols.iter().filter(|(_, count_star)| *count_star).count() == 1
+        {
+            let numeric_slot = numeric_slot.unwrap();
+            let numeric_col = agg_cols[numeric_slot].0;
+            if !self.column_has_nulls(numeric_col)
+                && footer
+                    .row_groups
+                    .iter()
+                    .all(|row_group| row_group.deletion_count == 0)
+            {
+                let numeric_idx = schema.get_index(numeric_col);
+                if let Some(numeric_idx) = numeric_idx {
+                    let col_type = schema.columns[numeric_idx].1;
+                    let is_int = matches!(
+                        col_type,
+                        ColumnType::Int64
+                            | ColumnType::Int8
+                            | ColumnType::Int16
+                            | ColumnType::Int32
+                            | ColumnType::UInt8
+                            | ColumnType::UInt16
+                            | ColumnType::UInt32
+                            | ColumnType::UInt64
+                    );
+                    let is_float =
+                        matches!(col_type, ColumnType::Float64 | ColumnType::Float32);
+                    if is_int || is_float {
+                        let file_guard = self.file.read();
+                        let file = file_guard.as_ref().ok_or_else(|| {
+                            err_not_conn("File not open for cached parallel group-by")
+                        })?;
+                        let mut mmap_guard = self.mmap_cache.write();
+                        let mmap_ref = mmap_guard.get_or_create(file)?;
+                        struct NumericRg {
+                            row_offset: usize,
+                            rows: usize,
+                            values: usize,
+                        }
+                        let mut descriptors = Vec::with_capacity(footer.row_groups.len());
+                        let mut row_offset = 0usize;
+                        let mut complete = group_ids.len()
+                            == footer
+                                .row_groups
+                                .iter()
+                                .map(|row_group| row_group.row_count as usize)
+                                .sum::<usize>();
+                        for (row_group_index, row_group) in
+                            footer.row_groups.iter().enumerate()
+                        {
+                            let rows = row_group.row_count as usize;
+                            let Some(offsets) = footer.col_offsets.get(row_group_index) else {
+                                complete = false;
+                                break;
+                            };
+                            let Some(&column_offset) = offsets.get(numeric_idx) else {
+                                complete = false;
+                                break;
+                            };
+                            let row_group_end =
+                                (row_group.offset + row_group.data_size) as usize;
+                            if rows == 0
+                                || row_group_end > mmap_ref.len()
+                                || row_group_end < row_group.offset as usize + 32
+                            {
+                                complete &= rows == 0;
+                                row_offset += rows;
+                                continue;
+                            }
+                            let bytes =
+                                &mmap_ref[row_group.offset as usize..row_group_end];
+                            if bytes[28] != RG_COMPRESS_NONE || bytes[29] < 1 {
+                                complete = false;
+                                break;
+                            }
+                            let body = &bytes[32..];
+                            let data_start =
+                                column_offset as usize + rows.div_ceil(8);
+                            if data_start + 9 > body.len()
+                                || body[data_start] != COL_ENCODING_PLAIN
+                            {
+                                complete = false;
+                                break;
+                            }
+                            let payload = &body[data_start + 1..];
+                            let encoded_rows = u64::from_le_bytes(
+                                payload[0..8].try_into().unwrap(),
+                            ) as usize;
+                            let scan_rows = encoded_rows
+                                .min(rows)
+                                .min((payload.len() - 8) / 8);
+                            if scan_rows != rows {
+                                complete = false;
+                                break;
+                            }
+                            descriptors.push(NumericRg {
+                                row_offset,
+                                rows,
+                                values: unsafe { payload.as_ptr().add(8) } as usize,
+                            });
+                            row_offset += rows;
+                        }
+                        if complete {
+                            use rayon::prelude::*;
+                            let count_slot = count_slot.unwrap();
+                            let parts: Vec<(Vec<f64>, Vec<i64>)> = descriptors
+                                .par_iter()
+                                .map(|descriptor| {
+                                    let mut sums = vec![0.0f64; flat_len];
+                                    let mut counts = vec![0i64; flat_len];
+                                    let values = descriptor.values as *const u8;
+                                    for row in 0..descriptor.rows {
+                                        let group = unsafe {
+                                            *group_ids
+                                                .get_unchecked(descriptor.row_offset + row)
+                                        } as usize;
+                                        if group >= num_groups {
+                                            continue;
+                                        }
+                                        let base = group * num_aggs;
+                                        let value = if is_int {
+                                            unsafe {
+                                                std::ptr::read_unaligned(
+                                                    values.add(row * 8) as *const i64,
+                                                ) as f64
+                                            }
+                                        } else {
+                                            unsafe {
+                                                std::ptr::read_unaligned(
+                                                    values.add(row * 8) as *const f64,
+                                                )
+                                            }
+                                        };
+                                        unsafe {
+                                            *counts.get_unchecked_mut(base + count_slot) += 1;
+                                            *counts.get_unchecked_mut(base + numeric_slot) += 1;
+                                            *sums.get_unchecked_mut(base + numeric_slot) += value;
+                                        }
+                                    }
+                                    (sums, counts)
+                                })
+                                .collect();
+                            for (sums, counts) in parts {
+                                for slot in 0..flat_len {
+                                    flat_sums[slot] += sums[slot];
+                                    flat_counts[slot] += counts[slot];
+                                }
+                            }
+                            let results = (0..num_groups)
+                                .filter(|&group| flat_counts[group * num_aggs] > 0)
+                                .map(|group| {
+                                    let stats = (0..num_aggs)
+                                        .map(|aggregate| {
+                                            (
+                                                flat_sums[group * num_aggs + aggregate],
+                                                flat_counts[group * num_aggs + aggregate],
+                                            )
+                                        })
+                                        .collect();
+                                    (dict_strings[group].clone(), stats)
+                                })
+                                .collect();
+                            return Ok(Some(results));
+                        }
+                    }
+                }
+            }
+        }
+
         // Check if all RGs support the streaming zero-copy path
         let max_col_idx = needed.iter().copied().max().unwrap_or(0);
         let all_rcix = footer.row_groups.iter().enumerate().all(|(rg_i, rg_meta)| {
@@ -3846,6 +6375,7 @@ impl OnDemandStorage {
             let mut mmap_guard = self.mmap_cache.write();
             let mmap_ref = mmap_guard.get_or_create(file)?;
             let mut rg_row_offset = 0usize;
+            let mut streaming_complete = true;
 
             for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
                 let rg_rows = rg_meta.row_count as usize;
@@ -3865,8 +6395,11 @@ impl OnDemandStorage {
                 let rcix = &footer.col_offsets[rg_i];
 
                 if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
-                    // Compressed: fall back to scan_columns_mmap for this RG
-                    rg_row_offset += rg_rows; continue;
+                    // Restart through the full decoder below. Mixing partial
+                    // streaming results with a whole-column fallback would
+                    // double count the row groups already consumed.
+                    streaming_complete = false;
+                    break;
                 }
 
                 let body = &rg_bytes[32..];
@@ -3995,35 +6528,56 @@ impl OnDemandStorage {
                     }
                     rg_row_offset += rg_rows; continue;
                 }
-                rg_row_offset += rg_rows;
+                // An encoded column or deletion bitmap not handled by the
+                // specialized loop must use the complete decoder below.
+                streaming_complete = false;
+                break;
             }
 
-            // Handle multi-agg or any RGs that fell through: collect remaining via old path
-            // (most common case handled above; this is just a safety fallback)
-            let results: Vec<(String, Vec<(f64, i64)>)> = (0..num_groups)
-                .filter(|&gid| flat_counts[gid * num_aggs] > 0 || agg_col_indices.iter().all(|x| x.is_none()))
-                .filter(|&gid| flat_counts[gid] > 0)
-                .map(|gid| {
-                    let aggs: Vec<(f64, i64)> = (0..num_aggs).map(|ai| (flat_sums[gid * num_aggs + ai], flat_counts[gid * num_aggs + ai])).collect();
-                    (dict_strings[gid].clone(), aggs)
-                })
-                .collect();
-            return Ok(Some(results));
+            if streaming_complete {
+                let results: Vec<(String, Vec<(f64, i64)>)> = (0..num_groups)
+                    .filter(|&gid| {
+                        flat_counts[gid * num_aggs] > 0
+                            || agg_col_indices.iter().all(|x| x.is_none())
+                    })
+                    .map(|gid| {
+                        let aggs: Vec<(f64, i64)> = (0..num_aggs)
+                            .map(|ai| {
+                                (
+                                    flat_sums[gid * num_aggs + ai],
+                                    flat_counts[gid * num_aggs + ai],
+                                )
+                            })
+                            .collect();
+                        (dict_strings[gid].clone(), aggs)
+                    })
+                    .collect();
+                return Ok(Some(results));
+            }
         }
 
         // FALLBACK: full materialization via scan_columns_mmap (compressed or no RCIX)
         let (scanned, del_bytes) = if needed.is_empty() {
             (Vec::new(), Vec::new())
         } else {
-            self.scan_columns_mmap(&needed, &footer)?
+            match self.scan_numeric_columns_mmap_parallel(&needed, &footer)? {
+                Some(columns) => (columns, Vec::new()),
+                None => {
+                    let (columns, deleted) = self.scan_columns_mmap(&needed, &footer)?;
+                    (
+                        columns.into_iter().map(std::sync::Arc::new).collect(),
+                        deleted,
+                    )
+                }
+            }
         };
         let has_deleted = del_bytes.iter().any(|&b| b != 0);
-        
+
         // Pre-resolve column data slices — resolve HashMap once, not per row
         let needed_to_pos: Vec<(usize, usize)> = needed.iter().enumerate()
             .map(|(pos, &idx)| (idx, pos))
             .collect();
-        
+
         struct AggSlice<'a> { i64_vals: Option<&'a [i64]>, f64_vals: Option<&'a [f64]>, is_count: bool }
         let agg_slices: Vec<AggSlice> = agg_col_indices.iter().map(|opt_idx| {
             if opt_idx.is_none() { return AggSlice { i64_vals: None, f64_vals: None, is_count: true }; }
@@ -4031,7 +6585,7 @@ impl OnDemandStorage {
             let pos = needed_to_pos.iter().find(|&&(idx, _)| idx == col_idx).map(|&(_, p)| p);
             if let Some(pos) = pos {
                 if pos < scanned.len() {
-                    match &scanned[pos] {
+                    match scanned[pos].as_ref() {
                         ColumnData::Int64(v)   => return AggSlice { i64_vals: Some(v.as_slice()), f64_vals: None, is_count: false },
                         ColumnData::Float64(v) => return AggSlice { i64_vals: None, f64_vals: Some(v.as_slice()), is_count: false },
                         _ => {}
@@ -4040,16 +6594,60 @@ impl OnDemandStorage {
             }
             AggSlice { i64_vals: None, f64_vals: None, is_count: true }
         }).collect();
-        
+
         let num_groups = dict_strings.len();
         let num_aggs = agg_cols.len();
         let scan_rows = group_ids.len();
         let flat_len = num_groups * num_aggs;
         let mut flat_sums = vec![0.0f64; flat_len];
         let mut flat_counts = vec![0i64; flat_len];
-        
+
+        if !has_deleted && scan_rows >= 131_072 && flat_len <= 1_000_000 {
+            use rayon::prelude::*;
+            const CHUNK_ROWS: usize = 65_536;
+            let parts: Vec<(Vec<f64>, Vec<i64>)> = group_ids[..scan_rows]
+                .par_chunks(CHUNK_ROWS)
+                .enumerate()
+                .map(|(chunk_index, groups)| {
+                    let start = chunk_index * CHUNK_ROWS;
+                    let mut sums = vec![0.0f64; flat_len];
+                    let mut counts = vec![0i64; flat_len];
+                    for (local_row, &group_id) in groups.iter().enumerate() {
+                        let row = start + local_row;
+                        let base = group_id as usize * num_aggs;
+                        if base + num_aggs > flat_len {
+                            continue;
+                        }
+                        for (aggregate, source) in agg_slices.iter().enumerate() {
+                            unsafe { *counts.get_unchecked_mut(base + aggregate) += 1; }
+                            if let Some(values) = source.f64_vals {
+                                if row < values.len() {
+                                    unsafe {
+                                        *sums.get_unchecked_mut(base + aggregate) +=
+                                            *values.get_unchecked(row);
+                                    }
+                                }
+                            } else if let Some(values) = source.i64_vals {
+                                if row < values.len() {
+                                    unsafe {
+                                        *sums.get_unchecked_mut(base + aggregate) +=
+                                            *values.get_unchecked(row) as f64;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    (sums, counts)
+                })
+                .collect();
+            for (sums, counts) in parts {
+                for slot in 0..flat_len {
+                    flat_sums[slot] += sums[slot];
+                    flat_counts[slot] += counts[slot];
+                }
+            }
         // Specialized fast path for single agg column (most common) — no inner loop
-        if num_aggs == 1 && !has_deleted {
+        } else if num_aggs == 1 && !has_deleted {
             match &agg_slices[0] {
                 AggSlice { f64_vals: Some(vals), .. } => {
                     let limit = scan_rows.min(vals.len());
@@ -4091,7 +6689,7 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         let results: Vec<(String, Vec<(f64, i64)>)> = (0..num_groups)
             .filter(|&gid| flat_counts[gid * num_aggs] > 0)
             .map(|gid| {
@@ -4101,7 +6699,7 @@ impl OnDemandStorage {
                 (dict_strings[gid].clone(), aggs)
             })
             .collect();
-        
+
         Ok(Some(results))
     }
 
@@ -4462,18 +7060,18 @@ impl OnDemandStorage {
             // MMAP PATH: scan filter+agg columns from disk
             return self.execute_between_group_agg_cached_mmap(filter_col, lo, hi, dict_strings, group_ids, agg_col);
         }
-        
+
         let schema = self.schema.read();
         let columns = self.columns.read();
         let deleted = self.deleted.read();
         let total_rows = self.ids.read().len();
-        
+
         let filter_idx = match schema.get_index(filter_col) {
             Some(idx) => idx,
             None => return Ok(None),
         };
         if filter_idx >= columns.len() { return Ok(None); }
-        
+
         let has_deleted = deleted.iter().any(|&b| b != 0);
         // `lo`/`hi` carry strict-inequality epsilon bounds (next/prev f64) for
         // `>` / `<`; ceil/floor map those to the exact inclusive integer
@@ -4483,10 +7081,10 @@ impl OnDemandStorage {
         let hi_i64 = hi.floor() as i64;
         let scan_rows = total_rows.min(group_ids.len());
         let num_groups = dict_strings.len();
-        
+
         let mut group_sums = vec![0.0f64; num_groups];
         let mut group_counts = vec![0i64; num_groups];
-        
+
         let agg_idx = agg_col.and_then(|ac| schema.get_index(ac));
         let agg_f64 = agg_idx.and_then(|idx| {
             if idx < columns.len() { match &columns[idx] { ColumnData::Float64(v) => Some(v.as_slice()), _ => None } } else { None }
@@ -4494,7 +7092,7 @@ impl OnDemandStorage {
         let agg_i64 = agg_idx.and_then(|idx| {
             if idx < columns.len() { match &columns[idx] { ColumnData::Int64(v) => Some(v.as_slice()), _ => None } } else { None }
         });
-        
+
         // Branchless accumulation: eliminates branch misprediction at ~50% BETWEEN hit rate
         // mask = (in_range) as i64 → 0 or 1, multiply with agg value so non-matching adds 0
         macro_rules! between_agg_branchy {
@@ -4512,7 +7110,7 @@ impl OnDemandStorage {
                 }
             }};
         }
-        
+
         if let Some(filter_vals) = match &columns[filter_idx] { ColumnData::Int64(v) => Some(v.as_slice()), _ => None } {
             let limit = scan_rows.min(filter_vals.len()).min(group_ids.len());
             let limit = limit.min(agg_f64.map_or(usize::MAX, |a| a.len())).min(agg_i64.map_or(usize::MAX, |a| a.len()));
@@ -4582,12 +7180,12 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         let results: Vec<(String, f64, i64)> = (0..num_groups)
             .filter(|&gid| group_counts[gid] > 0)
             .map(|gid| (dict_strings[gid].clone(), group_sums[gid], group_counts[gid]))
             .collect();
-        
+
         Ok(Some(results))
     }
 
@@ -4983,13 +7581,13 @@ impl OnDemandStorage {
         let agg_col_data = agg_idx.map(|ai| {
             if ai == filter_idx { &scanned[0] } else { &scanned[1] }
         });
-        
+
         let scan_rows = group_ids.len();
-        
+
         // Pre-resolve agg data slice — avoids match/option check inside hot loop
         let agg_f64 = agg_col_data.and_then(|acd| match acd { ColumnData::Float64(v) => Some(v.as_slice()), _ => None });
         let agg_i64 = agg_col_data.and_then(|acd| match acd { ColumnData::Int64(v) => Some(v.as_slice()), _ => None });
-        
+
         macro_rules! between_hot {
             ($fvals:expr, $lo_c:expr, $hi_c:expr) => {{
                 let limit = scan_rows.min($fvals.len()).min(group_ids.len());
@@ -5041,18 +7639,18 @@ impl OnDemandStorage {
                 }
             }};
         }
-        
+
         match filter_col_data {
             ColumnData::Int64(vals) => { between_hot!(vals, lo_i64, hi_i64); }
             ColumnData::Float64(vals) => { between_hot!(vals, lo, hi); }
             _ => return Ok(None),
         }
-        
+
         let results: Vec<(String, f64, i64)> = (0..num_groups)
             .filter(|&gid| group_counts[gid] > 0)
             .map(|gid| (dict_strings[gid].clone(), group_sums[gid], group_counts[gid]))
             .collect();
-        
+
         Ok(Some(results))
     }
 
@@ -5073,12 +7671,12 @@ impl OnDemandStorage {
             }
             return Ok(None);
         }
-        
+
         let schema = self.schema.read();
         let columns = self.columns.read();
         let deleted = self.deleted.read();
         let total_rows = self.ids.read().len();
-        
+
         let filter_idx = match schema.get_index(filter_col) {
             Some(idx) => idx,
             None => return Ok(None),
@@ -5088,29 +7686,29 @@ impl OnDemandStorage {
             None => return Ok(None),
         };
         let agg_idx = agg_col.and_then(|ac| schema.get_index(ac));
-        
+
         if filter_idx >= columns.len() || group_idx >= columns.len() {
             return Ok(None);
         }
-        
+
         let has_deleted = deleted.iter().any(|&b| b != 0);
         let lo_i64 = lo.ceil() as i64;
         let hi_i64 = hi.floor() as i64;
-        
+
         let (group_offsets, group_bytes) = match &columns[group_idx] {
             ColumnData::String { offsets, data } => (offsets, data),
             _ => return Ok(None),
         };
         let group_count = group_offsets.len().saturating_sub(1);
         let scan_rows = total_rows.min(group_count);
-        
+
         // Single-pass: build group dict + filter + aggregate simultaneously
         // Use small linear-scan dict for ≤64 groups (faster than hash map for short strings)
         let mut dict_entries: Vec<(u32, u32)> = Vec::with_capacity(32); // (start, end) in group_bytes
         let mut dict_strings: Vec<String> = Vec::with_capacity(32);
         let mut group_sums = vec![0.0f64; 64]; // pre-alloc for up to 64 groups
         let mut group_counts = vec![0i64; 64];
-        
+
         let filter_i64 = match &columns[filter_idx] {
             ColumnData::Int64(v) => Some(v.as_slice()),
             _ => None,
@@ -5125,7 +7723,7 @@ impl OnDemandStorage {
         let agg_f64 = agg_idx.and_then(|idx| {
             if idx < columns.len() { match &columns[idx] { ColumnData::Float64(v) => Some(v.as_slice()), _ => None } } else { None }
         });
-        
+
         // Macro for the inner aggregation to avoid code duplication
         macro_rules! agg_row {
             ($gid:expr, $i:expr) => {
@@ -5134,7 +7732,7 @@ impl OnDemandStorage {
                 else if let Some(av) = agg_i64 { if $i < av.len() { group_sums[$gid] += av[$i] as f64; } }
             }
         }
-        
+
         // Inline group lookup: linear scan of ≤64 entries
         #[inline(always)]
         fn find_group(dict: &[(u32, u32)], group_bytes: &[u8], s: usize, e: usize) -> Option<usize> {
@@ -5147,7 +7745,7 @@ impl OnDemandStorage {
             }
             None
         }
-        
+
         // Single-pass: filter + group + aggregate
         if let Some(vals) = filter_i64 {
             let limit = scan_rows.min(vals.len());
@@ -5208,14 +7806,14 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         let num_groups = dict_entries.len();
-        
+
         let results: Vec<(String, f64, i64)> = (0..num_groups)
             .filter(|&gid| group_counts[gid] > 0)
             .map(|gid| (dict_strings[gid].clone(), group_sums[gid], group_counts[gid]))
             .collect();
-        
+
         Ok(Some(results))
     }
 
@@ -5233,20 +7831,20 @@ impl OnDemandStorage {
             }
             return Ok(None);
         }
-        
+
         let schema = self.schema.read();
         let columns = self.columns.read();
         let deleted = self.deleted.read();
         let total_rows = self.ids.read().len();
-        
+
         let group_idx = match schema.get_index(group_col) {
             Some(idx) => idx,
             None => return Ok(None),
         };
         if group_idx >= columns.len() { return Ok(None); }
-        
+
         let has_deleted = deleted.iter().any(|&b| b != 0);
-        
+
         let (group_offsets, group_bytes) = match &columns[group_idx] {
             ColumnData::String { offsets, data } => (offsets, data),
             _ => return Ok(None),
@@ -5254,7 +7852,7 @@ impl OnDemandStorage {
         let group_count = group_offsets.len().saturating_sub(1);
         let scan_rows = total_rows.min(group_count);
         let num_aggs = agg_cols.len();
-        
+
         // Resolve agg column slices
         struct AggSlice<'a> { i64_vals: Option<&'a [i64]>, f64_vals: Option<&'a [f64]>, is_count: bool }
         let agg_slices: Vec<AggSlice> = agg_cols.iter().map(|(name, is_count)| {
@@ -5270,14 +7868,14 @@ impl OnDemandStorage {
                 } else { AggSlice { i64_vals: None, f64_vals: None, is_count: true } }
             } else { AggSlice { i64_vals: None, f64_vals: None, is_count: true } }
         }).collect();
-        
+
         // Linear-scan dictionary for ≤64 groups (faster than hash map for short strings)
         let mut dict_entries: Vec<(u32, u32)> = Vec::with_capacity(32);
         let mut dict_strings: Vec<String> = Vec::with_capacity(32);
         let max_flat = 64 * num_aggs;
         let mut flat_sums = vec![0.0f64; max_flat];
         let mut flat_counts = vec![0i64; max_flat];
-        
+
         #[inline(always)]
         fn find_group_ga(dict: &[(u32, u32)], gb: &[u8], s: usize, e: usize) -> Option<usize> {
             let needle = &gb[s..e];
@@ -5287,7 +7885,7 @@ impl OnDemandStorage {
             }
             None
         }
-        
+
         // Single-pass: group + aggregate
         for i in 0..scan_rows {
             if has_deleted {
@@ -5316,7 +7914,7 @@ impl OnDemandStorage {
                 }
             }
         }
-        
+
         let num_groups = dict_entries.len();
         let results: Vec<(String, Vec<(f64, i64)>)> = (0..num_groups)
             .filter(|&gid| flat_counts[gid * num_aggs] > 0)
@@ -5327,7 +7925,7 @@ impl OnDemandStorage {
                 (dict_strings[gid].clone(), aggs)
             })
             .collect();
-        
+
         Ok(Some(results))
     }
 
@@ -5335,17 +7933,17 @@ impl OnDemandStorage {
     pub fn durability(&self) -> super::DurabilityLevel {
         self.durability
     }
-    
+
     /// Set the durability level
-    /// 
+    ///
     /// Note: This only affects future operations. Existing buffered data
     /// is not automatically synced when changing to a higher durability level.
     pub fn set_durability(&mut self, level: super::DurabilityLevel) {
         self.durability = level;
     }
-    
+
     /// Checkpoint: merge WAL records into main file and clear WAL
-    /// 
+    ///
     /// This is called automatically on save() for safe/max modes.
     /// After checkpoint, all data is in the main file and WAL is cleared.
     /// This improves read performance by eliminating WAL merge overhead.
@@ -5353,41 +7951,41 @@ impl OnDemandStorage {
         if self.durability == super::DurabilityLevel::Fast {
             return Ok(()); // No WAL in fast mode
         }
-        
+
         let wal_buffer = self.wal_buffer.read();
         if wal_buffer.is_empty() {
             return Ok(()); // Nothing to checkpoint
         }
         drop(wal_buffer);
-        
+
         // Save main file (this persists all in-memory data including WAL records)
         self.save()?;
-        
+
         // Clear WAL after successful save
         {
             let mut wal_buffer = self.wal_buffer.write();
             let mut wal_writer = self.wal_writer.write();
-            
+
             wal_buffer.clear();
-            
+
             // Create fresh WAL file
             if let Some(_) = wal_writer.take() {
                 let wal_path = Self::wal_path(&self.path);
                 *wal_writer = Some(super::incremental::WalWriter::create(
-                    &wal_path, 
+                    &wal_path,
                     self.next_id.load(Ordering::SeqCst)
                 )?);
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Get number of pending WAL records
     pub fn wal_record_count(&self) -> usize {
         self.wal_buffer.read().len()
     }
-    
+
     /// Check if WAL needs checkpoint (has pending records)
     pub fn needs_checkpoint(&self) -> bool {
         !self.wal_buffer.read().is_empty()
@@ -5497,7 +8095,7 @@ impl OnDemandStorage {
         let delta_rows = self.delta_row_count() as u64;
         base_rows + delta_rows
     }
-    
+
     /// Fast path: Get base table row count only (O(1) lock-free atomic read)
     /// Use this for COUNT(*) without WHERE clause
     pub fn base_row_count(&self) -> u64 {
@@ -5557,7 +8155,7 @@ impl OnDemandStorage {
 
     /// Insert rows using generic value type (compatibility with ColumnarStorage)
     /// Optimized with single-pass column collection
-    /// 
+    ///
     /// For safe/max durability modes, rows are written to WAL first for crash recovery.
     /// - Safe mode: WAL is flushed but fsync is deferred to flush() call
     /// - Max mode: WAL is fsync'd immediately after each insert for strongest guarantee
@@ -5581,17 +8179,17 @@ impl OnDemandStorage {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
-        
+
         // For safe/max durability with batch writes: use WAL for efficiency
         // Single-row writes skip WAL (original fsync-on-save behavior is faster)
         // WAL benefit: single I/O for many rows; WAL overhead: extra I/O for single rows
         let start_id = self.next_id.load(Ordering::SeqCst);
         let use_wal = self.durability != super::DurabilityLevel::Fast && rows.len() > 1;
-        
+
         if use_wal {
             // Batch writes: use WAL for efficiency (single I/O for all rows)
             let mut wal_writer = self.wal_writer.write();
-            
+
             if let Some(writer) = wal_writer.as_mut() {
                 let wal_rows = rows
                     .iter()
@@ -5604,13 +8202,13 @@ impl OnDemandStorage {
                     })
                     .collect();
                 let record = super::incremental::WalRecord::BatchInsert {
-                    start_id, 
+                    start_id,
                     rows: wal_rows,
                     txn_id: 0,
                 };
                 writer.append(&record)?;
                 writer.flush()?;
-                
+
                 // For max durability: fsync WAL immediately
                 if self.durability == super::DurabilityLevel::Max {
                     writer.sync()?;
@@ -5618,23 +8216,23 @@ impl OnDemandStorage {
             }
         }
         // Note: For single-row writes, fsync happens in save() based on durability level
-        
+
         // Handle case where all rows are empty dicts - still create rows with just _id
         let all_empty = rows.iter().all(|r| r.is_empty());
         if all_empty {
             let row_count = rows.len();
             let start_id = self.next_id.fetch_add(row_count as u64, Ordering::SeqCst);
             let ids: Vec<u64> = (start_id..start_id + row_count as u64).collect();
-            
+
             // Add IDs
             self.ids.write().extend_from_slice(&ids);
-            
+
             // Update header
             {
                 let mut header = self.header.write();
                 header.row_count = self.ids.read().len() as u64;
             }
-            
+
             // Update id_to_idx mapping only if it's already built
             {
                 let ids_guard = self.ids.read();
@@ -5646,21 +8244,21 @@ impl OnDemandStorage {
                     }
                 }
             }
-            
+
             // Extend deleted bitmap
             {
                 let mut deleted = self.deleted.write();
                 let new_len = (self.ids.read().len() + 7) / 8;
                 deleted.resize(new_len, 0);
             }
-            
+
             // Update active count
             self.active_count.fetch_add(row_count as u64, Ordering::Relaxed);
-            
+
             // Update pending rows counter and check auto-flush
             self.pending_rows.fetch_add(row_count as u64, Ordering::Relaxed);
             self.maybe_auto_flush()?;
-            
+
             return Ok(ids);
         }
 
@@ -5722,7 +8320,7 @@ impl OnDemandStorage {
         let sample_size = std::cmp::min(10, num_rows);
         for row in rows.iter().take(sample_size) {
             for (key, val) in row {
-                if int_columns.contains_key(key) || float_columns.contains_key(key) 
+                if int_columns.contains_key(key) || float_columns.contains_key(key)
                     || string_columns.contains_key(key) || binary_columns.contains_key(key)
                     || blob_columns.contains_key(key)
                     || bool_columns.contains_key(key) {
@@ -5744,13 +8342,13 @@ impl OnDemandStorage {
 
         // Pre-allocate NULL string to avoid repeated allocation
         static NULL_MARKER: &str = "\x00__NULL__\x00";
-        
+
         // Single pass: collect all values and track NULLs
         // Note: For homogeneous data (common case), new columns won't be discovered mid-stream
         for row in rows {
             // Handle new columns discovered mid-stream (rare case for heterogeneous data)
             for (key, val) in row {
-                if !int_columns.contains_key(key) && !float_columns.contains_key(key) 
+                if !int_columns.contains_key(key) && !float_columns.contains_key(key)
                     && !string_columns.contains_key(key) && !binary_columns.contains_key(key)
                     && !blob_columns.contains_key(key)
                     && !fixedlist_columns.contains_key(key) && !bool_columns.contains_key(key) {
@@ -5767,7 +8365,7 @@ impl OnDemandStorage {
                     null_positions.insert(key.clone(), Vec::with_capacity(num_rows));
                 }
             }
-            
+
             // Collect values for all columns and track NULL positions
             for (key, col) in int_columns.iter_mut() {
                 let (val, is_null) = match row.get(key).map(|v| v.as_column_value_ref()) {
@@ -5853,7 +8451,7 @@ impl OnDemandStorage {
     }
 
     /// Insert typed columns and immediately persist to disk
-    /// 
+    ///
     /// This is the preferred method for direct writes - data is immediately
     /// visible to the executor after this call returns.
     pub fn insert_typed_and_persist(
@@ -5897,18 +8495,18 @@ impl OnDemandStorage {
     pub fn close(&self) -> io::Result<()> {
         // Save any pending changes first
         self.save()?;
-        
+
         // Release mmap cache BEFORE closing file (critical for Windows)
         self.mmap_cache.write().invalidate();
-        
+
         // Close file handle
         *self.file.write() = None;
         *self.write_file.write() = None;
         *self.delta_file.write() = None;
-        
+
         Ok(())
     }
-    
+
     /// Release mmap without saving (for cleanup scenarios)
     pub fn release_mmap(&self) {
         self.mmap_cache.write().invalidate();

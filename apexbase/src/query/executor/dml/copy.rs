@@ -48,6 +48,90 @@ impl CsvBuffer {
     }
 }
 
+/// Numeric state produced by a direct CSV aggregation scan.
+///
+/// The scanner keeps only these scalars per requested column.  It deliberately
+/// mirrors the scalar aggregate types used by the Arrow execution path so a
+/// query can return without materialising unrelated CSV columns.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::query::executor) struct CsvNumericStats {
+    pub(in crate::query::executor) count: i64,
+    pub(in crate::query::executor) sum: f64,
+    pub(in crate::query::executor) min: f64,
+    pub(in crate::query::executor) max: f64,
+    pub(in crate::query::executor) is_int: bool,
+}
+
+impl CsvNumericStats {
+    fn new(is_int: bool) -> Self {
+        Self {
+            count: 0,
+            sum: 0.0,
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            is_int,
+        }
+    }
+
+    #[inline]
+    fn add(&mut self, value: f64) {
+        self.count += 1;
+        self.sum += value;
+        if value < self.min {
+            self.min = value;
+        }
+        if value > self.max {
+            self.max = value;
+        }
+    }
+
+    #[inline]
+    fn merge(&mut self, other: Self) {
+        if other.count == 0 {
+            return;
+        }
+        self.count += other.count;
+        self.sum += other.sum;
+        if other.min < self.min {
+            self.min = other.min;
+        }
+        if other.max > self.max {
+            self.max = other.max;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CsvGroupTarget {
+    Group,
+    Numeric { output: usize, is_int: bool },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::query::executor) enum CsvGroupKeyType {
+    Utf8,
+    Int64,
+}
+
+#[derive(Eq, Hash, PartialEq)]
+enum CsvGroupKey {
+    Null,
+    Utf8(Vec<u8>),
+    Int64(i64),
+}
+
+#[derive(Clone, Copy)]
+enum CsvDistinctKeyType {
+    Utf8,
+    Int64,
+}
+
+#[derive(Eq, Hash, PartialEq)]
+enum CsvDistinctValue {
+    Utf8(Vec<u8>),
+    Int64(i64),
+}
+
 impl ApexExecutor {
     pub(in crate::query::executor) fn execute_copy_to_parquet(
         storage_path: &Path,
@@ -863,7 +947,9 @@ impl ApexExecutor {
                 let raw = &first_line[fs..i];
                 let s = std::str::from_utf8(raw)
                     .unwrap_or("")
+                    .trim()
                     .trim_matches('"')
+                    .trim()
                     .to_string();
                 names.push(if s.is_empty() {
                     format!("col_{}", names.len())
@@ -875,7 +961,9 @@ impl ApexExecutor {
             let tail = &first_line[fs..];
             let s = std::str::from_utf8(tail)
                 .unwrap_or("")
+                .trim()
                 .trim_matches('"')
+                .trim()
                 .to_string();
             names.push(if s.is_empty() {
                 format!("col_{}", names.len())
@@ -1519,6 +1607,875 @@ impl ApexExecutor {
             return Ok(None);
         }
         Ok(Some(count as i64))
+    }
+
+    /// Scan only the requested numeric CSV columns and return scalar aggregate
+    /// state without constructing an Arrow batch for the whole file.
+    ///
+    /// This is intentionally limited to quote-free CSV.  The regular parser is
+    /// still the correctness path for quoted fields, and for malformed rows the
+    /// caller receives `None` so it can preserve the parser's existing error or
+    /// skip-row behaviour.  The scan validates field counts while it finds the
+    /// requested fields, so valid rows are never silently omitted.
+    pub(in crate::query::executor) fn try_fast_csv_numeric_agg(
+        path: &str,
+        options: &[(String, String)],
+        columns: &[String],
+        predicates: &[(String, f64, f64)],
+    ) -> io::Result<Option<(i64, Vec<CsvNumericStats>)>> {
+        use arrow::datatypes::DataType;
+        use rayon::prelude::*;
+
+        if columns.is_empty() {
+            return Ok(None);
+        }
+
+        let has_header = options
+            .iter()
+            .find(|(k, _)| k == "header")
+            .map(|(_, v)| !matches!(v.to_lowercase().as_str(), "false" | "0"))
+            .unwrap_or(true);
+        let bad_line_policy = csv_bad_line_policy(options)?;
+        // The full parser emits one warning for every skipped malformed row.
+        // Keep that observable behaviour by letting it handle the `warn`
+        // policy instead of silently skipping rows in the parallel scanner.
+        if bad_line_policy == CsvBadLinePolicy::Warn {
+            return Ok(None);
+        }
+
+        let file = std::fs::File::open(path).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Cannot open CSV file '{}': {}", path, e),
+            )
+        })?;
+        let buffer = if file.metadata()?.len() >= SEQUENTIAL_READ_THRESHOLD {
+            CsvBuffer::Owned(read_file_sequential(path)?)
+        } else {
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap error: {}", e)))?;
+            CsvBuffer::Mmap(mmap)
+        };
+        let data = buffer.as_slice();
+
+        let delimiter = options
+            .iter()
+            .find(|(k, _)| k == "delimiter" || k == "delim" || k == "sep")
+            .map(|(_, v)| {
+                if v.eq_ignore_ascii_case("auto") {
+                    Self::sniff_csv_delimiter(data)
+                } else {
+                    v.chars().next().map(|c| c as u8).unwrap_or(b',')
+                }
+            })
+            .unwrap_or(b',');
+
+        let schema = Self::infer_csv_schema_fast(data, has_header, delimiter, 100)?;
+        let mut scan_columns = columns.to_vec();
+        for (column, _, _) in predicates {
+            if !scan_columns.contains(column) {
+                scan_columns.push(column.clone());
+            }
+        }
+        let mut target_specs: Vec<(usize, usize, bool)> = Vec::with_capacity(scan_columns.len());
+        for (output_index, column) in scan_columns.iter().enumerate() {
+            let Some(field_index) = schema.fields().iter().position(|field| field.name() == column)
+            else {
+                return Ok(None);
+            };
+            let is_int = match schema.field(field_index).data_type() {
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => true,
+                DataType::Float64 | DataType::Float32 => false,
+                _ => return Ok(None),
+            };
+            target_specs.push((field_index, output_index, is_int));
+        }
+        target_specs.sort_unstable_by_key(|(field_index, _, _)| *field_index);
+        let predicate_specs = predicates
+            .iter()
+            .map(|(column, low, high)| {
+                scan_columns
+                    .iter()
+                    .position(|candidate| candidate == column)
+                    .map(|index| (index, *low, *high))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(predicate_specs) = predicate_specs else {
+            return Ok(None);
+        };
+
+        let data_start = if has_header {
+            memchr::memchr(b'\n', data)
+                .map(|index| index + 1)
+                .unwrap_or(data.len())
+        } else {
+            0
+        };
+        let data = &data[data_start..];
+        let empty_stats = target_specs
+            .iter()
+            .map(|(_, output_index, is_int)| (*output_index, CsvNumericStats::new(*is_int)))
+            .collect::<Vec<_>>();
+        if data.is_empty() {
+            let mut stats = vec![CsvNumericStats::new(true); columns.len()];
+            for (output_index, stat) in empty_stats {
+                stats[output_index] = stat;
+            }
+            return Ok(Some((0, stats)));
+        }
+
+        // The fast line/field scanner has the same quote-naive contract as the
+        // existing CSV fast count.  Decline quoted data instead of changing CSV
+        // semantics for files that need a quote-aware parser.
+        if memchr::memchr(b'"', data).is_some() {
+            return Ok(None);
+        }
+
+        let first_line = data
+            .split(|&byte| byte == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .find(|line| !line.is_empty())
+            .unwrap_or(&[]);
+        if first_line.is_empty() {
+            let mut stats = vec![CsvNumericStats::new(true); columns.len()];
+            for (output_index, stat) in empty_stats {
+                stats[output_index] = stat;
+            }
+            return Ok(Some((0, stats)));
+        }
+        let n_cols = memchr::memchr_iter(delimiter, first_line).count() + 1;
+
+        let mut starts = vec![0usize];
+        let n_threads = rayon::current_num_threads().min(16).max(1);
+        if n_threads > 1 {
+            let chunk = (data.len() + n_threads - 1) / n_threads;
+            for thread in 1..n_threads {
+                let approx = thread * chunk;
+                if approx >= data.len() {
+                    break;
+                }
+                let start = memchr::memchr(b'\n', &data[approx..])
+                    .map(|index| approx + index + 1)
+                    .unwrap_or(data.len());
+                if start != *starts.last().unwrap() {
+                    starts.push(start);
+                }
+            }
+        }
+        starts.push(data.len());
+
+        struct SendSlice(*const u8, usize);
+        unsafe impl Send for SendSlice {}
+        unsafe impl Sync for SendSlice {}
+
+        let chunks: Vec<SendSlice> = starts
+            .windows(2)
+            .map(|window| {
+                let chunk = &data[window[0]..window[1]];
+                SendSlice(chunk.as_ptr(), chunk.len())
+            })
+            .collect();
+        let partials: io::Result<Vec<(i64, Vec<CsvNumericStats>)>> = chunks
+            .par_iter()
+            .map(|slice| {
+                let chunk = unsafe { std::slice::from_raw_parts(slice.0, slice.1) };
+                Self::scan_csv_numeric_chunk(
+                    chunk,
+                    delimiter,
+                    n_cols,
+                    bad_line_policy,
+                    &target_specs,
+                    scan_columns.len(),
+                    columns.len(),
+                    &predicate_specs,
+                )
+            })
+            .collect();
+
+        let partials = match partials {
+            Ok(partials) => partials,
+            // Let the regular parser produce the established malformed-row
+            // error (or apply its skip/warn policy) rather than returning a
+            // fast-path-specific error.
+            Err(_) => return Ok(None),
+        };
+        let mut row_count = 0i64;
+        let mut stats = vec![CsvNumericStats::new(true); columns.len()];
+        for (partial_rows, partial_stats) in partials {
+            row_count += partial_rows;
+            for (output_index, stat) in partial_stats.into_iter().enumerate() {
+                if stats[output_index].count == 0 {
+                    stats[output_index].is_int = stat.is_int;
+                }
+                stats[output_index].merge(stat);
+            }
+        }
+        Ok(Some((row_count, stats)))
+    }
+
+    /// Group a quote-free CSV by one string or integer column while aggregating only the
+    /// requested numeric columns. Each worker owns a compact local group map;
+    /// maps are merged after the parallel scan, so wide input rows are never
+    /// materialised as Arrow arrays.
+    pub(in crate::query::executor) fn try_fast_csv_group_numeric_agg(
+        path: &str,
+        options: &[(String, String)],
+        group_column: &str,
+        columns: &[String],
+        predicates: &[(String, f64, f64)],
+    ) -> io::Result<
+        Option<(
+            CsvGroupKeyType,
+            Vec<(Option<Vec<u8>>, i64, Vec<CsvNumericStats>)>,
+        )>,
+    > {
+        use arrow::datatypes::DataType;
+        use rayon::prelude::*;
+
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        let has_header = options
+            .iter()
+            .find(|(key, _)| key == "header")
+            .map(|(_, value)| !matches!(value.to_lowercase().as_str(), "false" | "0"))
+            .unwrap_or(true);
+        let bad_line_policy = csv_bad_line_policy(options)?;
+        if bad_line_policy == CsvBadLinePolicy::Warn {
+            return Ok(None);
+        }
+        let file = std::fs::File::open(path)?;
+        let buffer = if file.metadata()?.len() >= SEQUENTIAL_READ_THRESHOLD {
+            CsvBuffer::Owned(read_file_sequential(path)?)
+        } else {
+            CsvBuffer::Mmap(unsafe { memmap2::Mmap::map(&file) }?)
+        };
+        let all_data = buffer.as_slice();
+        let delimiter = options
+            .iter()
+            .find(|(key, _)| key == "delimiter" || key == "delim" || key == "sep")
+            .map(|(_, value)| {
+                if value.eq_ignore_ascii_case("auto") {
+                    Self::sniff_csv_delimiter(all_data)
+                } else {
+                    value.chars().next().map(|value| value as u8).unwrap_or(b',')
+                }
+            })
+            .unwrap_or(b',');
+        let schema = Self::infer_csv_schema_fast(all_data, has_header, delimiter, 100)?;
+        let Some(group_index) = schema
+            .fields()
+            .iter()
+            .position(|field| field.name() == group_column)
+        else {
+            return Ok(None);
+        };
+        let group_key_type = match schema.field(group_index).data_type() {
+            DataType::Utf8 => CsvGroupKeyType::Utf8,
+            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+                CsvGroupKeyType::Int64
+            }
+            _ => return Ok(None),
+        };
+        let mut scan_columns = columns.to_vec();
+        for (column, _, _) in predicates {
+            if !scan_columns.contains(column) {
+                scan_columns.push(column.clone());
+            }
+        }
+        let mut targets = vec![(group_index, CsvGroupTarget::Group)];
+        let mut scan_is_int = Vec::with_capacity(scan_columns.len());
+        for (output, column) in scan_columns.iter().enumerate() {
+            let Some(index) = schema.fields().iter().position(|field| field.name() == column) else {
+                return Ok(None);
+            };
+            let is_int = match schema.field(index).data_type() {
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => true,
+                DataType::Float64 | DataType::Float32 => false,
+                _ => return Ok(None),
+            };
+            scan_is_int.push(is_int);
+            targets.push((index, CsvGroupTarget::Numeric { output, is_int }));
+        }
+        targets.sort_unstable_by_key(|(index, _)| *index);
+        let predicate_specs = predicates
+            .iter()
+            .map(|(column, low, high)| {
+                scan_columns
+                    .iter()
+                    .position(|candidate| candidate == column)
+                    .map(|index| (index, *low, *high))
+            })
+            .collect::<Option<Vec<_>>>();
+        let Some(predicate_specs) = predicate_specs else {
+            return Ok(None);
+        };
+
+        let data_start = if has_header {
+            memchr::memchr(b'\n', all_data)
+                .map(|index| index + 1)
+                .unwrap_or(all_data.len())
+        } else {
+            0
+        };
+        let data = &all_data[data_start..];
+        if data.is_empty() || memchr::memchr(b'"', data).is_some() {
+            return Ok(None);
+        }
+        let first_line = data
+            .split(|&byte| byte == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .find(|line| !line.is_empty())
+            .unwrap_or(&[]);
+        if first_line.is_empty() {
+            return Ok(Some((group_key_type, Vec::new())));
+        }
+        let column_count = memchr::memchr_iter(delimiter, first_line).count() + 1;
+        let mut starts = vec![0usize];
+        let thread_count = rayon::current_num_threads().clamp(1, 16);
+        let chunk_size = data.len().div_ceil(thread_count);
+        for thread in 1..thread_count {
+            let approximate = thread * chunk_size;
+            if approximate >= data.len() {
+                break;
+            }
+            let start = memchr::memchr(b'\n', &data[approximate..])
+                .map(|index| approximate + index + 1)
+                .unwrap_or(data.len());
+            if start != *starts.last().unwrap() {
+                starts.push(start);
+            }
+        }
+        starts.push(data.len());
+
+        struct SendSlice(*const u8, usize);
+        unsafe impl Send for SendSlice {}
+        unsafe impl Sync for SendSlice {}
+        let chunks = starts
+            .windows(2)
+            .map(|window| {
+                let chunk = &data[window[0]..window[1]];
+                SendSlice(chunk.as_ptr(), chunk.len())
+            })
+            .collect::<Vec<_>>();
+        type GroupMap = ahash::AHashMap<CsvGroupKey, (i64, Vec<CsvNumericStats>)>;
+        let partials: io::Result<Vec<GroupMap>> = chunks
+            .par_iter()
+            .map(|slice| {
+                let chunk = unsafe { std::slice::from_raw_parts(slice.0, slice.1) };
+                let mut groups = GroupMap::new();
+                let mut row_stats = scan_is_int
+                    .iter()
+                    .map(|&is_int| CsvNumericStats::new(is_int))
+                    .collect::<Vec<_>>();
+                let mut line_start = 0usize;
+                for line_end in memchr::memchr_iter(b'\n', chunk)
+                    .chain(std::iter::once(chunk.len()))
+                {
+                    let raw_line = &chunk[line_start..line_end];
+                    line_start = line_end.saturating_add(1);
+                    let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    for (stat, &is_int) in row_stats.iter_mut().zip(&scan_is_int) {
+                        *stat = CsvNumericStats::new(is_int);
+                    }
+                    let mut group = None;
+                    let mut field_index = 0usize;
+                    let mut field_start = 0usize;
+                    let mut target_index = 0usize;
+                    for field_end in memchr::memchr_iter(delimiter, line) {
+                        while target_index < targets.len()
+                            && targets[target_index].0 == field_index
+                        {
+                            match targets[target_index].1 {
+                                CsvGroupTarget::Group => group = Some(&line[field_start..field_end]),
+                                CsvGroupTarget::Numeric { output, is_int } => {
+                                    Self::update_csv_numeric_stat(
+                                        &mut row_stats[output],
+                                        &line[field_start..field_end],
+                                        is_int,
+                                    )?;
+                                }
+                            }
+                            target_index += 1;
+                        }
+                        field_index += 1;
+                        field_start = field_end + 1;
+                    }
+                    while target_index < targets.len() && targets[target_index].0 == field_index {
+                        match targets[target_index].1 {
+                            CsvGroupTarget::Group => group = Some(&line[field_start..]),
+                            CsvGroupTarget::Numeric { output, is_int } => {
+                                Self::update_csv_numeric_stat(
+                                    &mut row_stats[output],
+                                    &line[field_start..],
+                                    is_int,
+                                )?;
+                            }
+                        }
+                        target_index += 1;
+                    }
+                    if field_index + 1 != column_count || group.is_none() {
+                        if bad_line_policy == CsvBadLinePolicy::Error {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "CSV row has wrong field count",
+                            ));
+                        }
+                        continue;
+                    }
+                    if !predicate_specs.iter().all(|&(index, low, high)| {
+                        let value = row_stats[index];
+                        value.count == 1 && value.min >= low && value.max <= high
+                    }) {
+                        continue;
+                    }
+                    let group = group.unwrap();
+                    let key = match group_key_type {
+                        CsvGroupKeyType::Utf8 => {
+                            if group.is_empty() {
+                                CsvGroupKey::Null
+                            } else {
+                                CsvGroupKey::Utf8(group.to_vec())
+                            }
+                        }
+                        CsvGroupKeyType::Int64 => {
+                            if group.is_empty() {
+                                CsvGroupKey::Null
+                            } else {
+                                let value = Self::parse_csv_i64_checked(group)
+                                    .ok_or_else(|| {
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "invalid integer CSV group key",
+                                        )
+                                    })?;
+                                CsvGroupKey::Int64(value)
+                            }
+                        }
+                    };
+                    if let Some((count, stats)) = groups.get_mut(&key) {
+                        *count += 1;
+                        for (stat, row_stat) in stats.iter_mut().zip(&row_stats[..columns.len()]) {
+                            stat.merge(*row_stat);
+                        }
+                    } else {
+                        groups.insert(key, (1, row_stats[..columns.len()].to_vec()));
+                    }
+                }
+                Ok(groups)
+            })
+            .collect();
+        let partials = match partials {
+            Ok(partials) => partials,
+            Err(_) => return Ok(None),
+        };
+        let mut merged = GroupMap::new();
+        for partial in partials {
+            for (key, (count, stats)) in partial {
+                if let Some((merged_count, merged_stats)) = merged.get_mut(&key) {
+                    *merged_count += count;
+                    for (stat, partial_stat) in merged_stats.iter_mut().zip(stats) {
+                        stat.merge(partial_stat);
+                    }
+                } else {
+                    merged.insert(key, (count, stats));
+                }
+            }
+        }
+        let mut result = Vec::with_capacity(merged.len());
+        for (key, (count, stats)) in merged {
+            let group = match key {
+                CsvGroupKey::Null => None,
+                CsvGroupKey::Utf8(value) => Some(value),
+                CsvGroupKey::Int64(value) => Some(value.to_le_bytes().to_vec()),
+            };
+            result.push((group, count, stats));
+        }
+        Ok(Some((group_key_type, result)))
+    }
+
+    /// Fused quote-free CSV scan for one or more scalar COUNT(DISTINCT col)
+    /// expressions over string and integer columns. Nulls are ignored, and
+    /// integer text is normalized before hashing so equivalent values such as
+    /// `6` and `006` belong to the same SQL distinct value.
+    pub(in crate::query::executor) fn try_fast_csv_distinct_counts(
+        path: &str,
+        options: &[(String, String)],
+        columns: &[String],
+    ) -> io::Result<Option<Vec<i64>>> {
+        use arrow::datatypes::DataType;
+        use rayon::prelude::*;
+
+        if columns.is_empty() {
+            return Ok(None);
+        }
+        let has_header = options
+            .iter()
+            .find(|(key, _)| key == "header")
+            .map(|(_, value)| !matches!(value.to_lowercase().as_str(), "false" | "0"))
+            .unwrap_or(true);
+        let bad_line_policy = csv_bad_line_policy(options)?;
+        if bad_line_policy == CsvBadLinePolicy::Warn {
+            return Ok(None);
+        }
+        let file = std::fs::File::open(path)?;
+        let buffer = if file.metadata()?.len() >= SEQUENTIAL_READ_THRESHOLD {
+            CsvBuffer::Owned(read_file_sequential(path)?)
+        } else {
+            CsvBuffer::Mmap(unsafe { memmap2::Mmap::map(&file) }?)
+        };
+        let all_data = buffer.as_slice();
+        let delimiter = options
+            .iter()
+            .find(|(key, _)| key == "delimiter" || key == "delim" || key == "sep")
+            .map(|(_, value)| {
+                if value.eq_ignore_ascii_case("auto") {
+                    Self::sniff_csv_delimiter(all_data)
+                } else {
+                    value.chars().next().map(|value| value as u8).unwrap_or(b',')
+                }
+            })
+            .unwrap_or(b',');
+        let schema = Self::infer_csv_schema_fast(all_data, has_header, delimiter, 100)?;
+        let mut targets = Vec::with_capacity(columns.len());
+        for (output, column) in columns.iter().enumerate() {
+            let Some(index) = schema.fields().iter().position(|field| field.name() == column) else {
+                return Ok(None);
+            };
+            let key_type = match schema.field(index).data_type() {
+                DataType::Utf8 => CsvDistinctKeyType::Utf8,
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
+                    CsvDistinctKeyType::Int64
+                }
+                _ => return Ok(None),
+            };
+            targets.push((index, output, key_type));
+        }
+        targets.sort_unstable_by_key(|(index, _, _)| *index);
+
+        let data_start = if has_header {
+            memchr::memchr(b'\n', all_data)
+                .map(|index| index + 1)
+                .unwrap_or(all_data.len())
+        } else {
+            0
+        };
+        let data = &all_data[data_start..];
+        if data.is_empty() {
+            return Ok(Some(vec![0; columns.len()]));
+        }
+        if memchr::memchr(b'"', data).is_some() {
+            return Ok(None);
+        }
+        let first_line = data
+            .split(|&byte| byte == b'\n')
+            .map(|line| line.strip_suffix(b"\r").unwrap_or(line))
+            .find(|line| !line.is_empty())
+            .unwrap_or(&[]);
+        if first_line.is_empty() {
+            return Ok(Some(vec![0; columns.len()]));
+        }
+        let column_count = memchr::memchr_iter(delimiter, first_line).count() + 1;
+
+        let mut starts = vec![0usize];
+        let thread_count = rayon::current_num_threads().clamp(1, 16);
+        let chunk_size = data.len().div_ceil(thread_count);
+        for thread in 1..thread_count {
+            let approximate = thread * chunk_size;
+            if approximate >= data.len() {
+                break;
+            }
+            let start = memchr::memchr(b'\n', &data[approximate..])
+                .map(|index| approximate + index + 1)
+                .unwrap_or(data.len());
+            if start != *starts.last().unwrap() {
+                starts.push(start);
+            }
+        }
+        starts.push(data.len());
+
+        struct SendSlice(*const u8, usize);
+        unsafe impl Send for SendSlice {}
+        unsafe impl Sync for SendSlice {}
+        let chunks = starts
+            .windows(2)
+            .map(|window| {
+                let chunk = &data[window[0]..window[1]];
+                SendSlice(chunk.as_ptr(), chunk.len())
+            })
+            .collect::<Vec<_>>();
+        let partials: io::Result<Vec<Vec<ahash::AHashSet<CsvDistinctValue>>>> = chunks
+            .par_iter()
+            .map(|slice| {
+                let chunk = unsafe { std::slice::from_raw_parts(slice.0, slice.1) };
+                let mut sets = (0..columns.len())
+                    .map(|_| ahash::AHashSet::new())
+                    .collect::<Vec<_>>();
+                let mut row_fields = vec![None; columns.len()];
+                let mut line_start = 0usize;
+                for line_end in memchr::memchr_iter(b'\n', chunk)
+                    .chain(std::iter::once(chunk.len()))
+                {
+                    let raw_line = &chunk[line_start..line_end];
+                    line_start = line_end.saturating_add(1);
+                    let line = raw_line.strip_suffix(b"\r").unwrap_or(raw_line);
+                    if line.is_empty() {
+                        continue;
+                    }
+                    row_fields.fill(None);
+                    let mut field_index = 0usize;
+                    let mut field_start = 0usize;
+                    let mut target_index = 0usize;
+                    for field_end in memchr::memchr_iter(delimiter, line) {
+                        while target_index < targets.len()
+                            && targets[target_index].0 == field_index
+                        {
+                            row_fields[targets[target_index].1] =
+                                Some(&line[field_start..field_end]);
+                            target_index += 1;
+                        }
+                        field_index += 1;
+                        field_start = field_end + 1;
+                    }
+                    while target_index < targets.len() && targets[target_index].0 == field_index {
+                        row_fields[targets[target_index].1] = Some(&line[field_start..]);
+                        target_index += 1;
+                    }
+                    if field_index + 1 != column_count {
+                        if bad_line_policy == CsvBadLinePolicy::Error {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "CSV row has wrong field count",
+                            ));
+                        }
+                        continue;
+                    }
+                    for &(_, output, key_type) in &targets {
+                        let Some(field) = row_fields[output] else {
+                            continue;
+                        };
+                        if field.is_empty() {
+                            continue;
+                        }
+                        let value = match key_type {
+                            CsvDistinctKeyType::Utf8 => {
+                                std::str::from_utf8(field).map_err(|_| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        "invalid UTF-8 CSV distinct value",
+                                    )
+                                })?;
+                                CsvDistinctValue::Utf8(field.to_vec())
+                            }
+                            CsvDistinctKeyType::Int64 => {
+                                let value = Self::parse_csv_i64_checked(field)
+                                    .ok_or_else(|| {
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            "invalid integer CSV distinct value",
+                                        )
+                                    })?;
+                                CsvDistinctValue::Int64(value)
+                            }
+                        };
+                        sets[output].insert(value);
+                    }
+                }
+                Ok(sets)
+            })
+            .collect();
+        let partials = match partials {
+            Ok(partials) => partials,
+            Err(_) => return Ok(None),
+        };
+        let mut merged = (0..columns.len())
+            .map(|_| ahash::AHashSet::new())
+            .collect::<Vec<_>>();
+        for partial in partials {
+            for (target, values) in merged.iter_mut().zip(partial) {
+                target.extend(values);
+            }
+        }
+        Ok(Some(
+            merged.into_iter().map(|values| values.len() as i64).collect(),
+        ))
+    }
+
+    fn scan_csv_numeric_chunk(
+        data: &[u8],
+        delimiter: u8,
+        n_cols: usize,
+        bad_line_policy: CsvBadLinePolicy,
+        target_specs: &[(usize, usize, bool)],
+        n_targets: usize,
+        n_outputs: usize,
+        predicate_specs: &[(usize, f64, f64)],
+    ) -> io::Result<(i64, Vec<CsvNumericStats>)> {
+        let mut rows = 0i64;
+        let mut stats = vec![CsvNumericStats::new(true); n_outputs];
+        let mut row_stats = vec![CsvNumericStats::new(true); n_targets];
+        for &(_, output_index, is_int) in target_specs {
+            if output_index < n_outputs {
+                stats[output_index] = CsvNumericStats::new(is_int);
+            }
+            row_stats[output_index] = CsvNumericStats::new(is_int);
+        }
+        let mut line_start = 0usize;
+
+        for newline in memchr::memchr_iter(b'\n', data) {
+            let raw = &data[line_start..newline];
+            line_start = newline + 1;
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if line.is_empty() {
+                continue;
+            }
+            if Self::scan_csv_numeric_line(
+                line,
+                delimiter,
+                n_cols,
+                bad_line_policy,
+                target_specs,
+                &mut row_stats,
+            )? && predicate_specs.iter().all(|&(index, low, high)| {
+                let value = row_stats[index];
+                value.count == 1 && value.min >= low && value.max <= high
+            }) {
+                rows += 1;
+                for (stat, row_stat) in stats.iter_mut().zip(row_stats.iter().take(n_outputs)) {
+                    stat.merge(*row_stat);
+                }
+            }
+        }
+        if line_start < data.len() {
+            let raw = &data[line_start..];
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if !line.is_empty()
+                && Self::scan_csv_numeric_line(
+                    line,
+                    delimiter,
+                    n_cols,
+                    bad_line_policy,
+                    target_specs,
+                    &mut row_stats,
+                )?
+                && predicate_specs.iter().all(|&(index, low, high)| {
+                    let value = row_stats[index];
+                    value.count == 1 && value.min >= low && value.max <= high
+                })
+            {
+                rows += 1;
+                for (stat, row_stat) in stats.iter_mut().zip(row_stats.iter().take(n_outputs)) {
+                    stat.merge(*row_stat);
+                }
+            }
+        }
+        Ok((rows, stats))
+    }
+
+    fn scan_csv_numeric_line(
+        line: &[u8],
+        delimiter: u8,
+        n_cols: usize,
+        bad_line_policy: CsvBadLinePolicy,
+        target_specs: &[(usize, usize, bool)],
+        row_stats: &mut [CsvNumericStats],
+    ) -> io::Result<bool> {
+        for &(_, output_index, is_int) in target_specs {
+            row_stats[output_index] = CsvNumericStats::new(is_int);
+        }
+
+        let mut field_index = 0usize;
+        let mut field_start = 0usize;
+        let mut target_index = 0usize;
+        for field_end in memchr::memchr_iter(delimiter, line) {
+            if target_index < target_specs.len() && target_specs[target_index].0 == field_index {
+                let (_, output_index, is_int) = target_specs[target_index];
+                Self::update_csv_numeric_stat(
+                    &mut row_stats[output_index],
+                    &line[field_start..field_end],
+                    is_int,
+                )?;
+                target_index += 1;
+            }
+            field_index += 1;
+            field_start = field_end + 1;
+        }
+
+        let actual_fields = field_index + 1;
+        if actual_fields != n_cols {
+            if bad_line_policy == CsvBadLinePolicy::Error {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "CSV row has wrong field count",
+                ));
+            }
+            return Ok(false);
+        }
+
+        if target_index < target_specs.len() && target_specs[target_index].0 == field_index {
+            let (_, output_index, is_int) = target_specs[target_index];
+            Self::update_csv_numeric_stat(
+                &mut row_stats[output_index],
+                &line[field_start..],
+                is_int,
+            )?;
+        }
+        Ok(true)
+    }
+
+    #[inline]
+    fn update_csv_numeric_stat(
+        stat: &mut CsvNumericStats,
+        field: &[u8],
+        is_int: bool,
+    ) -> io::Result<()> {
+        if field.is_empty() {
+            return Ok(());
+        }
+        if is_int {
+            let value = Self::parse_csv_i64_checked(field)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid integer CSV field"))?;
+            stat.add(value as f64);
+        } else {
+            let value = fast_float::parse::<f64, _>(field)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid float CSV field"))?;
+            stat.add(value);
+        }
+        Ok(())
+    }
+
+    #[inline]
+    fn parse_csv_i64_checked(field: &[u8]) -> Option<i64> {
+        let (&first, rest) = field.split_first()?;
+        let (negative, digits) = match first {
+            b'-' => (true, rest),
+            b'+' => (false, rest),
+            _ => (false, field),
+        };
+        if digits.is_empty() {
+            return None;
+        }
+        let mut value = 0u64;
+        for &digit in digits {
+            if !digit.is_ascii_digit() {
+                return None;
+            }
+            value = value.checked_mul(10)?.checked_add((digit - b'0') as u64)?;
+        }
+        if negative {
+            if value == 1u64 << 63 {
+                Some(i64::MIN)
+            } else if value <= i64::MAX as u64 {
+                Some(-(value as i64))
+            } else {
+                None
+            }
+        } else {
+            (value <= i64::MAX as u64).then_some(value as i64)
+        }
     }
 
     /// Count non-empty newline-delimited data rows in *chunk* that match the
@@ -3027,5 +3984,227 @@ mod csv_fast_count_tests {
         write(&p, "a,b\r\n1,2\r\n3,4\r\n");
         assert_eq!(fast_count(&path, &[]), Some(2));
         assert_eq!(full_count(&path, &[]), 2);
+    }
+
+    fn fast_numeric_agg(path: &str, columns: &[&str]) -> Option<(i64, Vec<CsvNumericStats>)> {
+        let columns = columns.iter().map(|column| (*column).to_string()).collect::<Vec<_>>();
+        ApexExecutor::try_fast_csv_numeric_agg(path, &[], &columns, &[]).unwrap()
+    }
+
+    #[test]
+    fn fast_numeric_agg_trims_header_whitespace_and_matches_values() {
+        let dir = tempdir().unwrap();
+        let p = dir.path().join("numeric.csv");
+        let path = p.to_str().unwrap().to_string();
+        write(&p, "id, Protocol ,score\n1,6,10.5\n2,17,20.25\n3,,5.0\n");
+
+        let schema = ApexExecutor::infer_csv_schema_fast(
+            std::fs::read(&p).unwrap().as_slice(),
+            true,
+            b',',
+            100,
+        )
+        .unwrap();
+        assert_eq!(
+            schema.fields().iter().map(|field| field.name()).collect::<Vec<_>>(),
+            vec!["id", "Protocol", "score"]
+        );
+
+        let (rows, stats) = fast_numeric_agg(&path, &["Protocol", "score"]).unwrap();
+        assert_eq!(rows, 3);
+        assert_eq!(stats[0].count, 2);
+        assert_eq!(stats[0].max, 17.0);
+        assert_eq!(stats[1].count, 3);
+        assert!((stats[1].max - 20.25).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn fast_numeric_agg_skips_bad_lines_and_declines_quoted_data() {
+        let dir = tempdir().unwrap();
+        let bad = dir.path().join("bad.csv");
+        let bad_path = bad.to_str().unwrap().to_string();
+        write(&bad, "id,value\n1,10\n2,20,extra\n3,30\n");
+        assert!(fast_numeric_agg(&bad_path, &["value"]).is_none());
+
+        let skipped = vec![("on_bad_lines".to_string(), "skip".to_string())];
+        let columns = vec!["value".to_string()];
+        let (rows, stats) = ApexExecutor::try_fast_csv_numeric_agg(
+            &bad_path,
+            &skipped,
+            &columns,
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rows, 2);
+        assert_eq!(stats[0].max, 30.0);
+
+        let quoted = dir.path().join("quoted.csv");
+        let quoted_path = quoted.to_str().unwrap().to_string();
+        write(&quoted, "id,value\n1,\"10\"\n2,20\n");
+        assert!(fast_numeric_agg(&quoted_path, &["value"]).is_none());
+    }
+
+    #[test]
+    fn fast_numeric_agg_applies_numeric_conjunction_before_merging() {
+        let dir = tempdir().unwrap();
+        let csv = dir.path().join("filtered.csv");
+        let path = csv.to_str().unwrap().to_string();
+        write(
+            &csv,
+            "protocol,duration,bytes\n6,10,100\n17,20,200\n6,30,300\n6,,400\n",
+        );
+        let columns = vec!["duration".to_string(), "bytes".to_string()];
+        let predicates = vec![
+            ("protocol".to_string(), 6.0, 6.0),
+            ("duration".to_string(), 15.0, f64::INFINITY),
+        ];
+        let (rows, stats) = ApexExecutor::try_fast_csv_numeric_agg(
+            &path,
+            &[],
+            &columns,
+            &predicates,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(rows, 1);
+        assert_eq!(stats[0].count, 1);
+        assert_eq!(stats[0].sum, 30.0);
+        assert_eq!(stats[1].sum, 300.0);
+    }
+
+    #[test]
+    fn fast_string_group_numeric_agg_merges_worker_state() {
+        let dir = tempdir().unwrap();
+        let csv = dir.path().join("groups.csv");
+        let path = csv.to_str().unwrap().to_string();
+        write(
+            &csv,
+            "label,duration,packets\nbenign,10,1\nattack,20,2\nbenign,30,3\n,40,4\n",
+        );
+        let (_, groups) = ApexExecutor::try_fast_csv_group_numeric_agg(
+            &path,
+            &[],
+            "label",
+            &["duration".to_string(), "packets".to_string()],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        let groups = groups
+            .into_iter()
+            .map(|(key, rows, stats)| {
+                (
+                    key.map(|value| String::from_utf8(value).unwrap()),
+                    (rows, stats[0].sum, stats[1].max),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(groups[&Some("benign".to_string())], (2, 40.0, 3.0));
+        assert_eq!(groups[&Some("attack".to_string())], (1, 20.0, 2.0));
+        assert_eq!(groups[&None], (1, 40.0, 4.0));
+    }
+
+    #[test]
+    fn fast_string_group_numeric_agg_applies_numeric_conjunction() {
+        let dir = tempdir().unwrap();
+        let csv = dir.path().join("filtered_groups.csv");
+        let path = csv.to_str().unwrap().to_string();
+        write(
+            &csv,
+            "label,duration,protocol,packets\nbenign,10,6,1\nattack,20,17,2\nbenign,30,17,3\nattack,40,6,4\n",
+        );
+        let (_, groups) = ApexExecutor::try_fast_csv_group_numeric_agg(
+            &path,
+            &[],
+            "label",
+            &["duration".to_string(), "packets".to_string()],
+            &[
+                ("protocol".to_string(), 17.0, 17.0),
+                ("duration".to_string(), 15.0, f64::INFINITY),
+            ],
+        )
+        .unwrap()
+        .unwrap();
+        let groups = groups
+            .into_iter()
+            .map(|(key, rows, stats)| {
+                (
+                    key.map(|value| String::from_utf8(value).unwrap()),
+                    (rows, stats[0].sum, stats[1].max),
+                )
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(groups[&Some("benign".to_string())], (1, 30.0, 3.0));
+        assert_eq!(groups[&Some("attack".to_string())], (1, 20.0, 2.0));
+    }
+
+    #[test]
+    fn fast_integer_group_numeric_agg_normalizes_keys() {
+        let dir = tempdir().unwrap();
+        let csv = dir.path().join("integer_groups.csv");
+        let path = csv.to_str().unwrap().to_string();
+        write(
+            &csv,
+            "protocol,duration\n6,10\n006,20\n17,30\n,40\n",
+        );
+        let (key_type, groups) = ApexExecutor::try_fast_csv_group_numeric_agg(
+            &path,
+            &[],
+            "protocol",
+            &["duration".to_string()],
+            &[],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(key_type, CsvGroupKeyType::Int64);
+        let groups = groups
+            .into_iter()
+            .map(|(key, rows, stats)| {
+                let key = key.map(|value| i64::from_le_bytes(value.try_into().unwrap()));
+                (key, (rows, stats[0].sum))
+            })
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(groups[&Some(6)], (2, 30.0));
+        assert_eq!(groups[&Some(17)], (1, 30.0));
+        assert_eq!(groups[&None], (1, 40.0));
+    }
+
+    #[test]
+    fn fast_csv_distinct_counts_handles_string_integer_and_null() {
+        let dir = tempdir().unwrap();
+        let csv = dir.path().join("distinct.csv");
+        let path = csv.to_str().unwrap().to_string();
+        write(
+            &csv,
+            "protocol,label\n6,benign\n006,benign\n17,attack\n,attack\n17,\n",
+        );
+        let counts = ApexExecutor::try_fast_csv_distinct_counts(
+            &path,
+            &[],
+            &["protocol".to_string(), "label".to_string()],
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(counts, vec![2, 2]);
+    }
+
+    #[test]
+    fn checked_csv_integer_parser_handles_boundaries() {
+        assert_eq!(ApexExecutor::parse_csv_i64_checked(b"+17"), Some(17));
+        assert_eq!(
+            ApexExecutor::parse_csv_i64_checked(b"-9223372036854775808"),
+            Some(i64::MIN)
+        );
+        assert_eq!(
+            ApexExecutor::parse_csv_i64_checked(b"9223372036854775807"),
+            Some(i64::MAX)
+        );
+        assert_eq!(ApexExecutor::parse_csv_i64_checked(b""), None);
+        assert_eq!(ApexExecutor::parse_csv_i64_checked(b"12x"), None);
+        assert_eq!(
+            ApexExecutor::parse_csv_i64_checked(b"9223372036854775808"),
+            None
+        );
     }
 }

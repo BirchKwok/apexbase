@@ -323,6 +323,13 @@ fn streaming_compact_merges_delta_and_deltastore_bounded_memory() {
     drop(storage);
     let reopened = OnDemandStorage::open(&path).unwrap();
     assert_eq!(reopened.row_count(), 6);
+    assert!(std::path::Path::new(&format!("{}.stats", path.display())).exists());
+    let stats = reopened
+        .execute_simple_agg(&["age", "name"])
+        .unwrap()
+        .unwrap();
+    assert_eq!(stats[0], (6, 320.0, 30.0, 99.0, true));
+    assert_eq!(stats[1].0, 6);
     let result = reopened
         .read_columns(Some(&["age", "name"]), 0, None)
         .unwrap();
@@ -849,6 +856,19 @@ fn test_v4_append_row_group() {
     storage
         .append_row_group(&new_ids, &new_columns, &new_nulls)
         .unwrap();
+
+    // Appends invalidate the old sidecar instead of synchronously rebuilding
+    // it on the write hot path. The first scalar scan recreates current stats.
+    let stats_path = PathBuf::from(format!("{}.stats", path.display()));
+    assert!(!stats_path.exists());
+    let stats_storage = OnDemandStorage::open(&path).unwrap();
+    let stats = stats_storage
+        .execute_simple_agg(&["val"])
+        .unwrap()
+        .unwrap();
+    assert_eq!(stats, vec![(6, 66.0, 1.0, 30.0, true)]);
+    assert!(stats_path.exists());
+    drop(stats_storage);
 
     // Verify updated header
     let header = storage.header.read();

@@ -180,6 +180,206 @@ pub fn get_global_dict_cache_with_nulls(
     get_global_dict_cache_entry(path, col_name, storage)
 }
 
+/// Get or build a type-isolated categorical cache for an integral column.
+/// The namespaced key prevents numeric labels from entering string-only paths.
+pub fn get_global_numeric_dict_cache(
+    path: &Path,
+    col_name: &str,
+    storage: &OnDemandStorage,
+) -> io::Result<Option<(Arc<(Vec<String>, Vec<u16>)>, bool, Option<u16>)>> {
+    let modified_time = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let cache_name = format!("\0numeric:{}", col_name);
+    let key = (path.to_path_buf(), cache_name);
+    let epoch = crate::storage::epoch::current(path);
+    {
+        let cache = GLOBAL_DICT_CACHE.read();
+        if let Some(entry) = cache.get(&key) {
+            if entry.epoch == epoch && entry.modified_time >= modified_time {
+                entry.last_access.store(
+                    GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                return Ok(Some((
+                    Arc::clone(&entry.data),
+                    entry.has_nulls,
+                    entry.max_group_id,
+                )));
+            }
+        }
+    }
+
+    let Some((labels, group_ids)) = storage.build_numeric_dict_cache(col_name)? else {
+        return Ok(None);
+    };
+    let data = Arc::new((
+        labels.into_iter().map(|value| value.to_string()).collect(),
+        group_ids,
+    ));
+    let has_nulls = storage.column_has_nulls(col_name);
+    let max_group_id = data.1.iter().copied().max();
+    let mut cache = GLOBAL_DICT_CACHE.write();
+    let mut current_bytes = GLOBAL_DICT_CACHE_BYTES.load(Ordering::Relaxed);
+    if let Some(replaced) = cache.remove(&key) {
+        current_bytes = current_bytes.saturating_sub(replaced.bytes);
+    }
+    let bytes = global_dict_entry_bytes(&key, &data);
+    evict_global_dict_cache(
+        &mut cache,
+        &mut current_bytes,
+        bytes,
+        GLOBAL_DICT_CACHE_MAX_BYTES,
+        GLOBAL_DICT_CACHE_MAX_ENTRIES,
+    );
+    current_bytes = current_bytes.saturating_add(bytes);
+    cache.insert(
+        key,
+        GlobalDictCacheEntry {
+            modified_time,
+            epoch,
+            data: Arc::clone(&data),
+            has_nulls,
+            max_group_id,
+            bytes,
+            last_access: AtomicU64::new(
+                GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
+            ),
+        },
+    );
+    GLOBAL_DICT_CACHE_BYTES.store(current_bytes, Ordering::Relaxed);
+    Ok(Some((data, has_nulls, max_group_id)))
+}
+
+/// Get or build dense cached group IDs for MOD(integral_column, modulus).
+pub fn get_global_numeric_mod_dict_cache(
+    path: &Path,
+    col_name: &str,
+    modulus: i64,
+    storage: &OnDemandStorage,
+) -> io::Result<Option<Arc<(Vec<String>, Vec<u16>)>>> {
+    let modified_time = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let cache_name = format!("\0mod:{col_name}:{modulus}");
+    let key = (path.to_path_buf(), cache_name);
+    let epoch = crate::storage::epoch::current(path);
+    {
+        let cache = GLOBAL_DICT_CACHE.read();
+        if let Some(entry) = cache.get(&key) {
+            if entry.epoch == epoch && entry.modified_time >= modified_time {
+                entry.last_access.store(
+                    GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                return Ok(Some(Arc::clone(&entry.data)));
+            }
+        }
+    }
+    let Some((labels, group_ids)) =
+        storage.build_numeric_mod_dict_cache(col_name, modulus)?
+    else {
+        return Ok(None);
+    };
+    let data = Arc::new((labels, group_ids));
+    let mut cache = GLOBAL_DICT_CACHE.write();
+    let mut current_bytes = GLOBAL_DICT_CACHE_BYTES.load(Ordering::Relaxed);
+    if let Some(replaced) = cache.remove(&key) {
+        current_bytes = current_bytes.saturating_sub(replaced.bytes);
+    }
+    let bytes = global_dict_entry_bytes(&key, &data);
+    evict_global_dict_cache(
+        &mut cache,
+        &mut current_bytes,
+        bytes,
+        GLOBAL_DICT_CACHE_MAX_BYTES,
+        GLOBAL_DICT_CACHE_MAX_ENTRIES,
+    );
+    current_bytes = current_bytes.saturating_add(bytes);
+    cache.insert(
+        key,
+        GlobalDictCacheEntry {
+            modified_time,
+            epoch,
+            data: Arc::clone(&data),
+            has_nulls: false,
+            max_group_id: data.1.iter().copied().max(),
+            bytes,
+            last_access: AtomicU64::new(
+                GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
+            ),
+        },
+    );
+    GLOBAL_DICT_CACHE_BYTES.store(current_bytes, Ordering::Relaxed);
+    Ok(Some(data))
+}
+
+/// Get or build a cache for a low-cardinality SQL SUBSTR result. The cache is
+/// namespaced by transform arguments and shares normal table epoch/mtime
+/// invalidation with the other categorical caches.
+pub fn get_global_substr_dict_cache(
+    path: &Path,
+    col_name: &str,
+    start: i64,
+    length: Option<i64>,
+    storage: &OnDemandStorage,
+) -> io::Result<Option<Arc<(Vec<String>, Vec<u16>)>>> {
+    let modified_time = std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let cache_name = format!("\0substr:{col_name}:{start}:{length:?}");
+    let key = (path.to_path_buf(), cache_name);
+    let epoch = crate::storage::epoch::current(path);
+    {
+        let cache = GLOBAL_DICT_CACHE.read();
+        if let Some(entry) = cache.get(&key) {
+            if entry.epoch == epoch && entry.modified_time >= modified_time {
+                entry.last_access.store(
+                    GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
+                    Ordering::Relaxed,
+                );
+                return Ok(Some(Arc::clone(&entry.data)));
+            }
+        }
+    }
+
+    let Some(data) = storage.build_string_substr_dict_cache(col_name, start, length)? else {
+        return Ok(None);
+    };
+    let data = Arc::new(data);
+    let max_group_id = data.1.iter().copied().max();
+    let mut cache = GLOBAL_DICT_CACHE.write();
+    let mut current_bytes = GLOBAL_DICT_CACHE_BYTES.load(Ordering::Relaxed);
+    if let Some(replaced) = cache.remove(&key) {
+        current_bytes = current_bytes.saturating_sub(replaced.bytes);
+    }
+    let bytes = global_dict_entry_bytes(&key, &data);
+    evict_global_dict_cache(
+        &mut cache,
+        &mut current_bytes,
+        bytes,
+        GLOBAL_DICT_CACHE_MAX_BYTES,
+        GLOBAL_DICT_CACHE_MAX_ENTRIES,
+    );
+    current_bytes = current_bytes.saturating_add(bytes);
+    cache.insert(
+        key,
+        GlobalDictCacheEntry {
+            modified_time,
+            epoch,
+            data: Arc::clone(&data),
+            has_nulls: false,
+            max_group_id,
+            bytes,
+            last_access: AtomicU64::new(
+                GLOBAL_DICT_CACHE_CLOCK.fetch_add(1, Ordering::Relaxed),
+            ),
+        },
+    );
+    GLOBAL_DICT_CACHE_BYTES.store(current_bytes, Ordering::Relaxed);
+    Ok(Some(data))
+}
+
 /// Return the global dictionary cache only when it already exists.  Building
 /// it here would scan the full column, which is expensive for high-cardinality
 /// strings that are merely read once (e.g. `name LIKE ...` filters).
@@ -1642,6 +1842,11 @@ impl TableStorageBackend {
         self.storage.is_v4_format() && !self.storage.has_v4_in_memory_data()
     }
 
+    /// Return whether this backend is owned by a true in-memory database.
+    pub fn is_in_memory(&self) -> bool {
+        self.storage.is_in_memory()
+    }
+
     /// Check if delta compaction is needed.
     pub fn needs_delta_compaction(&self) -> bool {
         self.storage.needs_delta_compaction()
@@ -2873,6 +3078,34 @@ impl TableStorageBackend {
             return Ok(None);
         }
         let active_rows = self.active_row_count() as usize;
+
+        // This path can only serve `_id` and cached dictionary strings.  Prove
+        // that every requested column is eligible before allocating keys or
+        // values; mixed projections should fall through to the native indexed
+        // extractor without paying for a partial batch that will be discarded.
+        for name in refs {
+            let plain = name.rsplit('.').next().unwrap_or(name);
+            if plain == "_id" {
+                continue;
+            }
+            let Some((dict, has_nulls, max_id)) =
+                crate::storage::backend::peek_global_dict_cache_with_nulls(
+                    self.path(),
+                    plain,
+                    &self.storage,
+                )?
+            else {
+                return Ok(None);
+            };
+            if has_nulls
+                || max_id.map_or(true, |max| max as usize >= dict.0.len())
+                || dict.1.len() != active_rows
+                || dict.0.len() > 4096
+            {
+                return Ok(None);
+            }
+        }
+
         let mut fields: Vec<Field> = Vec::with_capacity(refs.len());
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(refs.len());
         for name in refs {
@@ -4899,6 +5132,63 @@ impl TableStorageBackend {
             .execute_group_agg_cached(dict_strings, group_ids, agg_cols)
     }
 
+    pub fn execute_group_stats_2col_cached(
+        &self,
+        group_ids1: &[u16],
+        group_ids2: &[u16],
+        dict2_size: usize,
+        agg_cols: &[(&str, bool)],
+    ) -> io::Result<Option<Vec<(usize, Vec<(i64, f64, f64, f64, bool)>)>>> {
+        self.storage.execute_group_stats_2col_cached(
+            group_ids1,
+            group_ids2,
+            dict2_size,
+            agg_cols,
+        )
+    }
+
+    pub fn execute_group_stats_cached(
+        &self,
+        group_ids: &[u16],
+        group_count: usize,
+        agg_cols: &[(&str, bool)],
+    ) -> io::Result<Option<Vec<(usize, Vec<(i64, f64, f64, f64, bool)>)>>> {
+        self.storage
+            .execute_group_stats_cached(group_ids, group_count, agg_cols)
+    }
+
+    pub fn execute_group_ratio_avg_cached(
+        &self,
+        group_ids: &[u16],
+        group_count: usize,
+        ratios: &[(&str, &str, f64)],
+    ) -> io::Result<Option<Vec<(usize, Vec<(f64, i64)>)>>> {
+        self.storage
+            .execute_group_ratio_avg_cached(group_ids, group_count, ratios)
+    }
+
+    pub fn execute_filtered_numeric_agg_cached(
+        &self,
+        predicates: &[(&str, f64, f64)],
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.storage
+            .execute_filtered_numeric_agg_cached(predicates, agg_cols)
+    }
+
+    pub fn scan_filtered_numeric_top_k_cached(
+        &self,
+        sort_columns: &[(&str, bool)],
+        predicates: &[(&str, f64, f64)],
+        k: usize,
+    ) -> io::Result<Option<Vec<usize>>> {
+        self.storage.scan_filtered_numeric_top_k_cached(
+            sort_columns,
+            predicates,
+            k,
+        )
+    }
+
     /// Execute 2-column GROUP BY + aggregate using pre-built dict caches.
     pub(crate) fn execute_group_agg_2col_cached(
         &self,
@@ -4960,6 +5250,62 @@ impl TableStorageBackend {
         agg_cols: &[(&str, bool)],
     ) -> io::Result<Option<Vec<(String, Vec<(f64, i64)>)>>> {
         self.storage.execute_group_agg(group_col, agg_cols)
+    }
+
+    /// Parallel native aggregation for an integral GROUP BY key.
+    pub fn execute_numeric_group_agg_mmap(
+        &self,
+        group_col: &str,
+        agg_cols: &[(&str, bool)],
+        agg_ops: &[u8],
+    ) -> io::Result<Option<Vec<crate::storage::on_demand::NativeNumericGroupAgg>>> {
+        self.storage
+            .execute_numeric_group_agg_mmap(group_col, agg_cols, agg_ops)
+    }
+
+    pub fn execute_numeric_mod_group_agg_mmap(
+        &self,
+        group_col: &str,
+        modulus: i64,
+        agg_cols: &[(&str, bool)],
+        agg_ops: &[u8],
+    ) -> io::Result<Option<Vec<crate::storage::on_demand::NativeNumericGroupAgg>>> {
+        self.storage
+            .execute_numeric_mod_group_agg_mmap(group_col, modulus, agg_cols, agg_ops)
+    }
+
+    pub fn execute_numeric_bucket_group_agg_mmap(
+        &self,
+        group_col: &str,
+        upper_bounds: &[i64],
+        agg_cols: &[(&str, bool)],
+        agg_ops: &[u8],
+    ) -> io::Result<Option<Vec<crate::storage::on_demand::NativeNumericGroupAgg>>> {
+        self.storage
+            .execute_numeric_bucket_group_agg_mmap(group_col, upper_bounds, agg_cols, agg_ops)
+    }
+
+    /// Count scalar numeric CASE predicates in one Row Group scan.
+    pub fn execute_numeric_case_counts_mmap(
+        &self,
+        specs: &[(&str, f64, f64)],
+    ) -> io::Result<Option<Vec<i64>>> {
+        self.storage.execute_numeric_case_counts_mmap(specs)
+    }
+
+    /// Count NULL values by scanning only persisted null bitmaps.
+    pub fn execute_null_counts_mmap(
+        &self,
+        columns: &[&str],
+    ) -> io::Result<Option<Vec<i64>>> {
+        self.storage.execute_null_counts_mmap(columns)
+    }
+
+    pub fn execute_numeric_distinct_count_mmap(
+        &self,
+        column: &str,
+    ) -> io::Result<Option<i64>> {
+        self.storage.execute_numeric_distinct_count_mmap(column)
     }
 
     /// Execute mmap-native string GROUP BY with distinct counts, CASE counters,
@@ -5276,6 +5622,13 @@ impl StorageManager {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn in_memory_backend_reports_its_storage_mode() {
+        let path = Path::new("apexbase_memory:backend-mode-test");
+        let backend = TableStorageBackend::create(path).unwrap();
+        assert!(backend.is_in_memory());
+    }
 
     fn test_dict_entry(bytes: usize, access: u64) -> GlobalDictCacheEntry {
         GlobalDictCacheEntry {

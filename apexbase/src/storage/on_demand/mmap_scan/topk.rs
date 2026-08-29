@@ -85,7 +85,7 @@ impl OnDemandStorage {
             };
 
             // Get pointer to column data via RCIX if available
-            let col_bytes: &[u8] = if rg_i < footer.col_offsets.len()
+            let (col_bytes, col_nulls): (&[u8], &[u8]) = if rg_i < footer.col_offsets.len()
                 && col_idx < footer.col_offsets[rg_i].len()
                 && compress_flag == RG_COMPRESS_NONE
             {
@@ -95,18 +95,21 @@ impl OnDemandStorage {
                     global_offset += rg_rows;
                     continue;
                 }
-                &body[data_start..]
+                (&body[data_start..], &body[col_body_off..data_start])
             } else {
                 // Fallback: sequential column scan
                 let mut pos = id_section + del_vec_len;
                 let mut found: &[u8] = &[];
+                let mut found_nulls: &[u8] = &[];
                 for ci in 0..schema.column_count() {
                     if pos + null_bitmap_len > body.len() {
                         break;
                     }
+                    let nulls = &body[pos..pos + null_bitmap_len];
                     pos += null_bitmap_len;
                     if ci == col_idx {
                         found = &body[pos..];
+                        found_nulls = nulls;
                         break;
                     }
                     let consumed = if encoding_version >= 1 {
@@ -116,13 +119,28 @@ impl OnDemandStorage {
                     };
                     pos += consumed;
                 }
-                found
+                (found, found_nulls)
             };
 
             if col_bytes.is_empty() {
                 global_offset += rg_rows;
                 continue;
             }
+            // Numeric V4 zone maps already persist NULL presence per Row Group.
+            // Use that O(1) metadata on current files; scan the bitmap only for
+            // older files whose footer predates zone-map null metadata.
+            let has_nulls = footer
+                .zone_maps
+                .get(rg_i)
+                .and_then(|zone_maps| {
+                    zone_maps
+                        .iter()
+                        .find(|zone_map| zone_map.col_idx as usize == col_idx)
+                })
+                .map_or_else(
+                    || col_nulls.iter().any(|&byte| byte != 0),
+                    |zone_map| zone_map.has_nulls,
+                );
 
             let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
             let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
@@ -137,13 +155,20 @@ impl OnDemandStorage {
                 let n = count.min(rg_rows).min((payload.len() - 8) / 8);
 
                 macro_rules! topk_scan {
-                    ($vals:expr) => {{
+                    ($vals:expr, $check_nulls:expr) => {{
                         if descending {
                             // Keep k largest: heap sorted descending, threshold = heap[k-1]
                             for i in 0..n {
                                 if has_deletes
                                     && !del_bytes.is_empty()
                                     && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                {
+                                    continue;
+                                }
+                                if $check_nulls
+                                    && col_nulls
+                                    .get(i / 8)
+                                    .is_some_and(|byte| ((byte >> (i % 8)) & 1) != 0)
                                 {
                                     continue;
                                 }
@@ -166,6 +191,13 @@ impl OnDemandStorage {
                                 {
                                     continue;
                                 }
+                                if $check_nulls
+                                    && col_nulls
+                                    .get(i / 8)
+                                    .is_some_and(|byte| ((byte >> (i % 8)) & 1) != 0)
+                                {
+                                    continue;
+                                }
                                 let val = $vals[i];
                                 if heap.len() < k {
                                     let pos = heap.partition_point(|(v, _)| *v < val);
@@ -184,20 +216,32 @@ impl OnDemandStorage {
                     let ptr = payload[8..].as_ptr();
                     if ptr as usize % std::mem::align_of::<f64>() == 0 {
                         let vals = unsafe { std::slice::from_raw_parts(ptr as *const f64, n) };
-                        topk_scan!(vals);
+                        if has_nulls {
+                            topk_scan!(vals, true);
+                        } else {
+                            topk_scan!(vals, false);
+                        }
                     } else {
                         let data = &payload[8..8 + n * 8];
                         let vals: Vec<f64> = (0..n)
                             .map(|i| f64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap()))
                             .collect();
-                        topk_scan!(vals);
+                        if has_nulls {
+                            topk_scan!(vals, true);
+                        } else {
+                            topk_scan!(vals, false);
+                        }
                     }
                 } else {
                     let ptr = payload[8..].as_ptr();
                     if ptr as usize % std::mem::align_of::<i64>() == 0 {
                         let vals = unsafe { std::slice::from_raw_parts(ptr as *const i64, n) };
                         let fvals: Vec<f64> = vals.iter().map(|&v| v as f64).collect();
-                        topk_scan!(fvals);
+                        if has_nulls {
+                            topk_scan!(fvals, true);
+                        } else {
+                            topk_scan!(fvals, false);
+                        }
                     } else {
                         let data = &payload[8..8 + n * 8];
                         let fvals: Vec<f64> = (0..n)
@@ -206,7 +250,11 @@ impl OnDemandStorage {
                                     as f64
                             })
                             .collect();
-                        topk_scan!(fvals);
+                        if has_nulls {
+                            topk_scan!(fvals, true);
+                        } else {
+                            topk_scan!(fvals, false);
+                        }
                     }
                 }
             } else {
@@ -226,12 +274,19 @@ impl OnDemandStorage {
                 };
                 let n = fvals.len().min(rg_rows);
                 macro_rules! topk_scan2 {
-                    ($vals:expr) => {{
+                    ($vals:expr, $check_nulls:expr) => {{
                         if descending {
                             for i in 0..n {
                                 if has_deletes
                                     && !del_bytes.is_empty()
                                     && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                                {
+                                    continue;
+                                }
+                                if $check_nulls
+                                    && col_nulls
+                                    .get(i / 8)
+                                    .is_some_and(|byte| ((byte >> (i % 8)) & 1) != 0)
                                 {
                                     continue;
                                 }
@@ -253,6 +308,13 @@ impl OnDemandStorage {
                                 {
                                     continue;
                                 }
+                                if $check_nulls
+                                    && col_nulls
+                                    .get(i / 8)
+                                    .is_some_and(|byte| ((byte >> (i % 8)) & 1) != 0)
+                                {
+                                    continue;
+                                }
                                 let val = $vals[i];
                                 if heap.len() < k {
                                     let pos = heap.partition_point(|(v, _)| *v < val);
@@ -266,7 +328,11 @@ impl OnDemandStorage {
                         }
                     }};
                 }
-                topk_scan2!(fvals);
+                if has_nulls {
+                    topk_scan2!(fvals, true);
+                } else {
+                    topk_scan2!(fvals, false);
+                }
             }
             global_offset += rg_rows;
         }

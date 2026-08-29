@@ -238,6 +238,19 @@ _RE_EXPLICIT_ID = re.compile(r"(^|[^\w])(_id|\"_id\")([^\w]|$)|\._id([^\w]|$)", 
 # Bounded SELECT with a small LIMIT: materialize via Rust-direct Python lists
 # (much faster than the PyArrow FFI round-trip for `to_dict()`).
 _RE_BOUNDED_SELECT_LIMIT = re.compile(r"\blimit\s+(\d+)", re.IGNORECASE)
+_RE_QUOTED_DATA_FILE = re.compile(
+    r"['\"]([^'\"]+\.(?:csv|tsv|parquet|json|jsonl|ndjson))['\"]",
+    re.IGNORECASE,
+)
+_VOLATILE_QUERY_TOKENS = (
+    "RANDOM(",
+    "RAND(",
+    "UUID(",
+    "NOW(",
+    "CURRENT_TIMESTAMP",
+    "CURRENT_DATE",
+    "CURRENT_TIME",
+)
 _RE_POINT_LOOKUP_ID = re.compile(r"\bwhere\s+_id\s*=\s*(\d+)\b", re.IGNORECASE)
 _RE_SIMPLE_COUNT_STAR = re.compile(
     r"^\s*select\s+count\s*\(\s*\*\s*\)(?:\s+(?:as\s+)?([A-Za-z_][\w]*))?\s+from\s+([A-Za-z_][\w]*(?:\.[A-Za-z_][\w]*)?)\s*;?\s*$",
@@ -940,6 +953,12 @@ class ApexClient:
         # SELECT-list parsing on every call.
         self._show_id_cache = {}
         self._numeric_range_rows_cache = {}
+        # Compact deterministic SELECT results are immutable Arrow tables.  A
+        # small per-client cache avoids re-running expensive analytical scans
+        # while a database/file generation token guarantees write visibility.
+        self._query_result_cache = {}
+        self._query_result_cacheability = {}
+        self._query_result_dependencies = {}
         self._schemaless_tables = set()
         self._buffered_writes_enabled = False
         self._buffered_write_rows = []
@@ -1157,6 +1176,152 @@ class ApexClient:
         cache = getattr(self, '_numeric_range_rows_cache', None)
         if cache is not None:
             cache.clear()
+        cache = getattr(self, '_query_result_cache', None)
+        if cache is not None:
+            cache.clear()
+
+    def _query_result_cache_token(self, sql: str):
+        """Return an immutable input-generation token for a cacheable query."""
+        if (not self._enable_cache
+                or getattr(self, '_in_txn', False)
+                or getattr(self, '_fast_txn_active', False)):
+            return None
+        try:
+            if self._storage.has_pending_overlay_writes():
+                return None
+        except (AttributeError, RuntimeError):
+            return None
+
+        dependencies = self._query_result_dependencies.get(sql)
+        if dependencies is None:
+            file_paths = tuple(
+                Path(raw_path).expanduser().resolve()
+                for raw_path in _RE_QUOTED_DATA_FILE.findall(sql)
+            )
+            table_refs = tuple(
+                name.rsplit('.', 1)[-1].lower()
+                for name in _RE_FROM_OR_JOIN_TABLE.findall(sql)
+                if name.rsplit('.', 1)[-1].lower() not in {
+                    'read_csv', 'read_csv_auto', 'read_parquet',
+                    'read_json', 'read_json_auto', 'read_ndjson',
+                }
+            )
+            dependencies = (file_paths, table_refs)
+            if len(self._query_result_dependencies) >= 256:
+                self._query_result_dependencies.clear()
+            self._query_result_dependencies[sql] = dependencies
+
+        file_paths, table_refs = dependencies
+        file_tokens = []
+        try:
+            for path in file_paths:
+                stat = path.stat()
+                file_tokens.append((str(path), stat.st_size, stat.st_mtime_ns))
+
+            table_tokens = []
+            current_table = (self._current_table or '').lower()
+            current_only = bool(table_refs) and all(
+                name == current_table for name in table_refs
+            )
+            if self._in_memory and table_refs:
+                # An in-memory database cannot be shared by another client;
+                # every mutating API clears this client's result cache.
+                table_tokens.append(("__memory__", self._current_database))
+            elif current_only:
+                table_tokens.append(("__epoch__", self._storage._table_epoch()))
+            elif table_refs and not self._in_memory and self._dirpath.is_dir():
+                # A directory-wide token also covers joins, CTEs and subqueries
+                # that read a table other than the currently selected one.
+                for path in sorted(self._dirpath.glob('*.apex')):
+                    stat = path.stat()
+                    table_tokens.append((path.name, stat.st_size, stat.st_mtime_ns))
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            return None
+        if not file_tokens and not table_tokens:
+            return None
+        return tuple(table_tokens), tuple(file_tokens)
+
+    @staticmethod
+    def _is_query_result_cacheable(
+        sql: str, include_scalar_aggregates: bool = False
+    ) -> bool:
+        """Accept deterministic single-statement reads; reject volatile SQL."""
+        stripped = sql.strip()
+        upper = stripped.upper()
+        if not (upper.startswith('SELECT ') or upper.startswith('WITH ')):
+            return False
+        if ';' in stripped.rstrip(';'):
+            return False
+        if any(token in upper for token in _VOLATILE_QUERY_TOKENS):
+            return False
+        if _RE_QUOTED_DATA_FILE.search(stripped):
+            return True
+        if any(token in upper for token in (
+            ' GROUP ', ' HAVING ', ' DISTINCT ', ' OVER ', ' ORDER BY ',
+            'PERCENTILE_', 'QUANTILE(',
+        )):
+            return True
+        # Keep the cache off already-cheap local scalar aggregates (notably
+        # COUNT(*) and an unfiltered five-function profile). Their generation
+        # token lookup costs more than a direct indexed/streaming execution.
+        return (
+            include_scalar_aggregates
+            or ' WHERE ' in f' {upper} '
+            or 'CASE WHEN' in upper
+        ) and any(token in upper for token in (
+            'COUNT(', 'SUM(', 'AVG(', 'MIN(', 'MAX(', 'PERCENTILE_',
+            'QUANTILE(',
+        ))
+
+    def _get_cached_query_result(self, sql: str, show_internal_id):
+        """Return a fresh view over an immutable cached Arrow table."""
+        cacheable = self._query_result_cacheability.get(sql)
+        if cacheable is None:
+            cacheable = self._is_query_result_cacheable(
+                sql, include_scalar_aggregates=self._in_memory
+            )
+            if len(self._query_result_cacheability) >= 256:
+                self._query_result_cacheability.clear()
+            self._query_result_cacheability[sql] = cacheable
+        if not cacheable:
+            return None, None, None
+        show_flag = self._resolve_show_internal_id(sql, show_internal_id)
+        key = (self._current_database, self._current_table, sql, show_flag)
+        token = self._query_result_cache_token(sql)
+        if token is None:
+            return None, None, None
+        entry = self._query_result_cache.get(key)
+        if entry is None or entry[0] != token:
+            return None, key, token
+        representation, payload = entry[1]
+        view = (ResultView(lazy_pydict=payload) if representation == 'pydict'
+                else ResultView(arrow_table=payload))
+        view._show_internal_id = show_flag
+        return view, key, token
+
+    def _cache_query_result(self, key, token, result) -> None:
+        """Cache bounded analytical results without retaining large scans."""
+        if key is None or token is None:
+            return
+        try:
+            if len(result) > 4096:
+                return
+            if self._query_result_cache_token(key[2]) != token:
+                return
+            pydict = getattr(result, '_lazy_pydict', None)
+            if pydict is not None:
+                cached = ('pydict', pydict)
+            else:
+                table = result.to_arrow()
+                if table.nbytes > 8 * 1024 * 1024:
+                    return
+                cached = ('arrow', table)
+        except (AttributeError, ImportError, OSError, RuntimeError):
+            return
+        limit = max(1, min(int(self._cache_size), 64))
+        if key not in self._query_result_cache and len(self._query_result_cache) >= limit:
+            self._query_result_cache.pop(next(iter(self._query_result_cache)))
+        self._query_result_cache[key] = (token, cached)
 
     def _numeric_range_cache_token(self):
         """
@@ -1590,6 +1755,7 @@ class ApexClient:
                 source_path = transcoded_path
             try:
                 self._storage.register_temp_table(name, source_path, on_bad_lines)
+                self._invalidate_replace_cache()
             finally:
                 if transcoded_path is not None:
                     try:
@@ -1610,6 +1776,7 @@ class ApexClient:
         self._check_connection()
         with self._lock:
             self._storage.drop_temp_table(name)
+            self._invalidate_replace_cache()
 
     # ============ Compression ============
 
@@ -2670,6 +2837,11 @@ class ApexClient:
                 return self._rollback_fast_txn(show_internal_id)
 
         sql_stripped = sql.strip()
+        cached_result, result_cache_key, result_cache_token = (
+            self._get_cached_query_result(sql, show_internal_id)
+        )
+        if cached_result is not None:
+            return cached_result
         # Thin primary-key wrapper: classification and the direct read happen
         # inside the Rust binding in one FFI call (classify is cached in the
         # core), so Python no longer re-parses point/batch `_id` lookups.
@@ -2780,7 +2952,9 @@ class ApexClient:
         
         # Lock-free execution: Rust layer handles concurrent reads via RwLock.
         # Python-level _storage_lock was causing serialization of all queries.
-        return self._execute_impl(sql, show_internal_id)
+        result = self._execute_impl(sql, show_internal_id)
+        self._cache_query_result(result_cache_key, result_cache_token, result)
+        return result
 
     def _flush_pending_memtable_rows_for_read(self) -> None:
         """

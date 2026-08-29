@@ -4,6 +4,7 @@ use super::*;
 
 #[path = "copy.rs"]
 mod copy;
+pub(in crate::query::executor) use copy::CsvGroupKeyType;
 #[path = "delete.rs"]
 mod delete;
 #[path = "insert.rs"]
