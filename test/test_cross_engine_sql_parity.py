@@ -99,6 +99,13 @@ def setup_sqlite(tmp, data):
     # Python 3.9's bundled SQLite may predate the optional math functions.
     con.create_function("FLOOR", 1, lambda value: None if value is None else math.floor(value))
     con.create_function("CEIL", 1, lambda value: None if value is None else math.ceil(value))
+    con.create_function(
+        "MOD",
+        2,
+        lambda dividend, divisor: (
+            None if dividend is None or divisor is None else dividend % divisor
+        ),
+    )
     con.execute(
         "CREATE TABLE t (id INTEGER, name TEXT, age INTEGER, score REAL, "
         "city TEXT, category TEXT)"
