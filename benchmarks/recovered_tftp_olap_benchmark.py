@@ -28,7 +28,6 @@ import pyarrow.csv as arrow_csv
 from apexbase import ApexClient
 
 
-DEFAULT_CSV = Path("/Users/guobingming/Downloads/archive/01-12/TFTP.csv")
 DEFAULT_WORKDIR = Path("/tmp/apexbase-tftp-olap")
 THREADS = int(os.environ.get("TFTP_BENCH_THREADS", "10"))
 FULL_CSV_ROWS = 20_107_827
@@ -638,7 +637,7 @@ def raw_benchmark(csv_path: Path, workdir: Path, warmups: int, iterations: int) 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("phase", choices=("setup", "native", "memory", "raw", "all", "cleanup"))
-    parser.add_argument("--csv", type=Path, default=DEFAULT_CSV)
+    parser.add_argument("--csv", type=Path, help="Path to the TFTP CSV input")
     parser.add_argument("--workdir", type=Path, default=DEFAULT_WORKDIR)
     parser.add_argument("--max-rows", type=int, default=0, help="0 means the full CSV")
     parser.add_argument("--warmups", type=int, default=1)
@@ -650,6 +649,8 @@ def main() -> None:
             shutil.rmtree(args.workdir)
         print(f"removed {args.workdir}")
         return
+    if args.csv is None:
+        parser.error("--csv is required unless phase is cleanup")
     if not args.csv.is_file():
         raise FileNotFoundError(args.csv)
     if args.warmups < 0 or args.iterations < 1:
