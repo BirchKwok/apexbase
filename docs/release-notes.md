@@ -3,6 +3,25 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.32.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.32.0)
+*2026-08-29*
+
+[Compare with v1.31.1](https://github.com/BirchKwok/ApexBase/compare/v1.31.1...v1.32.0)
+
+- Add a true process-local in-memory backend for `ApexClient(":memory:")`, with the same table, SQL, DDL, DML, index, and full-text query paths as disk-backed databases while avoiding database, catalog, WAL, delta, and index files
+- Add the process-local `apexbase.execute()` convenience API, backed by a lazily initialized shared in-memory connection for small embedded SQL workflows
+- Preserve in-memory read-your-write behavior across table creation, schema changes, inserts, updates, deletes, truncation, table listing, and database cleanup
+- Add direct file fast paths for CSV/TSV reads, including `COUNT(*)`, bounded `LIMIT`/`OFFSET`, scalar aggregates, filtered aggregation, and string or numeric `GROUP BY` queries
+- Reduce query-planning and scan overhead for `GROUP BY`, `HAVING`, join aggregation, dictionary-backed projections, null checks, and mmap TopK paths while retaining generic fallbacks for unsupported shapes
+- Add bounded analytical result caching with lazy Python-dictionary or Arrow representations, file-generation and table-epoch invalidation, transaction/volatile-query protection, and write-visible invalidation for in-memory tables
+- Harden dictionary-indexed projections so mixed, nullable, or out-of-range dictionary data safely falls back to the general reader instead of constructing invalid arrays
+- Make Lance conversion safe for source columns containing dotted names by producing unique top-level field names
+- Add cross-engine default-execute and in-memory comparisons, expanded CSV/file-read and cache-invalidation regression coverage, and a recovered full TFTP OLAP benchmark covering native, in-memory, and raw-file workloads
+- Update the Rust crate and Python package version metadata to 1.32.0
+
+---
+
+
 ## [v1.31.1](https://github.com/BirchKwok/ApexBase/releases/tag/v1.31.1)
 *2026-08-23*
 
