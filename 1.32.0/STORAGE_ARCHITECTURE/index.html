@@ -1265,6 +1265,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#persistent-and-in-memory-backends" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Persistent And In-Memory Backends
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#storageengine-api-reference" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1607,6 +1618,34 @@
   
   
     <li class="md-nav__item">
+      <a href="../QUERY_OPTIMIZER_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Query Optimizer Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../HTAP_ROADMAP/" class="md-nav__link">
         
   
@@ -1871,6 +1910,57 @@ development.</p>
 </tr>
 </tbody>
 </table>
+<h2 id="persistent-and-in-memory-backends">Persistent And In-Memory Backends<a class="headerlink" href="#persistent-and-in-memory-backends" title="Permanent link">&para;</a></h2>
+<p><code>ApexClient(path)</code> and <code>ApexClient(":memory:")</code> converge at the
+<code>Database</code>/<code>Session</code> façade and use the same executor and
+<code>TableStorageBackend</code> operations. The difference is how a backend is opened
+and persisted:</p>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Filesystem database</th>
+<th><code>":memory:"</code> database</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Backend lookup</td>
+<td>V4 <code>.apex</code> file plus engine cache</td>
+<td>Process-local <code>StorageEngine</code> memory registry</td>
+</tr>
+<tr>
+<td>Table/catalog state</td>
+<td><code>.apex</code>, <code>.apex_tables</code>, <code>.apex_schemas</code></td>
+<td>Registry/backend state only</td>
+</tr>
+<tr>
+<td>WAL/delta/blob/index persistence</td>
+<td>Files and sidecars as required</td>
+<td>Kept in memory; no sidecar files</td>
+</tr>
+<tr>
+<td>Lifetime</td>
+<td>Survives client/process restart</td>
+<td>Bound to the explicit client; dropped on close</td>
+</tr>
+<tr>
+<td>SQL and feature routing</td>
+<td><code>Database</code>/<code>Session</code> → <code>ApexExecutor</code></td>
+<td>Same routing and validation paths</td>
+</tr>
+</tbody>
+</table>
+<p>The Python constructor maps the public <code>":memory:"</code> sentinel to a unique
+internal <code>apexbase_memory:</code> path. <code>Database::open_backend()</code> first checks the
+engine's memory registry; <code>create_backend()</code> registers a memory table instead
+of materializing a file. DDL, DML, indexes, FTS, schema changes, and query
+cache invalidation therefore reuse the normal database semantics while file
+creation, mmap, fsync, catalog writes, and atomic rename are bypassed.</p>
+<p>The module-level <code>apexbase.execute()</code> API owns a separate lazily created
+default in-memory client. It is intentionally shared by later module-level
+calls in the same process; independently constructed <code>ApexClient(":memory:")</code>
+instances remain isolated.</p>
 <h2 id="storageengine-api-reference">StorageEngine API Reference<a class="headerlink" href="#storageengine-api-reference" title="Permanent link">&para;</a></h2>
 <h3 id="write-operations">Write Operations<a class="headerlink" href="#write-operations" title="Permanent link">&para;</a></h3>
 <table>

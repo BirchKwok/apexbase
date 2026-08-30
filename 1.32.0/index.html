@@ -1334,6 +1334,34 @@
   
   
     <li class="md-nav__item">
+      <a href="QUERY_OPTIMIZER_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Query Optimizer Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="HTAP_ROADMAP/" class="md-nav__link">
         
   
@@ -1449,6 +1477,10 @@
 <p>Use it when you want a local database that can ingest records quickly, run analytical SQL, interoperate with DataFrames, and expose the same data through embedded Python, PostgreSQL Wire, or Arrow Flight.</p>
 <div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>pip<span class="w"> </span>install<span class="w"> </span>apexbase
 </span></code></pre></div>
+<p>Need an ephemeral database instead? <code>ApexClient(":memory:")</code> runs the same
+table, SQL, DDL, DML, index, and full-text paths without creating database
+files. For tiny SQL-only workflows, call the process-local
+<code>apexbase.execute(...)</code> convenience API.</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="kn">from</span><span class="w"> </span><span class="nn">apexbase</span><span class="w"> </span><span class="kn">import</span> <span class="n">ApexClient</span>
 </span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>
 </span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="k">with</span> <span class="n">ApexClient</span><span class="p">(</span><span class="s2">"./data"</span><span class="p">)</span> <span class="k">as</span> <span class="n">client</span><span class="p">:</span>
@@ -1552,8 +1584,13 @@
 <tbody>
 <tr>
 <td>Python API</td>
-<td>You are embedding ApexBase in a Python app or notebook</td>
-<td><code>from apexbase import ApexClient</code></td>
+<td>You are embedding persistent or in-memory ApexBase in a Python app or notebook</td>
+<td><code>ApexClient(path)</code> or <code>ApexClient(":memory:")</code></td>
+</tr>
+<tr>
+<td>Default SQL API</td>
+<td>You want a shared process-local connection with no setup</td>
+<td><code>from apexbase import execute</code></td>
 </tr>
 <tr>
 <td>Rust API</td>
