@@ -40,6 +40,36 @@ print(df)
 client.close()
 ```
 
+## In-Memory And Zero-Setup SQL
+
+Use `":memory:"` for a fully ephemeral database with the regular client API:
+
+```python
+from apexbase import ApexClient
+
+with ApexClient(":memory:") as client:
+    client.execute("CREATE TABLE events (kind TEXT, duration_ms DOUBLE)")
+    client.execute(
+        "INSERT INTO events VALUES (?, ?)",
+        params=["query", 1.8],
+    )
+    print(client.execute("SELECT AVG(duration_ms) FROM events").scalar())
+```
+
+For a short SQL-only script, the module-level helper removes even the client
+setup. Calls share one lazily initialized in-memory connection in the current
+process:
+
+```python
+import apexbase
+
+apexbase.execute("CREATE TABLE flags (name TEXT, enabled BOOL)")
+apexbase.execute("INSERT INTO flags VALUES ('cache', true)")
+print(apexbase.execute("SELECT * FROM flags").to_dict())
+```
+
+Use a filesystem path instead when data must survive process exit.
+
 ## Working with Tables
 
 ApexBase requires explicit table creation before any data operations. Each table is stored as a separate `.apex` file.

@@ -107,6 +107,7 @@ nav:
   - Internals:
       - Storage Architecture: STORAGE_ARCHITECTURE.md
       - Engineering Guidelines: ENGINEERING_GUIDELINES.md
+      - Query Optimizer Roadmap: QUERY_OPTIMIZER_ROADMAP.md
       - HTAP Roadmap: HTAP_ROADMAP.md
   - Release Notes: release-notes.md
   - Docs Index: documentation-index.md

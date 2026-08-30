@@ -21,6 +21,29 @@ with ApexClient.create_clean("./tmp_data") as client:
     client.create_table("scratch")
 ```
 
+Use a true in-memory database when persistence is not required:
+
+```python
+with ApexClient(":memory:") as client:
+    client.execute("CREATE TABLE scratch (value INT)")
+```
+
+Each explicit in-memory client is isolated and disappears when closed. It
+does not create a temporary directory or any ApexBase sidecar files.
+
+For a single shared process-local SQL session, use the module-level helper:
+
+```python
+import apexbase
+
+apexbase.execute("CREATE TABLE scratch (value INT)")
+apexbase.execute("INSERT INTO scratch VALUES (?)", [42])
+assert apexbase.execute("SELECT value FROM scratch").scalar() == 42
+```
+
+The helper is convenient for short scripts; an explicit client gives clearer
+lifecycle and isolation control.
+
 ## Database And Table Selection
 
 ```python
@@ -106,6 +129,12 @@ row = client.retrieve(1)
 rows = client.retrieve_many([1, 2, 3])
 all_rows = client.retrieve_all()
 ```
+
+Deterministic analytical `SELECT` results may be cached per client. Cache keys
+include the query shape and table/file generation state; writes, schema
+changes, external file changes, and in-memory table epochs invalidate affected
+entries. Transactional and volatile queries are not reused. Treat caching as
+an implementation optimization, not as a change to SQL visibility.
 
 ## Batch Execution
 

@@ -5,12 +5,13 @@ Complete API reference for ApexBase Python SDK.
 ## Table of Contents
 
 1. [ApexClient](#apexclient) - Main client class
-2. [ResultView](#resultview) - Query results
-3. [Constants](#constants) - Module constants
-4. [File Reading Table Functions](#file-reading-table-functions) - read_csv / read_parquet / read_json
-5. [Temporary Tables from Files](#temporary-tables-from-files) - register_temp_table / drop_temp_table
-6. [Set Operations](#set-operations) - UNION / INTERSECT / EXCEPT
-7. [Vector Search](#vector-search) - topk_distance / batch_topk_distance / SQL explode_rename
+2. [Module-Level Execute](#module-level-execute) - Shared process-local SQL
+3. [ResultView](#resultview) - Query results
+4. [Constants](#constants) - Module constants
+5. [File Reading Table Functions](#file-reading-table-functions) - read_csv / read_parquet / read_json
+6. [Temporary Tables from Files](#temporary-tables-from-files) - register_temp_table / drop_temp_table
+7. [Set Operations](#set-operations) - UNION / INTERSECT / EXCEPT
+8. [Vector Search](#vector-search) - topk_distance / batch_topk_distance / SQL explode_rename
 
 ---
 
@@ -36,6 +37,7 @@ ApexClient(
 **Parameters:**
 
 - `dirpath`: Data directory path (default: current directory)
+- `dirpath=":memory:"`: Create an isolated process-local database without filesystem persistence
 - `batch_size`: Batch size for bulk operations
 - `drop_if_exists`: If True, delete existing data on open
 - `enable_cache`: Enable query result caching
@@ -55,6 +57,41 @@ client = ApexClient("./data", durability="safe")
 
 # Clean start (drop existing)
 client = ApexClient.create_clean("./data")
+
+# True in-memory database (no temporary directory or sidecar files)
+client = ApexClient(":memory:")
+```
+
+---
+
+## Module-Level Execute
+
+```python
+apexbase.execute(
+    sql: str,
+    params=None,
+    *,
+    show_internal_id: bool = None,
+) -> ResultView
+```
+
+Execute SQL on a lazily initialized, process-local default in-memory
+connection. Later calls in the same process reuse that connection and see its
+tables. It creates no database, catalog, WAL, delta, blob-sidecar, or index
+files.
+
+`params` supports the same positional and named binding rules as
+`ApexClient.execute()`. Use an explicit `ApexClient(":memory:")` when you need
+an isolated lifecycle rather than the module-wide session.
+
+```python
+import apexbase
+
+apexbase.execute("CREATE TABLE kv (key TEXT, value INT)")
+apexbase.execute("INSERT INTO kv VALUES (?, ?)", ["answer", 42])
+answer = apexbase.execute(
+    "SELECT value FROM kv WHERE key = :key", {"key": "answer"}
+).scalar()
 ```
 
 ---

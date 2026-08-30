@@ -93,6 +93,33 @@ Supporting subsystems (not shown above, all under `apexbase/src/storage/`):
 | `table_catalog.rs` | `.apex_tables` / `.apex_schemas` memory-mapped registries |
 | `bloom.rs`, `concurrent.rs` | Filter helpers and concurrent primitives |
 
+## Persistent And In-Memory Backends
+
+`ApexClient(path)` and `ApexClient(":memory:")` converge at the
+`Database`/`Session` façade and use the same executor and
+`TableStorageBackend` operations. The difference is how a backend is opened
+and persisted:
+
+| Concern | Filesystem database | `":memory:"` database |
+| --- | --- | --- |
+| Backend lookup | V4 `.apex` file plus engine cache | Process-local `StorageEngine` memory registry |
+| Table/catalog state | `.apex`, `.apex_tables`, `.apex_schemas` | Registry/backend state only |
+| WAL/delta/blob/index persistence | Files and sidecars as required | Kept in memory; no sidecar files |
+| Lifetime | Survives client/process restart | Bound to the explicit client; dropped on close |
+| SQL and feature routing | `Database`/`Session` → `ApexExecutor` | Same routing and validation paths |
+
+The Python constructor maps the public `":memory:"` sentinel to a unique
+internal `apexbase_memory:` path. `Database::open_backend()` first checks the
+engine's memory registry; `create_backend()` registers a memory table instead
+of materializing a file. DDL, DML, indexes, FTS, schema changes, and query
+cache invalidation therefore reuse the normal database semantics while file
+creation, mmap, fsync, catalog writes, and atomic rename are bypassed.
+
+The module-level `apexbase.execute()` API owns a separate lazily created
+default in-memory client. It is intentionally shared by later module-level
+calls in the same process; independently constructed `ApexClient(":memory:")`
+instances remain isolated.
+
 ## StorageEngine API Reference
 
 ### Write Operations

@@ -12,14 +12,14 @@
 
 **ApexBase is a high-performance embedded HTAP database with a Rust core and a Python-first API.**
 
-**Install it, write local `.apex` table files, run analytical SQL, import/export DataFrames, and optionally expose the same data through PostgreSQL Wire or Arrow Flight. No separate database service is required.**
+**Install it, choose persistent `.apex` files or a true process-local in-memory database, run analytical SQL, import/export DataFrames, and optionally expose persistent data through PostgreSQL Wire or Arrow Flight. No separate database service is required.**
 
 ## Why ApexBase
 
 | What you need | What ApexBase gives you |
 | --- | --- |
 | **Fast local analytics** | Columnar storage, vectorized execution, SQL aggregations, joins, CTEs, windows, and indexes |
-| **Low-friction Python workflows** | `ApexClient`, Pandas / Polars / PyArrow conversion, file table functions, and simple local persistence |
+| **Low-friction Python workflows** | `ApexClient`, `apexbase.execute`, Pandas / Polars / PyArrow conversion, file table functions, and local or in-memory storage |
 | **One engine for mixed workloads** | HTAP design: fast writes, point lookups, analytical scans, transactions, and MVCC |
 | **Search built in** | Full-text search, vector TopK, Float16/BFloat16/Int8/UInt8/1Bit/TurboQuant storage, and exact reranking from a retained source vector |
 | **Tool compatibility** | PostgreSQL Wire for database clients and Arrow Flight for fast columnar transfer |
@@ -100,16 +100,32 @@ with ApexClient("./rag-data") as client:
 
 **ApexBase gives you pgvector-style semantic search, SQL filters, and full-text search in the same embedded database file.** It is the kind of stack you would otherwise assemble from SQLite/DuckDB + FTS + pgvector, but without a server process or a separate search/vector service; results still convert directly to Pandas, Polars, or Arrow.
 
+For scratch work, tests, and short-lived analytics, use the same API without
+creating database, catalog, WAL, delta, or index files:
+
+```python
+from apexbase import ApexClient
+
+with ApexClient(":memory:") as client:
+    client.execute("CREATE TABLE metrics (name TEXT, value DOUBLE)")
+    client.execute("INSERT INTO metrics VALUES ('latency_ms', 2.4)")
+    print(client.execute("SELECT AVG(value) AS average FROM metrics").scalar())
+```
+
+For the smallest SQL-only scripts, `apexbase.execute(...)` uses one lazily
+created process-local in-memory connection shared by later module-level calls.
+
 ## Performance At A Glance
 
-Latest local snapshot (2026-08-15): **ApexBase 1.29.0**, 1M-row tabular dataset, 1M-vector dataset, Apple arm, Python 3.12.
+The latest retained complete public snapshot uses **1,000,000 tabular rows**
+and **1,000,000 vectors x 128 dimensions** on Apple arm64 with Python 3.12.
 
 | Area | Snapshot |
 | --- | --- |
-| **Fair OLAP + OLTP comparison** | **102 public tabular metrics** tracked; ApexBase wins **87 / 102** in the benchmark harness. The remaining losses are the DDL gaps vs SQLite (`Table DROP`, `Table CREATE+DROP cycle`, `ALTER TABLE ADD COLUMN`, 1.3x–2.0x) and a dozen advanced-SQL metrics vs DuckDB at 1.2x–2.0x, plus `NOT` filter (4.6x) and `ORDER BY LENGTH(...)` (3.9x) as the two remaining larger gaps — down from the 1.5x–75x these metrics previously showed. |
-| **GROUP BY city** | **2.0x faster** than DuckDB in the representative snapshot |
-| **FTS search** | **5.6x faster** than SQLite in the representative snapshot |
-| **Batch vector TopK cosine** | **7.1x faster** than DuckDB in the representative snapshot |
+| **Public coverage** | 102 tabular metrics, 6 exact-vector metrics, and 8 ApexBase quantized-vector precision rows |
+| **Comparable results** | ApexBase wins 111 / 114 rows with a direct competitor in the retained complete snapshot |
+| **Exact vector search** | All 6 single/batch Float32 TopK rows beat the compared engines and match brute-force exact top-k row sets |
+| **Reproducibility** | Fixed data sizes, 2 warmups, 5 timed iterations, dependency metadata, and a retained JSON report |
 
 Benchmarks are workload-sensitive. The default benchmark command tracks this public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/apexbase/latest/performance/).
 

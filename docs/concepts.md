@@ -14,6 +14,18 @@ client = ApexClient("./data")
 
 The root directory contains the default database and any named databases. ApexBase stores each table as a `.apex` file.
 
+For an ephemeral database, pass the special path `":memory:"`:
+
+```python
+client = ApexClient(":memory:")
+```
+
+This is a true process-local storage backend, not a temporary directory.
+Tables still use the normal SQL, DDL, DML, index, FTS, schema, and result
+paths, but no database, catalog, WAL, delta, blob-sidecar, or index files are
+created. Its contents disappear when the client is closed and are not shared
+with another independently created in-memory client.
+
 ## Databases
 
 ApexBase supports multiple isolated databases under one root directory. The default database maps to the root directory. Named databases live in subdirectories.
@@ -98,6 +110,25 @@ arrow_table = result.to_arrow()
 ```
 
 Use `ResultView` when you want to move smoothly between SQL, Python lists, Pandas, Polars, and PyArrow.
+
+## Process-Local Default Connection
+
+The module-level `apexbase.execute()` helper lazily creates one shared
+in-memory client inside the current Python process:
+
+```python
+import apexbase
+
+apexbase.execute("CREATE TABLE counters (name TEXT, value INT)")
+apexbase.execute("INSERT INTO counters VALUES ('jobs', 3)")
+value = apexbase.execute(
+    "SELECT value FROM counters WHERE name = ?", ["jobs"]
+).scalar()
+```
+
+Later module-level calls see the same tables. Use an explicit `ApexClient`
+when you need lifecycle control, isolation, persistence, or more than one
+database connection.
 
 ## Durability
 

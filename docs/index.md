@@ -8,6 +8,11 @@ Use it when you want a local database that can ingest records quickly, run analy
 pip install apexbase
 ```
 
+Need an ephemeral database instead? `ApexClient(":memory:")` runs the same
+table, SQL, DDL, DML, index, and full-text paths without creating database
+files. For tiny SQL-only workflows, call the process-local
+`apexbase.execute(...)` convenience API.
+
 ```python
 from apexbase import ApexClient
 
@@ -79,7 +84,8 @@ with ApexClient("./data") as client:
 
 | Interface | Use when | Entry point |
 | --- | --- | --- |
-| Python API | You are embedding ApexBase in a Python app or notebook | `from apexbase import ApexClient` |
+| Python API | You are embedding persistent or in-memory ApexBase in a Python app or notebook | `ApexClient(path)` or `ApexClient(":memory:")` |
+| Default SQL API | You want a shared process-local connection with no setup | `from apexbase import execute` |
 | Rust API | You want direct Rust integration without Python | `apexbase::embedded::ApexDB` |
 | PostgreSQL Wire | You want DBeaver, DataGrip, psql, BI tools, or libpq clients | `apexbase-server` or `apexbase-serve` |
 | Arrow Flight | You need fast columnar result streaming | `apexbase-flight` or `apexbase-serve` |
