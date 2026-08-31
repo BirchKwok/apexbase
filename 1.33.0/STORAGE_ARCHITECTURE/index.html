@@ -1,0 +1,2576 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="High-performance HTAP embedded database with Rust core and Python API">
+      
+      
+        <meta name="author" content="Birch Kwok">
+      
+      
+        <link rel="canonical" href="https://birchkwok.github.io/apexbase/1.33.0/STORAGE_ARCHITECTURE/">
+      
+      
+        <link rel="prev" href="../VECTOR_QUANTIZATION_GUIDE/">
+      
+      
+        <link rel="next" href="../SCAN_EXECUTION_ARCHITECTURE/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../img/favicon.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Storage Architecture - ApexBase</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#apexbase-storage-architecture" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="ApexBase" class="md-header__button md-logo" aria-label="ApexBase" data-md-component="logo">
+      
+  <img src="../img/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            ApexBase
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Storage Architecture
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m14.3 16-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12zm-9.15 3.96h2.3L12 9z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_2" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to system preference"  type="radio" name="__palette" id="__palette_2">
+    
+      <label class="md-header__button md-icon" title="Switch to system preference" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+          <a href="javascript:void(0)" class="md-search__icon md-icon" title="Share" aria-label="Share" data-clipboard data-clipboard-text="" data-md-component="search-share" tabindex="-1">
+            
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9a3 3 0 0 0-3 3 3 3 0 0 0 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.15c-.05.21-.08.43-.08.66 0 1.61 1.31 2.91 2.92 2.91s2.92-1.3 2.92-2.91A2.92 2.92 0 0 0 18 16.08"/></svg>
+          </a>
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/BirchKwok/ApexBase" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    birchkwok/ApexBase
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../installation/" class="md-tabs__link">
+          
+  
+  
+  Getting Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../user-guide/python-client/" class="md-tabs__link">
+          
+  
+  
+  User Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../API_REFERENCE/" class="md-tabs__link">
+          
+  
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../performance/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../FTS_GUIDE/" class="md-tabs__link">
+          
+  
+  
+  Features
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="./" class="md-tabs__link">
+          
+  
+  
+  Internals
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../release-notes/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Release Notes
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../documentation-index/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Docs Index
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+  
+
+<nav class="md-nav md-nav--primary md-nav--lifted md-nav--integrated" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="ApexBase" class="md-nav__button md-logo" aria-label="ApexBase" data-md-component="logo">
+      
+  <img src="../img/logo.svg" alt="logo">
+
+    </a>
+    ApexBase
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/BirchKwok/ApexBase" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    birchkwok/ApexBase
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../QUICK_START/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Core Concepts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/python-client/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python Client
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/sql/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SQL Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/data-import/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data Import
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/server-protocols/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Server Protocols
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../EXAMPLES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../API_REFERENCE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RUST_EMBEDDED_API/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust Embedded API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Features
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Features
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FTS_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Full-Text Search
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FLOAT16_VECTOR_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Float16 Vectors
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../VECTOR_QUANTIZATION_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Vector Quantization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Storage Architecture
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Storage Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#overview" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Overview
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#architecture-diagram" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Architecture Diagram
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#scan-and-operator-boundary" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Scan And Operator Boundary
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#persistent-and-in-memory-backends" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Persistent And In-Memory Backends
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#storageengine-api-reference" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        StorageEngine API Reference
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="StorageEngine API Reference">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#write-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Write Operations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#read-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Read Operations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#delete-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Delete Operations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#schema-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Schema Operations
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#cache-management" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cache Management
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#smart-write-routing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Smart Write Routing
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Smart Write Routing">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#write-mode-selection" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Write Mode Selection
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#engineering-guidelines" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Engineering Guidelines
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Engineering Guidelines">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#1-always-use-database-facade-storageengine" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. Always Use Database Façade / StorageEngine
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#2-lock-ordering" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. Lock Ordering
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#3-cache-invalidation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. Cache Invalidation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#4-error-handling" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. Error Handling
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#5-durability-levels" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        5. Durability Levels
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#file-format" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        File Format
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="File Format">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#v4-row-group-format-apex-default" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        V4 Row Group Format (.apex) — Default
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#blob-sidecar-storage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Blob Sidecar Storage
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#delta-file-apexdelta" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Delta File (.apex.delta)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#compaction" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Compaction
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#schema-changes-bounded-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Schema Changes (bounded memory)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#deletes-bounded-memory" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Deletes (bounded memory)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#table-catalog-apex_tables" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Table Catalog (.apex_tables)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#concurrency-and-mvcc" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Concurrency and MVCC
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#adding-new-operations" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Adding New Operations
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#testing" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Testing
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SCAN_EXECUTION_ARCHITECTURE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scan & Physical Execution
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Engineering Guidelines
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../QUERY_OPTIMIZER_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Query Optimizer Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../HTAP_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTAP Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../release-notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release Notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../documentation-index/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Docs Index
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+                
+
+
+
+  
+
+
+  <nav class="md-path" aria-label="Navigation" >
+    <ol class="md-path__list">
+      
+        
+  
+  
+    <li class="md-path__item">
+      <a href=".." class="md-path__link">
+        
+  <span class="md-ellipsis">
+    Home
+  </span>
+
+      </a>
+    </li>
+  
+
+      
+      
+        
+  
+  
+    
+    
+      <li class="md-path__item">
+        <a href="./" class="md-path__link">
+          
+  <span class="md-ellipsis">
+    Internals
+  </span>
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ol>
+  </nav>
+
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="apexbase-storage-architecture">ApexBase Storage Architecture<a class="headerlink" href="#apexbase-storage-architecture" title="Permanent link">&para;</a></h1>
+<h2 id="overview">Overview<a class="headerlink" href="#overview" title="Permanent link">&para;</a></h2>
+<p>ApexBase uses a unified <code>StorageEngine</code> as the single entry point for all
+storage operations, with a <code>Database</code>/<code>Session</code> façade on top that Python
+bindings, the embedded Rust API, the PostgreSQL Wire server, and the Arrow
+Flight server all call. SQL execution is owned by <code>ApexExecutor</code>, which the
+<code>Database</code> façade routes to; storage internals never call the SQL executor.</p>
+<p>The on-disk format is the V4 row-group columnar format (<code>.apex</code>). Legacy V3
+files were dropped in v1.10.0 and are rejected on open; the <code>APEXV3</code> magic is
+retained in the header for compatibility with readers that check it.</p>
+<p>This document defines the architecture and engineering guidelines for future
+development.</p>
+<h2 id="architecture-diagram">Architecture Diagram<a class="headerlink" href="#architecture-diagram" title="Permanent link">&para;</a></h2>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>┌─────────────────────────────────────────────────────────────────────┐
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a>│                     Python Client (client.py)                       │
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a>│                store() / retrieve() / execute() / ...               │
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a>└─────────────────────────────┬───────────────────────────────────────┘
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a>                              │
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a>                              ▼
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a>┌─────────────────────────────────────────────────────────────────────┐
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a>│              PyO3 Bindings (python/bindings/)                       │
+</span><span id="__span-0-9"><a id="__codelineno-0-9" name="__codelineno-0-9" href="#__codelineno-0-9"></a>│  wrapper.rs (ApexStorageImpl) + read / write / sql / arrow / blob   │
+</span><span id="__span-0-10"><a id="__codelineno-0-10" name="__codelineno-0-10" href="#__codelineno-0-10"></a>│                                                                     │
+</span><span id="__span-0-11"><a id="__codelineno-0-11" name="__codelineno-0-11" href="#__codelineno-0-11"></a>│  Responsibilities:                                                  │
+</span><span id="__span-0-12"><a id="__codelineno-0-12" name="__codelineno-0-12" href="#__codelineno-0-12"></a>│  - File locking (acquire_write_lock / acquire_read_lock)            │
+</span><span id="__span-0-13"><a id="__codelineno-0-13" name="__codelineno-0-13" href="#__codelineno-0-13"></a>│  - FTS index coordination                                           │
+</span><span id="__span-0-14"><a id="__codelineno-0-14" name="__codelineno-0-14" href="#__codelineno-0-14"></a>│  - Local cached_backends per ApexStorageImpl instance               │
+</span><span id="__span-0-15"><a id="__codelineno-0-15" name="__codelineno-0-15" href="#__codelineno-0-15"></a>│  - Type conversion (Python ↔ Rust)                                  │
+</span><span id="__span-0-16"><a id="__codelineno-0-16" name="__codelineno-0-16" href="#__codelineno-0-16"></a>└─────────────────────────────┬───────────────────────────────────────┘
+</span><span id="__span-0-17"><a id="__codelineno-0-17" name="__codelineno-0-17" href="#__codelineno-0-17"></a>                              │ All storage ops via Database façade
+</span><span id="__span-0-18"><a id="__codelineno-0-18" name="__codelineno-0-18" href="#__codelineno-0-18"></a>                              ▼
+</span><span id="__span-0-19"><a id="__codelineno-0-19" name="__codelineno-0-19" href="#__codelineno-0-19"></a>┌─────────────────────────────────────────────────────────────────────┐
+</span><span id="__span-0-20"><a id="__codelineno-0-20" name="__codelineno-0-20" href="#__codelineno-0-20"></a>│                Database / Session façade (database.rs)              │
+</span><span id="__span-0-21"><a id="__codelineno-0-21" name="__codelineno-0-21" href="#__codelineno-0-21"></a>│  - open_backend / cached_backend / create_backend / invalidate      │
+</span><span id="__span-0-22"><a id="__codelineno-0-22" name="__codelineno-0-22" href="#__codelineno-0-22"></a>│  - write / write_typed → StorageEngine + index notification         │
+</span><span id="__span-0-23"><a id="__codelineno-0-23" name="__codelineno-0-23" href="#__codelineno-0-23"></a>│  - execute / query / txn → ApexExecutor                             │
+</span><span id="__span-0-24"><a id="__codelineno-0-24" name="__codelineno-0-24" href="#__codelineno-0-24"></a>└──────────────┬──────────────────────────────────┬───────────────────┘
+</span><span id="__span-0-25"><a id="__codelineno-0-25" name="__codelineno-0-25" href="#__codelineno-0-25"></a>               │                                   │ SQL / DML / DDL
+</span><span id="__span-0-26"><a id="__codelineno-0-26" name="__codelineno-0-26" href="#__codelineno-0-26"></a>               ▼                                   ▼
+</span><span id="__span-0-27"><a id="__codelineno-0-27" name="__codelineno-0-27" href="#__codelineno-0-27"></a>┌────────────────────────────────────┐  ┌─────────────────────────────┐
+</span><span id="__span-0-28"><a id="__codelineno-0-28" name="__codelineno-0-28" href="#__codelineno-0-28"></a>│   StorageEngine (engine.rs)        │  │  ApexExecutor               │
+</span><span id="__span-0-29"><a id="__codelineno-0-29" name="__codelineno-0-29" href="#__codelineno-0-29"></a>│   [SINGLETON]                      │  │  (query/executor/)          │
+</span><span id="__span-0-30"><a id="__codelineno-0-30" name="__codelineno-0-30" href="#__codelineno-0-30"></a>│                                    │  │  - SQL planning + fast paths│
+</span><span id="__span-0-31"><a id="__codelineno-0-31" name="__codelineno-0-31" href="#__codelineno-0-31"></a>│  Core Responsibilities:            │  │  - QuerySignature classifier│
+</span><span id="__span-0-32"><a id="__codelineno-0-32" name="__codelineno-0-32" href="#__codelineno-0-32"></a>│  - Smart write routing             │  │  - Index / stats / FTS      │
+</span><span id="__span-0-33"><a id="__codelineno-0-33" name="__codelineno-0-33" href="#__codelineno-0-33"></a>│    (classify_write)                │  │    coordination             │
+</span><span id="__span-0-34"><a id="__codelineno-0-34" name="__codelineno-0-34" href="#__codelineno-0-34"></a>│  - LRU backend cache (64 entries)  │  └─────────────────────────────┘
+</span><span id="__span-0-35"><a id="__codelineno-0-35" name="__codelineno-0-35" href="#__codelineno-0-35"></a>│  - Epoch-checked cache invalidation│
+</span><span id="__span-0-36"><a id="__codelineno-0-36" name="__codelineno-0-36" href="#__codelineno-0-36"></a>│  - Delta compaction coordination   │
+</span><span id="__span-0-37"><a id="__codelineno-0-37" name="__codelineno-0-37" href="#__codelineno-0-37"></a>└──────────────┬─────────────────────┘
+</span><span id="__span-0-38"><a id="__codelineno-0-38" name="__codelineno-0-38" href="#__codelineno-0-38"></a>               │
+</span><span id="__span-0-39"><a id="__codelineno-0-39" name="__codelineno-0-39" href="#__codelineno-0-39"></a>               ▼
+</span><span id="__span-0-40"><a id="__codelineno-0-40" name="__codelineno-0-40" href="#__codelineno-0-40"></a>┌─────────────────────────────────────────────────────────────────────┐
+</span><span id="__span-0-41"><a id="__codelineno-0-41" name="__codelineno-0-41" href="#__codelineno-0-41"></a>│              TableStorageBackend (backend.rs)                       │
+</span><span id="__span-0-42"><a id="__codelineno-0-42" name="__codelineno-0-42" href="#__codelineno-0-42"></a>│                                                                     │
+</span><span id="__span-0-43"><a id="__codelineno-0-43" name="__codelineno-0-43" href="#__codelineno-0-43"></a>│  Low-level operations:                                              │
+</span><span id="__span-0-44"><a id="__codelineno-0-44" name="__codelineno-0-44" href="#__codelineno-0-44"></a>│  - scan(ScanRequest) -&gt; Morsel / SelectionVector                    │
+</span><span id="__span-0-45"><a id="__codelineno-0-45" name="__codelineno-0-45" href="#__codelineno-0-45"></a>│  - insert_rows() / insert_rows_to_delta()                           │
+</span><span id="__span-0-46"><a id="__codelineno-0-46" name="__codelineno-0-46" href="#__codelineno-0-46"></a>│  - delete() / replace() / update                                    │
+</span><span id="__span-0-47"><a id="__codelineno-0-47" name="__codelineno-0-47" href="#__codelineno-0-47"></a>│  - add_column() / drop_column() / rename_column()                   │
+</span><span id="__span-0-48"><a id="__codelineno-0-48" name="__codelineno-0-48" href="#__codelineno-0-48"></a>│  - save() / compact() / open_for_insert / open_for_delete           │
+</span><span id="__span-0-49"><a id="__codelineno-0-49" name="__codelineno-0-49" href="#__codelineno-0-49"></a>└──────────────┬──────────────────────────────────────────────────────┘
+</span><span id="__span-0-50"><a id="__codelineno-0-50" name="__codelineno-0-50" href="#__codelineno-0-50"></a>               │
+</span><span id="__span-0-51"><a id="__codelineno-0-51" name="__codelineno-0-51" href="#__codelineno-0-51"></a>               ▼
+</span><span id="__span-0-52"><a id="__codelineno-0-52" name="__codelineno-0-52" href="#__codelineno-0-52"></a>┌─────────────────────────────────────────────────────────────────────┐
+</span><span id="__span-0-53"><a id="__codelineno-0-53" name="__codelineno-0-53" href="#__codelineno-0-53"></a>│                OnDemandStorage (on_demand/)                         │
+</span><span id="__span-0-54"><a id="__codelineno-0-54" name="__codelineno-0-54" href="#__codelineno-0-54"></a>│                                                                     │
+</span><span id="__span-0-55"><a id="__codelineno-0-55" name="__codelineno-0-55" href="#__codelineno-0-55"></a>│  - V4 columnar file I/O (read_write.rs, header.rs, storage_core.rs) │
+</span><span id="__span-0-56"><a id="__codelineno-0-56" name="__codelineno-0-56" href="#__codelineno-0-56"></a>│  - Memory-mapped scans (mmap_scan/{predicate,projection,groupby,    │
+</span><span id="__span-0-57"><a id="__codelineno-0-57" name="__codelineno-0-57" href="#__codelineno-0-57"></a>│    topk,vector,statistics}.rs)                                      │
+</span><span id="__span-0-58"><a id="__codelineno-0-58" name="__codelineno-0-58" href="#__codelineno-0-58"></a>│  - DeltaStore (.apex.delta) + compaction                            │
+</span><span id="__span-0-59"><a id="__codelineno-0-59" name="__codelineno-0-59" href="#__codelineno-0-59"></a>│  - Blob sidecars (&lt;table&gt;.blobs/)                                   │
+</span><span id="__span-0-60"><a id="__codelineno-0-60" name="__codelineno-0-60" href="#__codelineno-0-60"></a>│  - Stats sidecar (&lt;table&gt;.stats)                                    │
+</span><span id="__span-0-61"><a id="__codelineno-0-61" name="__codelineno-0-61" href="#__codelineno-0-61"></a>│  - Aggregation WAL (agg_wal.rs)                                     │
+</span><span id="__span-0-62"><a id="__codelineno-0-62" name="__codelineno-0-62" href="#__codelineno-0-62"></a>└─────────────────────────────────────────────────────────────────────┘
+</span></code></pre></div>
+<p>Supporting subsystems (not shown above, all under <code>apexbase/src/storage/</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Module</th>
+<th>Role</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>epoch.rs</code></td>
+<td>Generation counters; caches are only trusted when <code>epoch + mtime</code> match</td>
+</tr>
+<tr>
+<td><code>mvcc/</code></td>
+<td>Snapshot / version store / GC used by transactions</td>
+</tr>
+<tr>
+<td><code>index/</code></td>
+<td>B-Tree and hash secondary indexes (<code>IndexManager</code>)</td>
+</tr>
+<tr>
+<td><code>delta/</code></td>
+<td>DeltaStore: update log + delete bitmap, merge logic</td>
+</tr>
+<tr>
+<td><code>incremental.rs</code></td>
+<td>Append-only WAL (<code>.apex.wal</code>) for incremental writes</td>
+</tr>
+<tr>
+<td><code>table_catalog.rs</code></td>
+<td><code>.apex_tables</code> / <code>.apex_schemas</code> memory-mapped registries</td>
+</tr>
+<tr>
+<td><code>bloom.rs</code>, <code>concurrent.rs</code></td>
+<td>Filter helpers and concurrent primitives</td>
+</tr>
+<tr>
+<td><code>scan.rs</code></td>
+<td>SQL-independent scan request, Arrow column views, selection vectors, and morsels</td>
+</tr>
+</tbody>
+</table>
+<h2 id="scan-and-operator-boundary">Scan And Operator Boundary<a class="headerlink" href="#scan-and-operator-boundary" title="Permanent link">&para;</a></h2>
+<p><code>TableStorageBackend::scan()</code> is the shared boundary for new composable query
+paths. Base-only V4 data can select a string-equality or zone-map-estimated
+numeric mmap candidate before projected materialization. Any delta, pending
+write, or in-memory overlay instead uses the authoritative merged read. Both
+lanes return the same <code>Morsel</code> contract and reapply the full predicate
+conjunction before physical operators consume the selection.</p>
+<p>The first vertical pipeline is <code>WHERE -&gt; GROUP BY -&gt; HAVING -&gt; ordered TopK</code>.
+Unsupported expressions and numeric literals that cannot be represented
+exactly use the general evaluator. See
+<a href="../SCAN_EXECUTION_ARCHITECTURE/">Scan &amp; Physical Execution</a> for the complete
+protocol, fallback boundaries, and extension rules.</p>
+<h2 id="persistent-and-in-memory-backends">Persistent And In-Memory Backends<a class="headerlink" href="#persistent-and-in-memory-backends" title="Permanent link">&para;</a></h2>
+<p><code>ApexClient(path)</code> and <code>ApexClient(":memory:")</code> converge at the
+<code>Database</code>/<code>Session</code> façade and use the same executor and
+<code>TableStorageBackend</code> operations. The difference is how a backend is opened
+and persisted:</p>
+<table>
+<thead>
+<tr>
+<th>Concern</th>
+<th>Filesystem database</th>
+<th><code>":memory:"</code> database</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Backend lookup</td>
+<td>V4 <code>.apex</code> file plus engine cache</td>
+<td>Process-local <code>StorageEngine</code> memory registry</td>
+</tr>
+<tr>
+<td>Table/catalog state</td>
+<td><code>.apex</code>, <code>.apex_tables</code>, <code>.apex_schemas</code></td>
+<td>Registry/backend state only</td>
+</tr>
+<tr>
+<td>WAL/delta/blob/index persistence</td>
+<td>Files and sidecars as required</td>
+<td>Kept in memory; no sidecar files</td>
+</tr>
+<tr>
+<td>Lifetime</td>
+<td>Survives client/process restart</td>
+<td>Bound to the explicit client; dropped on close</td>
+</tr>
+<tr>
+<td>SQL and feature routing</td>
+<td><code>Database</code>/<code>Session</code> → <code>ApexExecutor</code></td>
+<td>Same routing and validation paths</td>
+</tr>
+</tbody>
+</table>
+<p>The Python constructor maps the public <code>":memory:"</code> sentinel to a unique
+internal <code>apexbase_memory:</code> path. <code>Database::open_backend()</code> first checks the
+engine's memory registry; <code>create_backend()</code> registers a memory table instead
+of materializing a file. DDL, DML, indexes, FTS, schema changes, and query
+cache invalidation therefore reuse the normal database semantics while file
+creation, mmap, fsync, catalog writes, and atomic rename are bypassed.</p>
+<p>The module-level <code>apexbase.execute()</code> API owns a separate lazily created
+default in-memory client. It is intentionally shared by later module-level
+calls in the same process; independently constructed <code>ApexClient(":memory:")</code>
+instances remain isolated.</p>
+<h2 id="storageengine-api-reference">StorageEngine API Reference<a class="headerlink" href="#storageengine-api-reference" title="Permanent link">&para;</a></h2>
+<h3 id="write-operations">Write Operations<a class="headerlink" href="#write-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Description</th>
+<th>Write Mode</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>write(path, rows, durability)</code></td>
+<td>Smart write routing</td>
+<td>Auto (delta/full)</td>
+</tr>
+<tr>
+<td><code>write_one(path, row, durability)</code></td>
+<td>Single row write</td>
+<td>Auto</td>
+</tr>
+<tr>
+<td><code>write_typed(path, columns..., durability)</code></td>
+<td>Typed columnar write</td>
+<td>V4 append / full</td>
+</tr>
+</tbody>
+</table>
+<p><code>query()</code> and <code>retrieve()</code> are no longer <code>StorageEngine</code> methods: SQL goes
+through <code>Database::execute</code> / <code>Database::query</code>, and point retrieval through
+the embedded API / Python bindings.</p>
+<h3 id="read-operations">Read Operations<a class="headerlink" href="#read-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>exists(path, id)</code></td>
+<td>Check if record exists</td>
+</tr>
+<tr>
+<td><code>row_count(path)</code></td>
+<td>Total row count (base + delta)</td>
+</tr>
+<tr>
+<td><code>active_row_count(path)</code></td>
+<td>Excluding deleted rows</td>
+</tr>
+</tbody>
+</table>
+<h3 id="delete-operations">Delete Operations<a class="headerlink" href="#delete-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>delete(path, ids, durability)</code></td>
+<td>Delete multiple by IDs</td>
+</tr>
+<tr>
+<td><code>delete_one(path, id, durability)</code></td>
+<td>Delete single record</td>
+</tr>
+</tbody>
+</table>
+<h3 id="schema-operations">Schema Operations<a class="headerlink" href="#schema-operations" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>create_table(path, durability)</code></td>
+<td>Create new table</td>
+</tr>
+<tr>
+<td><code>create_table_with_schema(path, durability, schema)</code></td>
+<td>Create with explicit schema</td>
+</tr>
+<tr>
+<td><code>get_schema(path)</code></td>
+<td>Get table schema</td>
+</tr>
+<tr>
+<td><code>add_column(path, name, dtype, durability)</code></td>
+<td>Add column</td>
+</tr>
+<tr>
+<td><code>drop_column(path, name, durability)</code></td>
+<td>Remove column</td>
+</tr>
+<tr>
+<td><code>rename_column(path, old, new, durability)</code></td>
+<td>Rename column</td>
+</tr>
+<tr>
+<td><code>list_columns(path)</code></td>
+<td>List all columns</td>
+</tr>
+<tr>
+<td><code>get_column_type(path, name)</code></td>
+<td>Get column type</td>
+</tr>
+</tbody>
+</table>
+<h3 id="cache-management">Cache Management<a class="headerlink" href="#cache-management" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Method</th>
+<th>Description</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>invalidate(path)</code></td>
+<td>Invalidate single table cache</td>
+</tr>
+<tr>
+<td><code>invalidate_dir(dir)</code></td>
+<td>Invalidate all tables in directory</td>
+</tr>
+<tr>
+<td><code>get_read_backend(path)</code></td>
+<td>Cached read backend (epoch-checked)</td>
+</tr>
+<tr>
+<td><code>get_write_backend(path, durability)</code></td>
+<td>Write backend, compacts delta first</td>
+</tr>
+<tr>
+<td><code>get_insert_backend(path, durability)</code></td>
+<td>Append backend reused for incremental inserts</td>
+</tr>
+</tbody>
+</table>
+<h2 id="smart-write-routing">Smart Write Routing<a class="headerlink" href="#smart-write-routing" title="Permanent link">&para;</a></h2>
+<p>Write routing is decided by <code>StorageEngine::classify_write()</code>, which combines
+the legacy delta check with V4 detection in a single pass and uses an
+epoch-checked schema cache to avoid file I/O on the fast path:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="c1">// engine.rs — classify_write(table_path, rows) -&gt; (use_delta, is_v4)</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="c1">// 1. Table must exist and be non-empty (file size &gt;= 256 bytes)</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="c1">// 2. V4 files ALWAYS take the full-write path:</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="c1">//      get_insert_backend() + insert_rows() + save()</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="c1">//      save() appends a new Row Group (no full rewrite, no delta file)</span>
+</span><span id="__span-1-6"><a id="__codelineno-1-6" name="__codelineno-1-6" href="#__codelineno-1-6"></a><span class="c1">// 3. Non-V4 legacy files with an exact column match use the delta path:</span>
+</span><span id="__span-1-7"><a id="__codelineno-1-7" name="__codelineno-1-7" href="#__codelineno-1-7"></a><span class="c1">//      insert_rows_to_delta() appends to .apex.delta</span>
+</span></code></pre></div>
+<h3 id="write-mode-selection">Write Mode Selection<a class="headerlink" href="#write-mode-selection" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Condition</th>
+<th>Write Mode</th>
+<th>Reason</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>New table</td>
+<td>Full</td>
+<td>Need to create file structure</td>
+</tr>
+<tr>
+<td>Empty table</td>
+<td>Full</td>
+<td>Need to establish schema</td>
+</tr>
+<tr>
+<td>V4 table (any schema)</td>
+<td><strong>Full (Row Group append)</strong></td>
+<td>Default format; <code>save()</code> appends via <code>append_row_group</code></td>
+</tr>
+<tr>
+<td>Legacy non-V4, new/missing columns</td>
+<td>Full</td>
+<td>Delta doesn't support schema evolution</td>
+</tr>
+<tr>
+<td>Legacy non-V4, same columns</td>
+<td>Delta</td>
+<td>Memory-efficient append-only</td>
+</tr>
+</tbody>
+</table>
+<p>Notes:</p>
+<ul>
+<li>The Python <code>store()</code> / <code>store_columnar()</code> path calls <code>Database::write_typed</code>,
+  which uses the <code>append_row_group</code> fast path when the V4 table exists with a
+  matching schema — incremental inserts avoid rewriting the base file.</li>
+<li>SQL <code>INSERT</code> inside a transaction goes through
+  <code>ApexExecutor</code> → <code>try_apply_txn_insert_delta()</code> → <code>insert_rows_to_delta()</code>
+  and appends to <code>.apex.delta</code> directly (guarded: no constraints, no secondary
+  indexes, no FTS on the table).</li>
+<li>V3 files are rejected on open (<code>Unsupported legacy file format (V3)</code>), so the
+  non-V4 delta branch above is a legacy code path, not a supported on-disk
+  format.</li>
+</ul>
+<h2 id="engineering-guidelines">Engineering Guidelines<a class="headerlink" href="#engineering-guidelines" title="Permanent link">&para;</a></h2>
+<h3 id="1-always-use-database-facade-storageengine">1. Always Use Database Façade / StorageEngine<a class="headerlink" href="#1-always-use-database-facade-storageengine" title="Permanent link">&para;</a></h3>
+<p><strong>DO:</strong></p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="c1">// In bindings</span>
+</span><span id="__span-2-2"><a id="__codelineno-2-2" name="__codelineno-2-2" href="#__codelineno-2-2"></a><span class="k">crate</span><span class="p">::</span><span class="n">Database</span><span class="p">::</span><span class="n">write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">table_path</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">rows</span><span class="p">,</span><span class="w"> </span><span class="n">durability</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-2-3"><a id="__codelineno-2-3" name="__codelineno-2-3" href="#__codelineno-2-3"></a>
+</span><span id="__span-2-4"><a id="__codelineno-2-4" name="__codelineno-2-4" href="#__codelineno-2-4"></a><span class="c1">// Storage-only call sites (engine-internal code)</span>
+</span><span id="__span-2-5"><a id="__codelineno-2-5" name="__codelineno-2-5" href="#__codelineno-2-5"></a><span class="kd">let</span><span class="w"> </span><span class="n">engine</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">crate</span><span class="p">::</span><span class="n">storage</span><span class="p">::</span><span class="n">engine</span><span class="p">::</span><span class="n">engine</span><span class="p">();</span>
+</span><span id="__span-2-6"><a id="__codelineno-2-6" name="__codelineno-2-6" href="#__codelineno-2-6"></a><span class="n">engine</span><span class="p">.</span><span class="n">write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">table_path</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">rows</span><span class="p">,</span><span class="w"> </span><span class="n">durability</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+</span></code></pre></div>
+<p><strong>DON'T:</strong></p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-3-1"><a id="__codelineno-3-1" name="__codelineno-3-1" href="#__codelineno-3-1"></a><span class="c1">// Direct backend access - AVOID</span>
+</span><span id="__span-3-2"><a id="__codelineno-3-2" name="__codelineno-3-2" href="#__codelineno-3-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">backend</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="n">TableStorageBackend</span><span class="p">::</span><span class="n">open</span><span class="p">(</span><span class="o">&amp;</span><span class="n">table_path</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-3-3"><a id="__codelineno-3-3" name="__codelineno-3-3" href="#__codelineno-3-3"></a><span class="n">backend</span><span class="p">.</span><span class="n">insert_rows</span><span class="p">(</span><span class="o">&amp;</span><span class="n">rows</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-3-4"><a id="__codelineno-3-4" name="__codelineno-3-4" href="#__codelineno-3-4"></a><span class="n">backend</span><span class="p">.</span><span class="n">save</span><span class="p">()</span><span class="o">?</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="2-lock-ordering">2. Lock Ordering<a class="headerlink" href="#2-lock-ordering" title="Permanent link">&para;</a></h3>
+<p>Always acquire locks in this order to prevent deadlocks:</p>
+<ol>
+<li>File lock (<code>acquire_write_lock</code> / <code>acquire_read_lock</code>)</li>
+<li>StorageEngine operation</li>
+<li>Release file lock</li>
+<li>Invalidate local caches</li>
+</ol>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-4-1"><a id="__codelineno-4-1" name="__codelineno-4-1" href="#__codelineno-4-1"></a><span class="c1">// Correct pattern</span>
+</span><span id="__span-4-2"><a id="__codelineno-4-2" name="__codelineno-4-2" href="#__codelineno-4-2"></a><span class="kd">let</span><span class="w"> </span><span class="n">lock_file</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="bp">Self</span><span class="p">::</span><span class="n">acquire_write_lock</span><span class="p">(</span><span class="o">&amp;</span><span class="n">table_path</span><span class="p">)</span><span class="o">?</span><span class="p">;</span>
+</span><span id="__span-4-3"><a id="__codelineno-4-3" name="__codelineno-4-3" href="#__codelineno-4-3"></a><span class="kd">let</span><span class="w"> </span><span class="n">result</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="k">crate</span><span class="p">::</span><span class="n">Database</span><span class="p">::</span><span class="n">write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">table_path</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">rows</span><span class="p">,</span><span class="w"> </span><span class="n">durability</span><span class="p">);</span>
+</span><span id="__span-4-4"><a id="__codelineno-4-4" name="__codelineno-4-4" href="#__codelineno-4-4"></a><span class="bp">Self</span><span class="p">::</span><span class="n">release_lock</span><span class="p">(</span><span class="n">lock_file</span><span class="p">);</span>
+</span><span id="__span-4-5"><a id="__codelineno-4-5" name="__codelineno-4-5" href="#__codelineno-4-5"></a><span class="bp">self</span><span class="p">.</span><span class="n">invalidate_backend</span><span class="p">(</span><span class="o">&amp;</span><span class="n">table_name</span><span class="p">);</span>
+</span></code></pre></div>
+<h3 id="3-cache-invalidation">3. Cache Invalidation<a class="headerlink" href="#3-cache-invalidation" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>StorageEngine</code> invalidates its own backend/schema caches internally.</li>
+<li>The <code>Database</code> façade invalidates per-instance <code>cached_backends</code> and the
+  global engine cache after writes.</li>
+<li>Python bindings invalidate their <code>cached_backends</code> map after writes
+  (<code>invalidate_backend</code>).</li>
+<li>Do NOT reach into <code>ApexExecutor</code> caches from storage code — the executor
+  coordinates its own index/stats/FTS invalidation through <code>Database</code>.</li>
+</ul>
+<h3 id="4-error-handling">4. Error Handling<a class="headerlink" href="#4-error-handling" title="Permanent link">&para;</a></h3>
+<p>All StorageEngine methods return <code>io::Result&lt;T&gt;</code>. Convert to PyErr at the
+bindings layer:</p>
+<div class="language-rust highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="n">engine</span><span class="p">.</span><span class="n">write</span><span class="p">(</span><span class="o">&amp;</span><span class="n">table_path</span><span class="p">,</span><span class="w"> </span><span class="o">&amp;</span><span class="n">rows</span><span class="p">,</span><span class="w"> </span><span class="n">durability</span><span class="p">)</span>
+</span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="w">    </span><span class="p">.</span><span class="n">map_err</span><span class="p">(</span><span class="o">|</span><span class="n">e</span><span class="o">|</span><span class="w"> </span><span class="n">PyIOError</span><span class="p">::</span><span class="n">new_err</span><span class="p">(</span><span class="n">e</span><span class="p">.</span><span class="n">to_string</span><span class="p">()))</span><span class="o">?</span><span class="p">;</span>
+</span></code></pre></div>
+<h3 id="5-durability-levels">5. Durability Levels<a class="headerlink" href="#5-durability-levels" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Level</th>
+<th>fsync Behavior</th>
+<th>Use Case</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>Fast</code></td>
+<td>No fsync</td>
+<td>Development, testing</td>
+</tr>
+<tr>
+<td><code>Safe</code></td>
+<td>fsync on save/flush</td>
+<td>Production default</td>
+</tr>
+<tr>
+<td><code>Max</code></td>
+<td>fsync on every write</td>
+<td>Critical data</td>
+</tr>
+</tbody>
+</table>
+<p>The append-only WAL (<code>.apex.wal</code>, <code>storage/incremental.rs</code>) is a separate
+incremental-write mechanism and is not tied to the <code>Max</code> durability level.</p>
+<h2 id="file-format">File Format<a class="headerlink" href="#file-format" title="Permanent link">&para;</a></h2>
+<h3 id="v4-row-group-format-apex-default">V4 Row Group Format (.apex) — Default<a class="headerlink" href="#v4-row-group-format-apex-default" title="Permanent link">&para;</a></h3>
+<p>V4 is the current default save format; legacy V3 compatibility was dropped in
+v1.10.0 (2026-03-18). Data is split into adaptive-size Row Groups (default
+65,536 rows; 131,072 for very narrow rows, 32,768 for wide rows), each
+self-contained with IDs, deletion vector, and per-column data.</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-6-1"><a id="__codelineno-6-1" name="__codelineno-6-1" href="#__codelineno-6-1"></a>┌─────────────────────────────────────┐
+</span><span id="__span-6-2"><a id="__codelineno-6-2" name="__codelineno-6-2" href="#__codelineno-6-2"></a>│ Header (256 bytes)                   │
+</span><span id="__span-6-3"><a id="__codelineno-6-3" name="__codelineno-6-3" href="#__codelineno-6-3"></a>│ - Magic "APEXV3\0\0" (retained),     │
+</span><span id="__span-6-4"><a id="__codelineno-6-4" name="__codelineno-6-4" href="#__codelineno-6-4"></a>│   version=4, flags, row_count,       │
+</span><span id="__span-6-5"><a id="__codelineno-6-5" name="__codelineno-6-5" href="#__codelineno-6-5"></a>│   column_count, row_group_size,      │
+</span><span id="__span-6-6"><a id="__codelineno-6-6" name="__codelineno-6-6" href="#__codelineno-6-6"></a>│   schema_offset, column_index_offset,│
+</span><span id="__span-6-7"><a id="__codelineno-6-7" name="__codelineno-6-7" href="#__codelineno-6-7"></a>│   id_offset, checksum                │
+</span><span id="__span-6-8"><a id="__codelineno-6-8" name="__codelineno-6-8" href="#__codelineno-6-8"></a>├─────────────────────────────────────┤
+</span><span id="__span-6-9"><a id="__codelineno-6-9" name="__codelineno-6-9" href="#__codelineno-6-9"></a>│ Schema Block                         │
+</span><span id="__span-6-10"><a id="__codelineno-6-10" name="__codelineno-6-10" href="#__codelineno-6-10"></a>├─────────────────────────────────────┤
+</span><span id="__span-6-11"><a id="__codelineno-6-11" name="__codelineno-6-11" href="#__codelineno-6-11"></a>│ Column Index (32 bytes per column)   │
+</span><span id="__span-6-12"><a id="__codelineno-6-12" name="__codelineno-6-12" href="#__codelineno-6-12"></a>├─────────────────────────────────────┤
+</span><span id="__span-6-13"><a id="__codelineno-6-13" name="__codelineno-6-13" href="#__codelineno-6-13"></a>│ ID Column (contiguous u64 array)     │
+</span><span id="__span-6-14"><a id="__codelineno-6-14" name="__codelineno-6-14" href="#__codelineno-6-14"></a>├─────────────────────────────────────┤
+</span><span id="__span-6-15"><a id="__codelineno-6-15" name="__codelineno-6-15" href="#__codelineno-6-15"></a>│ Row Group 0                          │
+</span><span id="__span-6-16"><a id="__codelineno-6-16" name="__codelineno-6-16" href="#__codelineno-6-16"></a>│ ┌─────────────────────────────────┐ │
+</span><span id="__span-6-17"><a id="__codelineno-6-17" name="__codelineno-6-17" href="#__codelineno-6-17"></a>│ │ RG Header (32B): magic "APXG",  │ │
+</span><span id="__span-6-18"><a id="__codelineno-6-18" name="__codelineno-6-18" href="#__codelineno-6-18"></a>│ │ row_count, col_count, min_id,   │ │
+</span><span id="__span-6-19"><a id="__codelineno-6-19" name="__codelineno-6-19" href="#__codelineno-6-19"></a>│ │ max_id, flags (LZ4/ZSTD/NONE)   │ │
+</span><span id="__span-6-20"><a id="__codelineno-6-20" name="__codelineno-6-20" href="#__codelineno-6-20"></a>│ │ IDs (u64, contiguous-encoded)   │ │
+</span><span id="__span-6-21"><a id="__codelineno-6-21" name="__codelineno-6-21" href="#__codelineno-6-21"></a>│ │ Deletion vector (bitmap)        │ │
+</span><span id="__span-6-22"><a id="__codelineno-6-22" name="__codelineno-6-22" href="#__codelineno-6-22"></a>│ │ Col 0: null bitmap + data       │ │
+</span><span id="__span-6-23"><a id="__codelineno-6-23" name="__codelineno-6-23" href="#__codelineno-6-23"></a>│ │ Col 1: null bitmap + data       │ │
+</span><span id="__span-6-24"><a id="__codelineno-6-24" name="__codelineno-6-24" href="#__codelineno-6-24"></a>│ │ ...                             │ │
+</span><span id="__span-6-25"><a id="__codelineno-6-25" name="__codelineno-6-25" href="#__codelineno-6-25"></a>│ └─────────────────────────────────┘ │
+</span><span id="__span-6-26"><a id="__codelineno-6-26" name="__codelineno-6-26" href="#__codelineno-6-26"></a>├─────────────────────────────────────┤
+</span><span id="__span-6-27"><a id="__codelineno-6-27" name="__codelineno-6-27" href="#__codelineno-6-27"></a>│ Row Group 1 ...                      │
+</span><span id="__span-6-28"><a id="__codelineno-6-28" name="__codelineno-6-28" href="#__codelineno-6-28"></a>├─────────────────────────────────────┤
+</span><span id="__span-6-29"><a id="__codelineno-6-29" name="__codelineno-6-29" href="#__codelineno-6-29"></a>│ V4 Footer                            │
+</span><span id="__span-6-30"><a id="__codelineno-6-30" name="__codelineno-6-30" href="#__codelineno-6-30"></a>│ - Schema                            │
+</span><span id="__span-6-31"><a id="__codelineno-6-31" name="__codelineno-6-31" href="#__codelineno-6-31"></a>│ - Vec&lt;RowGroupMeta&gt; (40B each)      │
+</span><span id="__span-6-32"><a id="__codelineno-6-32" name="__codelineno-6-32" href="#__codelineno-6-32"></a>│ - Optional zone maps (ZMAP)         │
+</span><span id="__span-6-33"><a id="__codelineno-6-33" name="__codelineno-6-33" href="#__codelineno-6-33"></a>│ - Optional RCIX offsets (per-RG     │
+</span><span id="__span-6-34"><a id="__codelineno-6-34" name="__codelineno-6-34" href="#__codelineno-6-34"></a>│   per-column body offsets)          │
+</span><span id="__span-6-35"><a id="__codelineno-6-35" name="__codelineno-6-35" href="#__codelineno-6-35"></a>│ - footer_size + magic "APXFOOT\0"   │
+</span><span id="__span-6-36"><a id="__codelineno-6-36" name="__codelineno-6-36" href="#__codelineno-6-36"></a>└─────────────────────────────────────┘
+</span></code></pre></div>
+<p><strong>Key design decisions:</strong></p>
+<ul>
+<li>String columns are dict-encoded on disk for low-cardinality data (transparent
+  to the read path); in-memory state always uses plain <code>String</code>.</li>
+<li>Row groups can be LZ4- or ZSTD-compressed (flag bits in the RG header);
+  default is no compression for maximum read performance.</li>
+<li>Appends are chunked by <code>row_group_size</code>: a single large batch is split into
+  multiple Row Groups, so per-RG buffers and later streaming rewrites stay
+  bounded regardless of batch size.</li>
+<li>Zone maps (<code>ZMAP</code>, numeric min/max per RG) let scans skip row groups that
+  cannot match a filter; the RCIX section enables O(1) direct seeks for
+  cold-start <code>SELECT * LIMIT N</code>.</li>
+<li>A statistics sidecar <code>&lt;table&gt;.stats</code> (magic <code>APEXSTAT</code>) stores per-column
+  null counts / ranges / histograms for the query optimizer and is invalidated
+  with each DDL/DML/compaction generation.</li>
+<li><code>save_v4()</code> pre-filters deleted rows, writes clean data, sets in-memory state
+  directly (no disk reload), and appends new Row Groups for incremental writes.</li>
+<li>The Python <code>store()</code> / <code>store_columnar()</code> path builds Row Group columns
+  directly from borrowed Python buffers (<code>&amp;str</code> / <code>&amp;[u8]</code>, no per-element
+  <code>String</code>/<code>Vec</code> allocation) and passes them to
+  <code>StorageEngine::write_typed_columns</code>, which appends without re-copying into
+  a typed intermediate layer. Peak memory for a string-heavy batch drops from
+  ~2× the data to ~1× (the caller's input plus one column buffer).</li>
+<li>In-memory string/binary columns use u64 offsets; the on-disk format keeps u32
+  offsets per Row Group (blocks stay far below 4 GiB), so columns larger than
+  4 GiB never silently truncate in memory. The disk format is unchanged.</li>
+<li>V3 files are <strong>not</strong> auto-converted: opening one fails with
+  <code>Unsupported legacy file format (V3). Please re-create the table.</code></li>
+</ul>
+<h3 id="blob-sidecar-storage">Blob Sidecar Storage<a class="headerlink" href="#blob-sidecar-storage" title="Permanent link">&para;</a></h3>
+<p><code>Blob</code> columns follow a Lance-like layout. The main table stores only a
+descriptor, so scans that do not project the blob column avoid loading large
+payloads.</p>
+<ul>
+<li>Inline blobs up to 64KB are embedded directly in the descriptor.</li>
+<li>Packed blobs from 64KB to 4MB are appended to <code>&lt;table&gt;.blobs/packed.blob</code>.</li>
+<li>Dedicated blobs larger than 4MB are written as separate files under
+  <code>&lt;table&gt;.blobs/objects/</code>.</li>
+<li>Descriptors include length and checksum metadata. Point reads can fetch
+  descriptor metadata, full bytes, or byte ranges without forcing unrelated
+  columns to load.</li>
+<li>Projected blob reads return Arrow <code>LargeBinary</code>; scans that omit blob columns
+  keep using descriptor-only column data.</li>
+</ul>
+<h3 id="delta-file-apexdelta">Delta File (.apex.delta)<a class="headerlink" href="#delta-file-apexdelta" title="Permanent link">&para;</a></h3>
+<p><code>.apex.delta</code> persists the DeltaStore: an update log (<code>(row, col, new_value)</code>)
+plus a delete bitmap, serialized with bincode. It is used for:</p>
+<ul>
+<li>pending deletes and row updates applied on top of the base V4 file;</li>
+<li>SQL transactional INSERT batches appended via <code>insert_rows_to_delta()</code>;</li>
+<li>legacy non-V4 delta appends.</li>
+</ul>
+<h3 id="compaction">Compaction<a class="headerlink" href="#compaction" title="Permanent link">&para;</a></h3>
+<p>Delta files are compacted into the base file when:</p>
+<ul>
+<li>Delta size &gt; 10MB (<code>DELTA_COMPACT_SIZE</code>)</li>
+<li>Delta rows &gt; 100,000 (<code>DELTA_COMPACT_ROWS</code>)</li>
+<li>Before opening a write backend when a delta exists (<code>open_for_compact</code>)</li>
+</ul>
+<p>Compaction merges delta into the V4 base file and clears the delta store.
+For mmap-only V4 backends (the production path) this is a <strong>streaming
+RG-by-RG rewrite</strong> (<code>compact_streaming_v4</code>): each Row Group is parsed from the
+mmap, merged with the DeltaStore updates/deletes and the appended delta rows,
+and written to a fresh <code>.apex.tmp</code> before an atomic rename. Peak memory is
+O(largest Row Group + delta payloads), so tables larger than physical memory
+can be compacted. The legacy in-memory merge path remains for backends that
+already materialized the base.</p>
+<h2 id="schema-changes-bounded-memory">Schema Changes (bounded memory)<a class="headerlink" href="#schema-changes-bounded-memory" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>ADD COLUMN</strong> on mmap-only V4 tables is footer-only: only the footer schema
+  is updated, no data is rewritten. Read paths synthesize all-NULL values for
+  rows already on disk; later compactions materialize the column.</li>
+<li><strong>DROP COLUMN</strong> runs a streaming RG-by-RG rewrite
+  (<code>rewrite_v4_drop_columns</code>) that physically removes the column without
+  loading the table. Any pending delta is compacted first.</li>
+<li><strong>RENAME COLUMN</strong> updates the footer schema in place.</li>
+</ul>
+<h2 id="deletes-bounded-memory">Deletes (bounded memory)<a class="headerlink" href="#deletes-bounded-memory" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Uncompressed Row Groups: deletion vectors are updated in place (O(row groups)
+  writes) via <code>save_delete_only</code>.</li>
+<li>Compressed Row Groups (deletion vectors live inside the compressed body): the
+  delete triggers a streaming rewrite (<code>rewrite_v4_active_rows</code>) that drops the
+  deleted rows RG-by-RG via mmap instead of loading the whole table.</li>
+</ul>
+<h2 id="table-catalog-apex_tables">Table Catalog (<code>.apex_tables</code>)<a class="headerlink" href="#table-catalog-apex_tables" title="Permanent link">&para;</a></h2>
+<p>Since v1.28.0, each database directory owns a memory-mapped binary table
+registry, <code>.apex_tables</code>, that is the authoritative source of table names
+across processes. It replaces the earlier behavior where <code>create_table</code> on an
+existing table could silently rebuild it: a fresh process calling
+<code>create_table</code> on an existing table now raises <code>Table already exists</code>.</p>
+<ul>
+<li><strong>Layout</strong>: 32-byte header with magic <code>APXTBL02</code> and format version 2,
+  followed by fixed-size slots (name length + 128-byte name + CRC32), default
+  capacity 1024.</li>
+<li><strong>Concurrency</strong>: all mutations run under an exclusive advisory lock
+  (<code>.apex_tables.lock</code>) and update the mapped region in place, so CREATE/DROP
+  no longer pay a full file rewrite per DDL.</li>
+<li><strong>Integrity</strong>: each slot carries its own CRC32, so accidental corruption or
+  manual edits are detected and rejected.</li>
+<li><strong>Readers</strong>: take an optimistic generation snapshot, verify CRCs, and retry
+  if the generation changed. A snapshot cache keyed by generation plus file
+  mtime guards against external rewrites.</li>
+<li><strong>Migration</strong>: legacy databases without a catalog, or with the earlier
+  one-shot binary/JSON formats, are backfilled/migrated on first access.</li>
+</ul>
+<p>Lazy schema information is kept in a second memory-mapped registry,
+<code>.apex_schemas</code> (magic <code>APXSCM01</code>, version 1, 256 KiB region), used by the
+on-demand storage layer to avoid parsing full <code>.apex</code> headers for schema-only
+reads.</p>
+<h2 id="concurrency-and-mvcc">Concurrency and MVCC<a class="headerlink" href="#concurrency-and-mvcc" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Epochs</strong>: every cache entry records the table epoch at insertion time;
+  readers re-check <code>epoch + mtime</code> before trusting a cached backend. All
+  storage mutations take a <code>logical_write</code> epoch guard.</li>
+<li><strong>MVCC</strong>: transaction reads use <code>Snapshot</code> / <code>SnapshotManager</code>; row versions
+  live in a <code>VersionStore</code> and are reclaimed by the <code>GarbageCollector</code>.</li>
+<li><strong>Locks</strong>: table file locks (advisory) serialize write paths; the catalog
+  uses its own <code>.apex_tables.lock</code>; writes are serialized per table while V4
+  mmap-only reads run in parallel.</li>
+</ul>
+<h2 id="adding-new-operations">Adding New Operations<a class="headerlink" href="#adding-new-operations" title="Permanent link">&para;</a></h2>
+<p>When adding a new storage operation:</p>
+<ol>
+<li><strong>Add the method to <code>StorageEngine</code></strong> (<code>engine.rs</code>)</li>
+<li>Handle cache invalidation</li>
+<li>Use appropriate backend method</li>
+<li>
+<p>Return <code>io::Result&lt;T&gt;</code></p>
+</li>
+<li>
+<p><strong>Expose it through the <code>Database</code> façade</strong> (<code>database.rs</code>) if bindings or
+   embedded callers need it; keep SQL-facing behavior in <code>ApexExecutor</code>.</p>
+</li>
+<li>
+<p><strong>Update the bindings</strong> (<code>python/bindings/</code>) to use the new façade method</p>
+</li>
+<li>Acquire file lock</li>
+<li>Call the façade/engine method</li>
+<li>Release lock</li>
+<li>
+<p>Invalidate local <code>cached_backends</code></p>
+</li>
+<li>
+<p><strong>Write tests</strong> covering:</p>
+</li>
+<li>Normal operation</li>
+<li>Edge cases (empty data, non-existent table)</li>
+<li>
+<p>Concurrent access</p>
+</li>
+<li>
+<p><strong>Update this document</strong> if the operation changes the data flow</p>
+</li>
+</ol>
+<h2 id="testing">Testing<a class="headerlink" href="#testing" title="Permanent link">&para;</a></h2>
+<p>Run all tests to verify storage operations:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-7-1"><a id="__codelineno-7-1" name="__codelineno-7-1" href="#__codelineno-7-1"></a>maturin<span class="w"> </span>develop<span class="w"> </span>--release
+</span><span id="__span-7-2"><a id="__codelineno-7-2" name="__codelineno-7-2" href="#__codelineno-7-2"></a>pytest
+</span><span id="__span-7-3"><a id="__codelineno-7-3" name="__codelineno-7-3" href="#__codelineno-7-3"></a>cargo<span class="w"> </span><span class="nb">test</span>
+</span></code></pre></div>
+<p>All Python and Rust tests must pass; see <code>ENGINEERING_GUIDELINES.md</code> for the
+full validation sequence.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.instant.progress", "navigation.top", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "toc.integrate", "search.suggest", "search.highlight", "search.share", "content.code.copy", "content.code.select", "content.code.annotate", "content.tabs.link"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"current": "1.33.0", "default": "latest", "label": "v1.33.0", "provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
