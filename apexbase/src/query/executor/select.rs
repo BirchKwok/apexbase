@@ -1562,22 +1562,10 @@ impl ApexExecutor {
                 .next()
                 .unwrap_or(column.trim_matches('"'));
             let count = if Self::column_is_string(backend, clean) {
-                let Some((dictionary, has_nulls, max_group_id)) =
-                    crate::storage::backend::get_global_dict_cache_with_nulls(
-                        backend.path(),
-                        clean,
-                        &backend.storage,
-                    )?
-                else {
+                let Some(count) = backend.cached_string_distinct_count(clean)? else {
                     return Ok(None);
                 };
-                if has_nulls
-                    || max_group_id.is_some_and(|id| id as usize >= dictionary.0.len())
-                    || dictionary.1.len() != backend.active_row_count() as usize
-                {
-                    return Ok(None);
-                }
-                dictionary.0.len() as i64
+                count
             } else {
                 let Some(count) = backend.execute_numeric_distinct_count_mmap(clean)? else {
                     return Ok(None);
@@ -3431,19 +3419,30 @@ impl ApexExecutor {
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.has_delta() {
-            return Ok(None);
+        // Reject unrelated query shapes before touching backend state. This
+        // candidate is also probed for no-WHERE GROUP BY queries, including
+        // the cached CASE aggregate path, where even extra hot-path checks are
+        // measurable and the scan pipeline cannot apply.
+        let where_clause = match &stmt.where_clause {
+            Some(where_clause) => where_clause,
+            None => return Ok(None),
+        };
+
+        // The legacy fused kernel does not receive a HAVING expression. Never
+        // let it accept HAVING and silently filter on the wrong side of TopK;
+        // the normalized scan pipeline below owns that complete semantic path.
+        if backend.has_pending_deltas() || backend.has_delta() || stmt.having.is_some() {
+            // Delta-aware and HAVING queries use the normalized scan/operator
+            // pipeline. Keeping this fallback behind the existing fused-path
+            // dispatch leaves unrelated WHERE hot paths byte-for-byte free of
+            // an additional candidate branch.
+            return Self::try_scan_group_pipeline(backend, stmt);
         }
 
         use crate::query::sql_parser::BinaryOperator;
         use crate::query::AggregateFunc;
 
         // Check pattern: must have WHERE, GROUP BY, ORDER BY, and LIMIT
-        let where_clause = match &stmt.where_clause {
-            Some(w) => w,
-            None => return Ok(None),
-        };
-
         if stmt.group_by.is_empty() || stmt.order_by.is_empty() || stmt.limit.is_none() {
             return Ok(None);
         }
@@ -3520,21 +3519,6 @@ impl ApexExecutor {
             AggregateFunc::Sum | AggregateFunc::Count | AggregateFunc::Avg
         ) {
             return Ok(None);
-        }
-
-        // Check HAVING clause - must be simple
-        if let Some(having) = &stmt.having {
-            match having {
-                SqlExpr::BinaryOp {
-                    left,
-                    op: BinaryOperator::Gt,
-                    right,
-                } => match (left.as_ref(), right.as_ref()) {
-                    (SqlExpr::Column(_col), SqlExpr::Literal(Value::Int64(_val))) => {}
-                    _ => return Ok(None),
-                },
-                _ => return Ok(None),
-            }
         }
 
         let limit = stmt.limit.unwrap_or(100);
@@ -3646,6 +3630,200 @@ impl ApexExecutor {
                 Ok(Some(ApexResult::Data(result)))
             }
         }
+    }
+
+    /// Translate a conjunction of simple SQL predicates into the storage scan
+    /// protocol. This translation is deliberately shape-independent: GROUP BY,
+    /// HAVING, ordering, and aggregate choices are handled by physical
+    /// operators after the scan has produced a selection vector.
+    fn collect_scan_predicates(
+        expr: &SqlExpr,
+        predicates: &mut Vec<crate::storage::ScanPredicate>,
+    ) -> bool {
+        use crate::query::sql_parser::BinaryOperator;
+        use crate::storage::{ScanBound, ScanPredicate};
+
+        fn clean(column: &str) -> String {
+            column
+                .trim_matches('"')
+                .rsplit('.')
+                .next()
+                .unwrap_or(column)
+                .trim_matches('"')
+                .to_string()
+        }
+
+        fn numeric(value: &SqlExpr) -> Option<f64> {
+            match value {
+                SqlExpr::Literal(value) => {
+                    // The scan protocol stores numeric bounds as f64 for the
+                    // mmap candidate scan. Reject integer literals that would
+                    // round-trip differently through f64; the general SQL
+                    // evaluator retains their exact Int64/UInt64 semantics.
+                    match value {
+                        Value::Int64(value) if (*value as f64) as i64 != *value => None,
+                        Value::UInt64(value) if (*value as f64) as u64 != *value => None,
+                        _ => value.as_f64(),
+                    }
+                }
+                _ => None,
+            }
+        }
+
+        fn range(
+            column: &str,
+            operator: &BinaryOperator,
+            value: f64,
+        ) -> Option<ScanPredicate> {
+            let (lower, upper) = match operator {
+                BinaryOperator::Eq => (
+                    Some(ScanBound::inclusive(value)),
+                    Some(ScanBound::inclusive(value)),
+                ),
+                BinaryOperator::Gt => (Some(ScanBound::exclusive(value)), None),
+                BinaryOperator::Ge => (Some(ScanBound::inclusive(value)), None),
+                BinaryOperator::Lt => (None, Some(ScanBound::exclusive(value))),
+                BinaryOperator::Le => (None, Some(ScanBound::inclusive(value))),
+                _ => return None,
+            };
+            Some(ScanPredicate::NumericRange {
+                column: clean(column),
+                lower,
+                upper,
+            })
+        }
+
+        fn reversed(operator: &BinaryOperator) -> Option<BinaryOperator> {
+            Some(match operator {
+                BinaryOperator::Eq => BinaryOperator::Eq,
+                BinaryOperator::Gt => BinaryOperator::Lt,
+                BinaryOperator::Ge => BinaryOperator::Le,
+                BinaryOperator::Lt => BinaryOperator::Gt,
+                BinaryOperator::Le => BinaryOperator::Ge,
+                _ => return None,
+            })
+        }
+
+        match expr {
+            SqlExpr::Paren(inner) => Self::collect_scan_predicates(inner, predicates),
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                Self::collect_scan_predicates(left, predicates)
+                    && Self::collect_scan_predicates(right, predicates)
+            }
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated: false,
+            } => {
+                let (Some(low), Some(high)) = (numeric(low), numeric(high)) else {
+                    return false;
+                };
+                predicates.push(ScanPredicate::NumericRange {
+                    column: clean(column),
+                    lower: Some(ScanBound::inclusive(low)),
+                    upper: Some(ScanBound::inclusive(high)),
+                });
+                true
+            }
+            SqlExpr::BinaryOp { left, op, right } => {
+                match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(column), SqlExpr::Literal(Value::String(value)))
+                        if *op == BinaryOperator::Eq =>
+                    {
+                        predicates.push(ScanPredicate::StringEq {
+                            column: clean(column),
+                            value: value.clone(),
+                        });
+                        true
+                    }
+                    (SqlExpr::Literal(Value::String(value)), SqlExpr::Column(column))
+                        if *op == BinaryOperator::Eq =>
+                    {
+                        predicates.push(ScanPredicate::StringEq {
+                            column: clean(column),
+                            value: value.clone(),
+                        });
+                        true
+                    }
+                    (SqlExpr::Column(column), literal) => {
+                        let Some(value) = numeric(literal) else {
+                            return false;
+                        };
+                        let Some(predicate) = range(column, op, value) else {
+                            return false;
+                        };
+                        predicates.push(predicate);
+                        true
+                    }
+                    (literal, SqlExpr::Column(column)) => {
+                        let (Some(value), Some(operator)) = (numeric(literal), reversed(op)) else {
+                            return false;
+                        };
+                        let Some(predicate) = range(column, &operator, value) else {
+                            return false;
+                        };
+                        predicates.push(predicate);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// First vertical physical pipeline over the shared scan protocol:
+    /// Filter -> GROUP BY -> HAVING -> ordered TopK. The storage lane decides
+    /// between selective mmap materialization and a delta-aware merged scan;
+    /// every downstream operator sees the same filtered RecordBatch contract.
+    fn try_scan_group_pipeline(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        if stmt.where_clause.is_none()
+            || stmt.group_by.is_empty()
+            || !stmt.joins.is_empty()
+            || stmt.distinct
+            || stmt.distinct_on.is_some()
+            || stmt.group_by_exprs.iter().any(Option::is_some)
+        {
+            return Ok(None);
+        }
+
+        let mut predicates = Vec::new();
+        if !Self::collect_scan_predicates(stmt.where_clause.as_ref().unwrap(), &mut predicates)
+            || predicates.is_empty()
+        {
+            return Ok(None);
+        }
+
+        let Some(columns) = Self::get_col_refs(stmt) else {
+            return Ok(None);
+        };
+        let column_refs = columns.iter().map(String::as_str).collect::<Vec<_>>();
+        let Some(projection) = Self::filter_columns_for_backend(backend, &column_refs) else {
+            return Ok(None);
+        };
+        let request = crate::storage::ScanRequest {
+            projection: Some(&projection),
+            predicates: &predicates,
+        };
+        let Some(morsel) = backend.scan(&request)? else {
+            return Ok(None);
+        };
+        let filtered = morsel.into_record_batch()?;
+
+        // The scan protocol consumed the complete WHERE conjunction. Removing
+        // it prevents the generic executor from evaluating the mask twice;
+        // HAVING remains attached and is applied after aggregation, before TopK.
+        let mut physical_stmt = stmt.clone();
+        physical_stmt.where_clause = None;
+        Self::execute_group_by(&filtered, &physical_stmt).map(Some)
     }
 
     /// Apply a low-cost dictionary transform (currently SQL SUBSTR) once per

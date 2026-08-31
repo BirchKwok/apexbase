@@ -1186,17 +1186,13 @@ class ApexClient:
                 or getattr(self, '_in_txn', False)
                 or getattr(self, '_fast_txn_active', False)):
             return None
-        try:
-            if self._storage.has_pending_overlay_writes():
-                return None
-        except (AttributeError, RuntimeError):
-            return None
 
         dependencies = self._query_result_dependencies.get(sql)
         if dependencies is None:
             file_paths = tuple(
-                Path(raw_path).expanduser().resolve()
+                (path, str(path))
                 for raw_path in _RE_QUOTED_DATA_FILE.findall(sql)
+                for path in (Path(raw_path).expanduser().resolve(),)
             )
             table_refs = tuple(
                 name.rsplit('.', 1)[-1].lower()
@@ -1214,9 +1210,9 @@ class ApexClient:
         file_paths, table_refs = dependencies
         file_tokens = []
         try:
-            for path in file_paths:
+            for path, path_text in file_paths:
                 stat = path.stat()
-                file_tokens.append((str(path), stat.st_size, stat.st_mtime_ns))
+                file_tokens.append((path_text, stat.st_size, stat.st_mtime_ns))
 
             table_tokens = []
             current_table = (self._current_table or '').lower()
@@ -1226,12 +1222,19 @@ class ApexClient:
             if self._in_memory and table_refs:
                 # An in-memory database cannot be shared by another client;
                 # every mutating API clears this client's result cache.
+                if self._storage.has_pending_overlay_writes():
+                    return None
                 table_tokens.append(("__memory__", self._current_database))
             elif current_only:
-                table_tokens.append(("__epoch__", self._storage._table_epoch()))
+                epoch = self._storage._stable_table_epoch()
+                if epoch is None:
+                    return None
+                table_tokens.append(("__epoch__", epoch))
             elif table_refs and not self._in_memory and self._dirpath.is_dir():
                 # A directory-wide token also covers joins, CTEs and subqueries
                 # that read a table other than the currently selected one.
+                if self._storage.has_pending_overlay_writes():
+                    return None
                 for path in sorted(self._dirpath.glob('*.apex')):
                     stat = path.stat()
                     table_tokens.append((path.name, stat.st_size, stat.st_mtime_ns))

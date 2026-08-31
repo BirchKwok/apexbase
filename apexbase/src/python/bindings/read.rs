@@ -10,6 +10,40 @@ impl ApexStorageImpl {
         Ok(crate::storage::epoch::current(&table_path))
     }
 
+    /// Return the current table epoch only when this client has no buffered
+    /// write state that could make a cached analytical result incomplete.
+    /// Combining both checks keeps the Python result-cache hit path to one FFI
+    /// call while retaining the same visibility contract.
+    fn _stable_table_epoch(&self, py: Python<'_>) -> PyResult<Option<u64>> {
+        let table_name = self.current_table.read().clone();
+        if table_name.is_empty() {
+            return Ok(None);
+        }
+
+        let table_path = self.get_current_table_path()?;
+        let mut backends: Vec<Arc<TableStorageBackend>> = Vec::new();
+        for cache_key in [
+            Self::backend_cache_key(&table_path, &table_name),
+            Self::insert_backend_cache_key(&table_path, &table_name),
+        ] {
+            if let Some(entry) = self.cached_backends.get(&cache_key) {
+                let backend = entry;
+                if !backends.iter().any(|cached| Arc::ptr_eq(cached, &backend)) {
+                    backends.push(backend);
+                }
+            }
+        }
+
+        let has_pending = py.allow_threads(|| {
+            backends.iter().any(|backend| {
+                backend.is_dirty()
+                    || backend.has_pending_deltas()
+                    || backend.pending_v4_in_memory_rows() > 0
+            })
+        });
+        Ok((!has_pending).then(|| crate::storage::epoch::current(&table_path)))
+    }
+
     fn row_count(&self, py: Python<'_>) -> PyResult<u64> {
         let table_path = self.get_current_table_path()?;
         // If file doesn't exist (e.g., after drop_if_exists), return 0

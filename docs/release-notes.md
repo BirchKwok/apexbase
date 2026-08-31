@@ -3,6 +3,75 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.33.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.33.0)
+*2026-09-01*
+
+[Compare with v1.32.0](https://github.com/BirchKwok/ApexBase/compare/v1.32.0...v1.33.0)
+
+### Highlights
+
+v1.33.0 establishes a shared physical scan boundary between SQL execution and
+storage. Instead of adding another query-shaped fast path for each benchmark,
+the executor can now compose projection, predicate selection, grouping,
+`HAVING`, ordering, and TopK over one storage contract. The first vertical
+slice covers filtered grouped analytics on both persisted base data and
+write-after-load delta state.
+
+### Scan And Physical Execution
+
+- Introduce `ScanRequest`, `ScanPredicate`, `ScanBound`, immutable Arrow-backed `ColumnView`, `SelectionVector`, and `Morsel` in a SQL-independent storage module
+- Resolve predicate columns and Arrow types once per morsel, then evaluate supported numeric ranges and string equality in one conjunctive pass
+- Preserve NULL behavior and support Int64, Float64, UTF-8, Large UTF-8, and UInt32-keyed dictionary strings in the shared selection evaluator
+- Materialize selected rows only at the operator boundary; an all-row selection keeps the original Arrow arrays without an unnecessary `take`
+- Carry physical row offset and row count in each morsel so future parallel scan scheduling can reuse the protocol without changing operator inputs
+
+### Base And Delta Lane Planning
+
+- Route base-only V4 tables through a selective mmap lane that prefers string equality, otherwise choosing the lowest zone-map-estimated numeric range instead of depending on SQL predicate order
+- Gather projected rows when the selected set is at most 75% of the table; use a full projected read for dense selections to avoid expensive random materialization
+- Reapply the complete predicate conjunction after candidate selection so a candidate access path never replaces residual SQL semantics
+- Route delta files, pending deltas, pending V4 rows, and in-memory overlay state through the authoritative merged read before applying the same morsel/selection contract
+
+### Filtered Grouped Pipeline
+
+- Add the first complete vertical physical pipeline for conjunctive `WHERE -> GROUP BY -> HAVING -> ordered TopK -> LIMIT/OFFSET`
+- Keep `HAVING` attached until after aggregation and before TopK, fixing the architectural ambiguity of legacy fused paths that did not own the complete semantic sequence
+- Translate parentheses, `AND`, `BETWEEN`, string equality, numeric equality, and numeric `<`, `<=`, `>`, `>=`, including reversed literal/column forms
+- Project only columns required by filters, grouping, aggregates, `HAVING`, and ordering before entering the shared scan path
+- Retain the general SQL evaluator for joins, distinct/grouping expressions, OR trees, unsupported Arrow types, and other shapes outside this first protocol slice
+
+### Correctness And Compatibility
+
+- Preserve exact Int64/UInt64 comparison behavior by rejecting numeric bounds that cannot round-trip through the scan protocol's `f64` representation
+- Preserve strict versus inclusive bound semantics, NULL exclusion, qualified/quoted column cleanup, delta visibility, and deterministic `HAVING`/TopK ordering
+- Keep the public SQL and Python APIs unchanged; existing `.apex` V4 files remain compatible and no storage-format migration is required
+- Keep unsupported queries on the existing general path rather than weakening semantics or returning approximate results
+
+### Cache And Fixed-Cost Improvements
+
+- Cache exact string cardinality summaries inside the epoch-checked `TableStorageBackend`, avoiding repeated filesystem metadata and global dictionary validation for warm `COUNT(DISTINCT string_column)` queries
+- Clear cardinality summaries through the normal read-cache invalidation path after local mutations; externally changed tables receive a newly validated backend
+- Skip table-overlay inspection for external-file-only analytical result-cache hits, which remain guarded by resolved path, file size, and nanosecond mtime
+- Combine the clean-overlay check and current-table epoch lookup into one Rust/Python boundary call for cached table analytics while retaining cross-client write visibility
+
+### Tests, Benchmarks, And Documentation
+
+- Add Rust unit coverage for strict/inclusive numeric bounds, NULL handling, dictionary-string predicates, and base/delta `HAVING`-before-TopK behavior
+- Add Python end-to-end coverage with the result cache disabled, rotating bound parameters, committed delta inserts/updates, wide-integer fallback, and stable cache-generation tokens
+- Extend the same-machine canary with `Uncached delta Filter+GROUP+HAVING+TopK`, a parameter-rotating write-after-load metric that exercises the complete new path
+- Document the protocol, lane selection, extension rules, fallback boundaries, cache visibility rules, and future parallel-morsel direction in the new Scan & Physical Execution architecture guide
+- Update the Rust crate and Python package version metadata to 1.33.0
+
+### Upgrade Notes
+
+- No public API migration is required
+- No `.apex` file-format migration is required
+- Applications relying on exact wide-integer predicates keep the same results; such predicates intentionally use the general evaluator when the shared scan bound cannot represent them exactly
+- Contributors extending scan predicates or operators should follow the protocol and fallback rules in `docs/SCAN_EXECUTION_ARCHITECTURE.md` and add corresponding base/current performance coverage
+
+---
+
+
 ## [v1.32.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.32.0)
 *2026-08-29*
 

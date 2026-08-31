@@ -18,7 +18,7 @@
 
 | What you need | What ApexBase gives you |
 | --- | --- |
-| **Fast local analytics** | Columnar storage, vectorized execution, SQL aggregations, joins, CTEs, windows, and indexes |
+| **Fast local analytics** | Columnar storage, shared scan/selection operators, vectorized execution, SQL aggregations, joins, CTEs, windows, and indexes |
 | **Low-friction Python workflows** | `ApexClient`, `apexbase.execute`, Pandas / Polars / PyArrow conversion, file table functions, and local or in-memory storage |
 | **One engine for mixed workloads** | HTAP design: fast writes, point lookups, analytical scans, transactions, and MVCC |
 | **Search built in** | Full-text search, vector TopK, Float16/BFloat16/Int8/UInt8/1Bit/TurboQuant storage, and exact reranking from a retained source vector |
@@ -128,6 +128,12 @@ and **1,000,000 vectors x 128 dimensions** on Apple arm64 with Python 3.12.
 | **Reproducibility** | Fixed data sizes, 2 warmups, 5 timed iterations, dependency metadata, and a retained JSON report |
 
 Benchmarks are workload-sensitive. The default benchmark command tracks this public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/apexbase/latest/performance/).
+
+Starting with 1.33, filtered grouped queries can use a shared physical scan
+protocol across persisted base data and delta/overlay state. The protocol
+keeps predicate selection, grouping, `HAVING`, and ordered TopK as composable
+operators with a generic fallback for unsupported or inexact predicate forms.
+See [Scan & Physical Execution](https://birchkwok.github.io/apexbase/latest/SCAN_EXECUTION_ARCHITECTURE/).
 
 ## Documentation
 

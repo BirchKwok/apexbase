@@ -2268,6 +2268,9 @@ class ApexBaseBench:
         self._txn_counter = 0
         self._txn_backlog_ready = False
         self._batch_update_queries = None
+        self._uncached_scan_client = None
+        self._scan_pipeline_query_index = 0
+        self._scan_pipeline_ready = False
 
     def _query_all(self, sql):
         return self.client.execute(sql, show_internal_id=True).to_dict()
@@ -2310,6 +2313,11 @@ class ApexBaseBench:
         self._txn_backlog_ready = False
         self._temp_csv_name = None
         self._temp_json_name = None
+        self._scan_pipeline_query_index = 0
+        self._scan_pipeline_ready = False
+        if self._uncached_scan_client:
+            self._uncached_scan_client.close()
+            self._uncached_scan_client = None
 
     def cold_start_setup(self):
         """Close and reopen client — clears all Python/Rust-side caches (arrow_batch_cache etc.)."""
@@ -2398,6 +2406,54 @@ class ApexBaseBench:
         return self._query_all(
             "SELECT category, COUNT(*) as cnt, AVG(score) FROM default GROUP BY category HAVING cnt > 1000"
         )
+
+    def setup_uncached_delta_scan_pipeline(self):
+        """Create a write-after-load overlay and a result-cache-free reader."""
+        if self._scan_pipeline_ready:
+            return
+        self.client.flush()
+        source = os.path.join(self.db_dir, "default.apex")
+        target = os.path.join(self.db_dir, "__perf_scan_pipeline.apex")
+        self.client.create_table("__perf_scan_pipeline")
+        shutil.copy2(source, target)
+        self.client.use_table("default")
+        if self._uncached_scan_client:
+            self._uncached_scan_client.close()
+        self._uncached_scan_client = ApexClient(self.db_dir, enable_cache=False)
+        self._uncached_scan_client.use_table("__perf_scan_pipeline")
+        self._uncached_scan_client.execute("BEGIN")
+        try:
+            self._uncached_scan_client.execute(
+                "INSERT INTO __perf_scan_pipeline (name, age, score, city, category) "
+                "VALUES ('scan_pipeline_delta', 33, 91.5, 'Shanghai', 'Books')"
+            )
+            self._uncached_scan_client.execute("COMMIT")
+        except Exception:
+            self._uncached_scan_client.execute("ROLLBACK")
+            raise
+        self._scan_pipeline_query_index = 0
+        self._scan_pipeline_ready = True
+
+    def bench_uncached_delta_scan_group_having_topk(self):
+        """Rotate bounds while measuring Filter -> GROUP -> HAVING -> TopK."""
+        if not self._scan_pipeline_ready:
+            raise RuntimeError("setup_uncached_delta_scan_pipeline must run first")
+        parameter_sets = (
+            (20, 35, 20.0, 0),
+            (25, 40, 30.0, 100),
+            (30, 50, 40.0, 250),
+            (35, 60, 50.0, 500),
+        )
+        params = parameter_sets[self._scan_pipeline_query_index % len(parameter_sets)]
+        self._scan_pipeline_query_index += 1
+        return self._uncached_scan_client.execute(
+            "SELECT city, COUNT(*) AS n, AVG(score) AS av, MAX(age) AS mx "
+            "FROM __perf_scan_pipeline WHERE age > ? AND age <= ? AND score >= ? "
+            "GROUP BY city HAVING COUNT(*) > ? "
+            "ORDER BY n DESC, city LIMIT 5",
+            params=params,
+            show_internal_id=True,
+        ).to_dict()
 
     def setup_view_bench(self):
         try:
@@ -3317,6 +3373,9 @@ class ApexBaseBench:
         )
 
     def close(self):
+        if self._uncached_scan_client:
+            self._uncached_scan_client.close()
+            self._uncached_scan_client = None
         if self.client:
             self.client.close()
 

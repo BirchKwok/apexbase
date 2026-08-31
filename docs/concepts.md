@@ -76,6 +76,18 @@ client.create_table("orders", schema={
 })
 ```
 
+## Query Execution And Visibility
+
+SQL semantics do not depend on whether rows live in the persisted base file or
+in delta/overlay state. Supported conjunctive filters can be translated into a
+shared physical scan request; the backend either uses selective mmap access or
+an authoritative merged read, then applies grouping, `HAVING`, ordering, and
+limits in SQL order. Unsupported or inexact predicate forms fall back to the
+general evaluator rather than returning approximate results.
+
+For implementation details, see
+[Scan & Physical Execution](SCAN_EXECUTION_ARCHITECTURE.md).
+
 ## Records And Columns
 
 ApexBase accepts row-oriented dictionaries, lists of dictionaries, and columnar dictionaries. For bulk ingest, columnar data is usually the fastest path.

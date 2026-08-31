@@ -862,6 +862,10 @@ pub struct TableStorageBackend {
     /// Cached string dictionary indices for GROUP BY acceleration
     /// col_name -> (dict_strings, group_ids)
     dict_cache: RwLock<HashMap<String, (Vec<String>, Vec<u16>)>>,
+    /// Validated scalar cardinalities for immutable string columns.
+    /// The owning backend has already passed table mtime/epoch validation, so
+    /// repeated COUNT(DISTINCT) queries avoid another filesystem metadata read.
+    string_distinct_count_cache: RwLock<HashMap<String, i64>>,
     /// High-cardinality string equality accelerator for `WHERE col = 'x' LIMIT 1`.
     /// Stores the first active row id for each distinct string value.
     first_string_row_id_cache: RwLock<HashMap<String, Arc<FirstStringRowIdCache>>>,
@@ -896,6 +900,7 @@ impl TableStorageBackend {
             row_count: RwLock::new(row_count),
             dirty: RwLock::new(false),
             dict_cache: RwLock::new(HashMap::new()),
+            string_distinct_count_cache: RwLock::new(HashMap::new()),
             first_string_row_id_cache: RwLock::new(HashMap::new()),
         }
     }
@@ -936,6 +941,7 @@ impl TableStorageBackend {
             row_count: RwLock::new(0),
             dirty: RwLock::new(false),
             dict_cache: RwLock::new(HashMap::new()),
+            string_distinct_count_cache: RwLock::new(HashMap::new()),
             first_string_row_id_cache: RwLock::new(HashMap::new()),
         })
     }
@@ -1142,6 +1148,107 @@ impl TableStorageBackend {
         }
     }
 
+    /// Execute one storage-level scan request and return an operator morsel.
+    ///
+    /// Persisted V4 data first uses one selective mmap predicate to reduce the
+    /// materialization set. The same predicate list is then evaluated against
+    /// the resulting Arrow views, which preserves strict-bound and conjunction
+    /// semantics. Tables with append/update delta state take the authoritative
+    /// merged read lane and feed the identical selection-vector evaluator.
+    pub(crate) fn scan(
+        &self,
+        request: &crate::storage::ScanRequest<'_>,
+    ) -> io::Result<Option<crate::storage::Morsel>> {
+        use crate::storage::ScanPredicate;
+
+        if let Some(columns) = request.projection {
+            for column in columns {
+                let clean = column
+                    .trim_matches('"')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(column)
+                    .trim_matches('"');
+                if clean != "_id" && self.get_column_type(clean).is_none() {
+                    return Ok(None);
+                }
+            }
+        }
+        for predicate in request.predicates {
+            if self.get_column_type(predicate.column()).is_none() {
+                return Ok(None);
+            }
+        }
+
+        let has_overlay = self.has_delta()
+            || self.has_pending_deltas()
+            || self.pending_v4_in_memory_rows() > 0
+            || self.storage.has_v4_in_memory_data();
+
+        let mut batch = None;
+        if !has_overlay && !request.predicates.is_empty() {
+            enum Candidate<'a> {
+                StringEq(&'a str, &'a str),
+                NumericRange(&'a str, f64, f64),
+            }
+
+            // String equality is generally the most selective available leaf.
+            // Otherwise use zone-map estimates to pick the narrowest numeric
+            // range rather than depending on SQL predicate order.
+            let mut candidate = request.predicates.iter().find_map(|predicate| match predicate {
+                ScanPredicate::StringEq { column, value } => {
+                    Some(Candidate::StringEq(column, value))
+                }
+                _ => None,
+            });
+            if candidate.is_none() {
+                let mut best: Option<(u64, Candidate<'_>)> = None;
+                for predicate in request.predicates {
+                    let Some((column, low, high)) = predicate.inclusive_numeric_range() else {
+                        continue;
+                    };
+                    let estimate = self
+                        .estimate_zone_map_range(column, low, high)?
+                        .map(|estimate| estimate.0)
+                        .unwrap_or(u64::MAX);
+                    if best
+                        .as_ref()
+                        .is_none_or(|(best_estimate, _)| estimate < *best_estimate)
+                    {
+                        best = Some((estimate, Candidate::NumericRange(column, low, high)));
+                    }
+                }
+                candidate = best.map(|(_, candidate)| candidate);
+            }
+
+            let indices = match candidate {
+                Some(Candidate::StringEq(column, value)) => {
+                    self.scan_string_filter_mmap(column, value, None)?
+                }
+                Some(Candidate::NumericRange(column, low, high)) => {
+                    self.scan_numeric_range_mmap(column, low, high, None)?
+                }
+                None => None,
+            };
+
+            if let Some(indices) = indices {
+                batch = Some(if indices.is_empty() {
+                    self.read_columns_to_arrow(request.projection, 0, Some(0))?
+                } else if indices.len().saturating_mul(4) <= self.row_count() as usize * 3 {
+                    self.read_columns_by_indices_to_arrow(&indices, request.projection)?
+                } else {
+                    self.read_columns_to_arrow(request.projection, 0, None)?
+                });
+            }
+        }
+
+        let batch = match batch {
+            Some(batch) => batch,
+            None => self.read_columns_to_arrow(request.projection, 0, None)?,
+        };
+        crate::storage::Morsel::from_batch(batch, 0).select(request.predicates)
+    }
+
     /// Get row count
     pub fn row_count(&self) -> u64 {
         *self.row_count.read()
@@ -1270,6 +1377,7 @@ impl TableStorageBackend {
     fn invalidate_read_caches(&self) {
         self.cached_columns.write().clear();
         self.dict_cache.write().clear();
+        self.string_distinct_count_cache.write().clear();
         self.first_string_row_id_cache.write().clear();
         invalidate_global_dict_cache(self.path());
     }
@@ -5080,6 +5188,37 @@ impl TableStorageBackend {
     /// Fast COUNT(DISTINCT col) for string columns. Null-aware via bitmaps.
     pub fn count_distinct_string(&self, col_name: &str) -> io::Result<Option<i64>> {
         self.storage.count_distinct_string(col_name)
+    }
+
+    /// Return an exact string cardinality after validating the global typed
+    /// dictionary once per backend instance. Storage-cache mtime/epoch checks
+    /// replace the backend after an external change, while local mutations
+    /// clear this summary through `invalidate_read_caches`.
+    pub(crate) fn cached_string_distinct_count(
+        &self,
+        col_name: &str,
+    ) -> io::Result<Option<i64>> {
+        if let Some(count) = self.string_distinct_count_cache.read().get(col_name) {
+            return Ok(Some(*count));
+        }
+
+        let Some((dictionary, has_nulls, max_group_id)) =
+            get_global_dict_cache_with_nulls(self.path(), col_name, &self.storage)?
+        else {
+            return Ok(None);
+        };
+        if has_nulls
+            || max_group_id.is_some_and(|id| id as usize >= dictionary.0.len())
+            || dictionary.1.len() != self.active_row_count() as usize
+        {
+            return Ok(None);
+        }
+
+        let count = dictionary.0.len() as i64;
+        self.string_distinct_count_cache
+            .write()
+            .insert(col_name.to_string(), count);
+        Ok(Some(count))
     }
 
     /// Fast COUNT(DISTINCT col) given a pre-built dict (from global cache). Null-aware via bitmaps.

@@ -61,6 +61,7 @@ development.
 │              TableStorageBackend (backend.rs)                       │
 │                                                                     │
 │  Low-level operations:                                              │
+│  - scan(ScanRequest) -> Morsel / SelectionVector                    │
 │  - insert_rows() / insert_rows_to_delta()                           │
 │  - delete() / replace() / update                                    │
 │  - add_column() / drop_column() / rename_column()                   │
@@ -92,6 +93,22 @@ Supporting subsystems (not shown above, all under `apexbase/src/storage/`):
 | `incremental.rs` | Append-only WAL (`.apex.wal`) for incremental writes |
 | `table_catalog.rs` | `.apex_tables` / `.apex_schemas` memory-mapped registries |
 | `bloom.rs`, `concurrent.rs` | Filter helpers and concurrent primitives |
+| `scan.rs` | SQL-independent scan request, Arrow column views, selection vectors, and morsels |
+
+## Scan And Operator Boundary
+
+`TableStorageBackend::scan()` is the shared boundary for new composable query
+paths. Base-only V4 data can select a string-equality or zone-map-estimated
+numeric mmap candidate before projected materialization. Any delta, pending
+write, or in-memory overlay instead uses the authoritative merged read. Both
+lanes return the same `Morsel` contract and reapply the full predicate
+conjunction before physical operators consume the selection.
+
+The first vertical pipeline is `WHERE -> GROUP BY -> HAVING -> ordered TopK`.
+Unsupported expressions and numeric literals that cannot be represented
+exactly use the general evaluator. See
+[Scan & Physical Execution](SCAN_EXECUTION_ARCHITECTURE.md) for the complete
+protocol, fallback boundaries, and extension rules.
 
 ## Persistent And In-Memory Backends
 

@@ -1397,6 +1397,15 @@ GROUP BY category
 HAVING COUNT(*) > 10
 ```
 
+For supported conjunctive numeric/string filters, ApexBase can route the scan
+through a shared base/delta-aware physical pipeline before grouping. `HAVING`
+is evaluated after aggregation and before ordered TopK/`LIMIT`. Queries outside
+the physical protocol—including wide integer bounds that cannot be represented
+exactly—retain the general SQL execution path with the same public semantics.
+
+See [Scan & Physical Execution](SCAN_EXECUTION_ARCHITECTURE.md) for contributor
+details and current fallback boundaries.
+
 ### JOINs
 ```sql
 SELECT * FROM table1 JOIN table2 ON table1.id = table2.id

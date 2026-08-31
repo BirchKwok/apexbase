@@ -4,6 +4,20 @@ This page records the latest complete public cross-engine benchmark. It is a
 reproducible snapshot, not a universal claim: rerun the suite on your own
 hardware and workload.
 
+## v1.33 Scan-Pipeline Guard Coverage
+
+The 1.33 architecture adds an ApexBase-only same-machine guard metric named
+`Uncached delta Filter+GROUP+HAVING+TopK`. It disables the Python result cache,
+creates a write-after-load overlay, rotates filter and `HAVING` parameters, and
+checks the complete storage-scan/operator path. This metric belongs to the
+base/current regression gate; it does not alter the retained public
+SQLite/DuckDB scoreboard below.
+
+Release acceptance still requires the public suite plus same-machine canary
+and full base/current comparisons. Reports are retained under
+`local-perf-results/<timestamp>/`; individual fast public results never replace
+the same-machine regression decision.
+
 ## v1.30.0 Public Snapshot
 
 - **Date / source**: 2026-08-22, v1.30.0 optimized `main` workspace

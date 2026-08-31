@@ -3,6 +3,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from apexbase import ApexClient
 from apexbase.client import _classify_sql_route, _sql_route_family
 
@@ -157,3 +159,84 @@ def test_delta_compaction_and_reopen_preserve_query_contract(tmp_path):
     assert after_reopen == before
     assert reopened.retrieve_many([1, 4]).to_dict() == retrieve_many_after
     reopened.close()
+
+
+def test_uncached_parameterized_scan_group_having_topk_sees_delta(tmp_path):
+    """The physical scan protocol must keep HAVING/TopK order and delta visibility."""
+    client = ApexClient(str(tmp_path), enable_cache=False)
+    client.create_table(
+        "analytics",
+        {"city": "string", "age": "int", "score": "float"},
+    )
+    client.use_table("analytics")
+    client.store(
+        [
+            {"city": "Beijing", "age": 20, "score": 99.0},
+            {"city": "Beijing", "age": 25, "score": 50.0},
+            {"city": "Beijing", "age": 30, "score": 70.0},
+            {"city": "Shanghai", "age": 32, "score": 60.0},
+            {"city": "Shenzhen", "age": 34, "score": 80.0},
+        ]
+    )
+    client.flush()
+
+    query = (
+        "SELECT city, COUNT(*) AS n, AVG(score) AS av FROM analytics "
+        "WHERE age > ? AND age <= ? AND score >= ? "
+        "GROUP BY city HAVING COUNT(*) > ? "
+        "ORDER BY n DESC, city LIMIT 3"
+    )
+    assert client.execute(query, params=[20, 35, 40, 1]).to_dict() == [
+        {"city": "Beijing", "n": 2, "av": 60.0}
+    ]
+
+    client.execute("BEGIN")
+    client.execute(
+        "INSERT INTO analytics (city, age, score) VALUES ('Shanghai', 31, 90.0)"
+    )
+    client.execute(
+        "INSERT INTO analytics (city, age, score) VALUES ('Shanghai', 33, 100.0)"
+    )
+    client.execute("UPDATE analytics SET score = 10 WHERE _id = 3")
+    client.execute("COMMIT")
+
+    table_path = Path(tmp_path) / "analytics.apex"
+    assert Path(f"{table_path}.delta").exists()
+    rows = client.execute(query, params=[20, 35, 40, 1]).to_dict()
+    assert rows[0]["city"] == "Shanghai"
+    assert rows[0]["n"] == 3
+    assert rows[0]["av"] == pytest.approx(250.0 / 3.0)
+    assert len(rows) == 1
+
+    # Vary every bound so repeated execution cannot accidentally prove only an
+    # exact-SQL cache hit. Strict/inclusive bounds and HAVING remain observable.
+    assert client.execute(query, params=[30, 33, 80, 1]).to_dict() == [
+        {"city": "Shanghai", "n": 2, "av": 95.0}
+    ]
+    assert client.execute(query, params=[30, 33, 80, 2]).to_dict() == []
+    assert not client._query_result_cache
+    client.close()
+
+
+def test_scan_pipeline_falls_back_for_unrepresentable_integer_bounds(tmp_path):
+    """Large Int64 bounds must retain exact semantics outside the f64 scan lane."""
+    client = ApexClient(str(tmp_path), enable_cache=False)
+    client.create_table("wide_ints", {"city": "string", "age": "int"})
+    client.use_table("wide_ints")
+    client.store(
+        [
+            {"city": "exact", "age": 9_007_199_254_740_992},
+            {"city": "next", "age": 9_007_199_254_740_993},
+        ]
+    )
+    client.flush()
+
+    query = (
+        "SELECT city, COUNT(*) AS n FROM wide_ints "
+        "WHERE age > ? AND age <= ? GROUP BY city ORDER BY city"
+    )
+    assert client.execute(
+        query,
+        params=[9_007_199_254_740_992, 9_007_199_254_740_993],
+    ).to_dict() == [{"city": "next", "n": 1}]
+    client.close()

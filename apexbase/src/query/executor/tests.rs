@@ -1187,6 +1187,97 @@ fn test_olap_group_by_with_having() {
 }
 
 #[test]
+fn test_scan_group_pipeline_applies_having_before_topk_and_reads_delta() {
+    use crate::data::Value;
+    use crate::storage::backend::TableStorageBackend;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("scan_group_delta.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    storage
+        .insert_typed(
+            HashMap::from([("age".to_string(), vec![20, 25, 30, 28, 35])]),
+            HashMap::from([("score".to_string(), vec![99.0, 50.0, 60.0, 70.0, 80.0])]),
+            HashMap::from([(
+                "city".to_string(),
+                vec!["A", "A", "A", "B", "C"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
+            )]),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save().unwrap();
+
+    let query = "SELECT city, COUNT(*) AS n, AVG(score) AS av FROM default \
+                 WHERE age > 20 AND age <= 35 AND score >= 40 \
+                 GROUP BY city HAVING COUNT(*) > 1 \
+                 ORDER BY n DESC, city LIMIT 2";
+    let base = ApexExecutor::execute(query, &path)
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+    assert_eq!(base.num_rows(), 1);
+    assert_eq!(
+        base.column_by_name("city")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0),
+        "A"
+    );
+    assert_eq!(
+        base.column_by_name("n")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        2
+    );
+
+    let backend = TableStorageBackend::open(&path).unwrap();
+    let delta_rows = [
+        HashMap::from([
+            ("age".to_string(), Value::Int64(32)),
+            ("score".to_string(), Value::Float64(90.0)),
+            ("city".to_string(), Value::String("B".to_string())),
+        ]),
+        HashMap::from([
+            ("age".to_string(), Value::Int64(33)),
+            ("score".to_string(), Value::Float64(100.0)),
+            ("city".to_string(), Value::String("B".to_string())),
+        ]),
+    ];
+    backend.insert_rows_to_delta(&delta_rows).unwrap();
+    drop(backend);
+    invalidate_storage_cache(&path);
+
+    let with_delta = ApexExecutor::execute(query, &path)
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+    assert_eq!(with_delta.num_rows(), 2);
+    let cities = with_delta
+        .column_by_name("city")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let counts = with_delta
+        .column_by_name("n")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!((cities.value(0), counts.value(0)), ("B", 3));
+    assert_eq!((cities.value(1), counts.value(1)), ("A", 2));
+}
+
+#[test]
 fn test_olap_order_by_desc_limit() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("olap_order.apex");
@@ -1326,6 +1417,19 @@ fn test_olap_count_distinct() {
         .unwrap()
         .value(0);
     assert_eq!(count, 10);
+
+    // The second execution exercises the backend-owned validated cardinality
+    // summary rather than repeating global dictionary/file validation.
+    let warm = ApexExecutor::execute("SELECT COUNT(DISTINCT city) FROM default", &path).unwrap();
+    let warm = warm.to_record_batch().unwrap();
+    assert_eq!(
+        warm.column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        10
+    );
 }
 
 #[test]

@@ -72,6 +72,22 @@ def test_batch_write_advances_table_epoch_once(tmp_path):
         writer.close()
 
 
+def test_stable_table_epoch_matches_clean_generation(tmp_path):
+    writer, reader = _open_clients(tmp_path)
+
+    try:
+        assert reader._storage._stable_table_epoch() == reader._storage._table_epoch()
+
+        writer.store({"name": "gamma", "score": 30, "category": "x"})
+        writer.flush()
+
+        assert reader._storage._stable_table_epoch() == reader._storage._table_epoch()
+        assert reader._storage._stable_table_epoch() > 0
+    finally:
+        reader.close()
+        writer.close()
+
+
 def test_transaction_commit_invalidates_all_warmed_read_caches(tmp_path):
     writer, reader = _open_clients(tmp_path)
     group_sql = (
