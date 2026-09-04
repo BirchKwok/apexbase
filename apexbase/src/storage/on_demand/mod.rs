@@ -942,6 +942,51 @@ fn bitpack_encode_i64(data: &[i64]) -> Option<Vec<u8>> {
     Some(buf)
 }
 
+/// Fill `out` (len == count) with bit-packed values. Each value is
+/// extracted with a two-word shift-merge (values span at most two u64
+/// words); a short per-bit tail covers the final partial word.
+fn bitpack_fill(packed: &[u8], count: usize, bit_width: usize, min_val: i64, out: &mut [i64]) {
+    if bit_width == 0 || count == 0 {
+        for v in out.iter_mut().take(count) {
+            *v = min_val;
+        }
+        return;
+    }
+    let mask = (1u64 << bit_width) - 1;
+    let base = packed.as_ptr() as *const u64;
+    // Fast prefix: every value's two-word window lies inside `packed`.
+    let fast_n = if packed.len() >= 16 {
+        ((packed.len() as u64 - 16) / 8 * 64 / bit_width as u64) as usize
+    } else {
+        0
+    };
+    let fast_n = fast_n.min(count);
+    for i in 0..fast_n {
+        let bit_offset = i * bit_width;
+        let wi = bit_offset / 64;
+        let off = (bit_offset % 64) as u32;
+        let lo = unsafe { std::ptr::read_unaligned(base.add(wi)) };
+        let delta = if off == 0 {
+            lo & mask
+        } else {
+            let hi = unsafe { std::ptr::read_unaligned(base.add(wi + 1)) };
+            ((lo >> off) | (hi << (64 - off))) & mask
+        };
+        out[i] = min_val.wrapping_add(delta as i64);
+    }
+    for i in fast_n..count {
+        let bit_offset = i * bit_width;
+        let mut delta: u64 = 0;
+        for b in 0..bit_width {
+            let global_bit = bit_offset + b;
+            if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
+                delta |= 1u64 << b;
+            }
+        }
+        out[i] = min_val.wrapping_add(delta as i64);
+    }
+}
+
 /// Decode Bit-packed Int64 data back to plain Vec<i64>.
 fn bitpack_decode_i64(bytes: &[u8]) -> io::Result<(Vec<i64>, usize)> {
     if bytes.len() < 17 {
@@ -956,18 +1001,8 @@ fn bitpack_decode_i64(bytes: &[u8]) -> io::Result<(Vec<i64>, usize)> {
         return Err(err_data("BitPack Int64: truncated packed data"));
     }
     let packed = &bytes[17..17 + packed_bytes];
-    let mut result = Vec::with_capacity(count);
-    for i in 0..count {
-        let bit_offset = i * bit_width;
-        let mut delta: u64 = 0;
-        for b in 0..bit_width {
-            let global_bit = bit_offset + b;
-            if (packed[global_bit / 8] >> (global_bit % 8)) & 1 == 1 {
-                delta |= 1u64 << b;
-            }
-        }
-        result.push(min_val.wrapping_add(delta as i64));
-    }
+    let mut result = vec![0i64; count];
+    bitpack_fill(packed, count, bit_width, min_val, &mut result);
     Ok((result, 17 + packed_bytes))
 }
 
@@ -1827,6 +1862,7 @@ include!("arrow_io.rs");
 include!("mmap_scan.rs");
 include!("read_write.rs");
 include!("agg_wal.rs");
+include!("fused.rs");
 
 #[cfg(test)]
 mod tests;

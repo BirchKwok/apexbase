@@ -449,6 +449,25 @@ impl ApexExecutor {
                                 }
                             }
 
+                            // FAST PATH: fuse a boolean predicate tree (numeric
+                            // ranges, numeric IN, dictionary IN/Eq on the group
+                            // column) with a single low-cardinality string GROUP
+                            // BY and COUNT/SUM/AVG/MIN/MAX in one streaming mmap
+                            // scan; HAVING/ORDER BY/LIMIT run on aggregated rows.
+                            if has_aggregation_check
+                                && stmt.where_clause.is_some()
+                                && !stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && !backend.has_pending_deltas()
+                                && !backend.has_delta()
+                            {
+                                if let Some(result) =
+                                    Self::try_fast_fused_group_by(&backend, &stmt)?
+                                {
+                                    return Ok(result);
+                                }
+                            }
+
                             // Correctness fallback for filtered aggregates when delta-backed
                             // rows are present. The generic full-batch path can miss string
                             // overlay state, but the string-filter reader already merges it.
@@ -3229,8 +3248,6 @@ impl ApexExecutor {
         use crate::query::AggregateFunc;
 
         if backend.pending_v4_in_memory_rows() > 0
-            || backend.has_pending_deltas()
-            || backend.has_delta()
             || stmt.distinct
             || stmt.distinct_on.is_some()
             || stmt.group_by.len() != 1
@@ -3413,6 +3430,789 @@ impl ApexExecutor {
         }
     }
 
+    /// Strip table prefix and quotes from a column reference.
+    fn clean_fused_column(name: &str) -> String {
+        let trimmed = name.trim_matches('"');
+        trimmed
+            .rsplit('.')
+            .next()
+            .unwrap_or(trimmed)
+            .trim_matches('"')
+            .to_string()
+    }
+
+    /// Aggregation mask bits for the fused kernel: bit 0 sum (SUM/AVG),
+    /// bit 1 min (MIN), bit 2 max (MAX); COUNT(*) needs none.
+    fn fused_agg_mask_bit(func: &crate::query::AggregateFunc) -> u8 {
+        match func {
+            crate::query::AggregateFunc::Sum | crate::query::AggregateFunc::Avg => 1,
+            crate::query::AggregateFunc::Min => 2,
+            crate::query::AggregateFunc::Max => 4,
+            crate::query::AggregateFunc::Count => 0,
+        }
+    }
+
+    /// FAST PATH: fuse an arbitrary boolean predicate tree (numeric ranges,
+    /// numeric IN, dictionary IN/Eq on the group column, AND/OR/NOT) with a
+    /// single low-cardinality string GROUP BY and COUNT/SUM/AVG/MIN/MAX over
+    /// one numeric column in one streaming mmap scan. HAVING / ORDER BY /
+    /// LIMIT / OFFSET are applied on the aggregated (≤ dictionary size) rows.
+    /// Falls back to the generic pipeline for anything outside the gate.
+    fn try_fast_fused_group_by(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<ApexResult>> {
+        use crate::query::AggregateFunc;
+        use crate::storage::on_demand::{FusedGroupAgg, FusedLaneSpec};
+
+        if backend.pending_v4_in_memory_rows() > 0
+            || backend.has_pending_deltas()
+            || backend.has_delta()
+            || stmt.distinct
+            || stmt.distinct_on.is_some()
+            || stmt.group_by.len() != 1
+            || stmt.group_by_exprs.iter().any(Option::is_some)
+            || !stmt.joins.is_empty()
+            || stmt.order_by.iter().any(|clause| clause.expr.is_some())
+        {
+            return Ok(None);
+        }
+
+        let where_clause = match &stmt.where_clause {
+            Some(expr) => expr,
+            None => return Ok(None),
+        };
+        let group_col = Self::clean_fused_column(&stmt.group_by[0]);
+
+        // The group column must be dictionary-encoded with a usable global
+        // dictionary cache (same gates as the indexed dictionary reads).
+        let Some((dict, has_nulls, max_id)) =
+            crate::storage::backend::get_global_dict_cache_with_nulls(
+                backend.path(),
+                &group_col,
+                &backend.storage,
+            )?
+        else {
+            return Ok(None);
+        };
+        if has_nulls {
+            return Ok(None);
+        }
+        let Some(max) = max_id else {
+            return Ok(None);
+        };
+        let (dict_strings, group_ids) = dict.as_ref();
+        if max as usize >= dict_strings.len() || dict_strings.len() > 4096 {
+            return Ok(None);
+        }
+
+        // WHERE → fused predicate tree over ≤2 numeric lanes + group column.
+        let mut lanes: Vec<FusedLaneSpec> = Vec::new();
+        let Some(predicate) =
+            Self::extract_fused_predicate(backend, where_clause, &group_col, dict_strings, &mut lanes)?
+        else {
+            return Ok(None);
+        };
+        if lanes.len() > 2 {
+            return Ok(None);
+        }
+
+        // SELECT shape: group column + at most one aggregate over one column.
+        let mut agg_col: Option<String> = None;
+        let mut has_value_agg = false;
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(name)
+                    if Self::clean_fused_column(name) == group_col => {}
+                SelectColumn::ColumnAlias { column, .. }
+                    if Self::clean_fused_column(column) == group_col => {}
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    distinct,
+                    ..
+                } => {
+                    if *distinct {
+                        return Ok(None);
+                    }
+                    if matches!(func, AggregateFunc::Count)
+                        && column
+                            .as_ref()
+                            .map_or(true, |name| name == "*" || name.trim_matches('"').is_empty())
+                    {
+                        // COUNT(*) consumes no lane; it may coexist with the
+                        // single value aggregate.
+                    } else {
+                        if has_value_agg {
+                            return Ok(None);
+                        }
+                        let name = match column {
+                            Some(name) if name != "*" => Self::clean_fused_column(name),
+                            _ => return Ok(None),
+                        };
+                        if Self::clean_fused_column(&name) == group_col {
+                            return Ok(None);
+                        }
+                        agg_col = Some(name);
+                        has_value_agg = true;
+                    }
+                }
+                _ => return Ok(None),
+            }
+        }
+        let agg_lane = match &agg_col {
+            Some(col) => Some(Self::fused_lane_for(backend, col, &mut lanes)?
+                .ok_or_else(|| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidData, "lane budget exceeded")
+                })?),
+            None => None,
+        };
+        if lanes.len() > 2 {
+            return Ok(None);
+        }
+
+        // Aggregate only what SELECT/HAVING actually reference: bit 0 sum
+        // (SUM/AVG), bit 1 min (MIN), bit 2 max (MAX).
+        let mut agg_mask: u8 = 0;
+        for column in &stmt.columns {
+            if let SelectColumn::Aggregate { func, .. } = column {
+                agg_mask |= Self::fused_agg_mask_bit(&func);
+            }
+        }
+        if let Some(having_expr) = &stmt.having {
+            for (func, _col) in &Self::collect_having_extra_aggs(having_expr, &stmt.columns) {
+                agg_mask |= Self::fused_agg_mask_bit(&func);
+            }
+        }
+
+        // The kernel omits null checks in its inner loop: keep nullable
+        // inputs on the generic Arrow path.
+        for spec in &lanes {
+            if backend.column_has_nulls(&spec.col) {
+                return Ok(None);
+            }
+        }
+        let raw = backend.execute_fused_group_agg(
+            dict_strings,
+            group_ids,
+            &lanes,
+            &predicate,
+            agg_lane,
+            agg_mask,
+        )?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let surviving: Vec<(usize, &FusedGroupAgg)> = raw
+            .iter()
+            .enumerate()
+            .filter(|(_, agg)| agg.count > 0)
+            .collect();
+        if surviving.is_empty() {
+            // Build an empty result with the right schema.
+            let (fields, arrays) = Self::fused_group_result_columns(
+                stmt,
+                &group_col,
+                dict_strings,
+                &[],
+            )?;
+            let schema = Arc::new(Schema::new(fields));
+            let result = RecordBatch::try_new(schema, arrays)
+                .map_err(|e| err_data(e.to_string()))?;
+            return Ok(Some(ApexResult::Empty(result.schema())));
+        }
+
+        let mut fields: Vec<Field> = Vec::with_capacity(stmt.columns.len() + 4);
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len() + 4);
+        let (col_fields, col_arrays) = Self::fused_group_result_columns(
+            stmt,
+            &group_col,
+            dict_strings,
+            &surviving,
+        )?;
+        fields.extend(col_fields);
+        arrays.extend(col_arrays);
+
+        // HAVING: references only COUNT(*) or aggregates over the agg column;
+        // extra aggregates are materialized, filtered, then stripped.
+        let mut extra_names: Vec<String> = Vec::new();
+        if let Some(having_expr) = &stmt.having {
+            let extras = Self::collect_having_extra_aggs(having_expr, &stmt.columns);
+            for (func, col) in &extras {
+                let supported = match func {
+                    AggregateFunc::Count => col.is_none(),
+                    _ => col.as_deref() == agg_col.as_deref() && agg_col.is_some(),
+                };
+                if !supported {
+                    return Ok(None);
+                }
+            }
+            for (func, col) in &extras {
+                let name = match func {
+                    AggregateFunc::Count => "COUNT(*)".to_string(),
+                    AggregateFunc::Sum => format!("SUM({})", col.as_deref().unwrap_or("*")),
+                    AggregateFunc::Avg => format!("AVG({})", col.as_deref().unwrap_or("*")),
+                    AggregateFunc::Min => format!("MIN({})", col.as_deref().unwrap_or("*")),
+                    AggregateFunc::Max => format!("MAX({})", col.as_deref().unwrap_or("*")),
+                };
+                extra_names.push(name.clone());
+                let values: Vec<f64> = surviving
+                    .iter()
+                    .map(|(slot, agg)| match func {
+                        AggregateFunc::Count => agg.count as f64,
+                        AggregateFunc::Sum => agg.sum,
+                        AggregateFunc::Avg if agg.count > 0 => agg.sum / agg.count as f64,
+                        AggregateFunc::Avg => 0.0,
+                        AggregateFunc::Min => agg.min,
+                        AggregateFunc::Max => agg.max,
+                    })
+                    .collect();
+                if matches!(func, AggregateFunc::Count) {
+                    fields.push(Field::new(&name, ArrowDataType::Int64, false));
+                    arrays.push(Arc::new(Int64Array::from(
+                        values.iter().map(|v| *v as i64).collect::<Vec<_>>(),
+                    )));
+                } else {
+                    fields.push(Field::new(&name, ArrowDataType::Float64, false));
+                    arrays.push(Arc::new(Float64Array::from(values)));
+                }
+            }
+        }
+
+        let schema = Arc::new(Schema::new(fields));
+        let mut result =
+            RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
+        if let Some(having_expr) = &stmt.having {
+            let mask = Self::evaluate_predicate(&result, having_expr)?;
+            result = arrow::compute::filter_record_batch(&result, &mask)
+                .map_err(|e| err_data(e.to_string()))?;
+        }
+        if !extra_names.is_empty() {
+            let keep_count = result.num_columns().saturating_sub(extra_names.len());
+            let new_schema = Arc::new(Schema::new(
+                result.schema().fields()[..keep_count]
+                    .iter()
+                    .map(|f| f.as_ref().clone())
+                    .collect::<Vec<_>>(),
+            ));
+            let new_arrays: Vec<ArrayRef> = (0..keep_count).map(|i| result.column(i).clone()).collect();
+            result = RecordBatch::try_new(new_schema, new_arrays)
+                .map_err(|e| err_data(e.to_string()))?;
+        }
+
+        if !stmt.order_by.is_empty() {
+            let resolved = Self::resolve_order_by_cols(&stmt.columns, &stmt.order_by);
+            if resolved
+                .iter()
+                .any(|clause| result.schema().field_with_name(&clause.column).is_err())
+            {
+                return Ok(None);
+            }
+            let top_k = stmt.limit.map(|limit| limit + stmt.offset.unwrap_or(0));
+            result = Self::apply_order_by_topk(&result, &resolved, top_k)?;
+        }
+        if stmt.limit.is_some() || stmt.offset.is_some() {
+            result = Self::apply_limit_offset(&result, stmt.limit, stmt.offset)?;
+        }
+
+        if result.num_rows() == 0 {
+            Ok(Some(ApexResult::Empty(result.schema())))
+        } else {
+            Ok(Some(ApexResult::Data(result)))
+        }
+    }
+
+    /// Build the result columns for a fused group aggregation: the group
+    /// column plus the aggregate column(s) in SELECT-list order.
+    fn fused_group_result_columns(
+        stmt: &SelectStatement,
+        group_col: &str,
+        dict_strings: &[String],
+        surviving: &[(usize, &crate::storage::on_demand::FusedGroupAgg)],
+    ) -> io::Result<(Vec<Field>, Vec<ArrayRef>)> {
+        let mut fields: Vec<Field> = Vec::with_capacity(stmt.columns.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(_) => {
+                    let values: Vec<&str> = surviving
+                        .iter()
+                        .map(|(slot, _)| dict_strings[*slot].as_str())
+                        .collect();
+                    fields.push(Field::new(
+                        Self::group_output_name(stmt, group_col),
+                        ArrowDataType::Utf8,
+                        false,
+                    ));
+                    arrays.push(Arc::new(StringArray::from(values)));
+                }
+                SelectColumn::ColumnAlias { alias, .. } => {
+                    let values: Vec<&str> = surviving
+                        .iter()
+                        .map(|(slot, _)| dict_strings[*slot].as_str())
+                        .collect();
+                    fields.push(Field::new(alias, ArrowDataType::Utf8, false));
+                    arrays.push(Arc::new(StringArray::from(values)));
+                }
+                SelectColumn::Aggregate {
+                    func,
+                    column,
+                    alias,
+                    distinct: false,
+                } => {
+                    let source = column.as_deref().unwrap_or("*");
+                    let output_name =
+                        alias.clone().unwrap_or_else(|| format!("{}({})", func, source));
+                    match func {
+                        AggregateFunc::Count => {
+                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                            arrays.push(Arc::new(Int64Array::from(
+                                surviving
+                                    .iter()
+                                    .map(|(_, agg)| agg.count)
+                                    .collect::<Vec<_>>(),
+                            )));
+                        }
+                        AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => {
+                            let values: Vec<f64> = surviving
+                                .iter()
+                                .map(|(_, agg)| match func {
+                                    AggregateFunc::Sum => agg.sum,
+                                    AggregateFunc::Min => agg.min,
+                                    AggregateFunc::Max => agg.max,
+                                    _ => unreachable!(),
+                                })
+                                .collect();
+                            fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
+                            arrays.push(Arc::new(Float64Array::from(values)));
+                        }
+                        AggregateFunc::Avg => {
+                            let values: Vec<f64> = surviving
+                                .iter()
+                                .map(|(_, agg)| {
+                                    if agg.count > 0 {
+                                        agg.sum / agg.count as f64
+                                    } else {
+                                        0.0
+                                    }
+                                })
+                                .collect();
+                            fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
+                            arrays.push(Arc::new(Float64Array::from(values)));
+                        }
+                    }
+                }
+                _ => return Err(err_input("unsupported column in fused group by")),
+            }
+        }
+        Ok((fields, arrays))
+    }
+
+    /// Parse a WHERE clause into the fused predicate tree. Registers numeric
+    /// lanes (≤2) as they are encountered; returns None for anything outside
+    /// the fused grammar.
+    fn extract_fused_predicate(
+        backend: &TableStorageBackend,
+        expr: &SqlExpr,
+        group_col: &str,
+        dict_strings: &[String],
+        lanes: &mut Vec<crate::storage::on_demand::FusedLaneSpec>,
+    ) -> io::Result<Option<crate::storage::on_demand::FusedPredicate>> {
+        use crate::storage::on_demand::{FusedLeaf, FusedPredicate};
+        use crate::query::sql_parser::BinaryOperator;
+
+        match expr {
+            SqlExpr::Paren(inner) => Self::extract_fused_predicate(
+                backend,
+                inner,
+                group_col,
+                dict_strings,
+                lanes,
+            ),
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => {
+                let left = Self::extract_fused_predicate(
+                    backend, left, group_col, dict_strings, lanes,
+                )?;
+                let right = Self::extract_fused_predicate(
+                    backend, right, group_col, dict_strings, lanes,
+                )?;
+                match (left, right) {
+                    (Some(left), Some(right)) => Ok(Some(FusedPredicate::And(
+                        Box::new(left),
+                        Box::new(right),
+                    ))),
+                    _ => Ok(None),
+                }
+            }
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Or,
+                right,
+            } => {
+                let left = Self::extract_fused_predicate(
+                    backend, left, group_col, dict_strings, lanes,
+                )?;
+                let right = Self::extract_fused_predicate(
+                    backend, right, group_col, dict_strings, lanes,
+                )?;
+                match (left, right) {
+                    (Some(left), Some(right)) => Ok(Some(FusedPredicate::Or(
+                        Box::new(left),
+                        Box::new(right),
+                    ))),
+                    _ => Ok(None),
+                }
+            }
+            SqlExpr::UnaryOp {
+                op: crate::query::sql_parser::UnaryOperator::Not,
+                expr: inner,
+            } => {
+                let inner_pred = Self::extract_fused_predicate(
+                    backend, inner, group_col, dict_strings, lanes,
+                )?;
+                Ok(inner_pred.map(|p| FusedPredicate::Not(Box::new(p))))
+            }
+            SqlExpr::Between {
+                column,
+                low,
+                high,
+                negated,
+            } => {
+                let col = Self::clean_fused_column(column);
+                let leaf = (col != group_col)
+                    .then(|| {
+                        Self::fused_range_leaf(
+                            backend, &col, Some(low.as_ref()), Some(high.as_ref()), lanes,
+                        )
+                    })
+                    .flatten();
+                let Some(leaf) = leaf else {
+                    return Ok(None);
+                };
+                Ok(Some(if *negated {
+                    FusedPredicate::Not(Box::new(FusedPredicate::Leaf(leaf)))
+                } else {
+                    FusedPredicate::Leaf(leaf)
+                }))
+            }
+            SqlExpr::In {
+                column,
+                values,
+                negated,
+            } => {
+                if values.is_empty() || values.len() > 16 {
+                    return Ok(None);
+                }
+                let col = Self::clean_fused_column(column);
+                let leaf = if col == group_col {
+                    let mut flags = vec![0u8; dict_strings.len()];
+                    for value in values {
+                        let crate::data::Value::String(s) = value else {
+                            return Ok(None);
+                        };
+                        // Values absent from the dictionary can never match a
+                        // row; they simply leave the slot flag unset.
+                        if let Some(key) = dict_strings.iter().position(|d| d == s.as_str()) {
+                            flags[key] = 1;
+                        }
+                    }
+                    Some(FusedLeaf::DictIn { flags })
+                } else {
+                    let Some(lane) = Self::fused_lane_for(backend, &col, lanes)? else {
+                        return Ok(None);
+                    };
+                    if lanes[lane].is_int {
+                        let mut vals: Vec<i64> =
+                            values.iter().filter_map(Self::fused_value_i64).collect();
+                        if vals.len() != values.len() {
+                            return Ok(None);
+                        }
+                        vals.sort_unstable();
+                        vals.dedup();
+                        Some(FusedLeaf::InI64 { lane, values: vals })
+                    } else {
+                        let mut vals: Vec<f64> =
+                            values.iter().filter_map(Self::fused_value_f64).collect();
+                        if vals.len() != values.len() {
+                            return Ok(None);
+                        }
+                        vals.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                        vals.dedup_by(|a, b| a == b);
+                        Some(FusedLeaf::InF64 { lane, values: vals })
+                    }
+                };
+                let Some(leaf) = leaf else {
+                    return Ok(None);
+                };
+                Ok(Some(if *negated {
+                    FusedPredicate::Not(Box::new(FusedPredicate::Leaf(leaf)))
+                } else {
+                    FusedPredicate::Leaf(leaf)
+                }))
+            }
+            SqlExpr::BinaryOp { left, op, right } => {
+                let (col, effective_op, lit) = match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(c), lit) => (Self::clean_fused_column(c), op.clone(), lit),
+                    (lit, SqlExpr::Column(c)) => {
+                        let flipped = match op {
+                            BinaryOperator::Gt => BinaryOperator::Lt,
+                            BinaryOperator::Ge => BinaryOperator::Le,
+                            BinaryOperator::Lt => BinaryOperator::Gt,
+                            BinaryOperator::Le => BinaryOperator::Ge,
+                            BinaryOperator::Eq => BinaryOperator::Eq,
+                            BinaryOperator::NotEq => BinaryOperator::NotEq,
+                            _ => return Ok(None),
+                        };
+                        (Self::clean_fused_column(c), flipped, lit)
+                    }
+                    _ => return Ok(None),
+                };
+                let negated = matches!(&effective_op, BinaryOperator::NotEq);
+                let leaf = Self::fused_range_leaf_for_op(
+                    backend, &col, &group_col, dict_strings, &effective_op, lit, lanes,
+                )?;
+                let Some(leaf) = leaf else {
+                    return Ok(None);
+                };
+                let pred = FusedPredicate::Leaf(leaf);
+                Ok(Some(if negated {
+                    FusedPredicate::Not(Box::new(pred))
+                } else {
+                    pred
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Build a range/eq leaf for `column OP literal`. The group column maps
+    /// to a dictionary equality; numeric columns map to a lane range using
+    /// exact i64 bounds for integral columns and the next/prev-representable
+    /// epsilon bounds for strict float inequalities.
+    fn fused_range_leaf_for_op(
+        backend: &TableStorageBackend,
+        col: &str,
+        group_col: &str,
+        dict_strings: &[String],
+        op: &BinaryOperator,
+        lit: &SqlExpr,
+        lanes: &mut Vec<crate::storage::on_demand::FusedLaneSpec>,
+    ) -> io::Result<Option<crate::storage::on_demand::FusedLeaf>> {
+        use crate::storage::on_demand::FusedLeaf;
+        use crate::query::sql_parser::BinaryOperator;
+
+        if col == group_col {
+            if !matches!(op, BinaryOperator::Eq) {
+                return Ok(None);
+            }
+            let s = match lit {
+                SqlExpr::Literal(crate::data::Value::String(s)) => s.as_str(),
+                _ => return Ok(None),
+            };
+            let key = dict_strings
+                .iter()
+                .position(|d| d == s)
+                .unwrap_or(usize::MAX)
+                .min(u16::MAX as usize);
+            // A key that is not in the dictionary can never match a row; the
+            // sentinel u16::MAX is unreachable because dictionaries are
+            // capped at 4096 entries.
+            return Ok(Some(FusedLeaf::DictEq { key: key as u16 }));
+        }
+
+        let Some(lane) = Self::fused_lane_for(backend, col, lanes)? else {
+            return Ok(None);
+        };
+        if lanes[lane].is_int {
+            let Some(v) = Self::fused_literal_i64(lit) else {
+                return Ok(None);
+            };
+            let (lo, hi) = match op {
+                BinaryOperator::Lt => (i64::MIN, v.saturating_sub(1)),
+                BinaryOperator::Le => (i64::MIN, v),
+                BinaryOperator::Gt => (v.saturating_add(1), i64::MAX),
+                BinaryOperator::Ge => (v, i64::MAX),
+                BinaryOperator::Eq => (v, v),
+                _ => return Ok(None),
+            };
+            Ok(Some(FusedLeaf::RangeI64 { lane, lo, hi }))
+        } else {
+            let Some(v) = Self::fused_literal_f64(lit) else {
+                return Ok(None);
+            };
+            let (lo, hi) = match op {
+                BinaryOperator::Lt => (f64::NEG_INFINITY, Self::fused_prev_f64(v)),
+                BinaryOperator::Le => (f64::NEG_INFINITY, v),
+                BinaryOperator::Gt => (Self::fused_next_f64(v), f64::INFINITY),
+                BinaryOperator::Ge => (v, f64::INFINITY),
+                BinaryOperator::Eq => (v, v),
+                _ => return Ok(None),
+            };
+            Ok(Some(FusedLeaf::RangeF64 { lane, lo, hi }))
+        }
+    }
+
+    /// BETWEEN bounds → lane range leaf (open bounds are unbounded).
+    fn fused_range_leaf(
+        backend: &TableStorageBackend,
+        col: &str,
+        low: Option<&SqlExpr>,
+        high: Option<&SqlExpr>,
+        lanes: &mut Vec<crate::storage::on_demand::FusedLaneSpec>,
+    ) -> Option<crate::storage::on_demand::FusedLeaf> {
+        use crate::storage::on_demand::FusedLeaf;
+        let lane = match Self::fused_lane_for(backend, col, lanes) {
+            Ok(lane) => lane?,
+            Err(_) => return None,
+        };
+        if lanes[lane].is_int {
+            let lo = low.map(Self::fused_literal_i64).unwrap_or(Some(i64::MIN))?;
+            let hi = high.map(Self::fused_literal_i64).unwrap_or(Some(i64::MAX))?;
+            Some(FusedLeaf::RangeI64 { lane, lo, hi })
+        } else {
+            let lo = low.map(Self::fused_literal_f64).unwrap_or(Some(f64::NEG_INFINITY))?;
+            let hi = high.map(Self::fused_literal_f64).unwrap_or(Some(f64::INFINITY))?;
+            Some(FusedLeaf::RangeF64 { lane, lo, hi })
+        }
+    }
+
+    fn fused_lane_for(
+        backend: &TableStorageBackend,
+        col: &str,
+        lanes: &mut Vec<crate::storage::on_demand::FusedLaneSpec>,
+    ) -> io::Result<Option<usize>> {
+        if let Some(pos) = lanes.iter().position(|l| l.col == col) {
+            return Ok(Some(pos));
+        }
+        if lanes.len() >= 2 {
+            return Ok(None);
+        }
+        let dtype = match backend.get_column_type(col) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let is_int = matches!(
+            dtype,
+            crate::data::DataType::Int8
+                | crate::data::DataType::Int16
+                | crate::data::DataType::Int32
+                | crate::data::DataType::Int64
+                | crate::data::DataType::UInt8
+                | crate::data::DataType::UInt16
+                | crate::data::DataType::UInt32
+                | crate::data::DataType::UInt64
+        );
+        let is_float = matches!(
+            dtype,
+            crate::data::DataType::Float32 | crate::data::DataType::Float64
+        );
+        if !is_int && !is_float {
+            return Ok(None);
+        }
+        lanes.push(crate::storage::on_demand::FusedLaneSpec {
+            col: col.to_string(),
+            is_int,
+        });
+        Ok(Some(lanes.len() - 1))
+    }
+
+    /// Exact i64 literal extraction for integral lanes. Integer-valued
+    /// floats are accepted below 2^53 to avoid precision loss.
+    fn fused_literal_i64(expr: &SqlExpr) -> Option<i64> {
+        match expr {
+            SqlExpr::Literal(crate::data::Value::Int64(n)) => Some(*n),
+            SqlExpr::Literal(crate::data::Value::Int32(n)) => Some(*n as i64),
+            SqlExpr::Literal(crate::data::Value::UInt64(n)) if *n <= i64::MAX as u64 => {
+                Some(*n as i64)
+            }
+            SqlExpr::Literal(crate::data::Value::Float64(f))
+                if f.fract() == 0.0 && f.abs() < 9.0e15 =>
+            {
+                Some(*f as i64)
+            }
+            SqlExpr::Literal(crate::data::Value::Float32(f))
+                if (*f as f64).fract() == 0.0 && (*f as f64).abs() < 9.0e15 =>
+            {
+                Some(*f as f64 as i64)
+            }
+            _ => None,
+        }
+    }
+
+    fn fused_literal_f64(expr: &SqlExpr) -> Option<f64> {
+        match expr {
+            SqlExpr::Literal(crate::data::Value::Int64(n)) => Some(*n as f64),
+            SqlExpr::Literal(crate::data::Value::Int32(n)) => Some(*n as f64),
+            SqlExpr::Literal(crate::data::Value::UInt64(n)) => Some(*n as f64),
+            SqlExpr::Literal(crate::data::Value::Float64(f)) => Some(*f),
+            SqlExpr::Literal(crate::data::Value::Float32(f)) => Some(*f as f64),
+            _ => None,
+        }
+    }
+
+    /// Exact i64 extraction from an IN-list literal (see fused_literal_i64).
+    fn fused_value_i64(value: &crate::data::Value) -> Option<i64> {
+        use crate::data::Value;
+        match value {
+            Value::Int8(n) => Some(*n as i64),
+            Value::Int16(n) => Some(*n as i64),
+            Value::Int32(n) => Some(*n as i64),
+            Value::Int64(n) => Some(*n),
+            Value::UInt8(n) => Some(*n as i64),
+            Value::UInt16(n) => Some(*n as i64),
+            Value::UInt32(n) => Some(*n as i64),
+            Value::UInt64(n) if *n <= i64::MAX as u64 => Some(*n as i64),
+            Value::Float64(f) if f.fract() == 0.0 && f.abs() < 9.0e15 => Some(*f as i64),
+            Value::Float32(f)
+                if (*f as f64).fract() == 0.0 && (*f as f64).abs() < 9.0e15 =>
+            {
+                Some(*f as f64 as i64)
+            }
+            _ => None,
+        }
+    }
+
+    fn fused_value_f64(value: &crate::data::Value) -> Option<f64> {
+        use crate::data::Value;
+        match value {
+            Value::Int8(n) => Some(*n as f64),
+            Value::Int16(n) => Some(*n as f64),
+            Value::Int32(n) => Some(*n as f64),
+            Value::Int64(n) => Some(*n as f64),
+            Value::UInt8(n) => Some(*n as f64),
+            Value::UInt16(n) => Some(*n as f64),
+            Value::UInt32(n) => Some(*n as f64),
+            Value::UInt64(n) => Some(*n as f64),
+            Value::Float32(f) => Some(*f as f64),
+            Value::Float64(f) => Some(*f),
+            _ => None,
+        }
+    }
+
+    /// Smallest representable f64 strictly above `v` (strict-inequality
+    /// epsilon bounds; mirrors extract_single_comparison_as_range).
+    #[inline]
+    fn fused_next_f64(v: f64) -> f64 {
+        if v >= 0.0 {
+            f64::from_bits(v.to_bits() + 1)
+        } else {
+            f64::from_bits(v.to_bits() - 1)
+        }
+    }
+
+    /// Largest representable f64 strictly below `v`.
+    #[inline]
+    fn fused_prev_f64(v: f64) -> f64 {
+        if v > 0.0 {
+            f64::from_bits(v.to_bits() - 1)
+        } else {
+            f64::from_bits(v.to_bits() + 1)
+        }
+    }
     /// FAST PATH for Complex (Filter+Group+Order) queries.
     /// Uses single-pass execution with direct dictionary indexing.
     fn try_fast_filter_group_order(
@@ -3442,9 +4242,11 @@ impl ApexExecutor {
         use crate::query::sql_parser::BinaryOperator;
         use crate::query::AggregateFunc;
 
-        // Check pattern: must have WHERE, GROUP BY, ORDER BY, and LIMIT
+        // Keep the proven fused kernel for its exact legacy shape. Every other
+        // representable filtered GROUP BY is delegated to the shared physical
+        // pipeline instead of growing another query-shaped branch here.
         if stmt.group_by.is_empty() || stmt.order_by.is_empty() || stmt.limit.is_none() {
-            return Ok(None);
+            return Self::try_scan_group_pipeline(backend, stmt);
         }
 
         // Support: string equality (col = 'val') OR BETWEEN (col BETWEEN low AND high)
@@ -3465,7 +4267,7 @@ impl ApexExecutor {
                 (SqlExpr::Literal(Value::String(val)), SqlExpr::Column(col)) => {
                     FilterType::StringEq(col.trim_matches('"').to_string(), val.as_str())
                 }
-                _ => return Ok(None),
+                _ => return Self::try_scan_group_pipeline(backend, stmt),
             },
             SqlExpr::Between {
                 column,
@@ -3478,47 +4280,47 @@ impl ApexExecutor {
                 if let (Some(lo), Some(hi)) = (low_val, high_val) {
                     FilterType::Between(column.trim_matches('"').to_string(), lo, hi)
                 } else {
-                    return Ok(None);
+                    return Self::try_scan_group_pipeline(backend, stmt);
                 }
             }
-            _ => return Ok(None),
+            _ => return Self::try_scan_group_pipeline(backend, stmt),
         };
 
         // Must have exactly one GROUP BY column (string)
         if stmt.group_by.len() != 1 {
-            return Ok(None);
+            return Self::try_scan_group_pipeline(backend, stmt);
         }
         let group_col = stmt.group_by[0].trim_matches('"');
 
         // Must have exactly one ORDER BY clause
         if stmt.order_by.len() != 1 {
-            return Ok(None);
+            return Self::try_scan_group_pipeline(backend, stmt);
         }
         let order_clause = &stmt.order_by[0];
         let order_col = order_clause.column.trim_matches('"');
         let descending = order_clause.descending;
 
         // Check if we have exactly one aggregate column
-        let mut agg_func = None;
-        let mut agg_col = None;
-        for col in &stmt.columns {
-            if let SelectColumn::Aggregate { func, column, .. } = col {
-                agg_func = Some(func.clone());
-                agg_col = column.as_deref();
-            }
-        }
-
-        let agg_func = match agg_func {
-            Some(f) => f,
-            None => return Ok(None),
+        let aggregates = stmt
+            .columns
+            .iter()
+            .filter_map(|column| match column {
+                SelectColumn::Aggregate { func, column, .. } => {
+                    Some((func.clone(), column.as_deref()))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [(agg_func, agg_col)] = aggregates.as_slice() else {
+            return Self::try_scan_group_pipeline(backend, stmt);
         };
 
         // Support SUM, COUNT, and AVG
         if !matches!(
-            agg_func,
+            *agg_func,
             AggregateFunc::Sum | AggregateFunc::Count | AggregateFunc::Avg
         ) {
-            return Ok(None);
+            return Self::try_scan_group_pipeline(backend, stmt);
         }
 
         let limit = stmt.limit.unwrap_or(100);
@@ -3529,14 +4331,21 @@ impl ApexExecutor {
             FilterType::StringEq(filter_col, filter_val) => {
                 // Only SUM/COUNT for the storage-level string eq path
                 if !matches!(agg_func, AggregateFunc::Sum | AggregateFunc::Count) {
-                    return Ok(None);
+                    return Self::try_scan_group_pipeline(backend, stmt);
                 }
                 match backend.execute_filter_group_order(
-                    filter_col, filter_val, group_col, agg_col, agg_func, order_col, descending,
-                    limit, offset,
+                    filter_col,
+                    filter_val,
+                    group_col,
+                    *agg_col,
+                    agg_func.clone(),
+                    order_col,
+                    descending,
+                    limit,
+                    offset,
                 ) {
                     Ok(Some(result)) => Ok(Some(ApexResult::Data(result))),
-                    Ok(None) => Ok(None),
+                    Ok(None) => Self::try_scan_group_pipeline(backend, stmt),
                     Err(e) => Err(e),
                 }
             }
@@ -3552,17 +4361,23 @@ impl ApexExecutor {
                         *hi,
                         &dict_arc.0,
                         &dict_arc.1,
-                        agg_col,
+                        *agg_col,
                     )?
                 } else {
                     backend
                         .storage
-                        .execute_between_group_agg(filter_col, *lo, *hi, group_col, agg_col)?
+                        .execute_between_group_agg(
+                            filter_col,
+                            *lo,
+                            *hi,
+                            group_col,
+                            *agg_col,
+                        )?
                 };
 
                 let raw = match raw {
                     Some(r) if !r.is_empty() => r,
-                    _ => return Ok(None),
+                    _ => return Self::try_scan_group_pipeline(backend, stmt),
                 };
 
                 // Compute final aggregated values
@@ -3596,7 +4411,7 @@ impl ApexExecutor {
                 let results: Vec<_> = results.into_iter().skip(offset).take(limit).collect();
 
                 if results.is_empty() {
-                    return Ok(None);
+                    return Self::try_scan_group_pipeline(backend, stmt);
                 }
 
                 // Build Arrow result
@@ -3632,16 +4447,15 @@ impl ApexExecutor {
         }
     }
 
-    /// Translate a conjunction of simple SQL predicates into the storage scan
-    /// protocol. This translation is deliberately shape-independent: GROUP BY,
-    /// HAVING, ordering, and aggregate choices are handled by physical
-    /// operators after the scan has produced a selection vector.
-    fn collect_scan_predicates(
-        expr: &SqlExpr,
-        predicates: &mut Vec<crate::storage::ScanPredicate>,
-    ) -> bool {
+    /// Translate an exactly representable SQL predicate into the storage scan
+    /// protocol. The result preserves boolean structure and typed literals;
+    /// GROUP BY, HAVING, ordering, and aggregate choices remain downstream
+    /// physical-operator concerns.
+    fn build_scan_predicate(expr: &SqlExpr) -> Option<crate::storage::ScanPredicateExpr> {
         use crate::query::sql_parser::BinaryOperator;
-        use crate::storage::{ScanBound, ScanPredicate};
+        use crate::storage::{
+            ScanBound, ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue,
+        };
 
         fn clean(column: &str) -> String {
             column
@@ -3653,127 +4467,126 @@ impl ApexExecutor {
                 .to_string()
         }
 
-        fn numeric(value: &SqlExpr) -> Option<f64> {
+        fn scalar(value: &SqlExpr) -> Option<ScanValue> {
             match value {
-                SqlExpr::Literal(value) => {
-                    // The scan protocol stores numeric bounds as f64 for the
-                    // mmap candidate scan. Reject integer literals that would
-                    // round-trip differently through f64; the general SQL
-                    // evaluator retains their exact Int64/UInt64 semantics.
-                    match value {
-                        Value::Int64(value) if (*value as f64) as i64 != *value => None,
-                        Value::UInt64(value) if (*value as f64) as u64 != *value => None,
-                        _ => value.as_f64(),
-                    }
+                SqlExpr::Literal(Value::Int8(value)) => Some(ScanValue::Int(*value as i64)),
+                SqlExpr::Literal(Value::Int16(value)) => Some(ScanValue::Int(*value as i64)),
+                SqlExpr::Literal(Value::Int32(value)) => Some(ScanValue::Int(*value as i64)),
+                SqlExpr::Literal(Value::Int64(value)) => Some(ScanValue::Int(*value)),
+                SqlExpr::Literal(Value::UInt8(value)) => Some(ScanValue::UInt(*value as u64)),
+                SqlExpr::Literal(Value::UInt16(value)) => Some(ScanValue::UInt(*value as u64)),
+                SqlExpr::Literal(Value::UInt32(value)) => Some(ScanValue::UInt(*value as u64)),
+                SqlExpr::Literal(Value::UInt64(value)) => Some(ScanValue::UInt(*value)),
+                SqlExpr::Literal(Value::Float32(value)) if value.is_finite() => {
+                    Some(ScanValue::Float(*value as f64))
                 }
+                SqlExpr::Literal(Value::Float64(value)) if value.is_finite() => {
+                    Some(ScanValue::Float(*value))
+                }
+                SqlExpr::Literal(Value::String(value)) => {
+                    Some(ScanValue::String(value.clone()))
+                }
+                SqlExpr::Literal(Value::Bool(value)) => Some(ScanValue::Bool(*value)),
                 _ => None,
             }
         }
 
-        fn range(
-            column: &str,
-            operator: &BinaryOperator,
-            value: f64,
-        ) -> Option<ScanPredicate> {
-            let (lower, upper) = match operator {
-                BinaryOperator::Eq => (
-                    Some(ScanBound::inclusive(value)),
-                    Some(ScanBound::inclusive(value)),
-                ),
-                BinaryOperator::Gt => (Some(ScanBound::exclusive(value)), None),
-                BinaryOperator::Ge => (Some(ScanBound::inclusive(value)), None),
-                BinaryOperator::Lt => (None, Some(ScanBound::exclusive(value))),
-                BinaryOperator::Le => (None, Some(ScanBound::inclusive(value))),
+        fn comparison(operator: &BinaryOperator) -> Option<ScanComparison> {
+            Some(match operator {
+                BinaryOperator::Eq => ScanComparison::Eq,
+                BinaryOperator::NotEq => ScanComparison::NotEq,
+                BinaryOperator::Lt => ScanComparison::Lt,
+                BinaryOperator::Le => ScanComparison::Le,
+                BinaryOperator::Gt => ScanComparison::Gt,
+                BinaryOperator::Ge => ScanComparison::Ge,
                 _ => return None,
-            };
-            Some(ScanPredicate::NumericRange {
-                column: clean(column),
-                lower,
-                upper,
             })
         }
 
-        fn reversed(operator: &BinaryOperator) -> Option<BinaryOperator> {
-            Some(match operator {
-                BinaryOperator::Eq => BinaryOperator::Eq,
-                BinaryOperator::Gt => BinaryOperator::Lt,
-                BinaryOperator::Ge => BinaryOperator::Le,
-                BinaryOperator::Lt => BinaryOperator::Gt,
-                BinaryOperator::Le => BinaryOperator::Ge,
-                _ => return None,
-            })
+        fn reversed(operator: ScanComparison) -> ScanComparison {
+            match operator {
+                ScanComparison::Eq => ScanComparison::Eq,
+                ScanComparison::NotEq => ScanComparison::NotEq,
+                ScanComparison::Gt => ScanComparison::Lt,
+                ScanComparison::Ge => ScanComparison::Le,
+                ScanComparison::Lt => ScanComparison::Gt,
+                ScanComparison::Le => ScanComparison::Ge,
+            }
         }
 
         match expr {
-            SqlExpr::Paren(inner) => Self::collect_scan_predicates(inner, predicates),
+            SqlExpr::Paren(inner) => Self::build_scan_predicate(inner),
             SqlExpr::BinaryOp {
                 left,
                 op: BinaryOperator::And,
                 right,
-            } => {
-                Self::collect_scan_predicates(left, predicates)
-                    && Self::collect_scan_predicates(right, predicates)
-            }
+            } => Some(ScanPredicateExpr::And(
+                Box::new(Self::build_scan_predicate(left)?),
+                Box::new(Self::build_scan_predicate(right)?),
+            )),
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::Or,
+                right,
+            } => Some(ScanPredicateExpr::Or(
+                Box::new(Self::build_scan_predicate(left)?),
+                Box::new(Self::build_scan_predicate(right)?),
+            )),
             SqlExpr::Between {
                 column,
                 low,
                 high,
                 negated: false,
             } => {
-                let (Some(low), Some(high)) = (numeric(low), numeric(high)) else {
-                    return false;
-                };
-                predicates.push(ScanPredicate::NumericRange {
+                let (low, high) = (scalar(low)?, scalar(high)?);
+                Some(ScanPredicateExpr::Predicate(ScanPredicate::Between {
                     column: clean(column),
                     lower: Some(ScanBound::inclusive(low)),
                     upper: Some(ScanBound::inclusive(high)),
-                });
-                true
+                }))
             }
             SqlExpr::BinaryOp { left, op, right } => {
+                let op = comparison(op)?;
                 match (left.as_ref(), right.as_ref()) {
-                    (SqlExpr::Column(column), SqlExpr::Literal(Value::String(value)))
-                        if *op == BinaryOperator::Eq =>
-                    {
-                        predicates.push(ScanPredicate::StringEq {
+                    (SqlExpr::Column(column), literal) => Some(ScanPredicateExpr::Predicate(
+                        ScanPredicate::Compare {
                             column: clean(column),
-                            value: value.clone(),
-                        });
-                        true
-                    }
-                    (SqlExpr::Literal(Value::String(value)), SqlExpr::Column(column))
-                        if *op == BinaryOperator::Eq =>
-                    {
-                        predicates.push(ScanPredicate::StringEq {
+                            op,
+                            value: scalar(literal)?,
+                        },
+                    )),
+                    (literal, SqlExpr::Column(column)) => Some(ScanPredicateExpr::Predicate(
+                        ScanPredicate::Compare {
                             column: clean(column),
-                            value: value.clone(),
-                        });
-                        true
-                    }
-                    (SqlExpr::Column(column), literal) => {
-                        let Some(value) = numeric(literal) else {
-                            return false;
-                        };
-                        let Some(predicate) = range(column, op, value) else {
-                            return false;
-                        };
-                        predicates.push(predicate);
-                        true
-                    }
-                    (literal, SqlExpr::Column(column)) => {
-                        let (Some(value), Some(operator)) = (numeric(literal), reversed(op)) else {
-                            return false;
-                        };
-                        let Some(predicate) = range(column, &operator, value) else {
-                            return false;
-                        };
-                        predicates.push(predicate);
-                        true
-                    }
-                    _ => false,
+                            op: reversed(op),
+                            value: scalar(literal)?,
+                        },
+                    )),
+                    _ => None,
                 }
             }
-            _ => false,
+            SqlExpr::In {
+                column,
+                values,
+                negated: false,
+            } => {
+                let values = values
+                    .iter()
+                    .filter(|value| !matches!(value, Value::Null))
+                    .map(|value| scalar(&SqlExpr::Literal(value.clone())))
+                    .collect::<Option<Vec<_>>>()?;
+                Some(ScanPredicateExpr::Predicate(ScanPredicate::In {
+                    column: clean(column),
+                    values,
+                }))
+            }
+            SqlExpr::IsNull { column, negated } => Some(ScanPredicateExpr::Predicate(
+                ScanPredicate::IsNull {
+                    column: clean(column),
+                    negated: *negated,
+                },
+            )),
+            _ => None,
         }
     }
 
@@ -3791,16 +4604,19 @@ impl ApexExecutor {
             || stmt.distinct
             || stmt.distinct_on.is_some()
             || stmt.group_by_exprs.iter().any(Option::is_some)
+            || stmt
+                .columns
+                .iter()
+                .any(|column| matches!(column, SelectColumn::WindowFunction { .. }))
         {
             return Ok(None);
         }
 
-        let mut predicates = Vec::new();
-        if !Self::collect_scan_predicates(stmt.where_clause.as_ref().unwrap(), &mut predicates)
-            || predicates.is_empty()
-        {
+        let Some(predicate) =
+            Self::build_scan_predicate(stmt.where_clause.as_ref().unwrap())
+        else {
             return Ok(None);
-        }
+        };
 
         let Some(columns) = Self::get_col_refs(stmt) else {
             return Ok(None);
@@ -3811,14 +4627,14 @@ impl ApexExecutor {
         };
         let request = crate::storage::ScanRequest {
             projection: Some(&projection),
-            predicates: &predicates,
+            predicate: Some(&predicate),
         };
         let Some(morsel) = backend.scan(&request)? else {
             return Ok(None);
         };
         let filtered = morsel.into_record_batch()?;
 
-        // The scan protocol consumed the complete WHERE conjunction. Removing
+        // The scan protocol consumed the complete WHERE predicate. Removing
         // it prevents the generic executor from evaluating the mask twice;
         // HAVING remains attached and is applied after aggregation, before TopK.
         let mut physical_stmt = stmt.clone();

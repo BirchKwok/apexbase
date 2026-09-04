@@ -2021,6 +2021,8 @@ impl ApexStorageImpl {
             if self.in_memory {
                 crate::Database::drop_memory_database(&self.root_dir);
             }
+            // Best-effort reap of table files dropped earlier in this process.
+            crate::storage::table_catalog::reap_pending_deletions();
         });
 
         // Clear per-instance cached backends (releases per-instance references)

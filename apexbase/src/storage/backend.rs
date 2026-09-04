@@ -1148,19 +1148,294 @@ impl TableStorageBackend {
         }
     }
 
+    #[inline]
+    fn scan_string_candidate_supported(&self, column: &str) -> bool {
+        matches!(self.get_column_type(column), Some(DataType::String))
+    }
+
+    #[inline]
+    fn scan_predicate_column_supported(&self, column: &str) -> bool {
+        matches!(
+            self.get_column_type(column),
+            Some(
+                DataType::Bool
+                    | DataType::Int8
+                    | DataType::Int16
+                    | DataType::Int32
+                    | DataType::Int64
+                    | DataType::UInt8
+                    | DataType::UInt16
+                    | DataType::UInt32
+                    | DataType::Float32
+                    | DataType::Float64
+                    | DataType::String
+            )
+        )
+    }
+
+    /// The mmap range API accepts `f64` bounds. Only use it when that boundary
+    /// preserves the comparison semantics of the projected Arrow column.
+    fn scan_numeric_candidate_value(
+        &self,
+        column: &str,
+        value: &crate::storage::ScanValue,
+    ) -> Option<f64> {
+        use crate::storage::ScanValue;
+
+        // UInt64 is intentionally excluded: the legacy mmap predicate lane
+        // decodes fixed-width integers through i64 and is not a safe pruning
+        // source for values above i64::MAX.
+        match self.get_column_type(column)? {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32 => match value {
+                ScanValue::Int(_) | ScanValue::UInt(_) => value.lossless_f64(),
+                _ => None,
+            },
+            DataType::Float32 | DataType::Float64 => value.lossless_f64(),
+            _ => None,
+        }
+    }
+
+    /// The existing mmap IN lane is integer-shaped. It is exact for integer
+    /// columns; float columns are eligible only when the typed target has an
+    /// exact `f64` representation as well as an `i64` representation.
+    fn scan_numeric_in_candidate_values(
+        &self,
+        column: &str,
+        values: &[crate::storage::ScanValue],
+    ) -> Option<Vec<i64>> {
+        // See `scan_numeric_candidate_value` for the UInt64 exclusion.
+        match self.get_column_type(column)? {
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32 => values.iter().map(|value| value.lossless_i64()).collect(),
+            DataType::Float32 | DataType::Float64 => values
+                .iter()
+                .map(|value| {
+                    value.lossless_f64()?;
+                    value.lossless_i64()
+                })
+                .collect(),
+            _ => None,
+        }
+    }
+
+    fn scan_candidate_score(
+        &self,
+        predicate: &crate::storage::ScanPredicateExpr,
+    ) -> io::Result<Option<u64>> {
+        use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+
+        match predicate {
+            ScanPredicateExpr::Predicate(predicate) => match predicate {
+                ScanPredicate::Compare {
+                    column,
+                    op: ScanComparison::Eq,
+                    value: ScanValue::String(_),
+                } if self.scan_string_candidate_supported(column) => Ok(Some(0)),
+                ScanPredicate::Compare {
+                    column, op, value, ..
+                } if *op != ScanComparison::NotEq => {
+                    let Some(value) = self.scan_numeric_candidate_value(column, value) else {
+                        return Ok(None);
+                    };
+                    let (low, high) = match op {
+                        ScanComparison::Eq => (value, value),
+                        ScanComparison::Lt | ScanComparison::Le => (f64::NEG_INFINITY, value),
+                        ScanComparison::Gt | ScanComparison::Ge => (value, f64::INFINITY),
+                        ScanComparison::NotEq => unreachable!(),
+                    };
+                    Ok(Some(
+                        self.estimate_zone_map_range(column, low, high)?
+                            .map(|estimate| estimate.0)
+                            .unwrap_or(u64::MAX / 4),
+                    ))
+                }
+                ScanPredicate::Between {
+                    column,
+                    lower,
+                    upper,
+                } => {
+                    let Some(low) = lower
+                        .as_ref()
+                        .map_or(Some(f64::NEG_INFINITY), |bound| {
+                            self.scan_numeric_candidate_value(column, &bound.value)
+                        })
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(high) = upper
+                        .as_ref()
+                        .map_or(Some(f64::INFINITY), |bound| {
+                            self.scan_numeric_candidate_value(column, &bound.value)
+                        })
+                    else {
+                        return Ok(None);
+                    };
+                    Ok(Some(
+                        self.estimate_zone_map_range(column, low, high)?
+                            .map(|estimate| estimate.0)
+                            .unwrap_or(u64::MAX / 4),
+                    ))
+                }
+                ScanPredicate::In { column, values }
+                    if values
+                        .iter()
+                        .all(|value| matches!(value, ScanValue::String(_)))
+                        && self.scan_string_candidate_supported(column) =>
+                {
+                    Ok(Some(values.len() as u64))
+                }
+                ScanPredicate::In { column, values }
+                    if self
+                        .scan_numeric_in_candidate_values(column, values)
+                        .is_some() =>
+                {
+                    Ok(Some(values.len() as u64))
+                }
+                _ => Ok(None),
+            },
+            ScanPredicateExpr::And(left, right) => {
+                let left = self.scan_candidate_score(left)?;
+                let right = self.scan_candidate_score(right)?;
+                Ok(match (left, right) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(score), None) | (None, Some(score)) => Some(score),
+                    (None, None) => None,
+                })
+            }
+            ScanPredicateExpr::Or(left, right) => {
+                let (Some(left), Some(right)) = (
+                    self.scan_candidate_score(left)?,
+                    self.scan_candidate_score(right)?,
+                ) else {
+                    return Ok(None);
+                };
+                Ok(Some(left.saturating_add(right)))
+            }
+        }
+    }
+
+    fn scan_candidate_indices(
+        &self,
+        predicate: &crate::storage::ScanPredicateExpr,
+    ) -> io::Result<Option<Vec<usize>>> {
+        use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+
+        match predicate {
+            ScanPredicateExpr::Predicate(predicate) => match predicate {
+                ScanPredicate::Compare {
+                    column,
+                    op: ScanComparison::Eq,
+                    value: ScanValue::String(value),
+                } => self.scan_string_filter_mmap(column, value, None),
+                ScanPredicate::Compare {
+                    column, op, value, ..
+                } if *op != ScanComparison::NotEq => {
+                    let Some(value) = self.scan_numeric_candidate_value(column, value) else {
+                        return Ok(None);
+                    };
+                    let (low, high) = match op {
+                        ScanComparison::Eq => (value, value),
+                        ScanComparison::Lt | ScanComparison::Le => (f64::NEG_INFINITY, value),
+                        ScanComparison::Gt | ScanComparison::Ge => (value, f64::INFINITY),
+                        ScanComparison::NotEq => unreachable!(),
+                    };
+                    self.scan_numeric_range_mmap(column, low, high, None)
+                }
+                ScanPredicate::Between {
+                    column,
+                    lower,
+                    upper,
+                } => {
+                    let Some(low) = lower
+                        .as_ref()
+                        .map_or(Some(f64::NEG_INFINITY), |bound| {
+                            self.scan_numeric_candidate_value(column, &bound.value)
+                        })
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(high) = upper
+                        .as_ref()
+                        .map_or(Some(f64::INFINITY), |bound| {
+                            self.scan_numeric_candidate_value(column, &bound.value)
+                        })
+                    else {
+                        return Ok(None);
+                    };
+                    self.scan_numeric_range_mmap(column, low, high, None)
+                }
+                ScanPredicate::In { column, values }
+                    if values
+                        .iter()
+                        .all(|value| matches!(value, ScanValue::String(_)))
+                        && self.scan_string_candidate_supported(column) =>
+                {
+                    let values = values
+                        .iter()
+                        .map(|value| match value {
+                            ScanValue::String(value) => value.clone(),
+                            _ => unreachable!(),
+                        })
+                        .collect::<Vec<_>>();
+                    self.scan_string_in_mmap(column, &values, None)
+                }
+                ScanPredicate::In { column, values } => {
+                    let Some(values) = self.scan_numeric_in_candidate_values(column, values) else {
+                        return Ok(None);
+                    };
+                    self.scan_numeric_in_mmap(column, &values, None)
+                }
+                _ => Ok(None),
+            },
+            ScanPredicateExpr::And(left, right) => {
+                let left_score = self.scan_candidate_score(left)?;
+                let right_score = self.scan_candidate_score(right)?;
+                match (left_score, right_score) {
+                    (Some(left_score), Some(right_score)) if left_score <= right_score => {
+                        self.scan_candidate_indices(left)
+                    }
+                    (Some(_), Some(_)) => self.scan_candidate_indices(right),
+                    (Some(_), None) => self.scan_candidate_indices(left),
+                    (None, Some(_)) => self.scan_candidate_indices(right),
+                    (None, None) => Ok(None),
+                }
+            }
+            ScanPredicateExpr::Or(left, right) => {
+                let (Some(mut left), Some(right)) = (
+                    self.scan_candidate_indices(left)?,
+                    self.scan_candidate_indices(right)?,
+                ) else {
+                    return Ok(None);
+                };
+                // Lane outputs are ascending and duplicate-free; merge in
+                // linear time instead of re-sorting the whole union.
+                merge_sorted_index_vectors(&mut left, &right);
+                Ok(Some(left))
+            }
+        }
+    }
+
     /// Execute one storage-level scan request and return an operator morsel.
     ///
-    /// Persisted V4 data first uses one selective mmap predicate to reduce the
-    /// materialization set. The same predicate list is then evaluated against
-    /// the resulting Arrow views, which preserves strict-bound and conjunction
-    /// semantics. Tables with append/update delta state take the authoritative
-    /// merged read lane and feed the identical selection-vector evaluator.
+    /// Persisted V4 data uses a safe candidate subset from the boolean tree to
+    /// reduce materialization. The complete typed predicate is then reapplied
+    /// against Arrow views. Tables with append/update delta state take the
+    /// authoritative merged read lane and feed the same evaluator.
     pub(crate) fn scan(
         &self,
         request: &crate::storage::ScanRequest<'_>,
     ) -> io::Result<Option<crate::storage::Morsel>> {
-        use crate::storage::ScanPredicate;
-
         if let Some(columns) = request.projection {
             for column in columns {
                 let clean = column
@@ -1174,10 +1449,14 @@ impl TableStorageBackend {
                 }
             }
         }
-        for predicate in request.predicates {
-            if self.get_column_type(predicate.column()).is_none() {
-                return Ok(None);
-            }
+        let mut invalid_predicate_column = false;
+        if let Some(predicate) = request.predicate {
+            predicate.visit_columns(&mut |column| {
+                invalid_predicate_column |= !self.scan_predicate_column_supported(column);
+            });
+        }
+        if invalid_predicate_column {
+            return Ok(None);
         }
 
         let has_overlay = self.has_delta()
@@ -1186,52 +1465,11 @@ impl TableStorageBackend {
             || self.storage.has_v4_in_memory_data();
 
         let mut batch = None;
-        if !has_overlay && !request.predicates.is_empty() {
-            enum Candidate<'a> {
-                StringEq(&'a str, &'a str),
-                NumericRange(&'a str, f64, f64),
-            }
-
-            // String equality is generally the most selective available leaf.
-            // Otherwise use zone-map estimates to pick the narrowest numeric
-            // range rather than depending on SQL predicate order.
-            let mut candidate = request.predicates.iter().find_map(|predicate| match predicate {
-                ScanPredicate::StringEq { column, value } => {
-                    Some(Candidate::StringEq(column, value))
-                }
-                _ => None,
-            });
-            if candidate.is_none() {
-                let mut best: Option<(u64, Candidate<'_>)> = None;
-                for predicate in request.predicates {
-                    let Some((column, low, high)) = predicate.inclusive_numeric_range() else {
-                        continue;
-                    };
-                    let estimate = self
-                        .estimate_zone_map_range(column, low, high)?
-                        .map(|estimate| estimate.0)
-                        .unwrap_or(u64::MAX);
-                    if best
-                        .as_ref()
-                        .is_none_or(|(best_estimate, _)| estimate < *best_estimate)
-                    {
-                        best = Some((estimate, Candidate::NumericRange(column, low, high)));
-                    }
-                }
-                candidate = best.map(|(_, candidate)| candidate);
-            }
-
-            let indices = match candidate {
-                Some(Candidate::StringEq(column, value)) => {
-                    self.scan_string_filter_mmap(column, value, None)?
-                }
-                Some(Candidate::NumericRange(column, low, high)) => {
-                    self.scan_numeric_range_mmap(column, low, high, None)?
-                }
+        if !has_overlay {
+            if let Some(indices) = match request.predicate {
+                Some(predicate) => self.scan_candidate_indices(predicate)?,
                 None => None,
-            };
-
-            if let Some(indices) = indices {
+            } {
                 batch = Some(if indices.is_empty() {
                     self.read_columns_to_arrow(request.projection, 0, Some(0))?
                 } else if indices.len().saturating_mul(4) <= self.row_count() as usize * 3 {
@@ -1246,7 +1484,7 @@ impl TableStorageBackend {
             Some(batch) => batch,
             None => self.read_columns_to_arrow(request.projection, 0, None)?,
         };
-        crate::storage::Morsel::from_batch(batch, 0).select(request.predicates)
+        crate::storage::Morsel::from_batch(batch, 0).select(request.predicate)
     }
 
     /// Get row count
@@ -3259,6 +3497,129 @@ impl TableStorageBackend {
         ))
     }
 
+    /// Mixed-projection indexed read: columns covered by the global string
+    /// dictionary cache are gathered as dictionary keys (2 B/row instead of
+    /// decoding and copying every string); the remaining columns use the
+    /// mmap indexed extractor.  Returns None when the projection is not a
+    /// proper mix (all-dictionary and all-plain have dedicated paths) or
+    /// when the extractor cannot serve the plain part.
+    fn try_mixed_dict_indexed_read(
+        &self,
+        row_indices: &[usize],
+        col_refs: Option<&[&str]>,
+    ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
+        use arrow::array::{ArrayRef, DictionaryArray, StringArray, UInt32Array};
+        use arrow::datatypes::{Field, Schema, UInt32Type};
+        use std::sync::Arc;
+
+        let Some(refs) = col_refs else {
+            return Ok(None);
+        };
+        if refs.is_empty() {
+            return Ok(None);
+        }
+        let active_rows = self.active_row_count() as usize;
+
+        enum Slot {
+            Dict(Arc<(Vec<String>, Vec<u16>)>),
+            Plain,
+        }
+        let mut slots: Vec<Slot> = Vec::with_capacity(refs.len());
+        let mut plain_refs: Vec<&str> = Vec::with_capacity(refs.len());
+        for name in refs {
+            let plain = name.rsplit('.').next().unwrap_or(name);
+            if plain == "_id" {
+                plain_refs.push(plain);
+                slots.push(Slot::Plain);
+                continue;
+            }
+            let usable = crate::storage::backend::peek_global_dict_cache_with_nulls(
+                self.path(),
+                plain,
+                &self.storage,
+            )?
+            .map(|(dict, has_nulls, max_id)| {
+                !has_nulls
+                    && max_id.map_or(false, |max| (max as usize) < dict.0.len())
+                    && dict.1.len() == active_rows
+                    && dict.0.len() <= 4096
+            })
+            .unwrap_or(false);
+            if usable {
+                // Re-peek after the eligibility probe; the cache is read-only
+                // between the two lookups in this call.
+                let (dict, _, _) = crate::storage::backend::peek_global_dict_cache_with_nulls(
+                    self.path(),
+                    plain,
+                    &self.storage,
+                )?
+                .expect("eligible dictionary column present");
+                slots.push(Slot::Dict(dict));
+            } else {
+                plain_refs.push(*name);
+                slots.push(Slot::Plain);
+            }
+        }
+        if plain_refs.is_empty() || slots.iter().all(|slot| matches!(slot, Slot::Plain)) {
+            return Ok(None);
+        }
+
+        let Some(batch) =
+            self.storage.extract_rows_by_indices_to_arrow(row_indices, Some(&plain_refs))?
+        else {
+            return Ok(None);
+        };
+        if batch.num_rows() != row_indices.len() {
+            return Ok(None);
+        }
+
+        let mut fields: Vec<Field> = Vec::with_capacity(refs.len());
+        let mut arrays: Vec<ArrayRef> = Vec::with_capacity(refs.len());
+        for (name, slot) in refs.iter().zip(slots.iter()) {
+            let plain = name.rsplit('.').next().unwrap_or(name);
+            match slot {
+                Slot::Dict(dict) => {
+                    let (dict_strings, group_ids) = dict.as_ref();
+                    let keys = UInt32Array::from(
+                        row_indices
+                            .iter()
+                            .map(|&i| group_ids[i] as u32)
+                            .collect::<Vec<_>>(),
+                    );
+                    let values =
+                        StringArray::from_iter_values(dict_strings.iter().map(|s| s.as_str()));
+                    let dict_array = DictionaryArray::<UInt32Type>::try_new(
+                        keys,
+                        Arc::new(values),
+                    )
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                    let array: ArrayRef = Arc::new(dict_array);
+                    fields.push(Field::new(plain, array.data_type().clone(), false));
+                    arrays.push(array);
+                }
+                Slot::Plain => {
+                    let schema = batch.schema();
+                    let Some(field) = schema
+                        .fields()
+                        .iter()
+                        .find(|f| f.name().eq_ignore_ascii_case(plain))
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(array) = batch.column_by_name(field.name()) else {
+                        return Ok(None);
+                    };
+                    fields.push(field.as_ref().clone());
+                    arrays.push(array.clone());
+                }
+            }
+        }
+        Ok(Some(
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?,
+        ))
+    }
+
     pub fn read_columns_by_indices_to_arrow(
         &self,
         row_indices: &[usize],
@@ -3279,6 +3640,9 @@ impl TableStorageBackend {
             // string; the DictionaryArray is decoded downstream only when a
             // plain result is actually needed.
             if let Some(batch) = self.try_dict_indexed_read(row_indices, col_refs)? {
+                return self.apply_delta_overlay_to_batch(batch);
+            }
+            if let Some(batch) = self.try_mixed_dict_indexed_read(row_indices, col_refs)? {
                 return self.apply_delta_overlay_to_batch(batch);
             }
             if let Some(batch) = self
@@ -5369,6 +5733,27 @@ impl TableStorageBackend {
         )
     }
 
+    /// Fused predicate-lane GROUP BY + aggregation on the persisted V4 file.
+    pub fn execute_fused_group_agg(
+        &self,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        lanes: &[crate::storage::on_demand::FusedLaneSpec],
+        predicate: &crate::storage::on_demand::FusedPredicate,
+        agg_lane: Option<usize>,
+        agg_mask: u8,
+    ) -> io::Result<Option<Vec<crate::storage::on_demand::FusedGroupAgg>>> {
+        self.storage
+            .execute_fused_group_agg_mmap(
+                dict_strings,
+                group_ids,
+                lanes,
+                predicate,
+                agg_lane,
+                agg_mask,
+            )
+    }
+
     /// Execute BETWEEN + GROUP BY + aggregate directly on V4 columns
     pub fn execute_between_group_agg(
         &self,
@@ -5757,16 +6142,114 @@ impl StorageManager {
     }
 }
 
+/// Merge two ascending, duplicate-free index vectors into one ascending,
+/// duplicate-free vector. Both candidate lanes emit indices in row order.
+fn merge_sorted_index_vectors(merged: &mut Vec<usize>, next: &[usize]) {
+    if next.is_empty() {
+        return;
+    }
+    let mut out = Vec::with_capacity(merged.len().saturating_add(next.len()));
+    let (mut li, mut ri) = (0usize, 0usize);
+    while li < merged.len() || ri < next.len() {
+        let value = match (li < merged.len(), ri < next.len()) {
+            (false, true) => next[ri],
+            (true, false) => merged[li],
+            (true, true) if merged[li] <= next[ri] => merged[li],
+            _ => next[ri],
+        };
+        out.push(value);
+        if li < merged.len() && merged[li] == value {
+            li += 1;
+        }
+        if ri < next.len() && next[ri] == value {
+            ri += 1;
+        }
+    }
+    *merged = out;
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
 
     #[test]
+    fn merge_sorted_index_vectors_keeps_order_and_dedups() {
+        let mut merged = vec![0, 2, 5, 7, 9];
+        merge_sorted_index_vectors(&mut merged, &[3, 5, 8, 9, 11]);
+        assert_eq!(merged, vec![0, 2, 3, 5, 7, 8, 9, 11]);
+
+        let mut empty = Vec::new();
+        merge_sorted_index_vectors(&mut empty, &[1, 2]);
+        assert_eq!(empty, vec![1, 2]);
+
+        let mut single = vec![4];
+        merge_sorted_index_vectors(&mut single, &[]);
+        assert_eq!(single, vec![4]);
+    }
+
+    #[test]
     fn in_memory_backend_reports_its_storage_mode() {
         let path = Path::new("apexbase_memory:backend-mode-test");
         let backend = TableStorageBackend::create(path).unwrap();
         assert!(backend.is_in_memory());
+    }
+
+    #[test]
+    fn typed_scan_candidates_reject_lossy_or_unsigned_mmap_coercions() {
+        use crate::storage::ScanValue;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("typed_scan_candidate_gates.apex");
+        let backend = TableStorageBackend::create(&path).unwrap();
+        backend.add_column("signed", DataType::Int64).unwrap();
+        backend.add_column("unsigned", DataType::UInt64).unwrap();
+        backend.add_column("float", DataType::Float64).unwrap();
+        backend.add_column("label", DataType::String).unwrap();
+        backend.add_column("event_time", DataType::Timestamp).unwrap();
+
+        assert_eq!(
+            backend.scan_numeric_candidate_value(
+                "signed",
+                &ScanValue::Int(1_i64 << 53),
+            ),
+            Some((1_i64 << 53) as f64)
+        );
+        assert_eq!(
+            backend.scan_numeric_candidate_value("signed", &ScanValue::Float(1.0)),
+            None
+        );
+        assert_eq!(
+            backend.scan_numeric_candidate_value("unsigned", &ScanValue::UInt(1)),
+            None
+        );
+        assert_eq!(
+            backend.scan_numeric_candidate_value("float", &ScanValue::Float(1.5)),
+            Some(1.5)
+        );
+        assert_eq!(
+            backend.scan_numeric_candidate_value(
+                "float",
+                &ScanValue::Int((1_i64 << 53) + 1),
+            ),
+            None
+        );
+        assert_eq!(
+            backend.scan_numeric_in_candidate_values(
+                "signed",
+                &[ScanValue::Int(i64::MAX)],
+            ),
+            Some(vec![i64::MAX])
+        );
+        assert_eq!(
+            backend.scan_numeric_in_candidate_values("unsigned", &[ScanValue::UInt(1)]),
+            None
+        );
+        assert!(backend.scan_string_candidate_supported("label"));
+        assert!(!backend.scan_string_candidate_supported("signed"));
+        assert!(backend.scan_predicate_column_supported("signed"));
+        assert!(!backend.scan_predicate_column_supported("unsigned"));
+        assert!(!backend.scan_predicate_column_supported("event_time"));
     }
 
     fn test_dict_entry(bytes: usize, access: u64) -> GlobalDictCacheEntry {

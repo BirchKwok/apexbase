@@ -4,19 +4,71 @@ This page records the latest complete public cross-engine benchmark. It is a
 reproducible snapshot, not a universal claim: rerun the suite on your own
 hardware and workload.
 
+## v1.33.1 Public No-Cache Snapshot
+
+- **Date / source**: 2026-09-05, v1.33.1 release tree; runtime code was measured immediately before the metadata-only version bump
+- **System**: macOS 26.6.2, Apple arm64 (10 cores), 32 GB RAM
+- **Tabular stack**: Python 3.12.2, ApexBase 1.33.0 runtime, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
+- **Vector stack**: Python 3.12.2, ApexBase 1.33.0 runtime, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1
+- **Tabular dataset**: 1,000,000 rows x 5 columns
+- **Vector dataset**: 1,000,000 Float32 vectors x 128 dimensions, `k=10`, 10 exact batch queries
+- **Method**: result cache disabled for every ApexBase client, 2 warmup iterations + 5 timed iterations, materialized results
+- **Retained baseline**: `benchmarks/latest_public_baseline.json`
+
+The no-cache public suite completed all **117/117 named rows**: 103 tabular,
+6 exact-vector, and 8 ApexBase quantized precision rows. Of the 115 rows with a
+direct competitor, ApexBase won **115/115**. Float16 and BFloat16 remain
+ApexBase-only quantized formats and are excluded from the comparable total.
+
+| Scope | Metrics | Apex wins | Ties | Slower |
+| --- | ---: | ---: | ---: | ---: |
+| OLAP fair | 71 | 71 | 0 | 0 |
+| OLTP fair | 32 | 32 | 0 | 0 |
+| Exact vector similarity | 6 | 6 | 0 | 0 |
+| Quantized vector, shared codecs | 6 | 6 | 0 | 0 |
+| **Comparable total** | **115** | **115** | **0** | **0** |
+
+Representative medians from the retained run:
+
+| Metric | ApexBase | SQLite | DuckDB | ApexBase vs best competitor |
+| --- | ---: | ---: | ---: | ---: |
+| COUNT(*) | 0.094 ms | 7.946 ms | 0.505 ms | 5.35x faster |
+| Projection full scan (3 cols) | 233.267 ms | 921.937 ms | 726.772 ms | 3.12x faster |
+| GROUP BY city (10 groups) | 0.577 ms | 370.302 ms | 3.386 ms | 5.87x faster |
+| GROUP BY + HAVING | 0.581 ms | 368.544 ms | 4.136 ms | 7.13x faster |
+| Boolean Filter+GROUP+HAVING+TopK | **3.978 ms** | 193.017 ms | **5.680 ms** | **1.43x faster** |
+| Multi-cond (age>30 AND score>50) | 196.598 ms | 614.324 ms | 390.751 ms | 1.99x faster |
+| JSON Read + GROUP BY category | 57.783 ms | N/A | 89.379 ms | 1.55x faster |
+| ORDER BY score LIMIT 100 | 1.935 ms | 56.396 ms | 5.058 ms | 2.61x faster |
+| Vector batch L2, 10 queries | 45.946 ms | 1.37 s | 317.081 ms | 6.90x faster |
+
+An independent repeat measured `Boolean Filter+GROUP+HAVING+TopK` at 4.02 ms
+versus DuckDB at 5.39 ms. Both complete runs recorded 103/103 tabular wins,
+6/6 exact-vector wins, and 6/6 wins for quantized codecs shared with
+sqlite-vector. The repeat is retained separately as
+`local-perf-results/20260905-no-cache-public/public_benchmark_repeat.json` and
+is not used to select or replace individual baseline samples.
+
+The benchmark now creates every ApexBase client with `enable_cache=False`.
+The legacy `--no-result-cache` option is accepted only for command-line
+compatibility; it does not change behavior because no-cache is unconditional.
+Results from older cached methodology remain useful historical snapshots but
+must not be treated as a base/current regression comparison against this run.
+
 ## v1.33 Scan-Pipeline Guard Coverage
 
 The 1.33 architecture adds an ApexBase-only same-machine guard metric named
 `Uncached delta Filter+GROUP+HAVING+TopK`. It disables the Python result cache,
 creates a write-after-load overlay, rotates filter and `HAVING` parameters, and
 checks the complete storage-scan/operator path. This metric belongs to the
-base/current regression gate; it does not alter the retained public
-SQLite/DuckDB scoreboard below.
+base/current regression gate. The public SQLite/DuckDB suite now independently
+uses the same no-result-cache contract for all ApexBase metrics.
 
 Release acceptance still requires the public suite plus same-machine canary
 and full base/current comparisons. Reports are retained under
 `local-perf-results/<timestamp>/`; individual fast public results never replace
-the same-machine regression decision.
+the same-machine regression decision when the compared revisions share a
+compatible benchmark contract.
 
 ## v1.30.0 Public Snapshot
 

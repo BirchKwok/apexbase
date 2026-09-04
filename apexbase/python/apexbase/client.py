@@ -1665,30 +1665,33 @@ class ApexClient:
         storage_context = storage_lock if storage_lock is not None else _NULL_CONTEXT
         with storage_context:
             with self._lock:
-                self.flush_buffered_writes()
+                if self._buffered_write_rows:
+                    self.flush_buffered_writes()
                 try:
                     self._storage.drop_table(table_name)
                 except (ValueError, RuntimeError):
                     pass
                 self._invalidate_replace_cache()
-        
+
         if table_name in self._fts_tables:
+            # Best-effort Python-side cleanup in case the engine keeps files
+            # open. Only FTS-indexed tables own these files; probing the
+            # directory for every drop costs several stat syscalls for no
+            # benefit on ordinary tables.
+            try:
+                fts_dir = self._dirpath / "fts_indexes"
+                for suffix in (".afts", ".afts.wal", ".afts.tmp", ".nfts", ".nfts.wal"):
+                    path = fts_dir / f"{table_name}{suffix}"
+                    if path.exists():
+                        try:
+                            path.unlink()
+                        except Exception:
+                            pass
+            except Exception:
+                pass
             self._fts_tables.pop(table_name, None)
             self._fts_initialized_tables.discard(table_name)
             self._save_fts_config()
-
-        # Best-effort Python-side cleanup in case the engine keeps files open
-        try:
-            fts_dir = self._dirpath / "fts_indexes"
-            for suffix in (".afts", ".afts.wal", ".afts.tmp", ".nfts", ".nfts.wal"):
-                path = fts_dir / f"{table_name}{suffix}"
-                if path.exists():
-                    try:
-                        path.unlink()
-                    except Exception:
-                        pass
-        except Exception:
-            pass
         
         if self._current_table == table_name:
             self._current_table = None

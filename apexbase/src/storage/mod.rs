@@ -19,7 +19,9 @@ pub mod on_demand;
 pub(crate) mod scan;
 pub mod table_catalog;
 
-pub(crate) use scan::{Morsel, ScanBound, ScanPredicate, ScanRequest};
+pub(crate) use scan::{
+    Morsel, ScanBound, ScanComparison, ScanPredicate, ScanPredicateExpr, ScanRequest, ScanValue,
+};
 
 /// First user-visible row ID. ApexBase uses 1-based `_id` values.
 pub const FIRST_ROW_ID: u64 = 1;

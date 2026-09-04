@@ -1237,11 +1237,16 @@ impl ApexStorageImpl {
             let registry = registry_lock
                 .snapshot()
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            if registry.contains_key(name) || table_path.exists() {
+            if registry.contains_key(name) {
                 return Err(PyValueError::new_err(format!(
                     "Table already exists: {}",
                     name
                 )));
+            }
+            // An unregistered file is an orphan (deferred deletion or crash);
+            // the registry is authoritative, so reap it and reuse the name.
+            if table_path.exists() {
+                crate::storage::table_catalog::reap_table_files(&table_path);
             }
 
             // Lazy materialization: CREATE records the name (and schema) in the
@@ -1317,11 +1322,17 @@ impl ApexStorageImpl {
                 .remove_schema(name)
                 .map_err(|e| PyIOError::new_err(e.to_string()))?;
             if path.exists() {
-                fs::remove_file(&path)
-                    .map_err(|e| PyIOError::new_err(format!("Failed to delete table file: {}", e)))?;
+                // Physical unlink is deferred; the file is reaped on
+                // same-name recreation or client close.
+                crate::storage::table_catalog::queue_file_deletions(&[&path]);
             }
             Ok::<PathBuf, PyErr>(path)
         })?;
+        // Mirror the SQL DROP path: invalidate the process-wide caches and
+        // bump the table epoch so cross-process result caches keyed on the
+        // old generation are discarded.
+        crate::Database::invalidate_dropped_table(&path);
+        crate::storage::epoch::bump(&path);
         self.table_paths.write().remove(name);
 
         if *self.current_table.read() == name {

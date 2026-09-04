@@ -2903,7 +2903,11 @@ impl OnDemandStorage {
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
                         | ColumnType::Date => {
-                            let mut vals: Vec<Option<i64>> = vec![None; n_out];
+                            // Primitive buffer + validity: 9 B/row instead of the
+                            // 16 B Option layout, and the final array is a buffer
+                            // move rather than an element-wise rebuild.
+                            let mut vals: Vec<i64> = vec![0; n_out];
+                            let mut valid: Vec<bool> = vec![false; n_out];
                             for_each_rg!(
                                 |pairs: &[(usize, usize)],
                                  null_bytes: &[u8],
@@ -2919,9 +2923,10 @@ impl OnDemandStorage {
                                             }
                                             let off = 8 + local_idx * 8;
                                             if off + 8 <= payload.len() {
-                                                vals[out_idx] = Some(i64::from_le_bytes(
+                                                vals[out_idx] = i64::from_le_bytes(
                                                     payload[off..off + 8].try_into().unwrap(),
-                                                ));
+                                                );
+                                                valid[out_idx] = true;
                                             }
                                         }
                                     } else if encoding == 2 {
@@ -2936,20 +2941,30 @@ impl OnDemandStorage {
                                                     payload, local_idx,
                                                 )
                                             {
-                                                vals[out_idx] = Some(v);
+                                                vals[out_idx] = v;
+                                                valid[out_idx] = true;
                                             }
                                         }
                                     }
                                 }
                             );
+                            let null_buf = valid
+                                .iter()
+                                .any(|&v| !v)
+                                .then(|| arrow::buffer::NullBuffer::from(valid));
                             (
                                 ci,
                                 Field::new(col_name, ArrowDataType::Int64, true),
-                                Arc::new(Int64Array::from(vals)) as ArrayRef,
+                                Arc::new(Int64Array::new(
+                                    arrow::buffer::ScalarBuffer::from(vals),
+                                    null_buf,
+                                )) as ArrayRef,
                             )
                         }
                         ColumnType::Float64 | ColumnType::Float32 => {
-                            let mut vals: Vec<Option<f64>> = vec![None; n_out];
+                            // Primitive buffer + validity (see Int64 arm).
+                            let mut vals: Vec<f64> = vec![0.0; n_out];
+                            let mut valid: Vec<bool> = vec![false; n_out];
                             for_each_rg!(
                                 |pairs: &[(usize, usize)],
                                  null_bytes: &[u8],
@@ -2965,9 +2980,10 @@ impl OnDemandStorage {
                                             }
                                             let off = 8 + local_idx * 8;
                                             if off + 8 <= payload.len() {
-                                                vals[out_idx] = Some(f64::from_le_bytes(
+                                                vals[out_idx] = f64::from_le_bytes(
                                                     payload[off..off + 8].try_into().unwrap(),
-                                                ));
+                                                );
+                                                valid[out_idx] = true;
                                             }
                                         }
                                     } else if encoding == COL_ENCODING_FLOAT_DICTIONARY {
@@ -2979,16 +2995,26 @@ impl OnDemandStorage {
                                                 {
                                                     continue;
                                                 }
-                                                vals[out_idx] = view.value(local_idx);
+                                                if let Some(v) = view.value(local_idx) {
+                                                    vals[out_idx] = v;
+                                                    valid[out_idx] = true;
+                                                }
                                             }
                                         }
                                     }
                                 }
                             );
+                            let null_buf = valid
+                                .iter()
+                                .any(|&v| !v)
+                                .then(|| arrow::buffer::NullBuffer::from(valid));
                             (
                                 ci,
                                 Field::new(col_name, ArrowDataType::Float64, true),
-                                Arc::new(Float64Array::from(vals)) as ArrayRef,
+                                Arc::new(Float64Array::new(
+                                    arrow::buffer::ScalarBuffer::from(vals),
+                                    null_buf,
+                                )) as ArrayRef,
                             )
                         }
                         ColumnType::StringDict => {

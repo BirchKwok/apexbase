@@ -1,4 +1,5 @@
 import importlib.util
+import json
 from functools import lru_cache
 from pathlib import Path
 
@@ -41,6 +42,30 @@ def test_generate_vector_data_is_deterministic_and_shaped():
     assert np.array_equal(batch1, batch2)
 
 
+def test_apex_benchmark_clients_always_disable_result_cache(monkeypatch):
+    module = load_benchmark_module()
+    calls = []
+
+    def client_stub(*args, **kwargs):
+        calls.append((args, kwargs))
+        return object()
+
+    monkeypatch.setattr(module, "ApexClient", client_stub)
+
+    result = module.open_apex_benchmark_client("bench", enable_cache=True)
+
+    assert result is not None
+    assert module.NO_RESULT_CACHE is True
+    assert calls == [(("bench",), {"enable_cache": False})]
+
+
+def test_public_baseline_uses_no_result_cache():
+    baseline_path = Path(__file__).resolve().parents[1] / "benchmarks" / "latest_public_baseline.json"
+    baseline = json.loads(baseline_path.read_text())
+
+    assert baseline["config"]["apex_result_cache"] is False
+
+
 def test_build_duckdb_vector_sql_uses_expected_functions():
     module = load_benchmark_module()
     query = np.array([0.1, 0.2, 0.3], dtype=np.float32)
@@ -64,10 +89,10 @@ def test_build_duckdb_vector_sql_uses_expected_functions():
 def test_public_profile_matches_readme_scoreboard_shape():
     module = load_benchmark_module()
 
-    assert len(module.PUBLIC_OLAP_BENCHMARK_NAMES) == 70
+    assert len(module.PUBLIC_OLAP_BENCHMARK_NAMES) == 71
     assert len(module.OLTP_FAIR_BENCHMARK_NAMES) == 32
-    assert len(module.benchmark_specs_for_profile(module.PROFILE_PUBLIC)) == 102
-    assert module.module_metric_counts(module.PROFILE_PUBLIC) == (70, 32, 14)
+    assert len(module.benchmark_specs_for_profile(module.PROFILE_PUBLIC)) == 103
+    assert module.module_metric_counts(module.PROFILE_PUBLIC) == (71, 32, 14)
     assert module.vector_metric_sets(module.PROFILE_PUBLIC) == (
         [
             ("TopK L2", "l2"),
@@ -88,8 +113,8 @@ def test_public_profile_matches_readme_scoreboard_shape():
 def test_extended_profile_keeps_diagnostics_available():
     module = load_benchmark_module()
 
-    assert len(module.benchmark_specs_for_profile(module.PROFILE_EXTENDED)) == 102
-    assert module.module_metric_counts(module.PROFILE_EXTENDED) == (78, 53, 17)
+    assert len(module.benchmark_specs_for_profile(module.PROFILE_EXTENDED)) == 103
+    assert module.module_metric_counts(module.PROFILE_EXTENDED) == (79, 53, 17)
     assert module.vector_metric_count(module.PROFILE_EXTENDED) == 9
 
 

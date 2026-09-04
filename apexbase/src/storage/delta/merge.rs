@@ -8,9 +8,11 @@ use std::io;
 use std::sync::Arc;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, BooleanBuilder, Float64Array, Float64Builder, Int64Array,
-    Int64Builder, StringArray, StringBuilder, UInt64Array, UInt64Builder,
+    Array, ArrayRef, BooleanArray, BooleanBuilder, DictionaryArray, Float64Array,
+    Float64Builder, Int64Array, Int64Builder, StringArray, StringBuilder, UInt64Array,
+    UInt64Builder,
 };
+use arrow::datatypes::UInt32Type;
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
@@ -94,6 +96,24 @@ impl DeltaMerger {
             new_columns.push(new_col);
         }
 
+        // Overlays can change a column's physical type (e.g. a dictionary
+        // column decoded to plain strings when an update introduces a value
+        // that is not in the base dictionary). Align the schema with the
+        // actual array types.
+        let fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .zip(new_columns.iter())
+            .map(|(field, column)| {
+                if *field.data_type() != *column.data_type() {
+                    Field::new(field.name(), column.data_type().clone(), true)
+                } else {
+                    field.as_ref().clone()
+                }
+            })
+            .collect();
+        let schema = Arc::new(Schema::new(fields));
+
         RecordBatch::try_new(schema, new_columns)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
@@ -156,8 +176,21 @@ impl DeltaMerger {
             ArrowDataType::Boolean => {
                 Self::merge_bool(base_col, col_name, kept_positions, base_row_ids, delta)
             }
+            ArrowDataType::Dictionary(_, value_dt)
+                if **value_dt == ArrowDataType::Utf8
+                    && delta.updates_column(col_name) =>
+            {
+                Self::merge_dictionary_string(
+                    base_col,
+                    col_name,
+                    kept_positions,
+                    base_row_ids,
+                    delta,
+                )
+            }
             _ => {
-                // For unsupported types, just take the kept rows without updates
+                // For unsupported types (including dictionary columns without
+                // pending updates), just take the kept rows without updates
                 let indices = arrow::array::UInt32Array::from(
                     kept_positions.iter().map(|&p| p as u32).collect::<Vec<_>>(),
                 );
@@ -264,6 +297,52 @@ impl DeltaMerger {
                 builder.append_null();
             } else {
                 builder.append_value(arr.value(pos));
+            }
+        }
+        Ok(Arc::new(builder.finish()))
+    }
+
+    /// Merge a dictionary-encoded string column: decode the base keys and
+    /// overlay pending updates, producing a plain string array (updated
+    /// strings may not exist in the original dictionary).
+    fn merge_dictionary_string(
+        base_col: &ArrayRef,
+        col_name: &str,
+        kept_positions: &[usize],
+        base_row_ids: &[u64],
+        delta: &DeltaStore,
+    ) -> io::Result<ArrayRef> {
+        let arr = base_col
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "expected dictionary array")
+            })?;
+        let values = arr
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "expected string dictionary values")
+            })?;
+        let mut builder =
+            StringBuilder::with_capacity(kept_positions.len(), kept_positions.len() * 32);
+        for &pos in kept_positions {
+            let row_id = base_row_ids[pos];
+            if let Some(updated) = delta.get_updated_value(row_id, col_name) {
+                match updated.as_str() {
+                    Some(s) => builder.append_value(s),
+                    None => builder.append_null(),
+                }
+            } else if arr.is_null(pos) {
+                builder.append_null();
+            } else {
+                let key = arr.keys().value(pos) as usize;
+                if key < values.len() && !values.is_null(key) {
+                    builder.append_value(values.value(key));
+                } else {
+                    builder.append_null();
+                }
             }
         }
         Ok(Arc::new(builder.finish()))
@@ -401,5 +480,83 @@ mod tests {
 
         let merged = DeltaMerger::merge(&batch, &delta, &row_ids).unwrap();
         assert_eq!(merged.num_rows(), 5);
+    }
+
+    fn make_dict_batch() -> (RecordBatch, Vec<u64>) {
+        use arrow::array::{DictionaryArray, UInt32Array};
+        use arrow::datatypes::UInt32Type;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", ArrowDataType::UInt64, false),
+            Field::new(
+                "city",
+                ArrowDataType::Dictionary(
+                    Box::new(ArrowDataType::UInt32),
+                    Box::new(ArrowDataType::Utf8),
+                ),
+                true,
+            ),
+            Field::new("age", ArrowDataType::Int64, true),
+        ]));
+
+        let ids = Arc::new(UInt64Array::from(vec![0, 1, 2, 3]));
+        let values = Arc::new(StringArray::from(vec!["beijing", "shanghai"]));
+        let keys = UInt32Array::from(vec![0, 1, 0, 1]);
+        let city =
+            DictionaryArray::<UInt32Type>::try_new(keys, values).unwrap();
+        let ages = Arc::new(Int64Array::from(vec![25, 30, 35, 40]));
+
+        let batch = RecordBatch::try_new(schema, vec![ids, Arc::new(city), ages]).unwrap();
+        (batch, vec![0, 1, 2, 3])
+    }
+
+    #[test]
+    fn test_merge_dictionary_column_with_updates_overlays_new_strings() {
+        let (batch, row_ids) = make_dict_batch();
+        let dir = tempfile::tempdir().unwrap();
+        let mut delta = DeltaStore::new(&dir.path().join("test.apex"));
+
+        // Update a dictionary column with a value that is NOT in the base
+        // dictionary: the merge must decode and overlay, not drop the update.
+        delta.update_cell(1, "city", Value::String("guangzhou".into()));
+        delta.delete_row(3);
+
+        let merged = DeltaMerger::merge(&batch, &delta, &row_ids).unwrap();
+        assert_eq!(merged.num_rows(), 3);
+
+        let city = merged
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(city.value(0), "beijing");
+        assert_eq!(city.value(1), "guangzhou");
+        assert_eq!(city.value(2), "beijing");
+    }
+
+    #[test]
+    fn test_merge_dictionary_column_deletes_only_keeps_encoding() {
+        let (batch, row_ids) = make_dict_batch();
+        let dir = tempfile::tempdir().unwrap();
+        let mut delta = DeltaStore::new(&dir.path().join("test.apex"));
+
+        delta.delete_row(0);
+
+        let merged = DeltaMerger::merge(&batch, &delta, &row_ids).unwrap();
+        assert_eq!(merged.num_rows(), 3);
+
+        let city = merged
+            .column(1)
+            .as_any()
+            .downcast_ref::<DictionaryArray<UInt32Type>>()
+            .unwrap();
+        let values = city
+            .values()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(city.keys().value(0) as usize), "shanghai");
+        assert_eq!(values.value(city.keys().value(1) as usize), "beijing");
+        assert_eq!(values.value(city.keys().value(2) as usize), "shanghai");
     }
 }

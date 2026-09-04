@@ -131,6 +131,9 @@ VECTOR_DIM_DEFAULT = 128
 VECTOR_K_DEFAULT = 10
 VECTOR_BATCH_QUERY_COUNT = 10
 VECTOR_ROWS_DEFAULT = 1_000_000
+# Public benchmark contract: ApexBase result caching stays disabled so every
+# timed query measures execution work, matching SQLite and DuckDB semantics.
+NO_RESULT_CACHE = True
 QUANTIZED_VECTOR_ROWS_DEFAULT = 1_000_000
 QUANTIZED_VECTOR_QUERY_COUNT = 20
 QUANTIZED_VECTOR_CANDIDATE_K = 100
@@ -345,10 +348,16 @@ def materialize_duckdb_vector_result(cursor):
     return cursor.fetchall()
 
 
+def open_apex_benchmark_client(*args, **kwargs):
+    """Create an ApexBase client with result caching disabled."""
+    kwargs["enable_cache"] = False
+    return ApexClient(*args, **kwargs)
+
+
 def setup_apex_vector_bench(base_tmpdir: str, vecs: np.ndarray):
     ensure_optional_imports()
     vector_dir = os.path.join(base_tmpdir, "vector_apex")
-    client = ApexClient(vector_dir, drop_if_exists=True)
+    client = open_apex_benchmark_client(vector_dir, drop_if_exists=True)
     client.create_table("vecs")
     client.use_table("vecs")
 
@@ -1194,6 +1203,15 @@ class SQLiteBench:
             "SELECT * FROM bench WHERE age = 25 OR city = 'Beijing'"
         )
 
+    def bench_boolean_filter_group_having_topk(self):
+        return self._query_all(
+            "SELECT city, COUNT(*) AS n, AVG(score) AS av FROM bench "
+            "WHERE (city IN ('Beijing', 'Shanghai', 'Guangzhou') "
+            "OR age IN (33, 44, 55)) AND score >= 40 "
+            "GROUP BY city HAVING COUNT(*) > 100 "
+            "ORDER BY n DESC, city LIMIT 5"
+        )
+
     def bench_filter_numeric_or(self):
         return self._query_all(
             "SELECT * FROM bench WHERE age = 20 OR age = 30 OR age = 40 OR age = 50"
@@ -1959,6 +1977,15 @@ class DuckDBBench:
             "SELECT * FROM bench WHERE age = 25 OR city = 'Beijing'"
         )
 
+    def bench_boolean_filter_group_having_topk(self):
+        return self._query_all(
+            "SELECT city, COUNT(*) AS n, AVG(score) AS av FROM bench "
+            "WHERE (city IN ('Beijing', 'Shanghai', 'Guangzhou') "
+            "OR age IN (33, 44, 55)) AND score >= 40 "
+            "GROUP BY city HAVING COUNT(*) > 100 "
+            "ORDER BY n DESC, city LIMIT 5"
+        )
+
     def bench_filter_numeric_or(self):
         return self._query_all(
             "SELECT * FROM bench WHERE age = 20 OR age = 30 OR age = 40 OR age = 50"
@@ -2270,6 +2297,7 @@ class ApexBaseBench:
         self._batch_update_queries = None
         self._uncached_scan_client = None
         self._scan_pipeline_query_index = 0
+        self._scan_pipeline_boolean_query_index = 0
         self._scan_pipeline_ready = False
 
     def _query_all(self, sql):
@@ -2298,7 +2326,7 @@ class ApexBaseBench:
             self.client = None
         if os.path.exists(self.db_dir):
             shutil.rmtree(self.db_dir)
-        self.client = ApexClient(self.db_dir, drop_if_exists=True)
+        self.client = open_apex_benchmark_client(self.db_dir, drop_if_exists=True)
         self.client.create_table('default')
         self.client.create_table('meta')
         self.client.use_table('meta')
@@ -2314,6 +2342,7 @@ class ApexBaseBench:
         self._temp_csv_name = None
         self._temp_json_name = None
         self._scan_pipeline_query_index = 0
+        self._scan_pipeline_boolean_query_index = 0
         self._scan_pipeline_ready = False
         if self._uncached_scan_client:
             self._uncached_scan_client.close()
@@ -2324,7 +2353,7 @@ class ApexBaseBench:
         ensure_optional_imports()
         if self.client:
             self.client.close()
-        self.client = ApexClient(self.db_dir)
+        self.client = open_apex_benchmark_client(self.db_dir)
         self.client.use_table('default')
 
     def bench_insert(self):
@@ -2419,7 +2448,7 @@ class ApexBaseBench:
         self.client.use_table("default")
         if self._uncached_scan_client:
             self._uncached_scan_client.close()
-        self._uncached_scan_client = ApexClient(self.db_dir, enable_cache=False)
+        self._uncached_scan_client = open_apex_benchmark_client(self.db_dir)
         self._uncached_scan_client.use_table("__perf_scan_pipeline")
         self._uncached_scan_client.execute("BEGIN")
         try:
@@ -2432,6 +2461,7 @@ class ApexBaseBench:
             self._uncached_scan_client.execute("ROLLBACK")
             raise
         self._scan_pipeline_query_index = 0
+        self._scan_pipeline_boolean_query_index = 0
         self._scan_pipeline_ready = True
 
     def bench_uncached_delta_scan_group_having_topk(self):
@@ -2449,6 +2479,31 @@ class ApexBaseBench:
         return self._uncached_scan_client.execute(
             "SELECT city, COUNT(*) AS n, AVG(score) AS av, MAX(age) AS mx "
             "FROM __perf_scan_pipeline WHERE age > ? AND age <= ? AND score >= ? "
+            "GROUP BY city HAVING COUNT(*) > ? "
+            "ORDER BY n DESC, city LIMIT 5",
+            params=params,
+            show_internal_id=True,
+        ).to_dict()
+
+    def bench_uncached_delta_boolean_scan_group_having_topk(self):
+        """Measure the typed Boolean scan tree on a visible delta overlay."""
+        if not self._scan_pipeline_ready:
+            raise RuntimeError("setup_uncached_delta_scan_pipeline must run first")
+        parameter_sets = (
+            (30.0, 0),
+            (40.0, 100),
+            (50.0, 250),
+            (60.0, 500),
+        )
+        params = parameter_sets[
+            self._scan_pipeline_boolean_query_index % len(parameter_sets)
+        ]
+        self._scan_pipeline_boolean_query_index += 1
+        return self._uncached_scan_client.execute(
+            "SELECT city, COUNT(*) AS n, AVG(score) AS av "
+            "FROM __perf_scan_pipeline "
+            "WHERE (city IN ('Beijing', 'Shanghai', 'Guangzhou') "
+            "OR age IN (33, 44, 55)) AND score >= ? "
             "GROUP BY city HAVING COUNT(*) > ? "
             "ORDER BY n DESC, city LIMIT 5",
             params=params,
@@ -3034,6 +3089,16 @@ class ApexBaseBench:
             "SELECT * FROM default WHERE age = 25 OR city = 'Beijing'"
         )
 
+    def bench_boolean_filter_group_having_topk(self):
+        return self.client.execute(
+            "SELECT city, COUNT(*) AS n, AVG(score) AS av FROM default "
+            "WHERE (city IN ('Beijing', 'Shanghai', 'Guangzhou') "
+            "OR age IN (33, 44, 55)) AND score >= 40 "
+            "GROUP BY city HAVING COUNT(*) > 100 "
+            "ORDER BY n DESC, city LIMIT 5",
+            show_internal_id=True,
+        ).to_dict()
+
     def bench_filter_numeric_or(self):
         return self._query_all(
             "SELECT * FROM default WHERE age = 20 OR age = 30 OR age = 40 OR age = 50"
@@ -3297,7 +3362,7 @@ class ApexBaseBench:
             # Close + reopen to clear the executor STORAGE_CACHE before backfill,
             # ensuring CREATE FTS INDEX reads fresh row data from disk.
             self.client.close()
-            self.client = ApexClient(self.db_dir)
+            self.client = open_apex_benchmark_client(self.db_dir)
             self.client.use_table('default')
             self.client.execute(
                 "CREATE FTS INDEX ON default (name, city, category)"
@@ -3427,6 +3492,7 @@ BENCHMARKS = [
     ("IN filter (city IN 3 cities)",     "bench_filter_in",        False, False, False, None),
     ("Numeric IN (age IN 9 values)",      "bench_filter_numeric_in",False, False, False, None),
     ("OR cross-col (age=25 OR city=BJ)",  "bench_filter_or_cross_col",False,False,False, None),
+    ("Boolean Filter+GROUP+HAVING+TopK",  "bench_boolean_filter_group_having_topk", False, False, False, None),
     ("Numeric OR (age=20|30|40|50)",      "bench_filter_numeric_or",False, False, False, None),
     # --- Window ---
     ("Window ROW_NUMBER PARTITION BY city",  "bench_window_row_number", False, False, False, None),
@@ -3539,6 +3605,7 @@ OLAP_BENCHMARK_NAMES = [
     "IN filter (city IN 3 cities)",
     "Numeric IN (age IN 9 values)",
     "OR cross-col (age=25 OR city=BJ)",
+    "Boolean Filter+GROUP+HAVING+TopK",
     "Numeric OR (age=20|30|40|50)",
     "Window ROW_NUMBER PARTITION BY city",
     "JOIN GROUP BY ORDER LIMIT",
@@ -4675,7 +4742,7 @@ def run_apex_buffered_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
 
     rows = []
     buf_tmpdir = tempfile.mkdtemp(prefix="apexbase_buffered_oltp_", dir=tmpdir)
-    client = ApexClient(buf_tmpdir, drop_if_exists=True)
+    client = open_apex_benchmark_client(buf_tmpdir, drop_if_exists=True)
     try:
         client.create_table("default")
         client.store({
@@ -4769,7 +4836,7 @@ def run_apex_memtable_oltp_benchmarks(tmpdir, oltp_results, warmup, iterations):
     mem_tmpdir = tempfile.mkdtemp(prefix="apexbase_memtable_oltp_", dir=tmpdir)
     old_disable_env = os.environ.get("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE")
     os.environ.pop("APEXBASE_DISABLE_MEMTABLE_SINGLE_WRITE", None)
-    client = ApexClient(mem_tmpdir, drop_if_exists=True)
+    client = open_apex_benchmark_client(mem_tmpdir, drop_if_exists=True)
     try:
         client.create_table("default")
         client.store({
@@ -5469,6 +5536,8 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     parser.add_argument("--memory", action="store_true", help="Track RSS memory delta per query")
     parser.add_argument("--low-memory", action="store_true",
                         help="Disable ApexBase arrow_batch_cache (simulate low-memory mode like SQLite/DuckDB)")
+    parser.add_argument("--no-result-cache", action="store_true",
+                        help="Deprecated compatibility flag; ApexBase result caching is always disabled")
     parser.add_argument("--skip-vector", action="store_true", help="Skip the vector similarity benchmark module")
     parser.add_argument(
         "--skip-quantized-vector", action="store_true",
@@ -5540,6 +5609,7 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     print(f"Warmup: {WARMUP} iterations, Timed: {ITERS} iterations (average)")
     print(f"Profile: {profile} ({'fair workload scoreboard' if profile == PROFILE_PUBLIC else 'full diagnostics'})")
     print("Fairness mode: default rankings use normal engine APIs, shared input data, and comparable materialized results.")
+    print("ApexBase client result cache: DISABLED (benchmark-wide no-cache contract).")
     print(
         f"Layout: OLAP, OLTP, exact vector, and quantized vector modules; "
         f"{olap_metric_count + oltp_metric_count + vector_metric_total} named metrics configured "
@@ -5918,6 +5988,7 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
                 "quantized_vector_candidate_k": QUANT_CANDIDATE_K,
                 "quantized_vector_seed": args.quantized_vector_seed,
                 "skip_quantized_vector": args.skip_quantized_vector,
+                "apex_result_cache": False,
             },
             "results": json_results,
             "fair_workload_scoreboard": fair_workload_scoreboard,

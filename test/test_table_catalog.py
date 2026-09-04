@@ -337,3 +337,125 @@ def test_concurrent_create_table_is_serialized_by_registry_lock(tmp_path):
         assert verify.list_tables() == ["t"]
     finally:
         verify.close()
+
+
+def test_drop_defers_file_removal_until_close(tmp_path):
+    """DROP is a catalog operation; the physical file is reaped on close."""
+    db = str(tmp_path / "deferred")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.create_table("t", {"k": "int64"})
+        client.store({"k": 1})
+        table_file = tmp_path / "deferred" / "t.apex"
+        assert table_file.exists()
+
+        client.drop_table("t")
+        assert client.list_tables() == []
+        # Deferred: the file survives until the client closes.
+        assert table_file.exists()
+    finally:
+        client.close()
+    assert not table_file.exists()
+
+
+def test_sql_drop_defers_file_removal_until_close(tmp_path):
+    """The SQL DROP TABLE path defers physical deletion the same way."""
+    db = str(tmp_path / "sqldef")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.execute("CREATE TABLE t (k INT64)")
+        client.use_table("t")
+        client.execute("INSERT INTO t (k) VALUES (1)")
+        client.flush()
+        table_file = tmp_path / "sqldef" / "t.apex"
+        assert table_file.exists()
+
+        client.execute("DROP TABLE t")
+        assert client.list_tables() == []
+        assert table_file.exists()
+    finally:
+        client.close()
+    assert not table_file.exists()
+
+
+def test_recreate_after_drop_starts_empty(tmp_path):
+    """Recreating a dropped name reaps the deferred file: no stale rows."""
+    db = str(tmp_path / "reuse")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.create_table("t", {"k": "int64"})
+        client.store({"k": 1})
+        client.store({"k": 2})
+        client.drop_table("t")
+
+        client.create_table("t", {"k": "int64"})
+        assert client.count_rows() == 0
+        client.store({"k": 3})
+        assert client.count_rows() == 1
+        assert list(client.execute("SELECT k FROM t")) == [{"k": 3}]
+    finally:
+        client.close()
+
+
+def test_drop_non_fts_table_does_not_create_fts_dir(tmp_path):
+    """Dropping a plain table must not probe or create the FTS directory."""
+    db = str(tmp_path / "plain")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.create_table("t", {"k": "int64"})
+        client.store({"k": 1})
+        client.drop_table("t")
+        assert client.list_tables() == []
+        assert not (tmp_path / "plain" / "fts_indexes").exists()
+    finally:
+        client.close()
+
+
+def test_drop_fts_table_removes_index_files(tmp_path):
+    """FTS-indexed tables still have their index files removed on drop."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    with tempfile.TemporaryDirectory() as temp_dir:
+        client = ApexClient(dirpath=temp_dir, drop_if_exists=True)
+        try:
+            client.create_table("default")
+            client.init_fts(index_fields=["content"])
+            client.store({"content": "Python programming language"})
+            _ = client.search_text("python")  # materialize the index file
+
+            index_path = _Path(temp_dir) / "fts_indexes" / "default.afts"
+            assert index_path.exists()
+
+            client.drop_table("default")
+            assert client.list_tables() == []
+            assert not index_path.exists(), "FTS index files must be removed on drop"
+        finally:
+            client.close()
+
+
+def test_sql_ctas_existing_table_preserves_data(tmp_path):
+    """A CTAS that returns AlreadyExists must not destroy the live table."""
+    db = str(tmp_path / "ctas")
+    client = ApexClient(dirpath=db, drop_if_exists=True)
+    try:
+        client.execute("CREATE TABLE src (k INT64)")
+        client.use_table("src")
+        client.execute("INSERT INTO src (k) VALUES (1), (2), (3)")
+        client.execute("CREATE TABLE dst AS SELECT k FROM src")
+        table_file = Path(db) / "dst.apex"
+        assert table_file.exists()
+
+        with pytest.raises((ValueError, RuntimeError), match="already exists"):
+            client.execute("CREATE TABLE dst AS SELECT k FROM src")
+        assert table_file.exists(), "failed CTAS must not delete the live table file"
+        rows = client.execute("SELECT k FROM dst ORDER BY k")
+        assert [row["k"] for row in rows] == [1, 2, 3]
+
+        # IF NOT EXISTS also succeeds without touching the existing table.
+        client.execute("CREATE TABLE IF NOT EXISTS dst AS SELECT k FROM src")
+        assert table_file.exists()
+        rows = client.execute("SELECT k FROM dst ORDER BY k")
+        assert [row["k"] for row in rows] == [1, 2, 3]
+    finally:
+        client.close()

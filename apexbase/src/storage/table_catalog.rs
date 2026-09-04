@@ -1035,6 +1035,96 @@ fn scan_apex_files(base_dir: &Path) -> io::Result<BTreeMap<String, PathBuf>> {
     Ok(tables)
 }
 
+// ---------------------------------------------------------------------------
+// Deferred physical deletion of dropped table files
+// ---------------------------------------------------------------------------
+
+/// Auxiliary files a table may own, as suffixes of the `t.apex` path.
+const TABLE_FILE_SUFFIXES: &[&str] = &[
+    ".wal",
+    ".lock",
+    ".tmp",
+    ".stats",
+    ".delta",
+    ".delta.meta",
+    ".deltastore",
+    ".deltastore.tmp",
+];
+
+/// (mtime nanos, len) fingerprint captured when a table file is queued for
+/// deferred deletion. A later reap only unlinks the file when it still
+/// matches, so a file recreated for a same-name table is never touched.
+type Fingerprint = Option<(u64, u64)>;
+
+static PENDING_DELETIONS: Lazy<dashmap::DashMap<PathBuf, Fingerprint>> =
+    Lazy::new(dashmap::DashMap::new);
+
+fn file_fingerprint(path: &Path) -> Fingerprint {
+    let meta = fs::metadata(path).ok()?;
+    let nanos = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos() as u64)?;
+    Some((nanos, meta.len()))
+}
+
+fn unlink_table_files(table_path: &Path) {
+    let _ = fs::remove_file(table_path);
+    let stem = table_path.to_string_lossy();
+    for suffix in TABLE_FILE_SUFFIXES {
+        let _ = fs::remove_file(&format!("{stem}{suffix}"));
+    }
+}
+
+fn fingerprint_matches(path: &Path, expected: &Fingerprint) -> bool {
+    match expected {
+        Some(expected) => file_fingerprint(path).as_ref() == Some(expected),
+        None => !path.exists(),
+    }
+}
+
+/// Queue dropped table files for deferred deletion. DROP itself stays a
+/// catalog-only operation; the files are reaped on same-name recreation,
+/// client close, or when the backlog grows past the bound.
+pub fn queue_file_deletions(paths: &[impl AsRef<Path>]) {
+    for path in paths {
+        let path = path.as_ref();
+        PENDING_DELETIONS.insert(path.to_path_buf(), file_fingerprint(path));
+    }
+    if PENDING_DELETIONS.len() >= 64 {
+        drain_pending_deletions(16);
+    }
+}
+
+/// Synchronously unlink one table file and its auxiliaries. Called under the
+/// registry lock when a same-name CREATE finds an unregistered file (either a
+/// deferred deletion or a crash orphan); the registry is authoritative, so
+/// the file is safe to remove.
+pub fn reap_table_files(table_path: &Path) {
+    PENDING_DELETIONS.remove(table_path);
+    unlink_table_files(table_path);
+}
+
+fn drain_pending_deletions(limit: usize) {
+    let mut drained = 0usize;
+    PENDING_DELETIONS.retain(|path, fingerprint| {
+        if drained < limit && fingerprint_matches(path, fingerprint) {
+            unlink_table_files(path);
+            drained += 1;
+            false
+        } else {
+            true
+        }
+    });
+}
+
+/// Best-effort reap of all queued deletions (client close).
+pub fn reap_pending_deletions() {
+    drain_pending_deletions(128);
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,6 +1240,56 @@ mod tests {
         );
         release(&dir);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_deletion_queued_and_reaped_on_drain() {
+        let dir = temp_dir("deferred_reap");
+        let table = dir.join("t.apex");
+        fs::write(&table, b"payload").unwrap();
+        fs::write(dir.join("t.apex.wal"), b"wal").unwrap();
+
+        queue_file_deletions(std::slice::from_ref(&table));
+        // Present until explicitly reaped.
+        assert!(table.exists());
+        assert!(dir.join("t.apex.wal").exists());
+
+        reap_pending_deletions();
+        assert!(!table.exists());
+        assert!(!dir.join("t.apex.wal").exists());
+        assert!(PENDING_DELETIONS.is_empty());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deferred_deletion_skips_replaced_file() {
+        let dir = temp_dir("deferred_replaced");
+        let table = dir.join("t.apex");
+        fs::write(&table, b"payload-one").unwrap();
+
+        queue_file_deletions(std::slice::from_ref(&table));
+        // Simulate a same-name recreation: new contents and mtime.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&table, b"payload-two-different-length").unwrap();
+
+        reap_pending_deletions();
+        assert!(table.exists());
+        PENDING_DELETIONS.remove(&table);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reap_table_files_unlinks_under_registry_lock() {
+        let dir = temp_dir("reap_under_lock");
+        let table = dir.join("t.apex");
+        fs::write(&table, b"payload").unwrap();
+        fs::write(dir.join("t.apex.delta"), b"delta").unwrap();
+        queue_file_deletions(std::slice::from_ref(&table));
+        reap_table_files(&table);
+        assert!(!table.exists());
+        assert!(!dir.join("t.apex.delta").exists());
+        assert!(PENDING_DELETIONS.is_empty());
         let _ = fs::remove_dir_all(&dir);
     }
 }

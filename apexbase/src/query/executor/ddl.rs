@@ -199,16 +199,21 @@ impl ApexExecutor {
         let base_dir = table_path.parent().unwrap_or(table_path);
         let registry_lock = crate::storage::table_catalog::lock(base_dir)?;
         let registry = registry_lock.snapshot()?;
-        if registry.contains_key(table_name) || table_path.exists() {
+        if registry.contains_key(table_name) {
             if if_not_exists {
                 // Return success without error
                 return Ok(ApexResult::Scalar(0));
-            } else {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    format!("Table '{}' already exists", table),
-                ));
             }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Table '{}' already exists", table),
+            ));
+        }
+        // An unregistered file is an orphan (deferred deletion or crash).
+        // The registry is authoritative for table names, so reap it and let
+        // the name be reused.
+        if table_path.exists() {
+            crate::storage::table_catalog::reap_table_files(table_path);
         }
         let epoch_write = crate::storage::epoch::logical_write(table_path);
 
@@ -397,28 +402,14 @@ impl ApexExecutor {
             registry_lock.remove_schema(table_name)?;
         }
 
+        let epoch_write = crate::storage::epoch::logical_write(table_path);
         if table_path.exists() {
-            let epoch_write = crate::storage::epoch::logical_write(table_path);
-
-            std::fs::remove_file(table_path)?;
             invalidate_table_schema_stats(&table_path.to_string_lossy());
-
-            // Clean up associated files (WAL, delta, deltastore) in same directory as table
-            let parent_dir = table_path.parent().unwrap_or(table_path);
-            let file_stem = table_path.file_name().unwrap_or_default().to_string_lossy();
-            let cleanup_extensions = [
-                format!("{}.wal", file_stem),
-                format!("{}.delta", file_stem),
-                format!("{}.deltastore", file_stem),
-            ];
-            for name in &cleanup_extensions {
-                let path = parent_dir.join(name);
-                if path.exists() {
-                    let _ = std::fs::remove_file(&path);
-                }
-            }
-            epoch_write.commit();
+            // Physical unlink is deferred: DROP is a catalog operation. The
+            // file is reaped on same-name recreation or client close.
+            crate::storage::table_catalog::queue_file_deletions(&[table_path]);
         }
+        epoch_write.commit();
 
         Ok(ApexResult::Scalar(0))
     }
@@ -2560,7 +2551,9 @@ impl ApexExecutor {
             .map(|registry| registry.snapshot().map(|items| items.contains_key(table_name)))
             .transpose()?
             .unwrap_or(false);
-        if registered || crate::storage::engine::engine().table_exists(&table_path) {
+        if registered
+            || (in_memory && crate::storage::engine::engine().table_exists(&table_path))
+        {
             if if_not_exists {
                 return Ok(ApexResult::Scalar(0));
             }
@@ -2568,6 +2561,13 @@ impl ApexExecutor {
                 io::ErrorKind::AlreadyExists,
                 format!("Table '{}' already exists", table),
             ));
+        }
+        // An unregistered file is an orphan (deferred deletion or crash).
+        // The registry is authoritative for table names, so reap it and let
+        // the name be reused. This only runs for unregistered names: a
+        // registered table returns above without touching its file.
+        if !in_memory && table_path.exists() {
+            crate::storage::table_catalog::reap_table_files(&table_path);
         }
         let epoch_write = crate::storage::epoch::logical_write(&table_path);
 

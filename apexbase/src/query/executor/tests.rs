@@ -2271,6 +2271,76 @@ fn test_ctas_if_not_exists() {
 }
 
 #[test]
+fn test_ctas_existing_table_keeps_registered_file() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    exec_multi("CREATE TABLE src4 (id INT)", base).unwrap();
+    exec_multi("INSERT INTO src4 (id) VALUES (1), (2), (3)", base).unwrap();
+    exec_multi("CREATE TABLE dst4 AS SELECT id FROM src4", base).unwrap();
+    let dst_file = base.join("dst4.apex");
+    assert!(dst_file.exists());
+
+    // A CTAS that only returns AlreadyExists must not touch the live file.
+    assert_err_contains(
+        exec_multi("CREATE TABLE dst4 AS SELECT id FROM src4", base),
+        "already exists",
+    );
+    assert!(
+        dst_file.exists(),
+        "failed CTAS must not delete the registered table file"
+    );
+    let q = exec_multi("SELECT COUNT(*) FROM dst4", base).unwrap();
+    let batch = q.to_record_batch().unwrap();
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        3
+    );
+}
+
+#[test]
+fn test_ctas_reaps_orphan_file_for_unregistered_name() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    exec_multi("CREATE TABLE seed (id INT)", base).unwrap();
+    exec_multi("INSERT INTO seed (id) VALUES (7)", base).unwrap();
+    exec_multi(
+        "CREATE TABLE ghost AS SELECT id FROM seed WHERE id > 999",
+        base,
+    )
+    .unwrap();
+    let ghost_file = base.join("ghost.apex");
+    assert!(ghost_file.exists());
+
+    // Unregister the name to simulate a crash orphan: file on disk,
+    // absent from the registry.
+    {
+        let lock = crate::storage::table_catalog::lock(base).unwrap();
+        assert!(lock.remove("ghost").unwrap().is_some());
+    }
+    let result = exec_multi("CREATE TABLE ghost AS SELECT id FROM seed", base).unwrap();
+    if let ApexResult::Scalar(n) = result {
+        assert_eq!(n, 1);
+    }
+    let q = exec_multi("SELECT id FROM ghost ORDER BY id", base).unwrap();
+    let batch = q.to_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert_eq!(
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0),
+        7
+    );
+}
+
+#[test]
 fn test_ctas_empty_result() {
     let dir = tempdir().unwrap();
     let base = dir.path();

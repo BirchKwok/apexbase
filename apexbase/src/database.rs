@@ -268,6 +268,14 @@ impl Database {
         engine().invalidate(table_path);
     }
 
+    /// Invalidate every per-table cache (engine backends and the SQL
+    /// executor storage cache) after DDL removes the table file.
+    #[inline]
+    pub fn invalidate_dropped_table(table_path: &Path) {
+        engine().invalidate(table_path);
+        crate::query::executor::invalidate_storage_cache(table_path);
+    }
+
     #[inline]
     pub fn invalidate_dir(dir: &Path) {
         engine().invalidate_dir(dir);

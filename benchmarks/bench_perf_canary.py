@@ -34,6 +34,11 @@ CANARY_SPECS = (
         "bench_uncached_delta_scan_group_having_topk",
         "mean",
     ),
+    (
+        "Uncached delta Boolean+GROUP+HAVING+TopK",
+        "bench_uncached_delta_boolean_scan_group_having_topk",
+        "mean",
+    ),
     ("ORDER BY score LIMIT 100", "bench_order_limit", "mean"),
     ("IS NOT NULL numeric TopK", "bench_not_null_numeric_topk", "mean"),
     ("Filtered numeric TopK", "bench_filtered_numeric_topk", "mean"),
@@ -168,7 +173,10 @@ def run_canary(rows, warmup, iterations, qps_only=False):
                     bench.setup_topk_join_canary()
                 elif method_name == "bench_dimension_join_aggregation":
                     bench.setup_dimension_join_aggregation()
-                elif method_name == "bench_uncached_delta_scan_group_having_topk":
+                elif method_name in {
+                    "bench_uncached_delta_scan_group_having_topk",
+                    "bench_uncached_delta_boolean_scan_group_having_topk",
+                }:
                     bench.setup_uncached_delta_scan_pipeline()
                 elapsed_ms = _run_metric(
                     bench, method_name, mode, warmup, iterations, setup_method

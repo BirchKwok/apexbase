@@ -1927,3 +1927,500 @@ fn filtered_aggregation_parallelism_requires_enough_rows_per_worker() {
     assert!(!should_parallel_filtered_agg(4_000_000, 1, 10));
     assert!(!should_parallel_filtered_agg(4_000_000, 16, 1));
 }
+
+// ====== Fused predicate-lane group aggregation tests ======
+
+fn fused_test_setup(path: &std::path::Path) -> (Vec<String>, Vec<u16>) {
+    use std::collections::HashMap;
+
+    let n = 200usize;
+    let cities: Vec<String> = (0..n).map(|i| ["A", "B", "C", "D"][i % 4].to_string()).collect();
+    let ages: Vec<i64> = (0..n).map(|i| (i % 10) as i64).collect();
+    let scores: Vec<f64> = (0..n).map(|i| (i % 7) as f64 * 0.5).collect();
+
+    let mut int_cols = HashMap::new();
+    int_cols.insert("age".to_string(), ages);
+    let mut float_cols = HashMap::new();
+    float_cols.insert("score".to_string(), scores);
+    let mut string_cols = HashMap::new();
+    string_cols.insert("city".to_string(), cities);
+
+    let storage = OnDemandStorage::create(path).unwrap();
+    storage
+        .insert_typed(int_cols, float_cols, string_cols, HashMap::new(), HashMap::new())
+        .unwrap();
+    storage.save_v4().unwrap();
+
+    let dict_strings = vec!["A", "B", "C", "D"].iter().map(|s| s.to_string()).collect();
+    let group_ids: Vec<u16> = (0..n).map(|i| (i % 4) as u16).collect();
+    (dict_strings, group_ids)
+}
+
+fn fused_reference<F: Fn(usize) -> bool>(n: usize, predicate: F) -> [i64; 4] {
+    let mut counts = [0i64; 4];
+    for i in 0..n {
+        if predicate(i) {
+            counts[i % 4] += 1;
+        }
+    }
+    counts
+}
+
+#[test]
+fn test_fused_group_agg_boolean_tree_matches_reference() {
+    use crate::storage::on_demand::{FusedLeaf, FusedLaneSpec, FusedPredicate};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fused_bool.apex");
+    let (dict_strings, group_ids) = fused_test_setup(&path);
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let lanes = vec![
+        FusedLaneSpec {
+            col: "age".to_string(),
+            is_int: true,
+        },
+        FusedLaneSpec {
+            col: "score".to_string(),
+            is_int: false,
+        },
+    ];
+    // (city IN {A, B} OR age IN {0, 1, 2}) AND score >= 1.0
+    let city_flags: Vec<u8> = vec![1, 1, 0, 0];
+    let predicate = FusedPredicate::And(
+        Box::new(FusedPredicate::Or(
+            Box::new(FusedPredicate::Leaf(FusedLeaf::DictIn { flags: city_flags })),
+            Box::new(FusedPredicate::Leaf(FusedLeaf::InI64 {
+                lane: 0,
+                values: vec![0, 1, 2],
+            })),
+        )),
+        Box::new(FusedPredicate::Leaf(FusedLeaf::RangeF64 {
+            lane: 1,
+            lo: 1.0,
+            hi: f64::INFINITY,
+        })),
+    );
+
+    let result = storage
+        .execute_fused_group_agg_mmap(&dict_strings, &group_ids, &lanes, &predicate, Some(1), 7)
+        .unwrap()
+        .expect("kernel should run");
+
+    let expected = fused_reference(200, |i| {
+        let city_ok = i % 4 == 0 || i % 4 == 1;
+        let age_ok = (i % 10) as i64 <= 2;
+        let score_ok = (i % 7) as f64 * 0.5 >= 1.0;
+        (city_ok || age_ok) && score_ok
+    });
+    for slot in 0..4 {
+        assert_eq!(result[slot].count, expected[slot], "slot {slot}");
+    }
+    // Sum cross-check for slot 0 (city A, i % 4 == 0)
+    let mut sum = 0.0f64;
+    for i in (0..200).step_by(4) {
+        let age_ok = (i % 10) as i64 <= 2;
+        let score_ok = (i % 7) as f64 * 0.5 >= 1.0;
+        if (true || age_ok) && score_ok {
+            sum += (i % 7) as f64 * 0.5;
+        }
+    }
+    assert!((result[0].sum - sum).abs() < 1e-9);
+    assert_eq!(result[0].min, 1.0);
+    assert_eq!(result[0].max, 3.0);
+}
+
+#[test]
+fn test_fused_group_agg_not_and_sentinel_dict_eq() {
+    use crate::storage::on_demand::{FusedLeaf, FusedLaneSpec, FusedPredicate};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fused_not.apex");
+    let (dict_strings, group_ids) = fused_test_setup(&path);
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let lanes = vec![FusedLaneSpec {
+        col: "age".to_string(),
+        is_int: true,
+    }];
+    // NOT (age IN {0, 1}) AND city = 'B'  → only slot 1
+    let predicate = FusedPredicate::And(
+        Box::new(FusedPredicate::Not(Box::new(FusedPredicate::Leaf(
+            FusedLeaf::InI64 {
+                lane: 0,
+                values: vec![0, 1],
+            },
+        )))),
+        Box::new(FusedPredicate::Leaf(FusedLeaf::DictEq { key: 1 })),
+    );
+    let result = storage
+        .execute_fused_group_agg_mmap(&dict_strings, &group_ids, &lanes, &predicate, None, 0)
+        .unwrap()
+        .expect("kernel should run");
+    let expected = fused_reference(200, |i| (i % 10) as i64 > 1 && i % 4 == 1);
+    for slot in 0..4 {
+        assert_eq!(result[slot].count, expected[slot], "slot {slot}");
+    }
+
+    // DictEq with the sentinel key (value absent from the dictionary) never
+    // matches; NOT of it matches every row.
+    let none_pred = FusedPredicate::Leaf(FusedLeaf::DictEq { key: u16::MAX });
+    let result = storage
+        .execute_fused_group_agg_mmap(&dict_strings, &group_ids, &lanes, &none_pred, None, 0)
+        .unwrap()
+        .expect("kernel should run");
+    assert!(result.iter().all(|agg| agg.count == 0));
+
+    let all_pred = FusedPredicate::Not(Box::new(none_pred));
+    let result = storage
+        .execute_fused_group_agg_mmap(&dict_strings, &group_ids, &lanes, &all_pred, None, 0)
+        .unwrap()
+        .expect("kernel should run");
+    for slot in 0..4 {
+        assert_eq!(result[slot].count, 50, "slot {slot}");
+    }
+}
+
+#[test]
+fn test_fused_group_agg_strict_integer_inequality_is_exact() {
+    use crate::storage::on_demand::{FusedLeaf, FusedLaneSpec, FusedPredicate};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fused_strict.apex");
+    let (dict_strings, group_ids) = fused_test_setup(&path);
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let lanes = vec![FusedLaneSpec {
+        col: "age".to_string(),
+        is_int: true,
+    }];
+    // age > 4  →  [5, i64::MAX]
+    let predicate = FusedPredicate::Leaf(FusedLeaf::RangeI64 {
+        lane: 0,
+        lo: 5,
+        hi: i64::MAX,
+    });
+    let result = storage
+        .execute_fused_group_agg_mmap(&dict_strings, &group_ids, &lanes, &predicate, None, 0)
+        .unwrap()
+        .expect("kernel should run");
+    let expected = fused_reference(200, |i| (i % 10) as i64 > 4);
+    for slot in 0..4 {
+        assert_eq!(result[slot].count, expected[slot], "slot {slot}");
+    }
+}
+
+#[test]
+fn test_fused_plan_compiles_per_slot_flat_shapes() {
+    use crate::storage::on_demand::{
+        compile_fused_plan, ExtraKind, FusedLeaf, FusedPredicate, FuseMode, SlotPlan,
+    };
+
+    // And(InI64, DictIn): the pure side becomes the common part; the
+    // dictionary side becomes per-slot All/None extras (OneMask).
+    let predicate = FusedPredicate::And(
+        Box::new(FusedPredicate::Leaf(FusedLeaf::InI64 {
+            lane: 0,
+            values: vec![3],
+        })),
+        Box::new(FusedPredicate::Leaf(FusedLeaf::DictIn {
+            flags: vec![1, 0, 1, 0],
+        })),
+    );
+    let plan = compile_fused_plan(&predicate, 4).expect("compile");
+    let in_id = plan
+        .leaves
+        .iter()
+        .position(|l| matches!(l, FusedLeaf::InI64 { .. }))
+        .unwrap() as u8;
+    assert_eq!(plan.mode, FuseMode::AndCommon);
+    assert!(matches!(plan.common, SlotPlan::One(l) if l == in_id));
+    assert_eq!(plan.extra_kind, ExtraKind::OneMask);
+    assert_eq!(plan.extra_mask, vec![0, 0xFF, 0, 0xFF]);
+
+    // Pure numeric And of two lanes: one flat common part for every slot.
+    let predicate = FusedPredicate::And(
+        Box::new(FusedPredicate::Leaf(FusedLeaf::RangeI64 {
+            lane: 0,
+            lo: 1,
+            hi: 9,
+        })),
+        Box::new(FusedPredicate::Leaf(FusedLeaf::RangeF64 {
+            lane: 1,
+            lo: 0.5,
+            hi: 2.0,
+        })),
+    );
+    let plan = compile_fused_plan(&predicate, 4).expect("compile");
+    assert_eq!(plan.mode, FuseMode::AndCommon);
+    assert!(matches!(plan.common, SlotPlan::And(_, _)));
+    assert_eq!(plan.extra_kind, ExtraKind::All);
+
+    // And(Or(leaf, leaf), leaf): the common 3-leaf shape stays flat.
+    let leaf = |lane: usize| {
+        FusedPredicate::Leaf(FusedLeaf::RangeI64 {
+            lane,
+            lo: 0,
+            hi: 9,
+        })
+    };
+    let predicate = FusedPredicate::And(
+        Box::new(FusedPredicate::Or(Box::new(leaf(0)), Box::new(leaf(1)))),
+        Box::new(leaf(2)),
+    );
+    let plan = compile_fused_plan(&predicate, 2).expect("compile");
+    assert_eq!(plan.mode, FuseMode::AndCommon);
+    assert!(matches!(plan.common, SlotPlan::Bin3 { .. }));
+
+    // And(Or, Or) with four leaves: deeper trees keep the Pure slot table.
+    let predicate = FusedPredicate::And(
+        Box::new(FusedPredicate::Or(Box::new(leaf(0)), Box::new(leaf(1)))),
+        Box::new(FusedPredicate::Or(Box::new(leaf(0)), Box::new(leaf(2)))),
+    );
+    let plan = compile_fused_plan(&predicate, 2).expect("compile");
+    assert_eq!(plan.mode, FuseMode::Pure);
+    assert!(plan
+        .slot_plans
+        .iter()
+        .all(|p| matches!(p, SlotPlan::Tree { .. })));
+
+    // Or(DictIn, RangeF64): the numeric side becomes the common part of an
+    // OrCommon plan with All/None extras.
+    let predicate = FusedPredicate::Or(
+        Box::new(FusedPredicate::Leaf(FusedLeaf::DictIn {
+            flags: vec![1, 0],
+        })),
+        Box::new(FusedPredicate::Leaf(FusedLeaf::RangeF64 {
+            lane: 0,
+            lo: 1.0,
+            hi: 2.0,
+        })),
+    );
+    let plan = compile_fused_plan(&predicate, 2).expect("compile");
+    assert_eq!(plan.mode, FuseMode::OrCommon);
+    assert!(matches!(plan.common, SlotPlan::One(_)));
+    assert_eq!(plan.extra_kind, ExtraKind::OneMask);
+    assert_eq!(plan.extra_mask, vec![0, 0xFF]);
+}
+
+#[test]
+fn test_lut_program_truth_table_matches_reference() {
+    use crate::storage::on_demand::{
+        try_build_lut_program, FusedLeaf, FusedPredicate, LcMode,
+    };
+    // (city IN {A, C} OR age IN {1, 3}) AND score >= 1.0
+    let predicate = FusedPredicate::And(
+        Box::new(FusedPredicate::Or(
+            Box::new(FusedPredicate::Leaf(FusedLeaf::DictIn {
+                flags: vec![1, 0, 1, 0],
+            })),
+            Box::new(FusedPredicate::Leaf(FusedLeaf::InI64 {
+                lane: 0,
+                values: vec![1, 3],
+            })),
+        )),
+        Box::new(FusedPredicate::Leaf(FusedLeaf::RangeF64 {
+            lane: 1,
+            lo: 1.0,
+            hi: f64::INFINITY,
+        })),
+    );
+    let prog = try_build_lut_program(&predicate, 4).expect("build");
+    assert_eq!(prog.k, 2);
+    assert_eq!(prog.mode[0], LcMode::InI64);
+    assert_eq!(prog.mode[1], LcMode::RangeF64);
+    assert!(!prog.all_none);
+    for gid in 0..4usize {
+        for cb in 0..4u8 {
+            let age_ok = ((cb >> 0) & 1) != 0;
+            let score_ok = ((cb >> 1) & 1) != 0;
+            let expect = ((gid == 0 || gid == 2) || age_ok) && score_ok;
+            assert_eq!(
+                prog.lut[(cb as usize) << prog.stride_shift | gid],
+                expect as u8,
+                "gid={gid} cb={cb}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_lut_program_rejects_over_budget() {
+    use crate::storage::on_demand::{try_build_lut_program, FusedLeaf, FusedPredicate};
+    let range = |lane: usize| {
+        FusedPredicate::Leaf(FusedLeaf::RangeI64 {
+            lane,
+            lo: 0,
+            hi: 9,
+        })
+    };
+    // Four distinct lane leaves exceed the budget: generic path.
+    let predicate = FusedPredicate::And(
+        Box::new(FusedPredicate::And(Box::new(range(0)), Box::new(range(1)))),
+        Box::new(FusedPredicate::And(Box::new(range(2)), Box::new(range(3)))),
+    );
+    assert!(try_build_lut_program(&predicate, 4).is_none());
+    // IN sets above the budget stay on the generic path.
+    let big_in = FusedPredicate::Leaf(FusedLeaf::InI64 {
+        lane: 0,
+        values: (0..9).collect(),
+    });
+    assert!(try_build_lut_program(&big_in, 4).is_none());
+    // An all-None predicate is still a valid LUT program with all_none set.
+    let none = FusedPredicate::Leaf(FusedLeaf::DictIn { flags: vec![0, 0] });
+    let prog = try_build_lut_program(&none, 2).expect("build");
+    assert_eq!(prog.k, 0);
+    assert!(prog.all_none);
+}
+
+#[test]
+fn test_fused_group_agg_k3_lut_matches_reference() {
+    use crate::storage::on_demand::{FusedLeaf, FusedLaneSpec, FusedPredicate};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fused_k3.apex");
+    let (dict_strings, group_ids) = fused_test_setup(&path);
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let lanes = vec![
+        FusedLaneSpec {
+            col: "age".to_string(),
+            is_int: true,
+        },
+        FusedLaneSpec {
+            col: "score".to_string(),
+            is_int: false,
+        },
+    ];
+    // (age IN {1, 3} OR score IN {0.5, 2.5}) AND age BETWEEN 0 AND 8:
+    // three distinct lane leaves, so the k=3 LUT loop runs.
+    let predicate = FusedPredicate::And(
+        Box::new(FusedPredicate::Or(
+            Box::new(FusedPredicate::Leaf(FusedLeaf::InI64 {
+                lane: 0,
+                values: vec![1, 3],
+            })),
+            Box::new(FusedPredicate::Leaf(FusedLeaf::InF64 {
+                lane: 1,
+                values: vec![0.5, 2.5],
+            })),
+        )),
+        Box::new(FusedPredicate::Leaf(FusedLeaf::RangeI64 {
+            lane: 0,
+            lo: 0,
+            hi: 8,
+        })),
+    );
+
+    let result = storage
+        .execute_fused_group_agg_mmap(
+            &dict_strings, &group_ids, &lanes, &predicate, Some(0), 7,
+        )
+        .unwrap()
+        .expect("kernel should run");
+
+    let matches = |i: usize| {
+        let age = (i % 10) as i64;
+        let score = (i % 7) as f64 * 0.5;
+        (age == 1 || age == 3 || score == 0.5 || score == 2.5) && age <= 8
+    };
+    let expected = fused_reference(200, matches);
+    for slot in 0..4 {
+        assert_eq!(result[slot].count, expected[slot], "slot {slot}");
+    }
+    // Value aggregate over the int lane (age) for slot 1.
+    let mut sum = 0.0f64;
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for i in (1..200).step_by(4) {
+        if matches(i) {
+            let age = (i % 10) as i64 as f64;
+            sum += age;
+            min = min.min(age);
+            max = max.max(age);
+        }
+    }
+    assert!((result[1].sum - sum).abs() < 1e-9);
+    assert_eq!(result[1].min, min);
+    assert_eq!(result[1].max, max);
+}
+
+#[test]
+fn test_bitpack_fill_matches_reference() {
+    fn ref_pack(values: &[i64], bw: usize) -> Vec<u8> {
+        let bits = values.len() * bw;
+        let mut packed = vec![0u8; (bits + 7) / 8];
+        for (i, &v) in values.iter().enumerate() {
+            let bits_u = v as u64;
+            for b in 0..bw {
+                if (bits_u >> b) & 1 == 1 {
+                    let g = i * bw + b;
+                    packed[g / 8] |= 1 << (g % 8);
+                }
+            }
+        }
+        packed
+    }
+    fn ref_unpack(packed: &[u8], count: usize, bw: usize, min_val: i64) -> Vec<i64> {
+        (0..count)
+            .map(|i| {
+                let bit_offset = i * bw;
+                let mut delta: u64 = 0;
+                for b in 0..bw {
+                    let g = bit_offset + b;
+                    if (packed[g / 8] >> (g % 8)) & 1 == 1 {
+                        delta |= 1u64 << b;
+                    }
+                }
+                min_val.wrapping_add(delta as i64)
+            })
+            .collect()
+    }
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u64
+    };
+    for bw in [1usize, 3, 5, 6, 7, 8, 15, 31, 47] {
+        for count in [1usize, 2, 7, 8, 15, 16, 63, 64, 65, 1000, 62_500] {
+            let min_val = -500i64;
+            let span = if bw == 47 { 1i64 << 40 } else { (1i64 << bw) - 1 };
+            let values: Vec<i64> = (0..count)
+                .map(|_| min_val + (next() % (span as u64 + 1)) as i64)
+                .collect();
+            let packed = ref_pack(&values, bw);
+            let mut out = vec![0i64; count];
+            bitpack_fill(&packed, count, bw, min_val, &mut out);
+            let expected = ref_unpack(&packed, count, bw, min_val);
+            assert_eq!(out, expected, "bw={bw} count={count}");
+            if bw <= 8 {
+                let mut compact = vec![0u8; count];
+                bitpack_fill_u8(&packed, count, bw, &mut compact);
+                let restored: Vec<i64> = compact
+                    .into_iter()
+                    .map(|delta| min_val.wrapping_add(delta as i64))
+                    .collect();
+                assert_eq!(restored, expected, "compact bw={bw} count={count}");
+            }
+        }
+    }
+}
+
+#[test]
+fn test_bitpack_roundtrip_encode_decode() {
+    let mut state: u64 = 0xDEADBEEF_CAFEBABE;
+    let mut next = move || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (state >> 33) as u32
+    };
+    let base = 1_000_000i64;
+    for count in [16usize, 123, 1000, 65_536] {
+        let values: Vec<i64> = (0..count)
+            .map(|_| base + (next() % 4096) as i64)
+            .collect();
+        let encoded = bitpack_encode_i64(&values).expect("should bitpack");
+        let (decoded, consumed) = bitpack_decode_i64(&encoded).unwrap();
+        assert_eq!(decoded, values, "count={count}");
+        assert_eq!(consumed, encoded.len());
+    }
+}

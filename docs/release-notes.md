@@ -3,6 +3,58 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.33.1](https://github.com/BirchKwok/ApexBase/releases/tag/v1.33.1)
+*2026-09-05*
+
+[Compare with v1.33.0](https://github.com/BirchKwok/ApexBase/compare/v1.33.0...v1.33.1)
+
+### Highlights
+
+v1.33.1 completes the first fused filtered-grouped execution kernel introduced
+by the 1.33 scan architecture and changes the public cross-engine benchmark to
+an explicit no-result-cache contract. On the retained 1-million-row run,
+`Boolean Filter+GROUP+HAVING+TopK` completes in 3.98 ms in ApexBase versus
+5.68 ms in DuckDB; an independent repeat measured 4.02 ms versus 5.39 ms.
+
+### Fused Boolean Grouped Execution
+
+- Compile supported Boolean predicate trees into reusable per-slot programs for `AND`, `OR`, `NOT`, numeric comparisons, `BETWEEN`, `IN`, and dictionary-string equality
+- Evaluate compact BITPACK integer predicates through per-row-group truth tables and reusable decode buffers, avoiding full-width temporary materialization
+- Fuse predicate evaluation, grouping, aggregate updates, `HAVING`, ordering, and TopK while preserving NULL, sentinel-dictionary, and strict integer comparison semantics
+- Keep unsupported expressions and over-budget truth tables on the general executor so the optimization never weakens SQL correctness
+
+### Catalog And Lifecycle Safety
+
+- Make the table registry authoritative for same-name CREATE and CTAS decisions, preserving registered table files on `AlreadyExists`
+- Reap only unregistered orphan files before same-name recreation and defer DROP file unlinking with fingerprint checks so a newly recreated file cannot be deleted later
+- Drain pending table deletions during client lifecycle cleanup and avoid unnecessary buffered-write and FTS filesystem work on ordinary table drops
+
+### Benchmark Contract And Results
+
+- Disable the ApexBase result cache for every public SQLite/DuckDB benchmark client instead of applying a one-off exception to a single metric
+- Record `apex_result_cache: false` in benchmark JSON and retain `--no-result-cache` as a compatibility no-op because no-cache is now unconditional
+- Reset `benchmarks/latest_public_baseline.json` to the new no-cache methodology; cached historical results are not compared as performance regressions
+- Complete all 103 tabular metrics, 6 exact-vector metrics, and 8 quantized-vector rows; ApexBase won all 115 rows with a direct competitor in the retained run
+- Add benchmark contract tests and Rust/Python correctness coverage for Boolean trees, LUT limits, BITPACK decoding, catalog-safe CTAS, and deferred deletion
+
+### Validation
+
+- Release build completed successfully before the final metadata and documentation-only edits
+- Full Python suite: 1,739 passed
+- Full Rust suite: 505 unit tests and 6 documentation tests passed
+- Two complete public no-cache benchmark runs both recorded 103/103 tabular, 6/6 exact-vector, and 6/6 shared quantized-vector wins
+- Per release instruction, no additional local base/current gate was run after the benchmark methodology changed globally
+
+### Upgrade Notes
+
+- No public API migration is required
+- No `.apex` file-format migration is required
+- Public benchmark results from earlier cached methodology are historical only and are not directly comparable to the v1.33.1 no-cache baseline
+- Update the Rust crate and Python package version metadata to 1.33.1
+
+---
+
+
 ## [v1.33.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.33.0)
 *2026-09-01*
 
