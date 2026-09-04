@@ -1,0 +1,1707 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="High-performance HTAP embedded database with Rust core and Python API">
+      
+      
+        <meta name="author" content="Birch Kwok">
+      
+      
+        <link rel="canonical" href="https://birchkwok.github.io/apexbase/1.33.1/FUSED_GROUP_AGG_DESIGN/">
+      
+      
+      
+      
+        
+      
+      
+      <link rel="icon" href="../img/favicon.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Fused Filter + GROUP BY Design (Boolean 6.4x 专项) - ApexBase</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#fused-filter-group-by-design-boolean-64x" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="ApexBase" class="md-header__button md-logo" aria-label="ApexBase" data-md-component="logo">
+      
+  <img src="../img/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            ApexBase
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Fused Filter + GROUP BY Design (Boolean 6.4x 专项)
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m14.3 16-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12zm-9.15 3.96h2.3L12 9z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_2" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to system preference"  type="radio" name="__palette" id="__palette_2">
+    
+      <label class="md-header__button md-icon" title="Switch to system preference" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+          <a href="javascript:void(0)" class="md-search__icon md-icon" title="Share" aria-label="Share" data-clipboard data-clipboard-text="" data-md-component="search-share" tabindex="-1">
+            
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9a3 3 0 0 0-3 3 3 3 0 0 0 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.15c-.05.21-.08.43-.08.66 0 1.61 1.31 2.91 2.92 2.91s2.92-1.3 2.92-2.91A2.92 2.92 0 0 0 18 16.08"/></svg>
+          </a>
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/BirchKwok/ApexBase" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    birchkwok/ApexBase
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../installation/" class="md-tabs__link">
+          
+  
+  
+  Getting Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../user-guide/python-client/" class="md-tabs__link">
+          
+  
+  
+  User Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../API_REFERENCE/" class="md-tabs__link">
+          
+  
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../performance/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../FTS_GUIDE/" class="md-tabs__link">
+          
+  
+  
+  Features
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../STORAGE_ARCHITECTURE/" class="md-tabs__link">
+          
+  
+  
+  Internals
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../release-notes/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Release Notes
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../documentation-index/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Docs Index
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+  
+
+<nav class="md-nav md-nav--primary md-nav--lifted md-nav--integrated" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="ApexBase" class="md-nav__button md-logo" aria-label="ApexBase" data-md-component="logo">
+      
+  <img src="../img/logo.svg" alt="logo">
+
+    </a>
+    ApexBase
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/BirchKwok/ApexBase" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    birchkwok/ApexBase
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../QUICK_START/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Core Concepts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/python-client/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python Client
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/sql/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SQL Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/data-import/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data Import
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/server-protocols/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Server Protocols
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../EXAMPLES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../API_REFERENCE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RUST_EMBEDDED_API/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust Embedded API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Features
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Features
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FTS_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Full-Text Search
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FLOAT16_VECTOR_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Float16 Vectors
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../VECTOR_QUANTIZATION_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Vector Quantization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../STORAGE_ARCHITECTURE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Storage Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SCAN_EXECUTION_ARCHITECTURE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scan & Physical Execution
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Engineering Guidelines
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../QUERY_OPTIMIZER_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Query Optimizer Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../HTAP_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTAP Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../release-notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release Notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../documentation-index/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Docs Index
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+                
+
+
+
+  
+
+
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="fused-filter-group-by-design-boolean-64x">Fused Filter + GROUP BY Design (Boolean 6.4x 专项)<a class="headerlink" href="#fused-filter-group-by-design-boolean-64x" title="Permanent link">&para;</a></h1>
+<p>Status: complete (2026-09, Phases 1-3 merged into the v1.33.x working tree)</p>
+<h2 id="problem">Problem<a class="headerlink" href="#problem" title="Permanent link">&para;</a></h2>
+<p>No-cache benchmark metric <code>Boolean Filter+GROUP+HAVING+TopK</code>:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">city</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">n</span><span class="p">,</span><span class="w"> </span><span class="k">AVG</span><span class="p">(</span><span class="n">score</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">av</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="k">FROM</span><span class="w"> </span><span class="k">default</span>
+</span><span id="__span-0-3"><a id="__codelineno-0-3" name="__codelineno-0-3" href="#__codelineno-0-3"></a><span class="k">WHERE</span><span class="w"> </span><span class="p">(</span><span class="n">city</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="s1">'Beijing'</span><span class="p">,</span><span class="s1">'Shanghai'</span><span class="p">,</span><span class="s1">'Guangzhou'</span><span class="p">)</span><span class="w"> </span><span class="k">OR</span><span class="w"> </span><span class="n">age</span><span class="w"> </span><span class="k">IN</span><span class="w"> </span><span class="p">(</span><span class="mi">33</span><span class="p">,</span><span class="mi">44</span><span class="p">,</span><span class="mi">55</span><span class="p">))</span>
+</span><span id="__span-0-4"><a id="__codelineno-0-4" name="__codelineno-0-4" href="#__codelineno-0-4"></a><span class="w">  </span><span class="k">AND</span><span class="w"> </span><span class="n">score</span><span class="w"> </span><span class="o">&gt;=</span><span class="w"> </span><span class="mi">40</span>
+</span><span id="__span-0-5"><a id="__codelineno-0-5" name="__codelineno-0-5" href="#__codelineno-0-5"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">city</span>
+</span><span id="__span-0-6"><a id="__codelineno-0-6" name="__codelineno-0-6" href="#__codelineno-0-6"></a><span class="k">HAVING</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">100</span>
+</span><span id="__span-0-7"><a id="__codelineno-0-7" name="__codelineno-0-7" href="#__codelineno-0-7"></a><span class="k">ORDER</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">n</span><span class="w"> </span><span class="k">DESC</span><span class="p">,</span><span class="w"> </span><span class="n">city</span>
+</span><span id="__span-0-8"><a id="__codelineno-0-8" name="__codelineno-0-8" href="#__codelineno-0-8"></a><span class="k">LIMIT</span><span class="w"> </span><span class="mi">5</span>
+</span></code></pre></div>
+<p>ApexBase 37.2 ms vs DuckDB 5.83 ms (6.4x slower) — the only structural
+weakness on the 103-metric fair scoreboard.</p>
+<h2 id="verified-cost-breakdown-1m-rows-no-cache">Verified cost breakdown (1M rows, no cache)<a class="headerlink" href="#verified-cost-breakdown-1m-rows-no-cache" title="Permanent link">&para;</a></h2>
+<p>Stage costs measured on the generic pipeline for this query:</p>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Cost</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Candidate lane (<code>city IN</code> scan)</td>
+<td>~7 ms</td>
+<td>already dict-key level: per-row u16 index + flag test</td>
+</tr>
+<tr>
+<td>OR/AND index merge</td>
+<td>~3 ms</td>
+<td>O(n) two-pointer merge (fixed in v1.33.0 dev)</td>
+</tr>
+<tr>
+<td>Gather (300K rows × 3 cols)</td>
+<td>~14 ms</td>
+<td><code>extract_rows_by_indices_to_arrow</code>; city decoded per row into a new StringArray; primitives use <code>Vec&lt;Option&lt;T&gt;&gt;</code> (16 B/row)</td>
+</tr>
+<tr>
+<td>Morsel predicate re-eval</td>
+<td>~4 ms</td>
+<td>generic <code>In</code> leaf does per-row string compare per value on the <code>StringDictionary</code> view</td>
+</tr>
+<tr>
+<td>GROUP BY city (192K rows)</td>
+<td>~1 ms</td>
+<td><code>execute_group_by</code> dispatch, not a bottleneck</td>
+</tr>
+</tbody>
+</table>
+<p>The pipeline reads the same data 2–3 times (candidate lane, gather, re-eval)
+and re-evaluates the same predicate twice. That redundancy is the structural
+gap vs DuckDB's single fused vectorized scan.</p>
+<h2 id="design-principles">Design principles<a class="headerlink" href="#design-principles" title="Permanent link">&para;</a></h2>
+<ol>
+<li><strong>One physical protocol.</strong> Dictionary keys (u16 row ids) + primitive
+   column lanes are the shared representation for candidate lanes, morsel
+   re-evaluation, and the fused aggregation kernel. New filter shapes are
+   expressed as small predicate trees over these lanes and route to the
+   fused path automatically when capability-gated, otherwise to the improved
+   generic pipeline. No per-metric <code>try_*</code> branching on SQL text.</li>
+<li><strong>Capability-gated fusion.</strong> The fused kernel accepts a bounded predicate
+   grammar (leaves: numeric range, numeric IN, string IN/Eq on a
+   dictionary-encoded column; structure: AND/OR/NOT). Anything outside the
+   grammar falls back to the generic pipeline — correctness first.</li>
+<li><strong>Post-aggregate tail processing.</strong> HAVING / ORDER BY / LIMIT / OFFSET run
+   on the aggregated result (≤ dictionary size rows), reusing existing
+   <code>apply_order_by_topk</code> / <code>apply_limit_offset</code> / HAVING evaluation.</li>
+</ol>
+<h2 id="phase-1-generic-pipeline-quick-wins">Phase 1 — generic pipeline quick wins<a class="headerlink" href="#phase-1-generic-pipeline-quick-wins" title="Permanent link">&para;</a></h2>
+<p>Benefits every filtered query, not just the benchmark shape.</p>
+<h3 id="p11-mixed-projection-dictionary-gather">P1.1 Mixed-projection dictionary gather<a class="headerlink" href="#p11-mixed-projection-dictionary-gather" title="Permanent link">&para;</a></h3>
+<p><code>read_columns_by_indices_to_arrow</code> today: <code>try_dict_indexed_read</code> requires
+<em>all</em> projected columns to be dictionary-covered, so a mixed projection
+(<code>city, age, score</code>) falls back to full indexed extraction, which decodes
+every selected city string and copies it into a fresh <code>StringArray</code>.</p>
+<p>Change: per-column dispatch in the V4 indexed path:</p>
+<ul>
+<li>string column with a usable global dict cache (no nulls, ≤4096 distinct,
+  group_ids length matches active rows) → <code>DictionaryArray</code> with keys
+  gathered from the cached u16 ids (2 B/row);</li>
+<li>every other column → existing parallel indexed extraction for that column.</li>
+</ul>
+<p>Result batch may mix <code>DictionaryArray</code> and primitive columns. Downstream
+operators already accept both (<code>ColumnView::StringDictionary</code>,
+<code>execute_group_by</code> dict dispatches).</p>
+<h3 id="p12-dictionary-level-ineq-in-morsel-re-evaluation">P1.2 Dictionary-level IN/Eq in morsel re-evaluation<a class="headerlink" href="#p12-dictionary-level-ineq-in-morsel-re-evaluation" title="Permanent link">&para;</a></h3>
+<p><code>ResolvedPredicate::In</code> on a <code>StringDictionary</code> view currently resolves each
+row's string and compares against every IN value. Add a <code>DictIn</code> leaf:
+resolve matching dictionary keys once (O(distinct)), then per row do a u32
+key load + bitset test. Same for <code>StringEq</code> on a dictionary view
+(<code>DictEq</code>, single key compare). Falls back to the generic leaf when the view
+is not a dictionary or the value set is empty.</p>
+<h3 id="p13-primitive-gather-layout">P1.3 Primitive gather layout<a class="headerlink" href="#p13-primitive-gather-layout" title="Permanent link">&para;</a></h3>
+<p>In <code>extract_rows_by_indices_to_arrow</code>, replace <code>Vec&lt;Option&lt;i64&gt;&gt;</code> /
+<code>Vec&lt;Option&lt;f64&gt;&gt;</code> accumulators (16 B/row incl. tag + zero fill) with
+primitive buffers + validity buffers (8 B/row), built directly into Arrow
+<code>Int64Array</code> / <code>Float64Array</code> with <code>NullBuffer</code>.</p>
+<p>Expected Phase-1 total: 37.2 ms → ~30 ms. The fused path (Phase 2) is the
+real win; Phase 1 raises the floor for all fallback shapes.</p>
+<h2 id="phase-2-fused-predicate-lane-aggregation-kernel">Phase 2 — fused predicate-lane aggregation kernel<a class="headerlink" href="#phase-2-fused-predicate-lane-aggregation-kernel" title="Permanent link">&para;</a></h2>
+<p>Generalize the existing fused path
+(<code>try_fast_numeric_filter_group_by</code> +
+<code>OnDemandStorage::execute_between_group_agg_cached(_mmap)</code>) instead of adding
+a parallel mechanism:</p>
+<h3 id="kernel">Kernel<a class="headerlink" href="#kernel" title="Permanent link">&para;</a></h3>
+<p>Single streaming pass over row groups (existing RCIX plumbing):</p>
+<ul>
+<li>group column: dictionary-encoded (global dict cache provides per-row u16
+  ids + distinct strings; ≤4096 distinct);</li>
+<li>up to 2 additional numeric lanes (Int64/UInt*/Float64, plain or bitpack /
+  float-dict encodings as already decoded by the kernel);</li>
+<li>predicate tree over lanes:</li>
+<li>leaf <code>num_range(col, lo, hi)</code> with the existing epsilon/ceil/floor
+    strict-bound semantics;</li>
+<li>leaf <code>num_in(col, sorted_values)</code> (binary search, ≤16 values);</li>
+<li>leaf <code>dict_in(group_col, keys)</code> / <code>dict_eq(group_col, key)</code> (bitset over
+    u16 ids, computed once from distinct strings);</li>
+<li>structure: AND / OR (NOT only around a leaf).</li>
+<li>per row: <code>pass = eval(tree)</code> → <code>counts[key] += pass</code>, <code>sums[key] += pass*agg[row]</code>.</li>
+</ul>
+<p>Aggregates: COUNT(*), SUM(col), AVG(col), MIN(col), MAX(col) over one
+numeric column (same set the kernel already supports; MIN/MAX added via
+per-group running min/max when enabled by gate).</p>
+<h3 id="gate-in-try_fast_numeric_filter_group_by-generalized">Gate (in <code>try_fast_numeric_filter_group_by</code>, generalized)<a class="headerlink" href="#gate-in-try_fast_numeric_filter_group_by-generalized" title="Permanent link">&para;</a></h3>
+<p>Accept when:</p>
+<ul>
+<li>single dictionary-encoded group column, ≤4096 distinct, no nulls in
+  group/filter/aggregate columns;</li>
+<li>WHERE is a tree of the supported leaves over ≤2 non-group numeric columns
+  plus the group column itself (string IN/Eq);</li>
+<li>SELECT = group column + COUNT(*) / SUM / AVG / MIN / MAX over ≤1 numeric
+  column (existing column-shape check);</li>
+<li>no joins, no DISTINCT, no windows, no delta/pending state;</li>
+<li>HAVING: optional, references only the aggregates in SELECT (post-filter);</li>
+<li>ORDER BY / LIMIT / OFFSET: applied post-aggregation (existing helpers).</li>
+</ul>
+<p>Anything unparseable returns <code>None</code> → existing generic pipeline.</p>
+<h3 id="expected-result">Expected result<a class="headerlink" href="#expected-result" title="Permanent link">&para;</a></h3>
+<p>1M-row single pass: ~18 MB sequential column reads (u16 ids + 2×8 B lanes) +
+predicate eval + L1-resident accumulation into ≤10 group slots.
+Target 8–12 ms (≤2x DuckDB), i.e. a 3–4x improvement over the 37.2 ms
+generic pipeline.</p>
+<h2 id="phase-3-lut-truth-table-fast-lane-decode">Phase 3 — LUT truth table + fast lane decode<a class="headerlink" href="#phase-3-lut-truth-table-fast-lane-decode" title="Permanent link">&para;</a></h2>
+<p>Phase 2's per-row predicate-tree evaluation is still the dominant cost once
+the data path is lean. Phase 3 removes both remaining costs: per-row tree
+evaluation (truth table) and per-row-group lane materialization (in-place
+decode).</p>
+<h3 id="p31-lut-truth-table-fast-path">P3.1 LUT truth-table fast path<a class="headerlink" href="#p31-lut-truth-table-fast-path" title="Permanent link">&para;</a></h3>
+<p>When the predicate has <strong>≤3 lane leaves</strong> (dictionary leaves are folded to
+group-id masks at compile time), the whole AND/OR/NOT tree is precomputed
+into a truth table over <code>(comparison bits, group id)</code>:</p>
+<ul>
+<li><code>lut_prog = try_build_lut_program(predicate, num_groups)</code>: for each of the
+  ≤3 lane leaves a comparison bit is defined (range or IN membership), and
+  the compiled LUT maps <code>(bits &lt;&lt; stride_shift) | group_id → 0/1</code>, where
+  <code>stride = next_power_of_two(num_groups)</code>.</li>
+<li>Size bound: <code>2^k × stride ≤ 8 × 4096 = 32 KB</code> (k ≤ 3, groups ≤ 4096) —
+  L1/L2 resident, one lookup per row.</li>
+<li>Per row: k straight-line comparisons (no branches over the tree), one LUT
+  byte load, one scatter into the group accumulator.</li>
+<li>The row loop is monomorphized per per-leaf mode tuple via const-generic
+  <code>lut_loop_{0,1,2,3}</code> (84 instantiations); IN comparisons with N ≤ 8 are
+  unrolled (first four direct, remainder a tiny loop) because a
+  runtime-length vectorized loop emits heavy reduction code.</li>
+<li><code>all_none</code> (no row can match) returns without scanning.</li>
+<li>Predicates with &gt;3 lane leaves fall back to the Phase 2 generic per-slot
+  plan — same kernel, same buffers, unchanged behavior.</li>
+</ul>
+<h3 id="p32-in-place-lane-views-no-per-rg-materialization">P3.2 In-place lane views (no per-RG materialization)<a class="headerlink" href="#p32-in-place-lane-views-no-per-rg-materialization" title="Permanent link">&para;</a></h3>
+<p><code>decode_fused_lane</code> returns a view instead of a copied buffer:</p>
+<ul>
+<li><strong>PLAIN, 8-byte aligned</strong> → zero-copy <code>&amp;[i64]</code> / <code>&amp;[f64]</code> over the mmap
+  body (existing behavior).</li>
+<li><strong>PLAIN, misaligned</strong> → raw in-place byte view (<code>FusedLaneView::Raw*</code>);
+  the LUT loop reads 8-byte slots with <code>ptr::read_unaligned</code>, which is a
+  native unaligned load on ARM64. No per-RG memcpy, no allocation. The
+  generic (fallback) path materializes such lanes into scratch buffers.</li>
+<li><strong>BITPACK int</strong> → two-word shift-merge decode (<code>bitpack_fill</code> in
+  <code>mod.rs</code>; each value spans at most two u64 words, short per-bit tail for
+  the final partial word) written <strong>directly into the caller buffer</strong> —
+  the generic decode path no longer allocates an intermediate per-RG Vec.
+  The shared <code>bitpack_decode_i64</code> uses the same core, so all bitpack
+  consumers benefit.</li>
+</ul>
+<h3 id="measured-1m-rows-no-cache-probe-query">Measured (1M rows, no cache, probe query)<a class="headerlink" href="#measured-1m-rows-no-cache-probe-query" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Stage</th>
+<th>Before P3</th>
+<th>After P3</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Row loop (k=2, count+avg)</td>
+<td>6.1 ms</td>
+<td>4.2 ms</td>
+</tr>
+<tr>
+<td>Lane decode (age BITPACK + score PLAIN)</td>
+<td>4.5 ms</td>
+<td>~1.3 ms</td>
+</tr>
+<tr>
+<td>Total <code>Boolean Filter+GROUP+HAVING+TopK</code> (probe, no cache)</td>
+<td>10.8 ms</td>
+<td>5.5 ms</td>
+</tr>
+</tbody>
+</table>
+<p>Public benchmark (no cache, 1M rows): the metric moved from 37.2 ms
+(6.4x slower than DuckDB) to 5.55 ms vs DuckDB 5.76 ms — now the winner.
+Tabular fair scoreboard: 103/103 (was 101/103).</p>
+<h2 id="testing-and-acceptance-per-phase-per-agentsmd">Testing and acceptance (per phase, per AGENTS.md)<a class="headerlink" href="#testing-and-acceptance-per-phase-per-agentsmd" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Rust unit tests: kernel vs generic pipeline on random predicate trees
+  (fuzzed leaves/structure), null-free gates, boundary epsilon cases,
+  HAVING/ORDER/LIMIT tails; P1.1/P1.2 mixed-batch round trips.</li>
+<li>Python differential tests in <code>test/test_query_architecture_contracts.py</code>:
+  random WHERE/GROUP/HAVING/ORDER/LIMIT shapes, fused result must match the
+  generic pipeline row-for-row.</li>
+<li>Benchmark: the existing <code>Boolean Filter+GROUP+HAVING+TopK</code> metric covers
+  the fused gate; P1.1/P1.2 are covered by the existing filtering metrics.</li>
+<li>Acceptance per phase: <code>maturin develop --release</code>, full pytest, full
+  cargo test, public benchmark (default + <code>--no-result-cache</code>) vs
+  <code>benchmarks/latest_public_baseline.json</code>, canary gate, and <code>--mode full</code>
+  local perf guard before release.</li>
+</ul>
+<h2 id="risk-notes">Risk notes<a class="headerlink" href="#risk-notes" title="Permanent link">&para;</a></h2>
+<ul>
+<li>Epsilon/strict-bound semantics of the numeric range leaf must be reused
+  verbatim from the existing kernel (no re-derivation).</li>
+<li><code>group_ids</code> (u16) validity: the gate must re-validate dictionary cache
+  length against active rows (deletes) exactly as <code>try_dict_indexed_read</code>
+  does.</li>
+<li>Mixed DictionaryArray batches change batch schema for some queries; the
+  Python layer and any code that assumes <code>Utf8</code> for string columns must be
+  audited (Arrow consumers in <code>into_record_batch</code> and result materialization).</li>
+</ul>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.instant.progress", "navigation.top", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "toc.integrate", "search.suggest", "search.highlight", "search.share", "content.code.copy", "content.code.select", "content.code.annotate", "content.tabs.link"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"current": "1.33.1", "default": "latest", "label": "v1.33.1", "provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>

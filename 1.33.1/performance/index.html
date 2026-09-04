@@ -1,0 +1,2691 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="High-performance HTAP embedded database with Rust core and Python API">
+      
+      
+        <meta name="author" content="Birch Kwok">
+      
+      
+        <link rel="canonical" href="https://birchkwok.github.io/apexbase/1.33.1/performance/">
+      
+      
+        <link rel="prev" href="../RUST_EMBEDDED_API/">
+      
+      
+        <link rel="next" href="../FTS_GUIDE/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../img/favicon.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Performance - ApexBase</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#performance" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="ApexBase" class="md-header__button md-logo" aria-label="ApexBase" data-md-component="logo">
+      
+  <img src="../img/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            ApexBase
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Performance
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m14.3 16-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12zm-9.15 3.96h2.3L12 9z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_2" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to system preference"  type="radio" name="__palette" id="__palette_2">
+    
+      <label class="md-header__button md-icon" title="Switch to system preference" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+          <a href="javascript:void(0)" class="md-search__icon md-icon" title="Share" aria-label="Share" data-clipboard data-clipboard-text="" data-md-component="search-share" tabindex="-1">
+            
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9a3 3 0 0 0-3 3 3 3 0 0 0 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.15c-.05.21-.08.43-.08.66 0 1.61 1.31 2.91 2.92 2.91s2.92-1.3 2.92-2.91A2.92 2.92 0 0 0 18 16.08"/></svg>
+          </a>
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/BirchKwok/ApexBase" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    birchkwok/ApexBase
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../installation/" class="md-tabs__link">
+          
+  
+  
+  Getting Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../user-guide/python-client/" class="md-tabs__link">
+          
+  
+  
+  User Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../API_REFERENCE/" class="md-tabs__link">
+          
+  
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    <li class="md-tabs__item md-tabs__item--active">
+      <a href="./" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../FTS_GUIDE/" class="md-tabs__link">
+          
+  
+  
+  Features
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../STORAGE_ARCHITECTURE/" class="md-tabs__link">
+          
+  
+  
+  Internals
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../release-notes/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Release Notes
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../documentation-index/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Docs Index
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+  
+
+<nav class="md-nav md-nav--primary md-nav--lifted md-nav--integrated" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="ApexBase" class="md-nav__button md-logo" aria-label="ApexBase" data-md-component="logo">
+      
+  <img src="../img/logo.svg" alt="logo">
+
+    </a>
+    ApexBase
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/BirchKwok/ApexBase" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    birchkwok/ApexBase
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../QUICK_START/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Core Concepts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/python-client/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python Client
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/sql/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SQL Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/data-import/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data Import
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/server-protocols/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Server Protocols
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../EXAMPLES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../API_REFERENCE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RUST_EMBEDDED_API/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust Embedded API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#v1331-public-no-cache-snapshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.33.1 Public No-Cache Snapshot
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v133-scan-pipeline-guard-coverage" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.33 Scan-Pipeline Guard Coverage
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#v1300-public-snapshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.30.0 Public Snapshot
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#tabular-and-exact-vector-metrics" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Tabular and Exact Vector Metrics
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Tabular and Exact Vector Metrics">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#olap-fair-metrics-70" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OLAP Fair Metrics (70)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#oltp-fair-metrics-32" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        OLTP Fair Metrics (32)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#exact-vector-similarity-6" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Exact Vector Similarity (6)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#quantized-l2-distance-snapshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Quantized L2 Distance Snapshot
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#reproduce" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Reproduce
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Features
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Features
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FTS_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Full-Text Search
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FLOAT16_VECTOR_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Float16 Vectors
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../VECTOR_QUANTIZATION_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Vector Quantization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../STORAGE_ARCHITECTURE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Storage Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SCAN_EXECUTION_ARCHITECTURE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scan & Physical Execution
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Engineering Guidelines
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../QUERY_OPTIMIZER_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Query Optimizer Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../HTAP_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTAP Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../release-notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release Notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../documentation-index/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Docs Index
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+                
+
+
+
+  
+
+
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="performance">Performance<a class="headerlink" href="#performance" title="Permanent link">&para;</a></h1>
+<p>This page records the latest complete public cross-engine benchmark. It is a
+reproducible snapshot, not a universal claim: rerun the suite on your own
+hardware and workload.</p>
+<h2 id="v1331-public-no-cache-snapshot">v1.33.1 Public No-Cache Snapshot<a class="headerlink" href="#v1331-public-no-cache-snapshot" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Date / source</strong>: 2026-09-05, v1.33.1 release tree; runtime code was measured immediately before the metadata-only version bump</li>
+<li><strong>System</strong>: macOS 26.6.2, Apple arm64 (10 cores), 32 GB RAM</li>
+<li><strong>Tabular stack</strong>: Python 3.12.2, ApexBase 1.33.0 runtime, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Vector stack</strong>: Python 3.12.2, ApexBase 1.33.0 runtime, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Tabular dataset</strong>: 1,000,000 rows x 5 columns</li>
+<li><strong>Vector dataset</strong>: 1,000,000 Float32 vectors x 128 dimensions, <code>k=10</code>, 10 exact batch queries</li>
+<li><strong>Method</strong>: result cache disabled for every ApexBase client, 2 warmup iterations + 5 timed iterations, materialized results</li>
+<li><strong>Retained baseline</strong>: <code>benchmarks/latest_public_baseline.json</code></li>
+</ul>
+<p>The no-cache public suite completed all <strong>117/117 named rows</strong>: 103 tabular,
+6 exact-vector, and 8 ApexBase quantized precision rows. Of the 115 rows with a
+direct competitor, ApexBase won <strong>115/115</strong>. Float16 and BFloat16 remain
+ApexBase-only quantized formats and are excluded from the comparable total.</p>
+<table>
+<thead>
+<tr>
+<th>Scope</th>
+<th style="text-align: right;">Metrics</th>
+<th style="text-align: right;">Apex wins</th>
+<th style="text-align: right;">Ties</th>
+<th style="text-align: right;">Slower</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OLAP fair</td>
+<td style="text-align: right;">71</td>
+<td style="text-align: right;">71</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>OLTP fair</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>Exact vector similarity</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>Quantized vector, shared codecs</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td><strong>Comparable total</strong></td>
+<td style="text-align: right;"><strong>115</strong></td>
+<td style="text-align: right;"><strong>115</strong></td>
+<td style="text-align: right;"><strong>0</strong></td>
+<td style="text-align: right;"><strong>0</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Representative medians from the retained run:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+<th style="text-align: right;">ApexBase vs best competitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>COUNT(*)</td>
+<td style="text-align: right;">0.094 ms</td>
+<td style="text-align: right;">7.946 ms</td>
+<td style="text-align: right;">0.505 ms</td>
+<td style="text-align: right;">5.35x faster</td>
+</tr>
+<tr>
+<td>Projection full scan (3 cols)</td>
+<td style="text-align: right;">233.267 ms</td>
+<td style="text-align: right;">921.937 ms</td>
+<td style="text-align: right;">726.772 ms</td>
+<td style="text-align: right;">3.12x faster</td>
+</tr>
+<tr>
+<td>GROUP BY city (10 groups)</td>
+<td style="text-align: right;">0.577 ms</td>
+<td style="text-align: right;">370.302 ms</td>
+<td style="text-align: right;">3.386 ms</td>
+<td style="text-align: right;">5.87x faster</td>
+</tr>
+<tr>
+<td>GROUP BY + HAVING</td>
+<td style="text-align: right;">0.581 ms</td>
+<td style="text-align: right;">368.544 ms</td>
+<td style="text-align: right;">4.136 ms</td>
+<td style="text-align: right;">7.13x faster</td>
+</tr>
+<tr>
+<td>Boolean Filter+GROUP+HAVING+TopK</td>
+<td style="text-align: right;"><strong>3.978 ms</strong></td>
+<td style="text-align: right;">193.017 ms</td>
+<td style="text-align: right;"><strong>5.680 ms</strong></td>
+<td style="text-align: right;"><strong>1.43x faster</strong></td>
+</tr>
+<tr>
+<td>Multi-cond (age&gt;30 AND score&gt;50)</td>
+<td style="text-align: right;">196.598 ms</td>
+<td style="text-align: right;">614.324 ms</td>
+<td style="text-align: right;">390.751 ms</td>
+<td style="text-align: right;">1.99x faster</td>
+</tr>
+<tr>
+<td>JSON Read + GROUP BY category</td>
+<td style="text-align: right;">57.783 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">89.379 ms</td>
+<td style="text-align: right;">1.55x faster</td>
+</tr>
+<tr>
+<td>ORDER BY score LIMIT 100</td>
+<td style="text-align: right;">1.935 ms</td>
+<td style="text-align: right;">56.396 ms</td>
+<td style="text-align: right;">5.058 ms</td>
+<td style="text-align: right;">2.61x faster</td>
+</tr>
+<tr>
+<td>Vector batch L2, 10 queries</td>
+<td style="text-align: right;">45.946 ms</td>
+<td style="text-align: right;">1.37 s</td>
+<td style="text-align: right;">317.081 ms</td>
+<td style="text-align: right;">6.90x faster</td>
+</tr>
+</tbody>
+</table>
+<p>An independent repeat measured <code>Boolean Filter+GROUP+HAVING+TopK</code> at 4.02 ms
+versus DuckDB at 5.39 ms. Both complete runs recorded 103/103 tabular wins,
+6/6 exact-vector wins, and 6/6 wins for quantized codecs shared with
+sqlite-vector. The repeat is retained separately as
+<code>local-perf-results/20260905-no-cache-public/public_benchmark_repeat.json</code> and
+is not used to select or replace individual baseline samples.</p>
+<p>The benchmark now creates every ApexBase client with <code>enable_cache=False</code>.
+The legacy <code>--no-result-cache</code> option is accepted only for command-line
+compatibility; it does not change behavior because no-cache is unconditional.
+Results from older cached methodology remain useful historical snapshots but
+must not be treated as a base/current regression comparison against this run.</p>
+<h2 id="v133-scan-pipeline-guard-coverage">v1.33 Scan-Pipeline Guard Coverage<a class="headerlink" href="#v133-scan-pipeline-guard-coverage" title="Permanent link">&para;</a></h2>
+<p>The 1.33 architecture adds an ApexBase-only same-machine guard metric named
+<code>Uncached delta Filter+GROUP+HAVING+TopK</code>. It disables the Python result cache,
+creates a write-after-load overlay, rotates filter and <code>HAVING</code> parameters, and
+checks the complete storage-scan/operator path. This metric belongs to the
+base/current regression gate. The public SQLite/DuckDB suite now independently
+uses the same no-result-cache contract for all ApexBase metrics.</p>
+<p>Release acceptance still requires the public suite plus same-machine canary
+and full base/current comparisons. Reports are retained under
+<code>local-perf-results/&lt;timestamp&gt;/</code>; individual fast public results never replace
+the same-machine regression decision when the compared revisions share a
+compatible benchmark contract.</p>
+<h2 id="v1300-public-snapshot">v1.30.0 Public Snapshot<a class="headerlink" href="#v1300-public-snapshot" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Date / source</strong>: 2026-08-22, v1.30.0 optimized <code>main</code> workspace</li>
+<li><strong>System</strong>: macOS 26.6.2, Apple arm64 (10 cores), 32 GB RAM</li>
+<li><strong>Tabular stack</strong>: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Vector stack</strong>: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Tabular dataset</strong>: 1,000,000 rows x 5 columns</li>
+<li><strong>Vector dataset</strong>: 1,000,000 Float32 vectors x 128 dimensions, <code>k=10</code>, 10 batch queries</li>
+<li><strong>Method</strong>: 2 warmup iterations + 5 timed iterations, materialized results</li>
+<li><strong>Report</strong>: <code>benchmarks/results/v1.30.0-public-unified-vector-1m.json</code></li>
+</ul>
+<p>The unified public suite completed all <strong>116/116 named metrics</strong>: 102 tabular,
+6 exact-vector, and 8 ApexBase quantized precision rows. Of the 114 rows with a
+direct competitor, ApexBase won <strong>111/114</strong>: 99 of 102 tabular metrics, all 6
+exact-vector metrics, and all 6 quantized codecs shared with sqlite-vector.
+Float16 and BFloat16 have no sqlite-vector quantized equivalent. The three
+slower tabular results were small table-management operations against SQLite's
+minimal empty-table DDL path; ApexBase remained faster than DuckDB on them.</p>
+<table>
+<thead>
+<tr>
+<th>Scope</th>
+<th style="text-align: right;">Metrics</th>
+<th style="text-align: right;">Apex wins</th>
+<th style="text-align: right;">Ties</th>
+<th style="text-align: right;">Slower</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OLAP fair</td>
+<td style="text-align: right;">70</td>
+<td style="text-align: right;">70</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>OLTP fair</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">29</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">3</td>
+</tr>
+<tr>
+<td>Exact vector similarity</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>Quantized vector, shared codecs</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td><strong>Comparable total</strong></td>
+<td style="text-align: right;"><strong>114</strong></td>
+<td style="text-align: right;"><strong>111</strong></td>
+<td style="text-align: right;"><strong>0</strong></td>
+<td style="text-align: right;"><strong>3</strong></td>
+</tr>
+</tbody>
+</table>
+<p>The six public vector rows use exact Float32 scans. SQLite is represented by
+the <a href="https://github.com/sqliteai/sqlite-vector">sqlite-vector</a> extension's
+<code>vector_full_scan()</code> rather than by SQLite core, which has no native vector
+distance operator. Quantized scans remain a separate diagnostic because their
+recall and storage contracts differ from exact Float32 search.</p>
+<h2 id="tabular-and-exact-vector-metrics">Tabular and Exact Vector Metrics<a class="headerlink" href="#tabular-and-exact-vector-metrics" title="Permanent link">&para;</a></h2>
+<h3 id="olap-fair-metrics-70">OLAP Fair Metrics (70)<a class="headerlink" href="#olap-fair-metrics-70" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>COUNT(*)</td>
+<td style="text-align: right;">0.075 ms</td>
+<td style="text-align: right;">8.035 ms</td>
+<td style="text-align: right;">0.519 ms</td>
+</tr>
+<tr>
+<td>SELECT * LIMIT 100 (cold reopen)</td>
+<td style="text-align: right;">0.110 ms</td>
+<td style="text-align: right;">0.140 ms</td>
+<td style="text-align: right;">0.602 ms</td>
+</tr>
+<tr>
+<td>SELECT * LIMIT 100 (warm cache)</td>
+<td style="text-align: right;">0.076 ms</td>
+<td style="text-align: right;">0.121 ms</td>
+<td style="text-align: right;">0.232 ms</td>
+</tr>
+<tr>
+<td>SELECT * LIMIT 10K (cold reopen)</td>
+<td style="text-align: right;">4.461 ms</td>
+<td style="text-align: right;">13.626 ms</td>
+<td style="text-align: right;">8.879 ms</td>
+</tr>
+<tr>
+<td>SELECT * LIMIT 10K (warm cache)</td>
+<td style="text-align: right;">4.303 ms</td>
+<td style="text-align: right;">12.919 ms</td>
+<td style="text-align: right;">8.590 ms</td>
+</tr>
+<tr>
+<td>Projection full scan (3 cols)</td>
+<td style="text-align: right;">238.617 ms</td>
+<td style="text-align: right;">922.001 ms</td>
+<td style="text-align: right;">698.914 ms</td>
+</tr>
+<tr>
+<td>Filtered LIMIT 100 (age&gt;30)</td>
+<td style="text-align: right;">0.017 ms</td>
+<td style="text-align: right;">0.141 ms</td>
+<td style="text-align: right;">0.290 ms</td>
+</tr>
+<tr>
+<td>LIMIT 100 OFFSET 10K</td>
+<td style="text-align: right;">0.049 ms</td>
+<td style="text-align: right;">0.240 ms</td>
+<td style="text-align: right;">0.301 ms</td>
+</tr>
+<tr>
+<td>Filter (name = 'user_5000')</td>
+<td style="text-align: right;">0.162 ms</td>
+<td style="text-align: right;">46.726 ms</td>
+<td style="text-align: right;">1.727 ms</td>
+</tr>
+<tr>
+<td>Filter (age BETWEEN 25 AND 35)</td>
+<td style="text-align: right;">70.793 ms</td>
+<td style="text-align: right;">288.977 ms</td>
+<td style="text-align: right;">165.045 ms</td>
+</tr>
+<tr>
+<td>GROUP BY city (10 groups)</td>
+<td style="text-align: right;">1.507 ms</td>
+<td style="text-align: right;">364.261 ms</td>
+<td style="text-align: right;">4.032 ms</td>
+</tr>
+<tr>
+<td>GROUP BY category (10 groups)</td>
+<td style="text-align: right;">1.511 ms</td>
+<td style="text-align: right;">365.684 ms</td>
+<td style="text-align: right;">3.358 ms</td>
+</tr>
+<tr>
+<td>GROUP BY city ORDER BY count</td>
+<td style="text-align: right;">0.969 ms</td>
+<td style="text-align: right;">279.311 ms</td>
+<td style="text-align: right;">3.416 ms</td>
+</tr>
+<tr>
+<td>GROUP BY category ORDER BY count</td>
+<td style="text-align: right;">1.010 ms</td>
+<td style="text-align: right;">281.478 ms</td>
+<td style="text-align: right;">3.149 ms</td>
+</tr>
+<tr>
+<td>GROUP BY + HAVING</td>
+<td style="text-align: right;">1.558 ms</td>
+<td style="text-align: right;">360.756 ms</td>
+<td style="text-align: right;">3.857 ms</td>
+</tr>
+<tr>
+<td>GROUP BY category + HAVING</td>
+<td style="text-align: right;">1.556 ms</td>
+<td style="text-align: right;">356.575 ms</td>
+<td style="text-align: right;">3.596 ms</td>
+</tr>
+<tr>
+<td>Persistent VIEW select</td>
+<td style="text-align: right;">0.910 ms</td>
+<td style="text-align: right;">363.288 ms</td>
+<td style="text-align: right;">2.582 ms</td>
+</tr>
+<tr>
+<td>ORDER BY score LIMIT 100</td>
+<td style="text-align: right;">2.260 ms</td>
+<td style="text-align: right;">55.744 ms</td>
+<td style="text-align: right;">5.601 ms</td>
+</tr>
+<tr>
+<td>ORDER BY score ASC LIMIT 100</td>
+<td style="text-align: right;">1.981 ms</td>
+<td style="text-align: right;">55.992 ms</td>
+<td style="text-align: right;">4.788 ms</td>
+</tr>
+<tr>
+<td>Aggregation (5 funcs)</td>
+<td style="text-align: right;">0.235 ms</td>
+<td style="text-align: right;">88.328 ms</td>
+<td style="text-align: right;">1.219 ms</td>
+</tr>
+<tr>
+<td>Filtered aggregation (category)</td>
+<td style="text-align: right;">0.434 ms</td>
+<td style="text-align: right;">61.952 ms</td>
+<td style="text-align: right;">1.174 ms</td>
+</tr>
+<tr>
+<td>Filtered aggregation (city)</td>
+<td style="text-align: right;">0.425 ms</td>
+<td style="text-align: right;">60.457 ms</td>
+<td style="text-align: right;">1.123 ms</td>
+</tr>
+<tr>
+<td>COUNT WHERE category</td>
+<td style="text-align: right;">0.247 ms</td>
+<td style="text-align: right;">57.858 ms</td>
+<td style="text-align: right;">0.841 ms</td>
+</tr>
+<tr>
+<td>Complex (Filter+Group+Order)</td>
+<td style="text-align: right;">1.544 ms</td>
+<td style="text-align: right;">167.413 ms</td>
+<td style="text-align: right;">3.037 ms</td>
+</tr>
+<tr>
+<td>SELECT * -&gt; pandas (full scan)</td>
+<td style="text-align: right;">27.275 ms</td>
+<td style="text-align: right;">1.43 s</td>
+<td style="text-align: right;">217.250 ms</td>
+</tr>
+<tr>
+<td>GROUP BY city,category (100 grp)</td>
+<td style="text-align: right;">1.164 ms</td>
+<td style="text-align: right;">681.439 ms</td>
+<td style="text-align: right;">5.467 ms</td>
+</tr>
+<tr>
+<td>LIKE filter (name LIKE user_1%)</td>
+<td style="text-align: right;">43.767 ms</td>
+<td style="text-align: right;">210.222 ms</td>
+<td style="text-align: right;">101.863 ms</td>
+</tr>
+<tr>
+<td>Multi-cond (age&gt;30 AND score&gt;50)</td>
+<td style="text-align: right;">195.705 ms</td>
+<td style="text-align: right;">619.532 ms</td>
+<td style="text-align: right;">373.821 ms</td>
+</tr>
+<tr>
+<td>ORDER BY city,score DESC LIMIT100</td>
+<td style="text-align: right;">3.412 ms</td>
+<td style="text-align: right;">76.123 ms</td>
+<td style="text-align: right;">7.217 ms</td>
+</tr>
+<tr>
+<td>COUNT(DISTINCT city)</td>
+<td style="text-align: right;">0.195 ms</td>
+<td style="text-align: right;">92.387 ms</td>
+<td style="text-align: right;">4.259 ms</td>
+</tr>
+<tr>
+<td>COUNT(DISTINCT category)</td>
+<td style="text-align: right;">0.192 ms</td>
+<td style="text-align: right;">94.236 ms</td>
+<td style="text-align: right;">4.832 ms</td>
+</tr>
+<tr>
+<td>IN filter (city IN 3 cities)</td>
+<td style="text-align: right;">125.114 ms</td>
+<td style="text-align: right;">514.088 ms</td>
+<td style="text-align: right;">285.915 ms</td>
+</tr>
+<tr>
+<td>Numeric IN (age IN 9 values)</td>
+<td style="text-align: right;">61.760 ms</td>
+<td style="text-align: right;">280.557 ms</td>
+<td style="text-align: right;">144.735 ms</td>
+</tr>
+<tr>
+<td>OR cross-col (age=25 OR city=BJ)</td>
+<td style="text-align: right;">71.940 ms</td>
+<td style="text-align: right;">226.453 ms</td>
+<td style="text-align: right;">112.400 ms</td>
+</tr>
+<tr>
+<td>Numeric OR (age=20|30|40|50)</td>
+<td style="text-align: right;">31.485 ms</td>
+<td style="text-align: right;">150.690 ms</td>
+<td style="text-align: right;">67.100 ms</td>
+</tr>
+<tr>
+<td>Window ROW_NUMBER PARTITION BY city</td>
+<td style="text-align: right;">0.742 ms</td>
+<td style="text-align: right;">518.455 ms</td>
+<td style="text-align: right;">46.636 ms</td>
+</tr>
+<tr>
+<td>JOIN GROUP BY ORDER LIMIT</td>
+<td style="text-align: right;">5.160 ms</td>
+<td style="text-align: right;">392.784 ms</td>
+<td style="text-align: right;">7.876 ms</td>
+</tr>
+<tr>
+<td>LEFT JOIN COUNT</td>
+<td style="text-align: right;">0.806 ms</td>
+<td style="text-align: right;">161.447 ms</td>
+<td style="text-align: right;">3.966 ms</td>
+</tr>
+<tr>
+<td>LEFT JOIN extra ON predicate</td>
+<td style="text-align: right;">0.812 ms</td>
+<td style="text-align: right;">145.464 ms</td>
+<td style="text-align: right;">3.527 ms</td>
+</tr>
+<tr>
+<td>FULL OUTER JOIN (bounded)</td>
+<td style="text-align: right;">0.728 ms</td>
+<td style="text-align: right;">1.246 ms</td>
+<td style="text-align: right;">1.771 ms</td>
+</tr>
+<tr>
+<td>CROSS JOIN COUNT</td>
+<td style="text-align: right;">0.598 ms</td>
+<td style="text-align: right;">48.583 ms</td>
+<td style="text-align: right;">1.596 ms</td>
+</tr>
+<tr>
+<td>UNION ALL (ordered)</td>
+<td style="text-align: right;">1.468 ms</td>
+<td style="text-align: right;">81.119 ms</td>
+<td style="text-align: right;">3.709 ms</td>
+</tr>
+<tr>
+<td>UNION DISTINCT (ordered)</td>
+<td style="text-align: right;">2.644 ms</td>
+<td style="text-align: right;">84.339 ms</td>
+<td style="text-align: right;">3.140 ms</td>
+</tr>
+<tr>
+<td>INTERSECT (ordered)</td>
+<td style="text-align: right;">7.846 ms</td>
+<td style="text-align: right;">177.454 ms</td>
+<td style="text-align: right;">8.191 ms</td>
+</tr>
+<tr>
+<td>EXCEPT (ordered)</td>
+<td style="text-align: right;">2.882 ms</td>
+<td style="text-align: right;">175.378 ms</td>
+<td style="text-align: right;">7.385 ms</td>
+</tr>
+<tr>
+<td>IN subquery COUNT</td>
+<td style="text-align: right;">0.673 ms</td>
+<td style="text-align: right;">101.201 ms</td>
+<td style="text-align: right;">3.414 ms</td>
+</tr>
+<tr>
+<td>EXISTS subquery COUNT</td>
+<td style="text-align: right;">5.185 ms</td>
+<td style="text-align: right;">399.828 ms</td>
+<td style="text-align: right;">23.765 ms</td>
+</tr>
+<tr>
+<td>Derived table GROUP BY</td>
+<td style="text-align: right;">1.118 ms</td>
+<td style="text-align: right;">279.524 ms</td>
+<td style="text-align: right;">4.106 ms</td>
+</tr>
+<tr>
+<td>CTE with AVG filter</td>
+<td style="text-align: right;">1.419 ms</td>
+<td style="text-align: right;">364.752 ms</td>
+<td style="text-align: right;">4.786 ms</td>
+</tr>
+<tr>
+<td>CASE aggregate GROUP BY</td>
+<td style="text-align: right;">1.360 ms</td>
+<td style="text-align: right;">315.547 ms</td>
+<td style="text-align: right;">5.727 ms</td>
+</tr>
+<tr>
+<td>String functions (UPPER/LENGTH/SUBSTR/CONCAT/TRIM)</td>
+<td style="text-align: right;">0.935 ms</td>
+<td style="text-align: right;">1.919 ms</td>
+<td style="text-align: right;">1.663 ms</td>
+</tr>
+<tr>
+<td>Numeric functions (ROUND/ABS/FLOOR/CEIL/MOD)</td>
+<td style="text-align: right;">0.736 ms</td>
+<td style="text-align: right;">1.344 ms</td>
+<td style="text-align: right;">1.273 ms</td>
+</tr>
+<tr>
+<td>COALESCE/NULLIF filter</td>
+<td style="text-align: right;">0.381 ms</td>
+<td style="text-align: right;">137.111 ms</td>
+<td style="text-align: right;">2.116 ms</td>
+</tr>
+<tr>
+<td>NOT filter (age NOT BETWEEN, name NOT LIKE)</td>
+<td style="text-align: right;">2.062 ms</td>
+<td style="text-align: right;">63.308 ms</td>
+<td style="text-align: right;">3.607 ms</td>
+</tr>
+<tr>
+<td>Deep offset (LIMIT 100 OFFSET 100K)</td>
+<td style="text-align: right;">47.073 ms</td>
+<td style="text-align: right;">255.639 ms</td>
+<td style="text-align: right;">198.049 ms</td>
+</tr>
+<tr>
+<td>ORDER BY expression (LENGTH)</td>
+<td style="text-align: right;">2.230 ms</td>
+<td style="text-align: right;">70.825 ms</td>
+<td style="text-align: right;">5.375 ms</td>
+</tr>
+<tr>
+<td>Window SUM OVER (running)</td>
+<td style="text-align: right;">0.575 ms</td>
+<td style="text-align: right;">452.769 ms</td>
+<td style="text-align: right;">42.017 ms</td>
+</tr>
+<tr>
+<td>Window RANK (partitioned)</td>
+<td style="text-align: right;">0.561 ms</td>
+<td style="text-align: right;">476.528 ms</td>
+<td style="text-align: right;">43.014 ms</td>
+</tr>
+<tr>
+<td>Window LAG (partitioned)</td>
+<td style="text-align: right;">0.574 ms</td>
+<td style="text-align: right;">441.836 ms</td>
+<td style="text-align: right;">35.582 ms</td>
+</tr>
+<tr>
+<td>DISTINCT (city, category)</td>
+<td style="text-align: right;">4.235 ms</td>
+<td style="text-align: right;">635.642 ms</td>
+<td style="text-align: right;">5.785 ms</td>
+</tr>
+<tr>
+<td>GROUP BY 2 cols + HAVING</td>
+<td style="text-align: right;">1.145 ms</td>
+<td style="text-align: right;">481.822 ms</td>
+<td style="text-align: right;">5.116 ms</td>
+</tr>
+<tr>
+<td>CSV Read + COUNT(*)</td>
+<td style="text-align: right;">13.659 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">46.370 ms</td>
+</tr>
+<tr>
+<td>CSV Read + Filter + GROUP BY</td>
+<td style="text-align: right;">27.802 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">51.477 ms</td>
+</tr>
+<tr>
+<td>CSV Read + Full Scan LIMIT 1000</td>
+<td style="text-align: right;">14.786 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">22.633 ms</td>
+</tr>
+<tr>
+<td>JSON Read + COUNT(*)</td>
+<td style="text-align: right;">4.652 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">66.710 ms</td>
+</tr>
+<tr>
+<td>JSON Read + Filter</td>
+<td style="text-align: right;">8.690 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">82.001 ms</td>
+</tr>
+<tr>
+<td>JSON Read + GROUP BY category</td>
+<td style="text-align: right;">56.599 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">89.853 ms</td>
+</tr>
+<tr>
+<td>Temp Table (CSV) Query (filter+agg)</td>
+<td style="text-align: right;">0.464 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">0.719 ms</td>
+</tr>
+<tr>
+<td>JSON Read + ORDER BY LIMIT 100</td>
+<td style="text-align: right;">48.435 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">103.954 ms</td>
+</tr>
+<tr>
+<td>CSV Read + ORDER BY LIMIT 100</td>
+<td style="text-align: right;">18.192 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">57.492 ms</td>
+</tr>
+</tbody>
+</table>
+<h3 id="oltp-fair-metrics-32">OLTP Fair Metrics (32)<a class="headerlink" href="#oltp-fair-metrics-32" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Bulk Insert (N rows; default fair)</td>
+<td style="text-align: right;">238.079 ms</td>
+<td style="text-align: right;">1.04 s</td>
+<td style="text-align: right;">185.68 s</td>
+</tr>
+<tr>
+<td>Point Lookup (SQL by ID)</td>
+<td style="text-align: right;">2.71 us</td>
+<td style="text-align: right;">4.31 us</td>
+<td style="text-align: right;">2.847 ms</td>
+</tr>
+<tr>
+<td>Retrieve Many (SQL, 100 IDs)</td>
+<td style="text-align: right;">0.197 ms</td>
+<td style="text-align: right;">0.335 ms</td>
+<td style="text-align: right;">4.835 ms</td>
+</tr>
+<tr>
+<td>COUNT(*) (direct API)</td>
+<td style="text-align: right;">6.19 us</td>
+<td style="text-align: right;">7.895 ms</td>
+<td style="text-align: right;">0.304 ms</td>
+</tr>
+<tr>
+<td>Point lookup (projected SQL)</td>
+<td style="text-align: right;">2.44 us</td>
+<td style="text-align: right;">3.32 us</td>
+<td style="text-align: right;">2.523 ms</td>
+</tr>
+<tr>
+<td>Point lookup (direct full row)</td>
+<td style="text-align: right;">2.05 us</td>
+<td style="text-align: right;">4.29 us</td>
+<td style="text-align: right;">2.613 ms</td>
+</tr>
+<tr>
+<td>Missing ID lookup</td>
+<td style="text-align: right;">2.16 us</td>
+<td style="text-align: right;">2.63 us</td>
+<td style="text-align: right;">2.918 ms</td>
+</tr>
+<tr>
+<td>Retrieve 10 IDs (projected SQL)</td>
+<td style="text-align: right;">7.88 us</td>
+<td style="text-align: right;">0.015 ms</td>
+<td style="text-align: right;">3.759 ms</td>
+</tr>
+<tr>
+<td>Retrieve 100 IDs (projected SQL)</td>
+<td style="text-align: right;">0.036 ms</td>
+<td style="text-align: right;">0.107 ms</td>
+<td style="text-align: right;">5.151 ms</td>
+</tr>
+<tr>
+<td>SELECT 3 cols LIMIT 100</td>
+<td style="text-align: right;">0.045 ms</td>
+<td style="text-align: right;">0.078 ms</td>
+<td style="text-align: right;">0.176 ms</td>
+</tr>
+<tr>
+<td>String equality (projected)</td>
+<td style="text-align: right;">0.049 ms</td>
+<td style="text-align: right;">47.056 ms</td>
+<td style="text-align: right;">1.462 ms</td>
+</tr>
+<tr>
+<td>City filter LIMIT 100</td>
+<td style="text-align: right;">0.020 ms</td>
+<td style="text-align: right;">0.109 ms</td>
+<td style="text-align: right;">0.216 ms</td>
+</tr>
+<tr>
+<td>Insert 1 row (default fair)</td>
+<td style="text-align: right;">0.011 ms</td>
+<td style="text-align: right;">0.015 ms</td>
+<td style="text-align: right;">0.319 ms</td>
+</tr>
+<tr>
+<td>Insert+Read own row</td>
+<td style="text-align: right;">0.014 ms</td>
+<td style="text-align: right;">0.019 ms</td>
+<td style="text-align: right;">4.150 ms</td>
+</tr>
+<tr>
+<td>Insert+COUNT visible</td>
+<td style="text-align: right;">0.017 ms</td>
+<td style="text-align: right;">8.230 ms</td>
+<td style="text-align: right;">0.678 ms</td>
+</tr>
+<tr>
+<td>UPDATE by ID</td>
+<td style="text-align: right;">3.04 us</td>
+<td style="text-align: right;">4.34 us</td>
+<td style="text-align: right;">0.891 ms</td>
+</tr>
+<tr>
+<td>UPDATE missing ID</td>
+<td style="text-align: right;">3.01 us</td>
+<td style="text-align: right;">3.90 us</td>
+<td style="text-align: right;">0.907 ms</td>
+</tr>
+<tr>
+<td>UPDATE+Read by ID</td>
+<td style="text-align: right;">5.11 us</td>
+<td style="text-align: right;">7.32 us</td>
+<td style="text-align: right;">1.852 ms</td>
+</tr>
+<tr>
+<td>Replace row by ID</td>
+<td style="text-align: right;">0.62 us</td>
+<td style="text-align: right;">4.44 us</td>
+<td style="text-align: right;">1.007 ms</td>
+</tr>
+<tr>
+<td>Insert+DELETE by ID</td>
+<td style="text-align: right;">0.023 ms</td>
+<td style="text-align: right;">0.027 ms</td>
+<td style="text-align: right;">1.385 ms</td>
+</tr>
+<tr>
+<td>DELETE missing ID</td>
+<td style="text-align: right;">0.41 us</td>
+<td style="text-align: right;">3.97 us</td>
+<td style="text-align: right;">0.684 ms</td>
+</tr>
+<tr>
+<td>Insert 1K rows (default fair)</td>
+<td style="text-align: right;">0.682 ms</td>
+<td style="text-align: right;">1.702 ms</td>
+<td style="text-align: right;">185.861 ms</td>
+</tr>
+<tr>
+<td>UPDATE rows (age=25; idempotent)</td>
+<td style="text-align: right;">4.144 ms</td>
+<td style="text-align: right;">43.291 ms</td>
+<td style="text-align: right;">15.605 ms</td>
+</tr>
+<tr>
+<td>Store+DELETE 1K (combined)</td>
+<td style="text-align: right;">1.076 ms</td>
+<td style="text-align: right;">40.499 ms</td>
+<td style="text-align: right;">184.709 ms</td>
+</tr>
+<tr>
+<td>DELETE 1K (pure delete; setup rows)</td>
+<td style="text-align: right;">0.187 ms</td>
+<td style="text-align: right;">39.612 ms</td>
+<td style="text-align: right;">0.385 ms</td>
+</tr>
+<tr>
+<td>FTS Index Build (name,city,category)</td>
+<td style="text-align: right;">1.546 ms</td>
+<td style="text-align: right;">1.57 s</td>
+<td style="text-align: right;">1.15 s</td>
+</tr>
+<tr>
+<td>FTS Search ('Electronics')</td>
+<td style="text-align: right;">5.437 ms</td>
+<td style="text-align: right;">30.056 ms</td>
+<td style="text-align: right;">23.242 ms</td>
+</tr>
+<tr>
+<td>Table CREATE (1 col)</td>
+<td style="text-align: right;">0.016 ms</td>
+<td style="text-align: right;">0.040 ms</td>
+<td style="text-align: right;">0.116 ms</td>
+</tr>
+<tr>
+<td>Table DROP</td>
+<td style="text-align: right;">0.056 ms</td>
+<td style="text-align: right;">0.031 ms</td>
+<td style="text-align: right;">0.098 ms</td>
+</tr>
+<tr>
+<td>Table CREATE+DROP cycle</td>
+<td style="text-align: right;">0.110 ms</td>
+<td style="text-align: right;">0.068 ms</td>
+<td style="text-align: right;">0.276 ms</td>
+</tr>
+<tr>
+<td>List tables (10)</td>
+<td style="text-align: right;">0.011 ms</td>
+<td style="text-align: right;">0.020 ms</td>
+<td style="text-align: right;">2.846 ms</td>
+</tr>
+<tr>
+<td>ALTER TABLE ADD COLUMN</td>
+<td style="text-align: right;">0.067 ms</td>
+<td style="text-align: right;">0.082 ms</td>
+<td style="text-align: right;">0.107 ms</td>
+</tr>
+</tbody>
+</table>
+<h3 id="exact-vector-similarity-6">Exact Vector Similarity (6)<a class="headerlink" href="#exact-vector-similarity-6" title="Permanent link">&para;</a></h3>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite + sqlite-vector</th>
+<th style="text-align: right;">DuckDB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TopK L2</td>
+<td style="text-align: right;">7.684 ms</td>
+<td style="text-align: right;">135.728 ms</td>
+<td style="text-align: right;">35.056 ms</td>
+</tr>
+<tr>
+<td>TopK Cosine</td>
+<td style="text-align: right;">7.888 ms</td>
+<td style="text-align: right;">160.234 ms</td>
+<td style="text-align: right;">41.254 ms</td>
+</tr>
+<tr>
+<td>TopK Dot</td>
+<td style="text-align: right;">8.080 ms</td>
+<td style="text-align: right;">134.895 ms</td>
+<td style="text-align: right;">32.260 ms</td>
+</tr>
+<tr>
+<td>Batch TopK L2 (10 queries)</td>
+<td style="text-align: right;">49.072 ms</td>
+<td style="text-align: right;">1,347.899 ms</td>
+<td style="text-align: right;">340.936 ms</td>
+</tr>
+<tr>
+<td>Batch TopK Cosine (10 queries)</td>
+<td style="text-align: right;">50.763 ms</td>
+<td style="text-align: right;">1,505.297 ms</td>
+<td style="text-align: right;">390.632 ms</td>
+</tr>
+<tr>
+<td>Batch TopK Dot (10 queries)</td>
+<td style="text-align: right;">49.674 ms</td>
+<td style="text-align: right;">1,337.900 ms</td>
+<td style="text-align: right;">344.654 ms</td>
+</tr>
+</tbody>
+</table>
+<p>All vector rows matched the brute-force exact top-k row sets.</p>
+<h2 id="quantized-l2-distance-snapshot">Quantized L2 Distance Snapshot<a class="headerlink" href="#quantized-l2-distance-snapshot" title="Permanent link">&para;</a></h2>
+<p>The public benchmark entrypoint includes this snapshot alongside the tabular
+and exact-vector modules. It uses 1,000,000 identical normally
+distributed Float32 vectors with 128 dimensions, 20 query vectors, <code>k=10</code>, two
+warmups, and five timed iterations. Latency is the median per query across
+repeated query batches. ApexBase uses its native <code>batch_topk_distance()</code> API;
+sqlite-vector has no batch API, so its measurement repeats
+<code>vector_quantize_scan()</code> once per query. These values therefore describe
+batch-amortized retrieval, not isolated single-query latency.</p>
+<p>Recall is overlap with each engine's own exact Float32 top-10. sqlite-vector
+quantized data was preloaded, and ApexBase exact reranking used
+<code>candidate_k=100</code>.</p>
+<p>The common comparison covers the six modes supported by both engines. The
+codec names describe each engine's implementation, not a shared binary format.</p>
+<table>
+<thead>
+<tr>
+<th>Codec</th>
+<th style="text-align: right;">ApexBase quantized</th>
+<th style="text-align: right;">Apex recall</th>
+<th style="text-align: right;">Apex exact-rescore</th>
+<th style="text-align: right;">Rescore recall</th>
+<th style="text-align: right;">sqlite-vector quantized</th>
+<th style="text-align: right;">SQLite recall</th>
+<th style="text-align: right;">SQLite preload</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>INT8</td>
+<td style="text-align: right;">1.306 ms</td>
+<td style="text-align: right;">0.975</td>
+<td style="text-align: right;">18.785 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">8.779 ms</td>
+<td style="text-align: right;">0.945</td>
+<td style="text-align: right;">129.70 MiB</td>
+</tr>
+<tr>
+<td>UINT8</td>
+<td style="text-align: right;">3.467 ms</td>
+<td style="text-align: right;">0.985</td>
+<td style="text-align: right;">23.775 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">8.765 ms</td>
+<td style="text-align: right;">0.960</td>
+<td style="text-align: right;">129.70 MiB</td>
+</tr>
+<tr>
+<td>1-bit</td>
+<td style="text-align: right;">0.695 ms</td>
+<td style="text-align: right;">0.140</td>
+<td style="text-align: right;">16.158 ms</td>
+<td style="text-align: right;">0.415</td>
+<td style="text-align: right;">2.057 ms</td>
+<td style="text-align: right;">0.100</td>
+<td style="text-align: right;">22.89 MiB</td>
+</tr>
+<tr>
+<td>TurboQuant 2-bit</td>
+<td style="text-align: right;">5.094 ms</td>
+<td style="text-align: right;">0.450</td>
+<td style="text-align: right;">21.372 ms</td>
+<td style="text-align: right;">0.870</td>
+<td style="text-align: right;">27.343 ms</td>
+<td style="text-align: right;">0.535</td>
+<td style="text-align: right;">41.96 MiB</td>
+</tr>
+<tr>
+<td>TurboQuant 3-bit</td>
+<td style="text-align: right;">18.641 ms</td>
+<td style="text-align: right;">0.595</td>
+<td style="text-align: right;">34.990 ms</td>
+<td style="text-align: right;">0.990</td>
+<td style="text-align: right;">66.771 ms</td>
+<td style="text-align: right;">0.725</td>
+<td style="text-align: right;">57.22 MiB</td>
+</tr>
+<tr>
+<td>TurboQuant 4-bit</td>
+<td style="text-align: right;">9.559 ms</td>
+<td style="text-align: right;">0.760</td>
+<td style="text-align: right;">26.240 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">52.141 ms</td>
+<td style="text-align: right;">0.840</td>
+<td style="text-align: right;">72.48 MiB</td>
+</tr>
+</tbody>
+</table>
+<p>sqlite-vector does not expose Float16 or BFloat16 through
+<code>vector_quantize_scan()</code>. ApexBase's additional derived-column results were:</p>
+<table>
+<thead>
+<tr>
+<th>ApexBase-only codec</th>
+<th style="text-align: right;">Quantized L2</th>
+<th style="text-align: right;">Recall@10</th>
+<th style="text-align: right;">Exact-rescore</th>
+<th style="text-align: right;">Rescore recall</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Float16</td>
+<td style="text-align: right;">2.504 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">17.064 ms</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+<tr>
+<td>BFloat16</td>
+<td style="text-align: right;">10.527 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">31.441 ms</td>
+<td style="text-align: right;">1.000</td>
+</tr>
+</tbody>
+</table>
+<p>Across all six shared quantizers, ApexBase's batch-amortized compressed scan
+was 2.53x to 6.72x faster. INT8, UINT8, and 1Bit also had higher
+recall in this dataset; TurboQuant 2/3/4 traded lower initial candidate recall
+for speed, while exact source reranking recovered 0.935-1.000 recall. The JSON
+report also retains build time, database size, and sqlite-vector's estimated
+preloaded representation size for every mode.</p>
+<h2 id="reproduce">Reproduce<a class="headerlink" href="#reproduce" title="Permanent link">&para;</a></h2>
+<p>Run the same default public profile:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a>python<span class="w"> </span>benchmarks/bench_vs_sqlite_duckdb.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-0-2"><a id="__codelineno-0-2" name="__codelineno-0-2" href="#__codelineno-0-2"></a><span class="w">  </span>--output<span class="w"> </span>benchmarks/results/public.json
+</span></code></pre></div>
+<p>Use <code>--skip-vector</code> for a tabular-only run, or
+<code>--skip-quantized-vector</code> to retain exact-vector metrics while omitting the
+compressed module. The unified command accepts <code>--quantized-vector-rows</code>,
+<code>--quantized-vector-queries</code>, <code>--quantized-vector-candidate-k</code>, and
+<code>--quantized-vector-seed</code> when a different compressed workload is required:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>python<span class="w"> </span>benchmarks/bench_vs_sqlite_duckdb.py<span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a><span class="w">  </span>--quantized-vector-rows<span class="w"> </span><span class="m">1000000</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a><span class="w">  </span>--quantized-vector-queries<span class="w"> </span><span class="m">20</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-4"><a id="__codelineno-1-4" name="__codelineno-1-4" href="#__codelineno-1-4"></a><span class="w">  </span>--quantized-vector-candidate-k<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+</span><span id="__span-1-5"><a id="__codelineno-1-5" name="__codelineno-1-5" href="#__codelineno-1-5"></a><span class="w">  </span>--output<span class="w"> </span>benchmarks/results/public-with-quantization.json
+</span></code></pre></div>
+<p>The quantization benchmark requires the optional <code>sqliteai-vector</code> Python
+package and a Python build linked against a compatible SQLite version.</p>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.instant.progress", "navigation.top", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "toc.integrate", "search.suggest", "search.highlight", "search.share", "content.code.copy", "content.code.select", "content.code.annotate", "content.tabs.link"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"current": "1.33.1", "default": "latest", "label": "v1.33.1", "provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
