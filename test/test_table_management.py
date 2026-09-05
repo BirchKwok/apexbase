@@ -812,6 +812,7 @@ class TestCreateTableWithSchema:
 
     def test_schema_performance(self):
         """Test that schema-defined table is at least as fast as no-schema"""
+        import statistics
         import time
 
         n = 100000
@@ -822,35 +823,41 @@ class TestCreateTableWithSchema:
         }
         schema = {"id": "int64", "value": "float64", "name": "string"}
 
-        times_schema = []
-        times_no_schema = []
-
-        for _ in range(3):
+        def timed_store(with_schema: bool) -> float:
             with tempfile.TemporaryDirectory() as td:
                 c = ApexClient(dirpath=td)
-                c.create_table("t", schema=schema)
+                if with_schema:
+                    c.create_table("t", schema=schema)
+                else:
+                    c.create_table("t")
                 # CREATE is lazily materialized; keep that one-time filesystem
                 # work outside the store-path comparison on every platform.
                 assert c.count_rows() == 0
                 t0 = time.perf_counter()
                 c.store(data)
-                times_schema.append(time.perf_counter() - t0)
+                elapsed = time.perf_counter() - t0
                 c.close()
+            return elapsed
 
-            with tempfile.TemporaryDirectory() as td:
-                c = ApexClient(dirpath=td)
-                c.create_table("t")
-                assert c.count_rows() == 0
-                t0 = time.perf_counter()
-                c.store(data)
-                times_no_schema.append(time.perf_counter() - t0)
-                c.close()
+        # Warm up one-time process/OS costs (first tempdir writes, page cache,
+        # allocator) so they are not charged to either measured arm.
+        timed_store(True)
+        timed_store(False)
 
-        avg_schema = sum(times_schema) / len(times_schema)
-        avg_no_schema = sum(times_no_schema) / len(times_no_schema)
+        times_schema = []
+        times_no_schema = []
+        for sample in range(5):
+            for with_schema in ((True, False) if sample % 2 == 0 else (False, True)):
+                elapsed = timed_store(with_schema)
+                (times_schema if with_schema else times_no_schema).append(elapsed)
+
+        # Median of 5 samples is robust against a single noisy measurement on
+        # shared CI runners; the comparison threshold itself is unchanged.
+        med_schema = statistics.median(times_schema)
+        med_no_schema = statistics.median(times_no_schema)
         # Schema should not be more than 2x slower than no-schema (relaxed for CI variance)
-        assert avg_schema < avg_no_schema * 2.0, \
-            f"Schema ({avg_schema*1000:.1f}ms) significantly slower than no-schema ({avg_no_schema*1000:.1f}ms)"
+        assert med_schema < med_no_schema * 2.0, \
+            f"Schema ({med_schema*1000:.1f}ms) significantly slower than no-schema ({med_no_schema*1000:.1f}ms)"
 
 
 if __name__ == "__main__":

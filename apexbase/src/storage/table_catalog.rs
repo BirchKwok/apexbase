@@ -1129,6 +1129,12 @@ pub fn reap_pending_deletions() {
 mod tests {
     use super::*;
 
+    /// The tests below share the process-global PENDING_DELETIONS queue.
+    /// Serialize them so one test's drain cannot reap another test's queued
+    /// files mid-run; unrelated tests may still hold entries, so assertions
+    /// must target their own paths instead of requiring an empty global map.
+    static DELETION_QUEUE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
             "apex_catalog_test_{}_{}",
@@ -1245,6 +1251,7 @@ mod tests {
 
     #[test]
     fn deferred_deletion_queued_and_reaped_on_drain() {
+        let _guard = DELETION_QUEUE_LOCK.lock().unwrap();
         let dir = temp_dir("deferred_reap");
         let table = dir.join("t.apex");
         fs::write(&table, b"payload").unwrap();
@@ -1258,12 +1265,13 @@ mod tests {
         reap_pending_deletions();
         assert!(!table.exists());
         assert!(!dir.join("t.apex.wal").exists());
-        assert!(PENDING_DELETIONS.is_empty());
+        assert!(!PENDING_DELETIONS.contains_key(&table));
         let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn deferred_deletion_skips_replaced_file() {
+        let _guard = DELETION_QUEUE_LOCK.lock().unwrap();
         let dir = temp_dir("deferred_replaced");
         let table = dir.join("t.apex");
         fs::write(&table, b"payload-one").unwrap();
@@ -1281,6 +1289,7 @@ mod tests {
 
     #[test]
     fn reap_table_files_unlinks_under_registry_lock() {
+        let _guard = DELETION_QUEUE_LOCK.lock().unwrap();
         let dir = temp_dir("reap_under_lock");
         let table = dir.join("t.apex");
         fs::write(&table, b"payload").unwrap();
@@ -1289,7 +1298,30 @@ mod tests {
         reap_table_files(&table);
         assert!(!table.exists());
         assert!(!dir.join("t.apex.delta").exists());
-        assert!(PENDING_DELETIONS.is_empty());
+        assert!(!PENDING_DELETIONS.contains_key(&table));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reap_table_files_leaves_other_queued_tables_untouched() {
+        let _guard = DELETION_QUEUE_LOCK.lock().unwrap();
+        let dir = temp_dir("reap_isolation");
+        let table = dir.join("t.apex");
+        let other = dir.join("other.apex");
+        fs::write(&table, b"payload").unwrap();
+        fs::write(&other, b"other-payload").unwrap();
+        queue_file_deletions(std::slice::from_ref(&table));
+        queue_file_deletions(std::slice::from_ref(&other));
+
+        reap_table_files(&table);
+
+        assert!(!table.exists());
+        // A targeted reap must neither unlink nor dequeue an unrelated table.
+        assert!(other.exists());
+        assert!(!PENDING_DELETIONS.contains_key(&table));
+        assert!(PENDING_DELETIONS.contains_key(&other));
+        PENDING_DELETIONS.remove(&other);
+        let _ = fs::remove_file(&other);
         let _ = fs::remove_dir_all(&dir);
     }
 }
