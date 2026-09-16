@@ -560,6 +560,20 @@ pub struct WalWriter {
     record_count: usize,
 }
 
+#[cfg(test)]
+thread_local! {
+    static WAL_SYNC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_wal_sync_count() -> usize {
+    WAL_SYNC_COUNT.with(|count| {
+        let value = count.get();
+        count.set(0);
+        value
+    })
+}
+
 impl WalWriter {
     /// Create new WAL file
     pub fn create(path: &Path, start_id: u64) -> io::Result<Self> {
@@ -715,7 +729,10 @@ impl WalWriter {
     /// Sync WAL to disk (fsync - ensures durability)
     pub fn sync(&mut self) -> io::Result<()> {
         self.file.flush()?;
-        self.file.get_ref().sync_all()
+        self.file.get_ref().sync_all()?;
+        #[cfg(test)]
+        WAL_SYNC_COUNT.with(|count| count.set(count.get() + 1));
+        Ok(())
     }
 
     /// Get record count

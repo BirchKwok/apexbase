@@ -148,6 +148,41 @@ fn fast_transaction_update_remains_supported() {
     assert_eq!(values.value(0), 9);
 }
 
+#[test]
+fn max_transaction_commit_syncs_the_wal() {
+    for (name, durability, expected_syncs) in [
+        ("t_safe", crate::storage::DurabilityLevel::Safe, 0),
+        ("t_max", crate::storage::DurabilityLevel::Max, 1),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(format!("{name}.apex"));
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            durability,
+            &[("value".to_string(), crate::storage::ColumnType::Int64)],
+        )
+        .unwrap();
+        storage.save_full().unwrap();
+        drop(storage);
+
+        crate::storage::incremental::take_wal_sync_count();
+        let session = crate::Session::new(dir.path(), &path).with_durability(durability);
+        let txn_id = crate::txn::txn_manager().begin();
+        session
+            .execute_in_txn(
+                txn_id,
+                SqlParser::parse(&format!("INSERT INTO {name} (value) VALUES (1)")).unwrap(),
+            )
+            .unwrap();
+        session.commit_txn(txn_id).unwrap();
+        assert_eq!(
+            crate::storage::incremental::take_wal_sync_count(),
+            expected_syncs,
+            "{name} commit used the wrong WAL sync boundary"
+        );
+    }
+}
+
 fn create_test_storage(path: &Path) {
     let storage = OnDemandStorage::create(path).unwrap();
 

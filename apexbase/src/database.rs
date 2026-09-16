@@ -607,3 +607,27 @@ impl Database {
         ApexExecutor::notify_indexes_after_write(table_path, ids);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_durability_scope_restores_previous_value() {
+        crate::query::executor::set_query_durability(DurabilityLevel::Safe);
+        let base = Path::new(".");
+        {
+            let session = Session::new(base, base).with_durability(DurabilityLevel::Max);
+            let _scope = session.enter();
+            assert_eq!(
+                crate::query::executor::get_query_durability(),
+                Some(DurabilityLevel::Max)
+            );
+        }
+        assert_eq!(
+            crate::query::executor::get_query_durability(),
+            Some(DurabilityLevel::Safe)
+        );
+        crate::query::executor::clear_query_durability();
+    }
+}
