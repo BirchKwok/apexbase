@@ -565,6 +565,69 @@ thread_local! {
     static WAL_SYNC_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(all(test, unix))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WalIoFault {
+    Write,
+    Flush,
+    Sync,
+}
+
+#[cfg(all(test, unix))]
+thread_local! {
+    static WAL_IO_FAULT: std::cell::Cell<Option<WalIoFault>> = const { std::cell::Cell::new(None) };
+    static WAL_FAULT_PIPE_READER: std::cell::RefCell<Option<File>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn set_wal_io_fault(fault: Option<WalIoFault>) {
+    WAL_IO_FAULT.with(|value| value.set(fault));
+    if fault.is_none() {
+        WAL_FAULT_PIPE_READER.with(|reader| reader.borrow_mut().take());
+    }
+}
+
+#[cfg(all(test, unix))]
+fn take_wal_io_fault(expected: WalIoFault) -> bool {
+    WAL_IO_FAULT.with(|value| {
+        if value.get() == Some(expected) {
+            value.set(None);
+            true
+        } else {
+            false
+        }
+    })
+}
+
+#[cfg(all(test, unix))]
+fn replace_with_read_only_fd(file: &File) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let read_only = File::open("/dev/null")?;
+    let result = unsafe { libc::dup2(read_only.as_raw_fd(), file.as_raw_fd()) };
+    if result < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+fn replace_with_pipe_fd(file: &File) -> io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+
+    let mut pipe_fds = [0; 2];
+    if unsafe { libc::pipe(pipe_fds.as_mut_ptr()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let reader = unsafe { File::from_raw_fd(pipe_fds[0]) };
+    let writer = unsafe { File::from_raw_fd(pipe_fds[1]) };
+    if unsafe { libc::dup2(writer.as_raw_fd(), file.as_raw_fd()) } < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    WAL_FAULT_PIPE_READER.with(|slot| *slot.borrow_mut() = Some(reader));
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn take_wal_sync_count() -> usize {
     WAL_SYNC_COUNT.with(|count| {
@@ -646,6 +709,10 @@ impl WalWriter {
     /// Append a record to WAL
     pub fn append(&mut self, record: &WalRecord) -> io::Result<()> {
         let bytes = record.to_bytes();
+        #[cfg(all(test, unix))]
+        if bytes.len() >= 64 * 1024 && take_wal_io_fault(WalIoFault::Write) {
+            replace_with_read_only_fd(self.file.get_ref())?;
+        }
         self.file.write_all(&bytes)?;
         self.record_count += 1;
         Ok(())
@@ -723,12 +790,20 @@ impl WalWriter {
 
     /// Flush WAL to disk (buffered write)
     pub fn flush(&mut self) -> io::Result<()> {
+        #[cfg(all(test, unix))]
+        if take_wal_io_fault(WalIoFault::Flush) {
+            replace_with_read_only_fd(self.file.get_ref())?;
+        }
         self.file.flush()
     }
 
     /// Sync WAL to disk (fsync - ensures durability)
     pub fn sync(&mut self) -> io::Result<()> {
         self.file.flush()?;
+        #[cfg(all(test, unix))]
+        if take_wal_io_fault(WalIoFault::Sync) {
+            replace_with_pipe_fd(self.file.get_ref())?;
+        }
         self.file.get_ref().sync_all()?;
         #[cfg(test)]
         WAL_SYNC_COUNT.with(|count| count.set(count.get() + 1));

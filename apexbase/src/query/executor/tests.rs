@@ -183,6 +183,108 @@ fn max_transaction_commit_syncs_the_wal() {
     }
 }
 
+#[test]
+#[cfg(unix)]
+fn commit_contract_real_wal_stage_failures() {
+    use crate::storage::incremental::{set_wal_io_fault, WalIoFault};
+    use crate::txn::{CommitError, CommitOutcome};
+
+    struct FaultReset;
+    impl Drop for FaultReset {
+        fn drop(&mut self) {
+            set_wal_io_fault(None);
+        }
+    }
+
+    for (name, fault, durability, expected_outcome, recovered_rows, wide_value) in [
+        (
+            "t_write_fault",
+            WalIoFault::Write,
+            crate::storage::DurabilityLevel::Safe,
+            CommitOutcome::NotCommitted,
+            0,
+            true,
+        ),
+        (
+            "t_flush_fault",
+            WalIoFault::Flush,
+            crate::storage::DurabilityLevel::Safe,
+            CommitOutcome::Unknown,
+            0,
+            false,
+        ),
+        (
+            "t_sync_fault",
+            WalIoFault::Sync,
+            crate::storage::DurabilityLevel::Max,
+            CommitOutcome::Unknown,
+            1,
+            false,
+        ),
+    ] {
+        let _reset = FaultReset;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join(format!("{name}.apex"));
+        let column_type = if wide_value {
+            crate::storage::ColumnType::String
+        } else {
+            crate::storage::ColumnType::Int64
+        };
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            durability,
+            &[("value".to_string(), column_type)],
+        )
+        .unwrap();
+        storage.save_full().unwrap();
+        drop(storage);
+
+        let session = crate::Session::new(dir.path(), &path).with_durability(durability);
+        let txn_id = crate::txn::txn_manager().begin();
+        let insert = if wide_value {
+            format!(
+                "INSERT INTO {name} (value) VALUES ('{}')",
+                "x".repeat(70 * 1024)
+            )
+        } else {
+            format!("INSERT INTO {name} (value) VALUES (1)")
+        };
+        session
+            .execute_in_txn(txn_id, SqlParser::parse(&insert).unwrap())
+            .unwrap();
+        set_wal_io_fault(Some(fault));
+        let error = session
+            .commit_txn(txn_id)
+            .err()
+            .expect("the armed OS-level WAL fault must fail commit");
+        set_wal_io_fault(None);
+        let detail = error
+            .get_ref()
+            .unwrap()
+            .downcast_ref::<CommitError>()
+            .unwrap();
+        assert_eq!(detail.outcome, expected_outcome, "{name}: {error}");
+        assert!(!crate::txn::txn_manager().is_active(txn_id));
+
+        let reopened = OnDemandStorage::open_with_durability(&path, durability).unwrap();
+        assert_eq!(reopened.row_count(), recovered_rows, "{name}");
+        drop(reopened);
+
+        let next_txn = crate::txn::txn_manager().begin();
+        let next_insert = if wide_value {
+            format!("INSERT INTO {name} (value) VALUES ('next')")
+        } else {
+            format!("INSERT INTO {name} (value) VALUES (2)")
+        };
+        session
+            .execute_in_txn(next_txn, SqlParser::parse(&next_insert).unwrap())
+            .unwrap();
+        session.commit_txn(next_txn).unwrap();
+        let reopened = OnDemandStorage::open_with_durability(&path, durability).unwrap();
+        assert_eq!(reopened.row_count(), recovered_rows + 1, "{name}");
+    }
+}
+
 fn create_test_storage(path: &Path) {
     let storage = OnDemandStorage::create(path).unwrap();
 
