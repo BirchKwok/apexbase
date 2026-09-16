@@ -195,10 +195,32 @@ impl ApexExecutor {
         // Collect affected table paths
         let mut affected_tables: std::collections::HashSet<std::path::PathBuf> =
             std::collections::HashSet::new();
+        let mut updated_tables: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
         for write in writes {
             let table_name = write.table();
             let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
+            if matches!(write, crate::txn::context::TxnWrite::Update { .. }) {
+                updated_tables.insert(table_path.clone());
+            }
             affected_tables.insert(table_path);
+        }
+
+        // WAL recovery currently replays transactional INSERT/DELETE only.
+        // Reject UPDATE on a WAL-backed table before writing TxnBegin so a
+        // successful marker can never promise recovery that does not exist.
+        for table_path in &updated_tables {
+            if Self::txn_wal_path(table_path).exists() {
+                let _ = mgr.rollback(txn_id);
+                return Err(CommitError::wrap(
+                    txn_id,
+                    CommitOutcome::NotCommitted,
+                    io::Error::new(
+                        io::ErrorKind::Unsupported,
+                        "transactional UPDATE is not supported for Safe/Max tables until UPDATE WAL recovery is available",
+                    ),
+                ));
+            }
         }
         let _epoch_writes: Vec<_> = affected_tables
             .iter()
@@ -345,15 +367,7 @@ impl ApexExecutor {
     pub(in crate::query::executor) fn open_txn_wal_backend(
         storage_path: &Path,
     ) -> io::Result<Option<TableStorageBackend>> {
-        let wal_path = {
-            let mut p = storage_path.to_path_buf();
-            let ext = p
-                .extension()
-                .map(|e| format!("{}.wal", e.to_string_lossy()))
-                .unwrap_or_else(|| "wal".to_string());
-            p.set_extension(ext);
-            p
-        };
+        let wal_path = Self::txn_wal_path(storage_path);
         if !wal_path.exists() {
             return Ok(None);
         }
@@ -363,6 +377,16 @@ impl ApexExecutor {
             crate::storage::DurabilityLevel::Safe,
         )
         .map(Some)
+    }
+
+    fn txn_wal_path(storage_path: &Path) -> std::path::PathBuf {
+        let mut path = storage_path.to_path_buf();
+        let ext = path
+            .extension()
+            .map(|e| format!("{}.wal", e.to_string_lossy()))
+            .unwrap_or_else(|| "wal".to_string());
+        path.set_extension(ext);
+        path
     }
 
     pub(in crate::query::executor) fn apply_txn_writes(
