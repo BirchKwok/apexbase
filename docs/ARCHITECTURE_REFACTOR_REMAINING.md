@@ -28,7 +28,7 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 | 顺序 | 优先级 / 编号 | 工作 | 完成条件 | 状态 |
 | --- | --- | --- | --- | --- |
 | 1 | P0 / C1 | 提交失败结果分类与提交后错误处理 | Rust 可识别、Python 可辨认“未提交/结果不确定/已提交”；保留原始错误；不把 WAL marker 写失败误判可安全重试；提交后维护失败仍发布可见性与失效；真实 I/O 故障测试 | 已实现并验收通过（2026-09-10，canary/full 对 base `1b60ae8` 均 exit 0）；C2 可开始 |
-| 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | 实施中；C2.1 与 C2.2a 已完成，真实 fsync 失败覆盖及 C2.3 待实施 |
+| 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | 实施中；C2.1/C2.2 已完成，C2.3 待设计与实施 |
 | 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | 待实施，依赖 C1/C2 |
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | 待实施，C1–C3 后 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | 待实施，按缓存拆批 |
@@ -170,7 +170,7 @@ UPDATE WAL 记录属于持久化格式变化。它还需要解决 applied waterm
 | --- | --- | --- | --- |
 | C2.1 | 无格式变化的安全边界 | WAL-backed 表的显式事务含 UPDATE 时，在任何 TxnBegin/DML/Commit WAL 写入前拒绝；结果为 `not_committed`；事务状态清除；原值及 WAL 长度不变；Fast 事务 UPDATE 兼容 | 已完成 |
 | C2.2a | durability 传播与 Max 同步边界 | Session/嵌入式/Python 到提交协调层保留 Safe/Max；Max commit marker 使用真实 fsync；作用域退出恢复原上下文 | 已完成（`546e71f`、`4104ba4`） |
-| C2.2b | 真实同步失败矩阵 | 真实写入/flush/fsync 故障分别验证结果分类、重开与后续事务；不能用 mock 替代核心 I/O 路径 | 待实施，依赖 C2.2a |
+| C2.2b | 真实同步失败矩阵 | 真实写入/flush/fsync 故障分别验证结果分类、重开与后续事务；不能用 mock 替代核心 I/O 路径 | 已完成（`14e630c`） |
 | C2.3 | UPDATE WAL 与后缀恢复 | 独立记录格式/版本/旧文件兼容设计；watermark 按偏移解析；只按 WAL 顺序幂等重放未应用且已提交的 UPDATE；覆盖崩溃、重复打开、更新后再更新、compact | 待设计，依赖 C2.2b |
 
 C2.1 只关闭“不把不可恢复 UPDATE 当作可持久提交”的漏洞，不代表 C2 整体完成，
@@ -180,3 +180,15 @@ WAL 写入之前；现有 C1 `CommitOutcome` 契约因此允许稳定返回 `not
 C2.2a 的聚焦 release 检查覆盖 Session durability 作用域恢复，以及 Safe/Max 事务
 commit marker 的真实同步分支。C2 最终验收仍使用第 4 节固定 base 和完整链；原子
 步骤只运行聚焦功能检查，所有文件修改结束后再统一执行完整验收。
+
+C2.2b 在 Unix 测试构建中直接替换实际 WAL 文件描述符，保留真实的 buffered write、
+flush 与 `fsync` 系统调用，不用固定返回值模拟核心 I/O。聚焦矩阵结果为：
+
+| 故障点 | 对外结果 | 重开结果 | 后续事务 |
+| --- | --- | --- | --- |
+| 大记录 WAL write | `not_committed` | 0 行 | 可继续提交 |
+| commit-marker flush | `unknown` | 0 行 | 可继续提交 |
+| Max commit-marker fsync | `unknown` | 已 flush marker，恢复 1 行 | 可继续提交 |
+
+fsync 返回前失败仍必须报告 `unknown`：即使本次测试中 marker 已进入 OS 缓冲并能恢复，
+调用方也不能从失败返回值推断它必然已经或必然没有持久化。
