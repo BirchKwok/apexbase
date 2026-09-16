@@ -412,6 +412,7 @@ impl ApexDB {
         let result = crate::Session::new(&base_dir, &base_dir)
             .with_root_dir(&self.inner.root_dir)
             .with_temp_dir(&self.inner.temp_dir)
+            .with_durability(self.inner.durability)
             .execute_classified(sql, &sig);
         let result = result?;
 
@@ -656,6 +657,7 @@ impl Table {
         let base_dir = self.inner.current_base_dir();
         let result = crate::Session::new(&base_dir, &self.path)
             .with_root_dir(&self.inner.root_dir)
+            .with_durability(self.inner.durability)
             .execute_classified(sql, &sig);
         Ok(ResultSet { inner: result? })
     }

@@ -108,6 +108,26 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
+// The storage handle owns the caller-selected durability mode, while the SQL
+// executor is otherwise stateless. Session scopes carry that mode across the
+// façade boundary so transaction commit can preserve Max fsync semantics.
+thread_local! {
+    static QUERY_DURABILITY: std::cell::Cell<Option<crate::storage::DurabilityLevel>> =
+        const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn set_query_durability(level: crate::storage::DurabilityLevel) {
+    QUERY_DURABILITY.with(|value| value.set(Some(level)));
+}
+
+pub(crate) fn clear_query_durability() {
+    QUERY_DURABILITY.with(|value| value.set(None));
+}
+
+pub(crate) fn get_query_durability() -> Option<crate::storage::DurabilityLevel> {
+    QUERY_DURABILITY.with(std::cell::Cell::get)
+}
+
 // ============================================================================
 // Thread-local physical path trace (architecture review R5)
 // Enabled only by EXPLAIN ANALYZE on its execution thread. Records the

@@ -233,8 +233,14 @@ impl ApexExecutor {
         // transaction commits into full-table rewrites.
         let mut wal_backends: std::collections::HashMap<std::path::PathBuf, TableStorageBackend> =
             std::collections::HashMap::new();
+        let txn_durability = match super::get_query_durability() {
+            Some(crate::storage::DurabilityLevel::Max) => crate::storage::DurabilityLevel::Max,
+            _ => crate::storage::DurabilityLevel::Safe,
+        };
         for table_path in &affected_tables {
-            if let Some(backend) = commit_try!(Self::open_txn_wal_backend(table_path)) {
+            if let Some(backend) =
+                commit_try!(Self::open_txn_wal_backend(table_path, txn_durability))
+            {
                 commit_try!(backend.storage.wal_write_txn_begin(txn_id));
                 wal_backends.insert(table_path.clone(), backend);
             }
@@ -366,17 +372,14 @@ impl ApexExecutor {
 
     pub(in crate::query::executor) fn open_txn_wal_backend(
         storage_path: &Path,
+        durability: crate::storage::DurabilityLevel,
     ) -> io::Result<Option<TableStorageBackend>> {
         let wal_path = Self::txn_wal_path(storage_path);
         if !wal_path.exists() {
             return Ok(None);
         }
 
-        TableStorageBackend::open_for_insert_with_durability(
-            storage_path,
-            crate::storage::DurabilityLevel::Safe,
-        )
-        .map(Some)
+        TableStorageBackend::open_for_insert_with_durability(storage_path, durability).map(Some)
     }
 
     fn txn_wal_path(storage_path: &Path) -> std::path::PathBuf {

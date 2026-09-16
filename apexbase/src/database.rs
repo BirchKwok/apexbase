@@ -22,15 +22,24 @@ pub struct Session<'a> {
     table_path: &'a Path,
     root_dir: Option<&'a Path>,
     temp_dir: Option<&'a Path>,
+    durability: Option<DurabilityLevel>,
 }
 
 struct QueryScope {
     previous_root_dir: Option<Option<std::path::PathBuf>>,
     previous_temp_dir: Option<Option<std::path::PathBuf>>,
+    previous_durability: Option<Option<DurabilityLevel>>,
 }
 
 impl Drop for QueryScope {
     fn drop(&mut self) {
+        if let Some(previous) = self.previous_durability.take() {
+            if let Some(level) = previous {
+                crate::query::executor::set_query_durability(level);
+            } else {
+                crate::query::executor::clear_query_durability();
+            }
+        }
         if let Some(previous) = self.previous_temp_dir.take() {
             if let Some(path) = previous {
                 crate::query::executor::set_temp_dir(&path);
@@ -56,6 +65,7 @@ impl<'a> Session<'a> {
             table_path,
             root_dir: None,
             temp_dir: None,
+            durability: None,
         }
     }
 
@@ -72,6 +82,12 @@ impl<'a> Session<'a> {
     }
 
     #[inline]
+    pub fn with_durability(mut self, durability: DurabilityLevel) -> Self {
+        self.durability = Some(durability);
+        self
+    }
+
+    #[inline]
     fn enter(&self) -> QueryScope {
         let previous_root_dir = self
             .root_dir
@@ -79,15 +95,22 @@ impl<'a> Session<'a> {
         let previous_temp_dir = self
             .temp_dir
             .map(|_| crate::query::executor::get_temp_dir());
+        let previous_durability = self
+            .durability
+            .map(|_| crate::query::executor::get_query_durability());
         if let Some(root_dir) = self.root_dir {
             crate::query::executor::set_query_root_dir(root_dir);
         }
         if let Some(temp_dir) = self.temp_dir {
             crate::query::executor::set_temp_dir(temp_dir);
         }
+        if let Some(durability) = self.durability {
+            crate::query::executor::set_query_durability(durability);
+        }
         QueryScope {
             previous_root_dir,
             previous_temp_dir,
+            previous_durability,
         }
     }
 

@@ -265,6 +265,7 @@ impl ApexStorageImpl {
                 let (result, final_txn) = crate::Session::new(&base_dir, &table_path)
                     .with_root_dir(&self.root_dir)
                     .with_temp_dir(&self.temp_dir)
+                    .with_durability(self.durability)
                     .execute_multi_with_txn(stmts, current_txn)
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
                 let batch = result

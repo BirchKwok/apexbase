@@ -893,7 +893,8 @@ impl ApexStorageImpl {
         let exec_out = py.allow_threads(|| -> PyResult<ExecOut> {
             let session = crate::Session::new(&base_dir, &table_path)
                 .with_root_dir(&self.root_dir)
-                .with_temp_dir(&self.temp_dir);
+                .with_temp_dir(&self.temp_dir)
+                .with_durability(self.durability);
             if is_begin {
                 let result = session
                     .execute_classified(&sql, &sig)
