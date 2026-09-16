@@ -250,3 +250,43 @@ def test_cross_table_apply_failure_is_unknown(tmp_path):
             assert reopened.execute(f"SELECT value FROM {table} ORDER BY _id").to_dict() == [
                 {"value": 0}, {"value": value},
             ]
+
+
+@pytest.mark.parametrize("durability", ["safe", "max"])
+def test_wal_backed_transaction_update_is_rejected_before_wal_write(
+    tmp_path, durability
+):
+    c = ApexClient(str(tmp_path), _auto_manage=False, durability=durability)
+    c.create_table("t", {"name": "string", "value": "int"})
+    c.use_table("t")
+    c.store([{"name": "seed", "value": 7}])
+    c.flush()
+
+    wal_path = tmp_path / "t.apex.wal"
+    wal_len = wal_path.stat().st_size
+    c._storage.execute("BEGIN")
+    c._in_txn = True
+    c.execute("UPDATE t SET value = 9 WHERE _id = 1")
+    with pytest.raises(
+        RuntimeError,
+        match="commit_outcome=not_committed.*UPDATE WAL recovery",
+    ):
+        c.execute("COMMIT")
+    assert c._in_txn is False
+    assert wal_path.stat().st_size == wal_len
+    assert c.execute("SELECT value FROM t WHERE _id = 1").scalar() == 7
+
+    c._storage.execute("BEGIN")
+    c._in_txn = True
+    c.execute("INSERT INTO t (name, value) VALUES ('next', 8)")
+    c.execute("COMMIT")
+    c.close()
+
+    with ApexClient(
+        str(tmp_path), _auto_manage=False, durability=durability
+    ) as reopened:
+        reopened.use_table("t")
+        assert reopened.execute("SELECT name, value FROM t ORDER BY _id").to_dict() == [
+            {"name": "seed", "value": 7},
+            {"name": "next", "value": 8},
+        ]

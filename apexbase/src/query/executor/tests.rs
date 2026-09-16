@@ -76,6 +76,78 @@ fn commit_contract_real_io_failures_and_recovery() {
     }
 }
 
+#[test]
+fn wal_backed_transaction_update_is_rejected_before_wal_write() {
+    use crate::txn::{CommitError, CommitOutcome};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Safe,
+        &[("value".to_string(), crate::storage::ColumnType::Int64)],
+    ).unwrap();
+    storage.insert_rows(&[HashMap::from([(
+        "value".to_string(),
+        crate::storage::ColumnValue::Int64(7),
+    )])]).unwrap();
+    storage.save_full().unwrap();
+    drop(storage);
+
+    let wal_path = path.with_extension("apex.wal");
+    let wal_len = std::fs::metadata(&wal_path).unwrap().len();
+    let session = crate::Session::new(dir.path(), &path);
+    let mgr = crate::txn::txn_manager();
+    let txn_id = mgr.begin();
+    session.execute_in_txn(
+        txn_id,
+        SqlParser::parse("UPDATE t SET value = 9 WHERE _id = 1").unwrap(),
+    ).unwrap();
+
+    let error = session.commit_txn(txn_id).err()
+        .expect("WAL-backed UPDATE must be rejected before commit");
+    let detail = error.get_ref().unwrap().downcast_ref::<CommitError>().unwrap();
+    assert_eq!(detail.outcome, CommitOutcome::NotCommitted);
+    assert!(error.to_string().contains("UPDATE WAL recovery"));
+    assert!(!mgr.is_active(txn_id));
+    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
+
+    let result = session.execute("SELECT value FROM t WHERE _id = 1").unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let values = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(values.value(0), 7);
+}
+
+#[test]
+fn fast_transaction_update_remains_supported() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("t.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Fast,
+        &[("value".to_string(), crate::storage::ColumnType::Int64)],
+    ).unwrap();
+    storage.insert_rows(&[HashMap::from([(
+        "value".to_string(),
+        crate::storage::ColumnValue::Int64(7),
+    )])]).unwrap();
+    storage.save_full().unwrap();
+    drop(storage);
+
+    let session = crate::Session::new(dir.path(), &path);
+    let txn_id = crate::txn::txn_manager().begin();
+    session.execute_in_txn(
+        txn_id,
+        SqlParser::parse("UPDATE t SET value = 9 WHERE _id = 1").unwrap(),
+    ).unwrap();
+    session.commit_txn(txn_id).unwrap();
+
+    let result = session.execute("SELECT value FROM t WHERE _id = 1").unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let values = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    assert_eq!(values.value(0), 9);
+}
+
 fn create_test_storage(path: &Path) {
     let storage = OnDemandStorage::create(path).unwrap();
 
