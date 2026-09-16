@@ -28,7 +28,7 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 | 顺序 | 优先级 / 编号 | 工作 | 完成条件 | 状态 |
 | --- | --- | --- | --- | --- |
 | 1 | P0 / C1 | 提交失败结果分类与提交后错误处理 | Rust 可识别、Python 可辨认“未提交/结果不确定/已提交”；保留原始错误；不把 WAL marker 写失败误判可安全重试；提交后维护失败仍发布可见性与失效；真实 I/O 故障测试 | 已实现并验收通过（2026-09-10，canary/full 对 base `1b60ae8` 均 exit 0）；C2 可开始 |
-| 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | 待实施，依赖 C1 |
+| 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | 实施中；C2.1 先拒绝 WAL-backed 事务 UPDATE，C2.2/C2.3 待实施 |
 | 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | 待实施，依赖 C1/C2 |
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | 待实施，C1–C3 后 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | 待实施，按缓存拆批 |
@@ -130,3 +130,50 @@ canary/full 均须退出 0，A/B 仅用于诊断；指标集合随仓库扩展�
 - C1 状态：已实现 + 功能已验证 + 性能已验收（canary/full 对 base
   `1b60ae8` 均 exit 0）。历史 R5.12 canary 未通过结论保持单独登记，不被本批
   结果替代。C2（UPDATE、Safe/Max 与恢复一致性）可开始。
+
+## 6. 第二批 C2：UPDATE、Safe/Max 与恢复一致性
+
+### 6.1 当前时序与已确认缺口
+
+本节以 C1 验收后的 `229b596` 为审查快照。当前事务提交时序如下：
+
+```text
+prepare/OCC
+  -> 每表 WAL TxnBegin
+  -> INSERT/DELETE 写 WAL；UPDATE 不写 WAL
+  -> 每表 WAL TxnCommit（Safe=flush；当前协调器无法获知调用方 Max）
+  -> apply_txn_writes
+       INSERT -> .delta
+       DELETE -> 删除状态
+       UPDATE -> 原位覆盖或 .deltastore 原子替换
+  -> 索引保存
+  -> MVCC finalize + epoch/cache 发布
+  -> WAL applied watermark
+```
+
+由此得到两个不能靠调整调用顺序消除的缺口：
+
+1. WAL commit marker 成功而 UPDATE 应用尚未完成时，恢复只会重放 INSERT/DELETE，
+   无法重建 UPDATE；把这种事务报告为可恢复的持久提交是不成立的。
+2. `open_txn_wal_backend()` 当前仅根据 `.wal` 是否存在判断 WAL-backed，并固定按
+   Safe 打开。Max 调用方要求的 commit-marker fsync 没有传播到协调层；在该边界
+   明确前，不能声称 Max 事务提交已经满足其公开语义。
+
+UPDATE WAL 记录属于持久化格式变化。它还需要解决 applied watermark 之后只重放
+未应用后缀的问题，否则旧 UPDATE 可能覆盖 watermark 之后的较新非事务更新。因此
+不在 C2.1 中直接追加一个记录类型并宣称恢复完成。
+
+### 6.2 子批与完成口径
+
+| 子批 | 范围 | 完成条件 | 状态 |
+| --- | --- | --- | --- |
+| C2.1 | 无格式变化的安全边界 | WAL-backed 表的显式事务含 UPDATE 时，在任何 TxnBegin/DML/Commit WAL 写入前拒绝；结果为 `not_committed`；事务状态清除；原值及 WAL 长度不变；Fast 事务 UPDATE 兼容 | 实施中 |
+| C2.2 | durability 传播与真实同步失败 | Session/嵌入式/Python 到提交协调层保留 Safe/Max；Max commit marker 使用真实 fsync；真实写入/flush/fsync 故障分别验证结果分类、重开与后续事务 | 待实施，依赖 C2.1 |
+| C2.3 | UPDATE WAL 与后缀恢复 | 独立记录格式/版本/旧文件兼容设计；watermark 按偏移解析；只按 WAL 顺序幂等重放未应用且已提交的 UPDATE；覆盖崩溃、重复打开、更新后再更新、compact | 待设计，依赖 C2.2 |
+
+C2.1 只关闭“不把不可恢复 UPDATE 当作可持久提交”的漏洞，不代表 C2 整体完成，
+也不把 Safe/Max 的事务 UPDATE 描述为已支持。拒绝发生在 prepare/OCC 之后、首次
+WAL 写入之前；现有 C1 `CommitOutcome` 契约因此允许稳定返回 `not_committed`。
+
+C2 最终验收仍使用第 4 节固定 base 和完整链；C2.1 原子步骤仅运行聚焦 release
+功能检查，所有文件修改结束后再统一执行完整验收。
