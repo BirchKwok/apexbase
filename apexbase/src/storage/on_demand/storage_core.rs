@@ -781,6 +781,8 @@ pub struct OnDemandStorage {
         uncommitted_insert_ids: std::collections::HashSet<u64>,
         /// Delete ids of committed transactions (re-applied if missing).
         committed_delete_ids: Vec<u64>,
+        /// Committed updates after the applied WAL byte offset, in WAL order.
+        committed_updates: Vec<(u64, HashMap<String, crate::data::Value>)>,
         /// next_id implied by the committed WAL inserts.
         recovered_next_id: u64,
     }
@@ -1158,6 +1160,7 @@ impl OnDemandStorage {
                     next_id,
                     &scan.uncommitted_insert_ids,
                     &scan.committed_delete_ids,
+                    &scan.committed_updates,
                 )?;
                 Self::write_wal_marker(path)?;
             }
@@ -1308,6 +1311,7 @@ impl OnDemandStorage {
                 base_next_id,
                 &scan.uncommitted_insert_ids,
                 &scan.committed_delete_ids,
+                &scan.committed_updates,
             )?;
             Self::write_wal_marker(path)?;
         }
@@ -2653,6 +2657,19 @@ impl OnDemandStorage {
         meta
     }
 
+    /// Return the byte offset through which the WAL is known to be applied.
+    /// Invalid sidecars are treated conservatively as no applied records.
+    fn wal_applied_offset(wal_path: &Path, wal_len: u64) -> u64 {
+        use crate::storage::incremental::WAL_HEADER_SIZE;
+        let header_len = WAL_HEADER_SIZE as u64;
+        std::fs::read(Self::wal_meta_path(wal_path))
+            .ok()
+            .filter(|bytes| bytes.len() == 8)
+            .map(|bytes| u64::from_le_bytes(bytes[0..8].try_into().unwrap()))
+            .filter(|offset| *offset >= header_len && *offset <= wal_len)
+            .unwrap_or(header_len)
+    }
+
     /// Cheap gate: does the WAL hold committed records that may be missing
     /// from the table? Steady state: every successful commit and every
     /// recovery run records the current WAL length, so a matching length
@@ -2663,13 +2680,7 @@ impl OnDemandStorage {
         if meta.len() <= (WAL_HEADER_SIZE as u64) {
             return Ok(false);
         }
-        let marker = std::fs::read(Self::wal_meta_path(wal_path))
-            .ok()
-            .filter(|bytes| bytes.len() == 8)
-            .map(|bytes| u64::from_le_bytes(bytes[0..8].try_into().unwrap()))
-            .unwrap_or(0);
-        let r = marker != meta.len();
-        Ok(r)
+        Ok(Self::wal_applied_offset(wal_path, meta.len()) != meta.len())
     }
 
     /// Record the current WAL length as fully applied (crash-recovery
@@ -2691,19 +2702,30 @@ impl OnDemandStorage {
 
     /// Parse a WAL and split its records for crash recovery: uncommitted
     /// insert ids (their applied delta rows belong to a dead transaction and
-    /// must be rolled back), committed delete ids (re-applied when the
-    /// process died between the commit marker and the apply), the replayable
-    /// record set (auto-commit + committed DML), and the recovered next id.
+    /// must be rolled back), committed delete ids, committed updates after
+    /// the applied byte offset, the replayable record set (auto-commit +
+    /// committed DML), and the recovered next id.
     fn scan_wal_for_recovery(
         wal_path: &Path,
         base_next_id: u64,
     ) -> io::Result<WalRecoveryScan> {
+        let wal_len = std::fs::metadata(wal_path)?.len();
+        let applied_offset = Self::wal_applied_offset(wal_path, wal_len);
         let mut reader = super::incremental::WalReader::open(wal_path)?;
-        let all_records = reader.read_all()?;
+        let all_records = reader.read_all_with_offsets()?;
+        let applied_offset = if applied_offset == wal_len
+            || all_records
+                .iter()
+                .any(|(record_offset, _)| *record_offset == applied_offset)
+        {
+            applied_offset
+        } else {
+            crate::storage::incremental::WAL_HEADER_SIZE as u64
+        };
 
         let committed_txns: std::collections::HashSet<u64> = all_records
             .iter()
-            .filter_map(|r| match r {
+            .filter_map(|(_, r)| match r {
                 super::incremental::WalRecord::TxnCommit { txn_id } => Some(*txn_id),
                 _ => None,
             })
@@ -2712,7 +2734,7 @@ impl OnDemandStorage {
         let mut uncommitted_insert_ids: std::collections::HashSet<u64> =
             std::collections::HashSet::new();
         let mut committed_delete_ids: Vec<u64> = Vec::new();
-        for record in &all_records {
+        for (_, record) in &all_records {
             match record {
                 super::incremental::WalRecord::Insert { id, txn_id, .. }
                     if *txn_id != 0
@@ -2744,11 +2766,51 @@ impl OnDemandStorage {
             }
         }
 
+        // Transaction ids restart with each process, so an UPDATE cannot be
+        // classified from a global set of ids that ever committed. Pair each
+        // UPDATE with the concrete Begin/Commit interval that contains it.
+        let mut pending_updates: std::collections::HashMap<
+            u64,
+            Vec<(u64, u64, HashMap<String, crate::data::Value>)>,
+        > = std::collections::HashMap::new();
+        let mut committed_updates = Vec::new();
+        for (offset, record) in &all_records {
+            match record {
+                super::incremental::WalRecord::TxnBegin { txn_id } => {
+                    pending_updates.insert(*txn_id, Vec::new());
+                }
+                super::incremental::WalRecord::Update { id, data, txn_id }
+                    if *offset >= applied_offset =>
+                {
+                    if let Some(updates) = pending_updates.get_mut(txn_id) {
+                        updates.push((*offset, *id, data.clone()));
+                    }
+                }
+                super::incremental::WalRecord::TxnCommit { txn_id } => {
+                    if let Some(updates) = pending_updates.remove(txn_id) {
+                        if !crate::txn::is_live_txn(*txn_id) {
+                            committed_updates.extend(updates);
+                        }
+                    }
+                }
+                super::incremental::WalRecord::TxnRollback { txn_id } => {
+                    pending_updates.remove(txn_id);
+                }
+                _ => {}
+            }
+        }
+        committed_updates.sort_unstable_by_key(|(offset, _, _)| *offset);
+        let committed_updates: Vec<_> = committed_updates
+            .into_iter()
+            .map(|(_, id, data)| (id, data))
+            .collect();
+
         // Keep auto-commit (txn_id=0) and committed txn DML records. Insert
         // records whose IDs are already in the base file are dropped
         // (persisted; replaying them would duplicate rows).
         let records: Vec<_> = all_records
             .into_iter()
+            .map(|(_, record)| record)
             .filter(|r| {
                 match r {
                     super::incremental::WalRecord::Insert { txn_id, id, .. } => {
@@ -2791,6 +2853,7 @@ impl OnDemandStorage {
             records,
             uncommitted_insert_ids,
             committed_delete_ids,
+            committed_updates,
             recovered_next_id: max_wal_id.map(|id| id + 1).unwrap_or(base_next_id),
         })
     }
@@ -2824,7 +2887,8 @@ impl OnDemandStorage {
     /// 2. Re-applies committed inserts whose rows are missing from the base
     ///    file and the delta file: the commit marker was durable but the
     ///    process died before the rows were applied.
-    /// 3. Re-applies committed deletes.
+    /// 3. Re-applies committed updates from the unapplied WAL suffix.
+    /// 4. Re-applies committed deletes.
     ///
     /// The WAL file is left intact (all instances in a process share it
     /// append-only); reconstruction deduplicates by row id, so repeated
@@ -2834,6 +2898,7 @@ impl OnDemandStorage {
         base_next_id: u64,
         uncommitted_insert_ids: &std::collections::HashSet<u64>,
         committed_delete_ids: &[u64],
+        committed_updates: &[(u64, HashMap<String, crate::data::Value>)],
     ) -> io::Result<()> {
         use std::io::SeekFrom;
         let delta_path = Self::delta_path(&self.path);
@@ -2949,15 +3014,19 @@ impl OnDemandStorage {
             }
         }
 
-        // 3) Committed deletes.
-        if !committed_delete_ids.is_empty() {
-            let mut any_deleted = false;
+        // 3/4) Committed updates followed by deletes, preserving the final
+        // transaction ordering for rows touched by both operations.
+        if !committed_updates.is_empty() || !committed_delete_ids.is_empty() {
+            for (id, data) in committed_updates {
+                self.delta_update_row(*id, data);
+            }
+            let mut changed = !committed_updates.is_empty();
             for id in committed_delete_ids {
                 if self.delta_delete_row(*id)? {
-                    any_deleted = true;
+                    changed = true;
                 }
             }
-            if any_deleted {
+            if changed {
                 self.save_delta_store()?;
             }
         }
@@ -4101,7 +4170,8 @@ impl OnDemandStorage {
     /// have the base materialized in memory (tests / legacy open_for_write).
     pub fn compact(&self) -> io::Result<()> {
         let delta_path = Self::delta_path(&self.path);
-        if !delta_path.exists() {
+        let has_row_delta = delta_path.exists();
+        if !has_row_delta && self.delta_store.read().is_empty() {
             return Ok(());
         }
 
@@ -4111,12 +4181,14 @@ impl OnDemandStorage {
         drop(header);
 
         if is_v4 && !base_loaded {
-            return self.compact_streaming_v4();
+            return self.stream_rewrite_v4(false, false);
         }
 
         // Legacy in-memory path (base already loaded)
         self.load_all_columns_into_memory()?;
-        self.merge_delta_file(&delta_path)?;
+        if has_row_delta {
+            self.merge_delta_file(&delta_path)?;
+        }
         self.save()?;
 
         // Delete delta file

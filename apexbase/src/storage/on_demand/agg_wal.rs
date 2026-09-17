@@ -8041,6 +8041,21 @@ impl OnDemandStorage {
         Ok(())
     }
 
+    /// Write a transactional UPDATE record to WAL for crash recovery.
+    pub fn wal_write_txn_update(
+        &self,
+        txn_id: u64,
+        id: u64,
+        data: HashMap<String, crate::data::Value>,
+    ) -> io::Result<()> {
+        let mut wal_writer = self.wal_writer.write();
+        if let Some(writer) = wal_writer.as_mut() {
+            let record = super::incremental::WalRecord::Update { id, data, txn_id };
+            writer.append(&record)?;
+        }
+        Ok(())
+    }
+
     /// Write a transaction BEGIN marker to WAL (for crash recovery)
     pub fn wal_write_txn_begin(&self, txn_id: u64) -> io::Result<()> {
         let mut wal_writer = self.wal_writer.write();

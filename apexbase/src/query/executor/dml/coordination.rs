@@ -195,32 +195,10 @@ impl ApexExecutor {
         // Collect affected table paths
         let mut affected_tables: std::collections::HashSet<std::path::PathBuf> =
             std::collections::HashSet::new();
-        let mut updated_tables: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
         for write in writes {
             let table_name = write.table();
             let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
-            if matches!(write, crate::txn::context::TxnWrite::Update { .. }) {
-                updated_tables.insert(table_path.clone());
-            }
             affected_tables.insert(table_path);
-        }
-
-        // WAL recovery currently replays transactional INSERT/DELETE only.
-        // Reject UPDATE on a WAL-backed table before writing TxnBegin so a
-        // successful marker can never promise recovery that does not exist.
-        for table_path in &updated_tables {
-            if Self::txn_wal_path(table_path).exists() {
-                let _ = mgr.rollback(txn_id);
-                return Err(CommitError::wrap(
-                    txn_id,
-                    CommitOutcome::NotCommitted,
-                    io::Error::new(
-                        io::ErrorKind::Unsupported,
-                        "transactional UPDATE is not supported for Safe/Max tables until UPDATE WAL recovery is available",
-                    ),
-                ));
-            }
         }
         let _epoch_writes: Vec<_> = affected_tables
             .iter()
@@ -279,8 +257,14 @@ impl ApexExecutor {
                     TxnWrite::Delete { row_id, .. } => {
                         commit_try!(backend.storage.wal_write_txn_delete(txn_id, *row_id));
                     }
-                    TxnWrite::Update { .. } => {
-                        // Updates are applied as delta store changes (not WAL-logged individually)
+                    TxnWrite::Update {
+                        row_id, new_data, ..
+                    } => {
+                        commit_try!(backend.storage.wal_write_txn_update(
+                            txn_id,
+                            *row_id,
+                            new_data.clone(),
+                        ));
                     }
                 }
             }
@@ -288,8 +272,8 @@ impl ApexExecutor {
 
         // A marker write/flush can fail after bytes reached the WAL. Fast
         // tables can partially apply writes without a WAL. Neither case may
-        // be reported as safely aborted; UPDATE and cross-table recovery
-        // remain limited even when all markers were written successfully.
+        // be reported as safely aborted; cross-table recovery remains limited
+        // even when all markers were written successfully.
         if !writes.is_empty() {
             outcome = CommitOutcome::Unknown;
         }
@@ -310,7 +294,7 @@ impl ApexExecutor {
         // Phase 4: Apply buffered writes to storage. A failure after the
         // commit point leaves the transaction durably committed in the WAL:
         // the error is propagated, the MVCC state is rolled back, and the
-        // rows converge on the next open. Callers must not re-issue the DML.
+        // writes converge on the next open. Callers must not re-issue the DML.
         let applied = commit_try!(Self::apply_txn_writes(writes, base_dir, default_table_path,));
 
         // Index maintenance is coordinated above storage so StorageEngine never

@@ -24,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
+use crate::data::Value;
 use crate::storage::FIRST_ROW_ID;
 
 use super::on_demand::{ColumnData, ColumnType, ColumnValue, OnDemandStorage};
@@ -47,6 +48,7 @@ const RECORD_TXN_COMMIT: u8 = 6;
 const RECORD_TXN_ROLLBACK: u8 = 7;
 const RECORD_INSERT_TXN: u8 = 8; // Insert with txn_id
 const RECORD_DELETE_TXN: u8 = 9; // Delete with txn_id
+const RECORD_UPDATE_TXN: u8 = 10; // Update with txn_id
 
 // Compaction threshold (number of WAL records before auto-compact)
 const DEFAULT_COMPACTION_THRESHOLD: usize = 10000;
@@ -73,6 +75,11 @@ pub enum WalRecord {
     },
     Delete {
         id: u64,
+        txn_id: u64,
+    },
+    Update {
+        id: u64,
+        data: HashMap<String, Value>,
         txn_id: u64,
     },
     Checkpoint {
@@ -146,6 +153,152 @@ impl WalRecord {
         }
     }
 
+    #[inline]
+    fn write_value_row(buf: &mut Vec<u8>, row: &HashMap<String, Value>) {
+        buf.extend_from_slice(&(row.len() as u32).to_le_bytes());
+        for (name, value) in row {
+            let name_bytes = name.as_bytes();
+            buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+            buf.extend_from_slice(name_bytes);
+            let len_pos = buf.len();
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            let value_pos = buf.len();
+            Self::write_value(buf, value);
+            let value_len = (buf.len() - value_pos) as u32;
+            buf[len_pos..len_pos + 4].copy_from_slice(&value_len.to_le_bytes());
+        }
+    }
+
+    fn write_value(buf: &mut Vec<u8>, value: &Value) {
+        macro_rules! fixed {
+            ($tag:expr, $value:expr) => {{
+                buf.push($tag);
+                buf.extend_from_slice(&$value.to_le_bytes());
+            }};
+        }
+        macro_rules! bytes {
+            ($tag:expr, $value:expr) => {{
+                buf.push($tag);
+                buf.extend_from_slice(&($value.len() as u32).to_le_bytes());
+                buf.extend_from_slice($value);
+            }};
+        }
+        match value {
+            Value::Null => buf.push(0),
+            Value::Bool(value) => {
+                buf.push(1);
+                buf.push(u8::from(*value));
+            }
+            Value::Int8(value) => {
+                buf.push(2);
+                buf.push(*value as u8);
+            }
+            Value::Int16(value) => fixed!(3, value),
+            Value::Int32(value) => fixed!(4, value),
+            Value::Int64(value) => fixed!(5, value),
+            Value::UInt8(value) => {
+                buf.push(6);
+                buf.push(*value);
+            }
+            Value::UInt16(value) => fixed!(7, value),
+            Value::UInt32(value) => fixed!(8, value),
+            Value::UInt64(value) => fixed!(9, value),
+            Value::Float32(value) => fixed!(10, value),
+            Value::Float64(value) => fixed!(11, value),
+            Value::String(value) => bytes!(12, value.as_bytes()),
+            Value::Binary(value) => bytes!(13, value),
+            Value::Blob(value) => bytes!(14, value),
+            Value::FixedList(value) => bytes!(15, value),
+            Value::Json(value) => {
+                let encoded = value.to_string().into_bytes();
+                bytes!(16, &encoded);
+            }
+            Value::Timestamp(value) => fixed!(17, value),
+            Value::Date(value) => fixed!(18, value),
+            Value::Array(values) => {
+                buf.push(19);
+                buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+                for value in values {
+                    Self::write_value(buf, value);
+                }
+            }
+        }
+    }
+
+    fn read_value(bytes: &[u8]) -> io::Result<(Value, usize)> {
+        fn take<'a>(bytes: &'a [u8], pos: &mut usize, len: usize) -> io::Result<&'a [u8]> {
+            let end = pos.checked_add(len).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "UPDATE value length overflow")
+            })?;
+            let value = bytes.get(*pos..end).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "Truncated UPDATE value")
+            })?;
+            *pos = end;
+            Ok(value)
+        }
+        macro_rules! fixed {
+            ($pos:expr, $type:ty, $variant:ident, $size:expr) => {{
+                let raw: [u8; $size] = take(bytes, $pos, $size)?.try_into().unwrap();
+                Value::$variant(<$type>::from_le_bytes(raw))
+            }};
+        }
+        fn read_bytes<'a>(bytes: &'a [u8], pos: &mut usize) -> io::Result<&'a [u8]> {
+            let len = u32::from_le_bytes(take(bytes, pos, 4)?.try_into().unwrap()) as usize;
+            take(bytes, pos, len)
+        }
+
+        let tag = *bytes
+            .first()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "Empty UPDATE value"))?;
+        let mut pos = 1;
+        let value = match tag {
+            0 => Value::Null,
+            1 => Value::Bool(take(bytes, &mut pos, 1)?[0] != 0),
+            2 => Value::Int8(take(bytes, &mut pos, 1)?[0] as i8),
+            3 => fixed!(&mut pos, i16, Int16, 2),
+            4 => fixed!(&mut pos, i32, Int32, 4),
+            5 => fixed!(&mut pos, i64, Int64, 8),
+            6 => Value::UInt8(take(bytes, &mut pos, 1)?[0]),
+            7 => fixed!(&mut pos, u16, UInt16, 2),
+            8 => fixed!(&mut pos, u32, UInt32, 4),
+            9 => fixed!(&mut pos, u64, UInt64, 8),
+            10 => fixed!(&mut pos, f32, Float32, 4),
+            11 => fixed!(&mut pos, f64, Float64, 8),
+            12 => Value::String(
+                std::str::from_utf8(read_bytes(bytes, &mut pos)?)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    .to_string(),
+            ),
+            13 => Value::Binary(read_bytes(bytes, &mut pos)?.to_vec()),
+            14 => Value::Blob(read_bytes(bytes, &mut pos)?.to_vec()),
+            15 => Value::FixedList(read_bytes(bytes, &mut pos)?.to_vec()),
+            16 => Value::Json(
+                serde_json::from_slice(read_bytes(bytes, &mut pos)?)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?,
+            ),
+            17 => fixed!(&mut pos, i64, Timestamp, 8),
+            18 => fixed!(&mut pos, i32, Date, 4),
+            19 => {
+                let count =
+                    u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().unwrap()) as usize;
+                let mut values = Vec::with_capacity(count.min(bytes.len()));
+                for _ in 0..count {
+                    let (value, consumed) = Self::read_value(&bytes[pos..])?;
+                    pos += consumed;
+                    values.push(value);
+                }
+                Value::Array(values)
+            }
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Invalid UPDATE value tag",
+                ))
+            }
+        };
+        Ok((value, pos))
+    }
+
     /// Serialize record to bytes
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::new();
@@ -202,6 +355,16 @@ impl WalRecord {
                     buf.extend_from_slice(&8u32.to_le_bytes());
                     buf.extend_from_slice(&id.to_le_bytes());
                 }
+            }
+            WalRecord::Update { id, data, txn_id } => {
+                buf.push(RECORD_UPDATE_TXN);
+                buf.extend_from_slice(&timestamp.to_le_bytes());
+                let mut data_buf = Vec::new();
+                data_buf.extend_from_slice(&id.to_le_bytes());
+                data_buf.extend_from_slice(&txn_id.to_le_bytes());
+                Self::write_value_row(&mut data_buf, data);
+                buf.extend_from_slice(&(data_buf.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&data_buf);
             }
             WalRecord::Checkpoint { row_count } => {
                 buf.push(RECORD_CHECKPOINT);
@@ -494,6 +657,49 @@ impl WalRecord {
                 let id = u64::from_le_bytes(data[0..8].try_into().unwrap());
                 let txn_id = u64::from_le_bytes(data[8..16].try_into().unwrap());
                 WalRecord::Delete { id, txn_id }
+            }
+            RECORD_UPDATE_TXN => {
+                fn take<'a>(data: &'a [u8], pos: &mut usize, len: usize) -> io::Result<&'a [u8]> {
+                    let end = pos.checked_add(len).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "UPDATE record length overflow")
+                    })?;
+                    let value = data.get(*pos..end).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "Truncated UPDATE record")
+                    })?;
+                    *pos = end;
+                    Ok(value)
+                }
+                let mut pos = 0;
+                let id = u64::from_le_bytes(take(data, &mut pos, 8)?.try_into().unwrap());
+                let txn_id = u64::from_le_bytes(take(data, &mut pos, 8)?.try_into().unwrap());
+                let col_count =
+                    u32::from_le_bytes(take(data, &mut pos, 4)?.try_into().unwrap()) as usize;
+                let mut row_data = HashMap::with_capacity(col_count.min(1024));
+                for _ in 0..col_count {
+                    let name_len = u16::from_le_bytes(
+                        take(data, &mut pos, 2)?.try_into().unwrap(),
+                    ) as usize;
+                    let name = std::str::from_utf8(take(data, &mut pos, name_len)?)
+                        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+                        .to_string();
+                    let value_len = u32::from_le_bytes(
+                        take(data, &mut pos, 4)?.try_into().unwrap(),
+                    ) as usize;
+                    let value_bytes = take(data, &mut pos, value_len)?;
+                    let (value, consumed) = Self::read_value(value_bytes)?;
+                    if consumed != value_len {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "UPDATE value has trailing bytes",
+                        ));
+                    }
+                    row_data.insert(name, value);
+                }
+                WalRecord::Update {
+                    id,
+                    data: row_data,
+                    txn_id,
+                }
             }
             RECORD_CHECKPOINT => {
                 let row_count = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -870,12 +1076,22 @@ impl WalReader {
 
     /// Read all records from WAL
     pub fn read_all(&mut self) -> io::Result<Vec<WalRecord>> {
+        Ok(self
+            .read_all_with_offsets()?
+            .into_iter()
+            .map(|(_, record)| record)
+            .collect())
+    }
+
+    /// Read all valid records together with their starting byte offsets.
+    pub fn read_all_with_offsets(&mut self) -> io::Result<Vec<(u64, WalRecord)>> {
         let mut records = Vec::new();
 
         while self.pos < self.data.len() {
+            let offset = self.pos as u64;
             match WalRecord::from_bytes_versioned(&self.data[self.pos..], self.version) {
                 Ok((record, len)) => {
-                    records.push(record);
+                    records.push((offset, record));
                     self.pos += len;
                 }
                 Err(_) => break, // End of valid records (truncated or CRC mismatch)
