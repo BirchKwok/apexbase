@@ -4225,7 +4225,12 @@ class ApexClient:
                 else:
                     table = None
             except Exception:
-                # Fallback: Arrow IPC
+                # The FFI path may fail after a write already reached storage
+                # (for example a secondary-index persistence error). Replaying a
+                # mutation here would apply it twice, so only read-only
+                # statements keep the Arrow IPC fallback.
+                if _sql_route_family(_sig) != 'read':
+                    raise
                 ipc_bytes = self._storage._execute_arrow_ipc(sql)
                 pa_mod = _ensure_pyarrow()
                 reader = pa_mod.ipc.open_stream(pa_mod.BufferReader(ipc_bytes))

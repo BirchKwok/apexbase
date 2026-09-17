@@ -146,7 +146,10 @@ impl ApexExecutor {
                 storage.delete_batch(&all_rids);
                 storage.save_delete_only()?;
             }
-            Self::notify_index_delete(storage_path, &deleted_entries)?;
+            if let Err(error) = Self::notify_index_delete(storage_path, &deleted_entries) {
+                flag_indexes_stale_after_failure(storage_path);
+                return Err(error);
+            }
             Self::notify_fts_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
             crate::storage::engine::engine().invalidate(storage_path);
@@ -393,7 +396,10 @@ impl ApexExecutor {
                 storage.delete_batch(&all_rids);
                 storage.save_delete_only()?;
             }
-            Self::notify_index_delete(storage_path, &deleted_entries)?;
+            if let Err(error) = Self::notify_index_delete(storage_path, &deleted_entries) {
+                flag_indexes_stale_after_failure(storage_path);
+                return Err(error);
+            }
             Self::notify_fts_delete(storage_path, &deleted_entries);
             invalidate_storage_cache(storage_path);
             crate::storage::engine::engine().invalidate(storage_path);

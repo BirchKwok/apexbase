@@ -288,6 +288,64 @@ fn committed_index_save_failure_falls_back_until_reindex() {
 }
 
 #[test]
+#[cfg(unix)]
+fn plain_insert_index_save_failure_marks_stale_and_scans() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("plain_insert_t.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Safe,
+        &[("value".to_string(), crate::storage::ColumnType::Int64)],
+    )
+    .unwrap();
+    storage
+        .insert_rows(&[HashMap::from([(
+            "value".to_string(),
+            crate::storage::ColumnValue::Int64(1),
+        )])])
+        .unwrap();
+    storage.save_full().unwrap();
+    drop(storage);
+
+    let session = crate::Session::new(dir.path(), &path);
+    session
+        .execute("CREATE INDEX idx_value ON plain_insert_t(value) USING HASH")
+        .unwrap();
+    let index_path = dir
+        .path()
+        .join("indexes")
+        .join("plain_insert_t_idx_value.hashidx");
+    assert!(index_path.exists());
+
+    // A non-transactional write persists its row before maintaining the index.
+    // A real save failure there must not leave reads trusting the old postings.
+    std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let result = session.execute("INSERT INTO plain_insert_t (value) VALUES (999)");
+    std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(result.is_err(), "index persistence failure must surface");
+
+    let stale_path = dir.path().join("plain_insert_t.apex.index.stale");
+    assert!(stale_path.exists());
+    assert!(!ApexExecutor::table_has_index_catalog(
+        Some(dir.path()),
+        &path
+    ));
+
+    // The row is durable; the scan fallback must still find it.
+    let found = session
+        .execute("SELECT value FROM plain_insert_t WHERE value = 999")
+        .unwrap();
+    let batch = found.to_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+
+    // REINDEX repairs the postings and clears the marker.
+    session.execute("REINDEX plain_insert_t").unwrap();
+    assert!(!stale_path.exists());
+}
+
+#[test]
 fn update_unchanged_unique_index_key_after_manager_reload() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("unique_update_t.apex");

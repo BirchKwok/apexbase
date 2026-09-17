@@ -815,6 +815,14 @@ fn clear_indexes_stale(storage_path: &Path) -> io::Result<()> {
     }
 }
 
+/// A completed non-transactional write could not persist its secondary index.
+/// The row data is already durable, so callers still receive the original
+/// error; flagging the index keeps later reads on the authoritative scan
+/// until REINDEX rebuilds it. Only taken on the failure path, never per write.
+fn flag_indexes_stale_after_failure(storage_path: &Path) {
+    let _ = mark_indexes_stale(storage_path, crate::storage::DurabilityLevel::Max);
+}
+
 /// Public (crate-visible) version for use in submodules.
 pub(crate) fn base_dir_and_table_pub(storage_path: &Path) -> (PathBuf, String) {
     let base_dir = storage_path

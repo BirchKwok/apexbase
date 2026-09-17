@@ -1050,6 +1050,10 @@ const TABLE_FILE_SUFFIXES: &[&str] = &[
     ".deltastore",
     ".deltastore.tmp",
     ".plan_feedback",
+    // Durable "secondary indexes may be incomplete" marker written before a
+    // transaction's commit point; it must be reaped with the table so a
+    // same-name recreation does not inherit a stale-marker read fallback.
+    ".index.stale",
 ];
 
 /// (mtime nanos, len) fingerprint captured when a table file is queued for
@@ -1296,11 +1300,15 @@ mod tests {
         fs::write(&table, b"payload").unwrap();
         fs::write(dir.join("t.apex.delta"), b"delta").unwrap();
         fs::write(dir.join("t.apex.plan_feedback"), b"feedback").unwrap();
+        fs::write(dir.join("t.apex.index.stale"), b"stale").unwrap();
         queue_file_deletions(std::slice::from_ref(&table));
         reap_table_files(&table);
         assert!(!table.exists());
         assert!(!dir.join("t.apex.delta").exists());
         assert!(!dir.join("t.apex.plan_feedback").exists());
+        // A durable stale-index marker must not outlive its table, or a
+        // same-name recreation would silently lose index acceleration.
+        assert!(!dir.join("t.apex.index.stale").exists());
         assert!(!PENDING_DELETIONS.contains_key(&table));
         let _ = fs::remove_dir_all(&dir);
     }
