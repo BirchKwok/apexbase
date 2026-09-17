@@ -221,6 +221,87 @@ fn fast_transaction_update_remains_supported() {
 }
 
 #[test]
+fn cross_table_wal_recovery_converges_per_table_at_marker_boundary() {
+    use crate::storage::on_demand::ColumnValue;
+
+    let dir = tempdir().unwrap();
+    let first_path = dir.path().join("a_first.apex");
+    let second_path = dir.path().join("b_second.apex");
+    let schema = &[("value".to_string(), crate::storage::ColumnType::Int64)];
+
+    let first = OnDemandStorage::create_with_schema_and_durability(
+        &first_path,
+        crate::storage::DurabilityLevel::Safe,
+        schema,
+    )
+    .unwrap();
+    let second = OnDemandStorage::create_with_schema_and_durability(
+        &second_path,
+        crate::storage::DurabilityLevel::Safe,
+        schema,
+    )
+    .unwrap();
+    for storage in [&first, &second] {
+        storage
+            .insert_rows(&[HashMap::from([(
+                "value".to_string(),
+                ColumnValue::Int64(0),
+            )])])
+            .unwrap();
+        storage.save_full().unwrap();
+    }
+
+    // This is the durable state produced by a process stopping between the
+    // two sorted per-table commit markers: the first WAL has a complete
+    // transaction, while the second has the same DML without its marker.
+    let txn_id = 77;
+    let inserted = HashMap::from([("value".to_string(), ColumnValue::Int64(1))]);
+    first.wal_write_txn_begin(txn_id).unwrap();
+    first
+        .wal_write_txn_insert(txn_id, 2, inserted.clone())
+        .unwrap();
+    first.wal_write_txn_commit(txn_id).unwrap();
+
+    second.wal_write_txn_begin(txn_id).unwrap();
+    second
+        .wal_write_txn_insert(txn_id, 2, inserted)
+        .unwrap();
+    second.wal_sync().unwrap();
+    drop(first);
+    drop(second);
+
+    let reopened_first = OnDemandStorage::open_with_durability(
+        &first_path,
+        crate::storage::DurabilityLevel::Safe,
+    )
+    .unwrap();
+    let reopened_second = OnDemandStorage::open_with_durability(
+        &second_path,
+        crate::storage::DurabilityLevel::Safe,
+    )
+    .unwrap();
+    assert_eq!(reopened_first.row_count(), 2);
+    assert_eq!(reopened_second.row_count(), 1);
+    drop(reopened_first);
+    drop(reopened_second);
+
+    // Per-table recovery is idempotent; it must not accidentally promote the
+    // uncommitted suffix on a later open.
+    let reopened_first = OnDemandStorage::open_with_durability(
+        &first_path,
+        crate::storage::DurabilityLevel::Safe,
+    )
+    .unwrap();
+    let reopened_second = OnDemandStorage::open_with_durability(
+        &second_path,
+        crate::storage::DurabilityLevel::Safe,
+    )
+    .unwrap();
+    assert_eq!(reopened_first.row_count(), 2);
+    assert_eq!(reopened_second.row_count(), 1);
+}
+
+#[test]
 fn max_transaction_commit_syncs_the_wal() {
     for (name, durability, expected_syncs) in [
         ("t_safe", crate::storage::DurabilityLevel::Safe, 0),
