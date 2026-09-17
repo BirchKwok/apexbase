@@ -192,14 +192,19 @@ impl ApexExecutor {
             };
         }
 
-        // Collect affected table paths
-        let mut affected_tables: std::collections::HashSet<std::path::PathBuf> =
-            std::collections::HashSet::new();
+        // Keep the per-table protocol deterministic.  There is deliberately
+        // no database-level commit record yet: after a crash each table
+        // converges from its own WAL, so this ordering defines which prefix
+        // may have durable commit markers without implying cross-table
+        // atomicity.
+        let mut affected_tables: Vec<std::path::PathBuf> = Vec::new();
         for write in writes {
             let table_name = write.table();
             let table_path = Self::resolve_table_path(table_name, base_dir, default_table_path);
-            affected_tables.insert(table_path);
+            affected_tables.push(table_path);
         }
+        affected_tables.sort_unstable();
+        affected_tables.dedup();
         let _epoch_writes: Vec<_> = affected_tables
             .iter()
             .map(|path| crate::storage::epoch::logical_write(path))
