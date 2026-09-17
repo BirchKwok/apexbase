@@ -288,6 +288,47 @@ fn committed_index_save_failure_falls_back_until_reindex() {
 }
 
 #[test]
+fn update_unchanged_unique_index_key_after_manager_reload() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("unique_update_t.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Safe,
+        &[
+            ("name".to_string(), crate::storage::ColumnType::String),
+            ("age".to_string(), crate::storage::ColumnType::Int64),
+        ],
+    )
+    .unwrap();
+    storage.save_full().unwrap();
+    drop(storage);
+
+    let session = crate::Session::new(dir.path(), &path);
+    session
+        .execute("CREATE UNIQUE INDEX idx_name ON unique_update_t(name) USING HASH")
+        .unwrap();
+    session
+        .execute("INSERT INTO unique_update_t (name, age) VALUES ('Alice', 25)")
+        .unwrap();
+
+    // The insert advances the table epoch, so the UPDATE obtains a freshly
+    // loaded manager whose runtime index instance has not been loaded yet.
+    session
+        .execute("UPDATE unique_update_t SET age = 30 WHERE name = 'Alice'")
+        .unwrap();
+    let result = session
+        .execute("SELECT age FROM unique_update_t WHERE name = 'Alice'")
+        .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let ages = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(ages.values(), &[30]);
+}
+
+#[test]
 fn fast_transaction_update_remains_supported() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("fast_update_t.apex");
