@@ -189,6 +189,105 @@ fn wal_backed_transaction_update_apply_failure_recovers() {
 }
 
 #[test]
+#[cfg(unix)]
+fn committed_index_save_failure_falls_back_until_reindex() {
+    use crate::txn::{CommitError, CommitOutcome};
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("indexed_recovery_t.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Safe,
+        &[("value".to_string(), crate::storage::ColumnType::Int64)],
+    )
+    .unwrap();
+    storage
+        .insert_rows(&[HashMap::from([(
+            "value".to_string(),
+            crate::storage::ColumnValue::Int64(1),
+        )])])
+        .unwrap();
+    storage.save_full().unwrap();
+    drop(storage);
+
+    let session = crate::Session::new(dir.path(), &path);
+    session
+        .execute("CREATE INDEX idx_value ON indexed_recovery_t(value) USING HASH")
+        .unwrap();
+    let index_path = dir
+        .path()
+        .join("indexes")
+        .join("indexed_recovery_t_idx_value.hashidx");
+    assert!(index_path.exists());
+
+    let txn_id = crate::txn::txn_manager().begin();
+    session
+        .execute_in_txn(
+            txn_id,
+            SqlParser::parse("INSERT INTO indexed_recovery_t (value) VALUES (999)").unwrap(),
+        )
+        .unwrap();
+    std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(0o444)).unwrap();
+    let result = session.commit_txn(txn_id);
+    std::fs::set_permissions(&index_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let error = result
+        .err()
+        .expect("index persistence failure after the WAL commit point must be reported");
+    let detail = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<CommitError>()
+        .unwrap();
+    assert_eq!(detail.outcome, CommitOutcome::Unknown);
+    let stale_path = dir.path().join("indexed_recovery_t.apex.index.stale");
+    assert!(stale_path.exists());
+    assert!(!ApexExecutor::table_has_index_catalog(
+        Some(dir.path()),
+        &path
+    ));
+
+    // The row is committed even though its posting was not persisted. A new
+    // session must see it through the authoritative scan fallback.
+    let reopened = crate::Session::new(dir.path(), &path);
+    let result = reopened
+        .execute("SELECT value FROM indexed_recovery_t WHERE value = 999")
+        .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.values(), &[999]);
+
+    // REINDEX first materializes sidecars/compaction, then rebuilds from the
+    // committed table and only clears the durable stale marker after save.
+    reopened.execute("REINDEX indexed_recovery_t").unwrap();
+    assert!(!stale_path.exists());
+    drop(reopened);
+
+    let reopened = crate::Session::new(dir.path(), &path);
+    let result = reopened
+        .execute("SELECT value FROM indexed_recovery_t WHERE value = 999")
+        .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 1);
+    assert!(ApexExecutor::table_has_index_catalog(Some(dir.path()), &path));
+    let idx_mgr = get_index_manager(dir.path(), "indexed_recovery_t");
+    let posting = idx_mgr
+        .lock()
+        .lookup(
+            "value",
+            &crate::storage::index::index_manager::PredicateHint::Eq(Value::Int64(999)),
+        )
+        .unwrap()
+        .expect("rebuilt HASH index must serve equality lookup");
+    assert_eq!(posting.row_ids.len(), 1);
+}
+
+#[test]
 fn fast_transaction_update_remains_supported() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("fast_update_t.apex");
