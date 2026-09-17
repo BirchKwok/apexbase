@@ -29,7 +29,7 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 | --- | --- | --- | --- | --- |
 | 1 | P0 / C1 | 提交失败结果分类与提交后错误处理 | Rust 可识别、Python 可辨认“未提交/结果不确定/已提交”；保留原始错误；不把 WAL marker 写失败误判可安全重试；提交后维护失败仍发布可见性与失效；真实 I/O 故障测试 | 已实现并验收通过（2026-09-10，canary/full 对 base `1b60ae8` 均 exit 0）；C2 可开始 |
 | 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | C2.1–C2.3 已实现，功能验收完成；性能证据已收口并登记 full 原始噪音例外；C3 可开始 |
-| 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | C3.1 已实现并聚焦验证；索引失效/重建契约待实施 |
+| 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | C3.1–C3.2 已实现并聚焦验证；最终统一验收待执行 |
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | 待实施，C1–C3 后 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | 待实施，按缓存拆批 |
 | 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 待实施，依赖 S1 |
@@ -267,7 +267,28 @@ Commit、cache invalidation 和 applied watermark 都使用同一个确定顺序
 次重开结果不变，确认恢复幂等且不会把未提交后缀提升为提交。聚焦结果：新增测试 1 项
 通过，`recovery` 过滤 3 项通过。
 
-下一子批 C3.2 处理索引保存失败：数据/WAL 已提交但 `.idxcat`、BTree 或 Hash index
-保存失败时，查询不能继续使用可能缺行的旧 postings。实现前先明确持久失效标记、scan
-回退与成功重建后清除标记的顺序，并覆盖 compact 后重开；这与数据库级跨表提交记录
-保持独立。
+### 7.2 C3.2 持久索引失效与重建
+
+事务在写完 WAL DML、写 commit marker 之前，对存在 secondary index catalog 的表创建
+`<table>.apex.index.stale`。数据与索引全部应用成功后才删除该标记；Max durability 会对
+标记内容执行 `sync_all`。索引标记存在或其元数据不可读取时，planner catalog 检查与
+执行期 index lookup 都拒绝 postings，查询回退到权威 scan，不把可能缺行的旧索引当作
+完整结果。
+
+INSERT/DELETE/UPDATE 的 index `on_insert`、读取与 `save` 错误不再被吞掉。事务 INSERT
+原先在普通 DML 应用完成后还会重复维护一次索引，C3.2 删除该重复写入，保留唯一的 DML
+owner。`REINDEX` 先物化 sidecar/compact，再从已提交表重建并保存所有索引；只有保存
+成功后才清除 stale 标记。删除最后一个索引也会清除不再有意义的标记，创建单个新索引
+不会错误地把其他旧索引视为已修复。
+
+新增 Unix release 测试将真实 Hash index 文件改为只读，使 WAL commit point 之后的
+index save 失败：commit 返回 `unknown`，标记持久存在，重开查询通过 scan 找到已提交
+行；随后 REINDEX 完成 compact/rebuild、清除标记，第二次重开后 Hash posting 包含该行。
+聚焦结果：新增故障测试 1 项通过，`recovery` 过滤 3 项通过，`index` 过滤 32 项通过。
+首次未配置 `DYLD_FALLBACK_LIBRARY_PATH` 的测试进程在加载 `libpython3.12.dylib` 前失败，
+补充 conda base 动态库路径后同一 release 二进制通过；该环境启动失败不计作测试执行。
+
+C3.1–C3.2 至此达到实现和聚焦功能验证边界，但尚未把 C3 描述为最终验收通过。下一步
+统一执行 release 安装、完整 pytest/cargo test、公开 benchmark、canary 与核心恢复/索引
+路径要求的 full 同机比较；性能异常按保留原始报告、结合源码路径和样本分布辨别噪音的
+规则处理，不为已证实噪音机械增加轮次。
