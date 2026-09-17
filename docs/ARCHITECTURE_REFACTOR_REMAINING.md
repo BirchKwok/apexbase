@@ -12,7 +12,7 @@
 | 原阶段 | 当前状态 | 尚未关闭的目标 |
 | --- | --- | --- |
 | R0 | 有环境、固定 base 和原始报告 | 当前源码快照与证据清单统一；历史失败保持可追溯 |
-| R1 | 错误传播和有限 INSERT/DELETE 恢复已实现 | 提交结果分类、UPDATE 恢复、Max 持久性、跨表/索引恢复契约 |
+| R1 | 错误传播和 INSERT/DELETE/UPDATE 恢复已实现 | 提交结果分类、跨表/索引恢复契约 |
 | R2 | SELECT 文件拆分完成 | backend 委托和状态所有权收敛；同模块 include 不等于依赖解耦 |
 | R3 | 纯持久化 V4 上的受限分批聚合已实现 | overlay 稳定读视图、selection 直接消费、更广查询形状 |
 | R4 | 状态清单、上下文传播、有界队列、局部取消已实现 | 内存预算、缓存容量与唯一 owner、协议背压/分批交付 |
@@ -28,7 +28,7 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 | 顺序 | 优先级 / 编号 | 工作 | 完成条件 | 状态 |
 | --- | --- | --- | --- | --- |
 | 1 | P0 / C1 | 提交失败结果分类与提交后错误处理 | Rust 可识别、Python 可辨认“未提交/结果不确定/已提交”；保留原始错误；不把 WAL marker 写失败误判可安全重试；提交后维护失败仍发布可见性与失效；真实 I/O 故障测试 | 已实现并验收通过（2026-09-10，canary/full 对 base `1b60ae8` 均 exit 0）；C2 可开始 |
-| 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | 实施中；C2.1/C2.2 已完成，C2.3 待设计与实施 |
+| 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | C2.1–C2.3 已实现并完成聚焦 release 验证；最终统一验收待执行 |
 | 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | 待实施，依赖 C1/C2 |
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | 待实施，C1–C3 后 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | 待实施，按缓存拆批 |
@@ -135,12 +135,12 @@ canary/full 均须退出 0，A/B 仅用于诊断；指标集合随仓库扩展�
 
 ### 6.1 当前时序与已确认缺口
 
-本节最初以 C1 验收后的 `229b596` 为审查快照；C2.2a 更新后的时序如下：
+本节最初以 C1 验收后的 `229b596` 为审查快照；C2.3 更新后的时序如下：
 
 ```text
 prepare/OCC
   -> 每表 WAL TxnBegin
-  -> INSERT/DELETE 写 WAL；UPDATE 不写 WAL
+  -> INSERT/DELETE/UPDATE 写 WAL
   -> 每表 WAL TxnCommit（Safe=flush；Max=flush + fsync）
   -> apply_txn_writes
        INSERT -> .delta
@@ -171,11 +171,11 @@ UPDATE WAL 记录属于持久化格式变化。它还需要解决 applied waterm
 | C2.1 | 无格式变化的安全边界 | WAL-backed 表的显式事务含 UPDATE 时，在任何 TxnBegin/DML/Commit WAL 写入前拒绝；结果为 `not_committed`；事务状态清除；原值及 WAL 长度不变；Fast 事务 UPDATE 兼容 | 已完成 |
 | C2.2a | durability 传播与 Max 同步边界 | Session/嵌入式/Python 到提交协调层保留 Safe/Max；Max commit marker 使用真实 fsync；作用域退出恢复原上下文 | 已完成（`546e71f`、`4104ba4`） |
 | C2.2b | 真实同步失败矩阵 | 真实写入/flush/fsync 故障分别验证结果分类、重开与后续事务；不能用 mock 替代核心 I/O 路径 | 已完成（`14e630c`） |
-| C2.3 | UPDATE WAL 与后缀恢复 | 独立记录格式/版本/旧文件兼容设计；watermark 按偏移解析；只按 WAL 顺序幂等重放未应用且已提交的 UPDATE；覆盖崩溃、重复打开、更新后再更新、compact | 待设计，依赖 C2.2b |
+| C2.3 | UPDATE WAL 与后缀恢复 | 独立记录格式/版本/旧文件兼容设计；watermark 按偏移解析；只按 WAL 顺序幂等重放未应用且已提交的 UPDATE；覆盖崩溃、重复打开、更新后再更新、compact | 已实现并完成聚焦 release 验证；C2 最终统一验收待执行 |
 
-C2.1 只关闭“不把不可恢复 UPDATE 当作可持久提交”的漏洞，不代表 C2 整体完成，
-也不把 Safe/Max 的事务 UPDATE 描述为已支持。拒绝发生在 prepare/OCC 之后、首次
-WAL 写入之前；现有 C1 `CommitOutcome` 契约因此允许稳定返回 `not_committed`。
+C2.1 曾作为“不把不可恢复 UPDATE 当作可持久提交”的临时安全边界：拒绝发生在
+prepare/OCC 之后、首次 WAL 写入之前，并稳定返回 `not_committed`。C2.3 完成后该
+保护性拒绝已移除，Safe/Max 事务 UPDATE 改由 WAL 与后缀恢复保证。
 
 C2.2a 的聚焦 release 检查覆盖 Session durability 作用域恢复，以及 Safe/Max 事务
 commit marker 的真实同步分支。C2 最终验收仍使用第 4 节固定 base 和完整链；原子
@@ -192,3 +192,22 @@ flush 与 `fsync` 系统调用，不用固定返回值模拟核心 I/O。聚焦�
 
 fsync 返回前失败仍必须报告 `unknown`：即使本次测试中 marker 已进入 OS 缓冲并能恢复，
 调用方也不能从失败返回值推断它必然已经或必然没有持久化。
+
+C2.3 在现有 WAL v2 的长度与 CRC record envelope 内新增 UPDATE record type，不改变
+文件头和 WAL 版本；新实现继续读取既有 v1/v2 WAL，旧文件无需重写。UPDATE payload
+使用显式 value tag 编码，完整保留整数宽度、无符号整数、JSON、Array、二进制、日期
+时间和向量等 `Value` 类型，不沿用 INSERT 的有损 `ColumnValue` 转换。
+
+`.wal.meta` 的 8 字节值现在同时作为已应用 WAL byte offset 使用。恢复扫描先校验该值
+位于 header/WAL 长度范围且落在 record 边界；无效值保守退回 header。UPDATE 只收集
+起始 offset 不早于 watermark 的记录，并按具体 `TxnBegin -> UPDATE -> TxnCommit` 区间
+配对后按 WAL offset 重放。不能只按“同 txn_id 曾出现 Commit”判断，因为事务 ID 在新
+进程中会重新计数；聚焦测试覆盖旧已提交 ID 与新未提交 ID 重用时不误重放。
+
+恢复写入 `.deltastore` 后推进 watermark；重复打开幂等，watermark 之后的普通更新不被
+旧 WAL 覆盖。`compact()` 也修正为在只有 `.deltastore`、没有 append `.delta` 时执行
+V4 streaming rewrite，使 update-only overlay 能合并进基表。真实故障测试在 commit
+marker 之后阻断 `.deltastore.tmp` 写入，确认返回 `unknown`，清除故障后重开恢复。
+聚焦 release 结果：Rust UPDATE 过滤 23 项通过、recovery 过滤 2 项通过；release
+`maturin develop` 成功；Python `test_commit_crash_recovery.py + test_transactions.py`
+40 项通过。上述是原子步骤验证，不替代第 4 节 C2 最终统一验收。
