@@ -776,6 +776,45 @@ fn base_dir_and_table(storage_path: &Path) -> (PathBuf, String) {
     base_dir_and_table_pub(storage_path)
 }
 
+fn index_stale_path(storage_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.index.stale", storage_path.display()))
+}
+
+fn indexes_stale(storage_path: &Path) -> bool {
+    match std::fs::metadata(index_stale_path(storage_path)) {
+        Ok(_) => true,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
+        // If marker state cannot be established, an authoritative scan is
+        // safer than trusting possibly incomplete postings.
+        Err(_) => true,
+    }
+}
+
+fn mark_indexes_stale(
+    storage_path: &Path,
+    durability: crate::storage::DurabilityLevel,
+) -> io::Result<()> {
+    use std::io::Write;
+
+    let marker_path = index_stale_path(storage_path);
+    let mut marker = std::fs::File::create(marker_path)?;
+    marker.write_all(b"index maintenance incomplete\n")?;
+    marker.flush()?;
+    if durability == crate::storage::DurabilityLevel::Max {
+        marker.sync_all()?;
+    }
+    Ok(())
+}
+
+fn clear_indexes_stale(storage_path: &Path) -> io::Result<()> {
+    let marker_path = index_stale_path(storage_path);
+    match std::fs::remove_file(marker_path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
 /// Public (crate-visible) version for use in submodules.
 pub(crate) fn base_dir_and_table_pub(storage_path: &Path) -> (PathBuf, String) {
     let base_dir = storage_path

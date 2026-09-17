@@ -773,16 +773,16 @@ impl ApexExecutor {
 
             // Index maintenance: update indexed values
             if !indexed_cols.is_empty() {
-                Self::notify_index_delete(storage_path, &old_index_entries);
+                Self::notify_index_delete(storage_path, &old_index_entries)?;
                 // Insert new indexed values directly
                 let (base_dir, table_name) = base_dir_and_table(storage_path);
                 let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
                 let mut idx_mgr = idx_mgr_arc.lock();
                 if !idx_mgr.list_indexes().is_empty() {
                     for (row_id, col_vals) in &new_index_entries {
-                        let _ = idx_mgr.on_insert(*row_id, col_vals);
+                        idx_mgr.on_insert(*row_id, col_vals)?;
                     }
-                    let _ = idx_mgr.save();
+                    idx_mgr.save()?;
                 }
             }
             Self::notify_fts_update(storage_path, fts_updates);

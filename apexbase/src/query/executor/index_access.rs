@@ -14,6 +14,12 @@ impl ApexExecutor {
     ) -> io::Result<Option<ApexResult>> {
         use crate::storage::index::index_manager::PredicateHint;
 
+        // A committed DML operation may have failed while persisting its
+        // secondary index. Until REINDEX repairs it, scans are authoritative.
+        if indexes_stale(storage_path) {
+            return Ok(None);
+        }
+
         // Only use index for simple queries: no GROUP BY, no aggregation, no JOIN
         if !stmt.group_by.is_empty() || !stmt.joins.is_empty() {
             return Ok(None);
@@ -565,6 +571,9 @@ impl ApexExecutor {
     }
 
     fn table_has_index_catalog(base_dir: Option<&Path>, storage_path: &Path) -> bool {
+        if indexes_stale(storage_path) {
+            return false;
+        }
         let stem = match storage_path.file_stem() {
             Some(stem) => stem.to_string_lossy(),
             None => return false,

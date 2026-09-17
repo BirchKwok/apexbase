@@ -843,7 +843,7 @@ impl ApexExecutor {
         storage.save_full()?;
 
         // Update indexes for newly inserted rows
-        Self::notify_index_insert(storage_path, &storage, pre_insert_count);
+        Self::notify_index_insert(storage_path, &storage, pre_insert_count)?;
         // Update FTS index for newly inserted rows
         Self::notify_fts_insert(storage_path, &storage, pre_insert_count);
 

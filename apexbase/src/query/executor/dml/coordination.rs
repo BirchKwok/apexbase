@@ -275,6 +275,22 @@ impl ApexExecutor {
             }
         }
 
+        // Once the WAL payload is present, guard indexed reads before the
+        // commit marker can make the transaction durable. The marker remains
+        // until every storage and index write succeeds (or REINDEX repairs it).
+        let mut indexed_tables = Vec::new();
+        for table_path in &affected_tables {
+            let (index_base_dir, table_name) = base_dir_and_table(table_path);
+            if index_base_dir
+                .join("indexes")
+                .join(format!("{}.idxcat", table_name))
+                .exists()
+            {
+                commit_try!(mark_indexes_stale(table_path, txn_durability));
+                indexed_tables.push(table_path.clone());
+            }
+        }
+
         // A marker write/flush can fail after bytes reached the WAL. Fast
         // tables can partially apply writes without a WAL. Neither case may
         // be reported as safely aborted; cross-table recovery remains limited
@@ -302,36 +318,8 @@ impl ApexExecutor {
         // writes converge on the next open. Callers must not re-issue the DML.
         let applied = commit_try!(Self::apply_txn_writes(writes, base_dir, default_table_path,));
 
-        // Index maintenance is coordinated above storage so StorageEngine never
-        // depends on the query runtime. WAL-backed inserts can already be visible
-        // to normal reads here, so use the committed transaction payload directly
-        // instead of reopening the table and trying to identify its new rows.
-        let mut inserted_rows = std::collections::HashMap::new();
-        for write in writes {
-            if let crate::txn::context::TxnWrite::Insert {
-                table,
-                row_id,
-                data,
-            } = write
-            {
-                let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
-                inserted_rows
-                    .entry(table_path)
-                    .or_insert_with(Vec::new)
-                    .push((*row_id, data));
-            }
-        }
-        for (table_path, rows) in inserted_rows {
-            let (index_base_dir, table_name) = base_dir_and_table(&table_path);
-            let idx_mgr_arc = get_index_manager(&index_base_dir, &table_name);
-            let mut idx_mgr = idx_mgr_arc.lock();
-            if idx_mgr.list_indexes().is_empty() {
-                continue;
-            }
-            for (row_id, values) in rows {
-                commit_try!(idx_mgr.on_insert(row_id, values));
-            }
-            commit_try!(idx_mgr.save());
+        for table_path in &indexed_tables {
+            commit_try!(clear_indexes_stale(table_path));
         }
 
         commit_try!(mgr.finalize_commit(prepared));
@@ -1316,6 +1304,9 @@ impl ApexExecutor {
 
         idx_mgr.drop_index(name)?;
         idx_mgr.save()?;
+        if idx_mgr.list_indexes().is_empty() {
+            clear_indexes_stale(&base_dir.join(format!("{table}.apex")))?;
+        }
 
         // Invalidate index cache to reload on next access
         invalidate_index_cache(base_dir, table);
@@ -1606,12 +1597,12 @@ impl ApexExecutor {
         storage_path: &Path,
         storage: &TableStorageBackend,
         start_row_count: u64,
-    ) {
+    ) -> io::Result<()> {
         let (base_dir, table_name) = base_dir_and_table(storage_path);
         let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
         let mut idx_mgr = idx_mgr_arc.lock();
         if idx_mgr.list_indexes().is_empty() {
-            return;
+            return Ok(());
         }
 
         // Read _id + indexed columns for new rows
@@ -1628,55 +1619,54 @@ impl ApexExecutor {
         let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
         let new_count = storage.row_count();
         if new_count <= start_row_count {
-            return;
+            return Ok(());
         }
         // Read all rows and only process new ones (rows after start_row_count)
-        if let Ok(batch) = storage.read_columns_to_arrow(Some(&col_refs), 0, None) {
-            let id_col = batch.column_by_name("_id");
-            // Process rows from start_row_count onwards
-            let start = start_row_count as usize;
-            for row in start..batch.num_rows() {
-                let row_id = if let Some(col) = id_col {
-                    if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
-                        arr.value(row)
-                    } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                        arr.value(row) as u64
-                    } else {
-                        continue;
-                    }
-                } else {
-                    continue;
-                };
+        let batch = storage.read_columns_to_arrow(Some(&col_refs), 0, None)?;
+        let id_col = batch
+            .column_by_name("_id")
+            .ok_or_else(|| err_data("_id column not found"))?;
+        // Process rows from start_row_count onwards
+        let start = start_row_count as usize;
+        for row in start..batch.num_rows() {
+            let row_id = if let Some(arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                arr.value(row)
+            } else if let Some(arr) = id_col.as_any().downcast_ref::<Int64Array>() {
+                arr.value(row) as u64
+            } else {
+                return Err(err_data("_id column must be UInt64 or Int64"));
+            };
 
-                let mut col_vals = std::collections::HashMap::new();
-                for col_name in &indexed_cols {
-                    if let Some(col) = batch.column_by_name(col_name) {
-                        col_vals.insert(col_name.clone(), Self::arrow_value_at_col(col, row));
-                    }
+            let mut col_vals = std::collections::HashMap::new();
+            for col_name in &indexed_cols {
+                if let Some(col) = batch.column_by_name(col_name) {
+                    col_vals.insert(col_name.clone(), Self::arrow_value_at_col(col, row));
                 }
-                let _ = idx_mgr.on_insert(row_id, &col_vals);
             }
-            let _ = idx_mgr.save();
+            idx_mgr.on_insert(row_id, &col_vals)?;
         }
+        idx_mgr.save()?;
+        Ok(())
     }
 
     pub(in crate::query::executor) fn notify_index_delete(
         storage_path: &Path,
         deleted_entries: &[(u64, std::collections::HashMap<String, Value>)],
-    ) {
+    ) -> io::Result<()> {
         if deleted_entries.is_empty() {
-            return;
+            return Ok(());
         }
         let (base_dir, table_name) = base_dir_and_table(storage_path);
         let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
         let mut idx_mgr = idx_mgr_arc.lock();
         if idx_mgr.list_indexes().is_empty() {
-            return;
+            return Ok(());
         }
         for (row_id, col_vals) in deleted_entries {
             idx_mgr.on_delete(*row_id, col_vals);
         }
-        let _ = idx_mgr.save();
+        idx_mgr.save()?;
+        Ok(())
     }
 
     pub(in crate::query::executor) fn notify_fts_insert(storage_path: &Path, storage: &TableStorageBackend, start_row_count: u64) {
@@ -2188,6 +2178,7 @@ impl ApexExecutor {
 
         idx_mgr.save()?;
         drop(idx_mgr);
+        clear_indexes_stale(&table_path)?;
         invalidate_index_cache(base_dir, table);
         Self::invalidate_cache_for_path(&table_path);
         crate::storage::backend::invalidate_global_dict_cache(&table_path);
