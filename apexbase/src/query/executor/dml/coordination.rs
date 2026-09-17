@@ -1575,22 +1575,23 @@ impl ApexExecutor {
         storage_path: &Path,
         deleted_ids: &[u64],
         column_values: &[std::collections::HashMap<String, Value>],
-    ) {
+    ) -> io::Result<()> {
         if deleted_ids.is_empty() {
-            return;
+            return Ok(());
         }
         let (base_dir, table_name) = base_dir_and_table(storage_path);
         let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
         let mut idx_mgr = idx_mgr_arc.lock();
         if idx_mgr.list_indexes().is_empty() {
-            return;
+            return Ok(());
         }
         for (i, &row_id) in deleted_ids.iter().enumerate() {
             if i < column_values.len() {
-                idx_mgr.on_delete(row_id, &column_values[i]);
+                idx_mgr.on_delete(row_id, &column_values[i])?;
             }
         }
-        let _ = idx_mgr.save();
+        idx_mgr.save()?;
+        Ok(())
     }
 
     pub(in crate::query::executor) fn notify_index_insert(
@@ -1663,7 +1664,7 @@ impl ApexExecutor {
             return Ok(());
         }
         for (row_id, col_vals) in deleted_entries {
-            idx_mgr.on_delete(*row_id, col_vals);
+            idx_mgr.on_delete(*row_id, col_vals)?;
         }
         idx_mgr.save()?;
         Ok(())

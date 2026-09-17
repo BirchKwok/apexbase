@@ -558,7 +558,11 @@ impl IndexManager {
     }
 
     /// Notify that a row was deleted
-    pub fn on_delete(&mut self, row_id: u64, column_values: &HashMap<String, Value>) {
+    pub fn on_delete(
+        &mut self,
+        row_id: u64,
+        column_values: &HashMap<String, Value>,
+    ) -> io::Result<()> {
         let mut seen_indexes: std::collections::HashSet<String> = std::collections::HashSet::new();
         for col_name in column_values.keys() {
             if let Some(index_names) = self.column_index_map.get(col_name).cloned() {
@@ -579,11 +583,11 @@ impl IndexManager {
                 })
                 .unwrap_or_default();
             if let Some(key) = composite_key(&cols, column_values) {
-                if let Some(instance) = self.instances.get_mut(idx_name.as_str()) {
-                    instance.remove(&key, row_id);
-                }
+                let instance = self.ensure_loaded(idx_name)?;
+                instance.remove(&key, row_id);
             }
         }
+        Ok(())
     }
 
     /// Notify that a row was updated
