@@ -1,6 +1,6 @@
 # ApexBase 架构重构剩余工作与执行计划
 
-更新日期：2026-09-10。起点：`1b60ae8f916c48e25ae2dc2e1354ec586ca7133a`。
+更新日期：2026-09-17。起点：`1b60ae8f916c48e25ae2dc2e1354ec586ca7133a`。
 依据：[架构评审](ARCHITECTURE_REVIEW_2026_09.md)、当前源码及已保留的本地验收报告。
 本文维护剩余工作；历史评审的阶段记录不等于当前整体完成状态。
 
@@ -22,6 +22,8 @@
 最新 R5.12 完整模式 `local-perf-results/20260910-155135/` 比较通过；
 canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退。
 专项 A/B 是归因证据，不能把失败门禁改称通过。同构建自 A/B 只能解释波动，不能替代旧版/新版比较。
+最新 C3 最终验收见第 7.3 节：`local-perf-results/c3-acceptance-20260917/`
+（canary exit 0；full 原始 exit 1，标记项经 current 侧独立复测登记为已证实噪音）。
 
 ## 2. 优先级、依赖和交付边界
 
@@ -29,7 +31,7 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 | --- | --- | --- | --- | --- |
 | 1 | P0 / C1 | 提交失败结果分类与提交后错误处理 | Rust 可识别、Python 可辨认“未提交/结果不确定/已提交”；保留原始错误；不把 WAL marker 写失败误判可安全重试；提交后维护失败仍发布可见性与失效；真实 I/O 故障测试 | 已实现并验收通过（2026-09-10，canary/full 对 base `1b60ae8` 均 exit 0）；C2 可开始 |
 | 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | C2.1–C2.3 已实现，功能验收完成；性能证据已收口并登记 full 原始噪音例外；C3 可开始 |
-| 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | C3.1–C3.2 已实现并聚焦验证；最终统一验收待执行 |
+| 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | C3.1–C3.2 已实现并完成最终统一验收（full 原始噪音例外见 7.3）；S1 可开始 |
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | 待实施，C1–C3 后 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | 待实施，按缓存拆批 |
 | 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 待实施，依赖 S1 |
@@ -130,6 +132,17 @@ canary/full 均须退出 0，A/B 仅用于诊断；指标集合随仓库扩展�
 - C1 状态：已实现 + 功能已验证 + 性能已验收（canary/full 对 base
   `1b60ae8` 均 exit 0）。历史 R5.12 canary 未通过结论保持单独登记，不被本批
   结果替代。C2（UPDATE、Safe/Max 与恢复一致性）可开始。
+- C2 状态：已实现 + 功能已验证 + 性能证据已收口（full 原始 exit 1 的
+  `Filter (name = 'user_5000')` 双峰噪音例外已登记，见 6.3）。C3 可开始。
+- C3 实施与最终验收（2026-09-17）：C3.1 按表排序收敛、C3.2 持久索引失效与
+  重建按计划落地；审查后追加 `9f04098` 关闭三个 C3.2 范围内缺陷（stale 标记
+  随表回收、非事务索引失败标记 stale、客户端 IPC 回退不重放 DML）。最终验收
+  报告 `local-perf-results/c3-acceptance-20260917/`：pytest 1785 passed、
+  cargo test 569+6 passed、公开 benchmark exit 0、canary exit 0（64 项）、
+  full 原始 exit 1（`COUNT WHERE category` 与 `Parallel batch scan (8 threads)`
+  经 current 侧独立复测证实为噪音，qps/quant/idx 全部通过）。完整记录与后续
+  事项见 7.3。C3 状态：已实现 + 功能已验证 + 性能证据已收口（含 full 原始
+  噪音例外）。
 
 ## 6. 第二批 C2：UPDATE、Safe/Max 与恢复一致性
 
@@ -288,7 +301,60 @@ index save 失败：commit 返回 `unknown`，标记持久存在，重开查询�
 首次未配置 `DYLD_FALLBACK_LIBRARY_PATH` 的测试进程在加载 `libpython3.12.dylib` 前失败，
 补充 conda base 动态库路径后同一 release 二进制通过；该环境启动失败不计作测试执行。
 
-C3.1–C3.2 至此达到实现和聚焦功能验证边界，但尚未把 C3 描述为最终验收通过。下一步
-统一执行 release 安装、完整 pytest/cargo test、公开 benchmark、canary 与核心恢复/索引
-路径要求的 full 同机比较；性能异常按保留原始报告、结合源码路径和样本分布辨别噪音的
-规则处理，不为已证实噪音机械增加轮次。
+C3.1–C3.2 至此达到实现和聚焦功能验证边界。下一步统一执行 release 安装、完整 pytest/cargo test、公开 benchmark、canary 与核心恢复/索引路径要求的 full 同机比较；性能异常按保留原始报告、结合源码路径和样本分布辨别噪音的规则处理，不为已证实噪音机械增加轮次。
+
+### 7.3 C3 最终统一验收（2026-09-17）
+
+固定使用 pre-C2 提交 `1b60ae8f916c48e25ae2dc2e1354ec586ca7133a` 作为同机
+base；current 为 `9f04098`。验收在 conda base、同一台 M1 Pro 10c 主机上完成，
+base/current 使用隔离 worktree、venv、release wheel 与 Cargo 构建目录，未降低
+行数、预热、计时次数或阈值。报告目录
+`local-perf-results/c3-acceptance-20260917/`（含 README、全部 JSON/比较/日志、
+诊断样本）。
+
+审查后先关闭了三个 C3.2 范围内的缺陷（`9f04098`）：
+
+- 持久 stale 标记未随表清理：`TABLE_FILE_SUFFIXES` 未包含 `.index.stale`，
+  DROP/同名重建会继承旧的读回退；现已随 `unlink_table_files` 回收。
+- 非事务写入在行已持久后索引维护失败时，后续读取仍可能信任缺行的 postings；
+  现失败路径写入 stale 标记，读取回退权威 scan（仅在失败路径，无热路径 IO）。
+- Python 客户端 Arrow IPC 回退会重放已到达存储的 DML，导致行被写两次；现只对
+  只读语句保留该回退。
+
+验收结果：
+
+- `maturin develop --release` 成功（197 个既有 warning）。
+- 完整串行 `pytest`：1785 passed，33.58 s（含新增
+  `test/test_index_failure_fallback.py`）。
+- 完整 `cargo test --release`：569 单元 + 6 doc-test 通过（含新增非事务索引
+  失败与标记回收测试）。
+- 公开 benchmark 默认百万行、2 预热、5 计时，脚本 exit 0：vector head-to-head
+  6/6、共同量化 codec 6/6 胜出。与 `latest_public_baseline.json`（旧基线
+  `492956bb`，且基线记录为 macOS 26.6.2、当前为 macOS 27.0）比较覆盖
+  109/109，6 项单次指标同时超过 15% 与 0.005ms；同次运行中同等规模形状也有
+  明显反向移动（`COUNT(*)` -18.47%、Deep offset -18.24%）。沿用 C1 的旧基线
+  漂移登记，不用单次公开比较替代同机门禁。
+- canary（200K/2/7，64 项，含 `Rust Safe TXN INSERT 10 + COMMIT`）：
+  `canary/` exit 0，无项触发五样本扩展。
+- full（1M/2/5）：`full/` 主比较 109 项中 1 项、par 附加比较 4 项中 1 项在五样本
+  终判仍标记；qps 10/10、quant 8/8、idx 4/4 通过。初判标记的
+  `Filter (name = 'user_5000')` +134.29%、`JSON Read + COUNT(*)` +18.28%、
+  `Parallel batch scan (auto)` +16.33% 均在五样本终判恢复。
+- 终判标记项与噪音归因：`COUNT WHERE category` base 五样本中位数 0.2432ms、
+  current 0.2872ms（+18.11%）；`Parallel batch scan (8 threads)` base 5.870ms、
+  current 7.124ms（+21.37%）。三项独立 current 侧 `--parallel-only` 复测得到
+  8 线程 6.536/5.704/5.774ms（中位数 5.774，回到 base 水平），auto
+  5.833/5.495/5.685ms，同门禁中 4 线程/2 线程仅 +1.0%/+0.7%；两次独立
+  current 侧表格复测得到 `COUNT WHERE category` 0.233943/0.233870ms，等于或
+  低于 base 中位数。批量内唯一查询路径改动是索引准入/planner catalog 增加的
+  一次 `.index.stale` 元数据检查，量级远小于标记差值。据此登记为已证实的
+  机器/调度双峰噪音，保留原始 exit 1 与全部 JSON 样本、各阶段比较报告，不表述为
+  门禁通过，也不为已证实噪音追加轮次。
+
+C3 状态据此记为“已实现 + 功能已验证 + 性能证据已收口（含已登记的 full 原始
+噪音例外）”。审查同时登记两个后续批次事项，不作为 C3 阻塞项：
+
+- `CREATE UNIQUE INDEX` 的唯一性在索引维护阶段、存储持久化之后才拒绝，重复写入
+  会留下已持久行（读取因 stale 标记仍正确，但写入非原子）；需要改为变更前预校验。
+- DROP TABLE 不清理 `<base>/indexes/<table>_*.hashidx` / `.idxcat`，同名重建索引
+  会报 "already exists"（既有行为，已用探针复现）。
