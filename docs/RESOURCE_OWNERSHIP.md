@@ -27,6 +27,7 @@
 | `QUERY_ROOT_DIR` / `TEMP_DIR`（thread-local） | `Session`（façade） | 当前线程 | 调用方传入的 root/temp 目录 | — | `Session` drop 时 RAII 恢复 | 每查询 | 无（线程本地；R4 起调度器工作线程也会收到，见 §3） |
 | `KEEP_DICT_PROJECTION`（thread-local） | 执行器 | 当前线程 | 布尔开关 | — | `with_keep_dict_projection` 结束 | 每查询 | 无 |
 | `PATH_TRACE`（thread-local） | 执行器 | 当前线程 | EXPLAIN ANALYZE 记录的实际物理路径标签（首个胜出路由 + 可选细节） | 单个短字符串 | `begin_path_trace` 重置 / `finish_path_trace` 取出置 None | 每 EXPLAIN ANALYZE | 无（线程本地；默认关闭，非 EXPLAIN ANALYZE 查询零成本） |
+| `QUERY_MEMORY_BUDGET`（thread-local，S1） | 执行器（`executor/memory.rs`） | 当前线程 | 顶层查询的聚合内存预算：`limit` + 共享 `AtomicUsize` 已用字节；并行 worker 通过捕获同一 `Arc` 共享计数 | 每顶层查询一个 `Arc`；`APEX_QUERY_MEMORY_MB` 可配置，`0`=不限，默认 1 GiB | `QueryMemoryBudgetGuard` RAII：查询结束（成功/取消/失败）恢复上一层上下文；失败的内核回退释放自己的预留 | 每查询 | 无（进程内计数，不跨进程） |
 | `PLAN_DIVERGENCE`（thread-local，Cell） | 执行器 | 当前线程 | EXPLAIN ANALYZE 记录的规划/执行分歧说明（首个胜出，静态字符串） | 单个 `&'static str` | `begin_path_trace` 重置 / `finish_plan_divergence` 取出置 None | 每 EXPLAIN ANALYZE | 无（线程本地；默认关闭且未记录时零状态、零分配） |
 
 ### 1.2 查询规划与分类（`apexbase/src/query/`）
@@ -140,3 +141,23 @@
   `get_flight_info` 与 `do_get` 的一致性/成本评估。
 - **G1/G2/G3**：按"每种缓存和每个入口单独迁移"原则，
   在后续阶段逐项处理，每项独立提交与验收。
+
+## 5. S1 查询内存预算（2026-09-17）
+
+§4 的"查询内存预算"已按 A5 顺序（先明确所有权，再谈预算）落地第一版：
+
+- **预算口径**：按字节计量，针对**查询自身持有的聚合状态**（分组 map、每行索引向量、
+  字典直索引数组、每组 distinct 集合），不含扫描批次（R3 已限定为一个行组）与最终
+  结果物化（完整结果 API 允许 O(输出)）。
+- **配置**：`APEX_QUERY_MEMORY_MB`（正整数 MiB，`0`=不限），每个顶层查询安装时读取，
+  可逐查询切换；默认 1 GiB。未配置上限的嵌入式点查询只支付一次线程本地写入。
+- **超预算**：返回 `io::ErrorKind::OutOfMemory`，错误文本包含已用/上限字节，Python 侧
+  为 `RuntimeError`。失败的内核若回退到其他算子，会先释放自己的预留，避免重复计数。
+- **已覆盖入口**：分批管道（串行流 + 并行 partial 及合并）、`execute_group_by_with_indices`
+  行索引回退、单键 streaming（含 COUNT DISTINCT）、`execute_group_by_incremental`
+  通用键路径（含 rayon 分区局部状态与合并）、`VectorizedHashAgg` 单键哈希、字典直索引
+  路径（`execute_group_by_string_dict` / dict case count / vectorized dict count）。
+- **仍不在本预算内**：无 WHERE 的整型键查询若命中存储层 numeric dict cache（u16 组 ID，
+  上限 65536 组）或存储原生 `execute_group_agg`（结果本身 O(组数)），其内存属于全局缓存
+  容量（G1）与输出物化，按 S2/G1 单独处理，不用查询预算重复计量。
+

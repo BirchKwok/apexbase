@@ -5247,3 +5247,152 @@ fn stale_index_execution_spec_falls_back_to_scan() {
         result.is_some()
     );
 }
+
+// ============================================================================
+// S1: per-query aggregation memory budget
+// ============================================================================
+
+#[test]
+fn query_memory_budget_tracks_and_limits_reservations() {
+    let budget = QueryMemoryBudget::new(100);
+    assert_eq!(budget.limit(), 100);
+    assert_eq!(budget.used(), 0);
+    budget.reserve(60).unwrap();
+    assert_eq!(budget.used(), 60);
+    // A rejected reservation must leave the counter untouched.
+    let error = budget.reserve(50).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+    assert_eq!(budget.used(), 60);
+    budget.reserve(40).unwrap();
+    assert_eq!(budget.used(), 100);
+    budget.release(30);
+    assert_eq!(budget.used(), 70);
+    assert!(budget.reserve(31).is_err());
+    assert!(budget.reserve(30).is_ok());
+}
+
+#[test]
+fn query_memory_budget_guard_restores_previous_context() {
+    assert!(crate::query::executor::memory::query_memory_budget().is_none());
+    let outer = Arc::new(QueryMemoryBudget::new(10));
+    {
+        let _guard =
+            crate::query::executor::memory::install_query_memory_budget(Some(outer.clone()));
+        let installed = crate::query::executor::memory::query_memory_budget().unwrap();
+        assert!(Arc::ptr_eq(&installed, &outer));
+        {
+            // A nested query shares the installed budget instead of
+            // replacing it with its own.
+            let _nested = QueryMemoryBudgetGuard::ensure();
+            let installed = crate::query::executor::memory::query_memory_budget().unwrap();
+            assert!(Arc::ptr_eq(&installed, &outer));
+        }
+        let installed = crate::query::executor::memory::query_memory_budget().unwrap();
+        assert!(Arc::ptr_eq(&installed, &outer));
+    }
+    // Drop restores the empty context, so the next query starts fresh.
+    assert!(crate::query::executor::memory::query_memory_budget().is_none());
+}
+
+#[test]
+fn batch_pipeline_rejects_high_cardinality_state_over_budget() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("memory_budget_serial.apex");
+    create_batch_scan_fixture(&path);
+    // Two group keys keep the query inside the batched aggregation kernel
+    // (the single-key fused path is dispatched earlier).
+    let sql = "SELECT city, code, COUNT(*) AS n FROM default \
+               WHERE amount IS NOT NULL AND code >= 1 GROUP BY city, code";
+
+    // The fixture's distinct (city, code) groups need more than 512 bytes of
+    // tracked state.
+    {
+        let _guard = install_query_memory_budget(Some(Arc::new(QueryMemoryBudget::new(512))));
+        let error = ApexExecutor::execute(sql, &path)
+            .err()
+            .expect("high-cardinality state must exceed the tiny budget");
+        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory, "{error}");
+        assert!(error.to_string().contains("query memory budget exceeded"));
+    }
+    // The failure path restores the context and releases the charge: the same
+    // query succeeds once the budget allows the state.
+    assert!(crate::query::executor::memory::query_memory_budget().is_none());
+    let budget = Arc::new(QueryMemoryBudget::new(1024 * 1024));
+    {
+        let _guard = install_query_memory_budget(Some(budget.clone()));
+        let batch = ApexExecutor::execute(sql, &path)
+            .unwrap()
+            .to_record_batch()
+            .unwrap();
+        assert!(batch.num_rows() > 0);
+    }
+    assert!(
+        budget.used() > 0,
+        "the fixture must reach the batched aggregation kernel"
+    );
+}
+
+#[test]
+fn parallel_partial_state_shares_the_query_memory_budget() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("memory_budget_parallel.apex");
+    create_batch_scan_fixture(&path);
+    let sql = "SELECT city, code, COUNT(*) AS n FROM default \
+               WHERE amount IS NOT NULL AND code >= 1 GROUP BY city, code";
+
+    // Hold the env lock (parallel selection is process-global and the token
+    // pool is shared) so the serial and parallel runs are deterministic.
+    let _env_guard = BATCH_SCAN_ENV_LOCK.lock().unwrap();
+    std::env::set_var("APEX_PARALLEL_SCAN", "0");
+    let probe = Arc::new(QueryMemoryBudget::new(1024 * 1024));
+    {
+        let _guard = install_query_memory_budget(Some(probe.clone()));
+        ApexExecutor::execute(sql, &path).unwrap();
+    }
+    let serial_bytes = probe.used();
+    assert!(
+        serial_bytes > 0,
+        "the fixture must reach the batched aggregation kernel"
+    );
+
+    // Each worker folds the same distinct group set, so two live partials
+    // need about twice the serial state. A budget with only 50% headroom must
+    // reject the parallel fold: the bound covers resident partials, not just
+    // the merged result.
+    std::env::set_var("APEX_PARALLEL_SCAN", "2");
+    let parallel_budget = Arc::new(QueryMemoryBudget::new(serial_bytes + serial_bytes / 2));
+    let result = {
+        let _guard = install_query_memory_budget(Some(parallel_budget));
+        ApexExecutor::execute(sql, &path)
+    };
+    std::env::remove_var("APEX_PARALLEL_SCAN");
+    let error = result
+        .err()
+        .expect("two live partial folds must exceed the budget");
+    assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+}
+
+#[test]
+fn vectorized_hash_agg_tracks_group_state_bytes() {
+    use crate::query::vectorized::VectorizedHashAgg;
+
+    let mut agg = VectorizedHashAgg::new(false, 16);
+    assert_eq!(agg.state_bytes(), 0);
+    agg.get_or_create_group_str("alpha", 0);
+    let one_group = agg.state_bytes();
+    assert!(one_group > 0);
+    // Re-using an existing group adds no state.
+    agg.get_or_create_group_str("alpha", 1);
+    assert_eq!(agg.state_bytes(), one_group);
+    // A longer distinct key costs strictly more.
+    agg.get_or_create_group_str("a-much-longer-key", 2);
+    assert!(agg.state_bytes() > one_group);
+
+    let mut int_agg = VectorizedHashAgg::new(true, 16);
+    int_agg.get_or_create_group_int(7, 0);
+    let one_int_group = int_agg.state_bytes();
+    assert!(one_int_group > 0);
+    int_agg.get_or_create_group_int(7, 1);
+    assert_eq!(int_agg.state_bytes(), one_int_group);
+}
+

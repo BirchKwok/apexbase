@@ -138,6 +138,7 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         group_cols: &[String],
     ) -> io::Result<Option<ApexResult>> {
+
         if group_cols.len() != 1
             || stmt.having.is_some()
             || !stmt.order_by.is_empty()
@@ -559,7 +560,7 @@ impl ApexExecutor {
             return Ok(None);
         }
 
-        let mut apply_row_ops = |row: usize, state: &mut State| {
+        let mut apply_row_ops = |row: usize, state: &mut State, pending: &mut usize| {
             for op in &row_ops {
                 match op {
                     RowOp::Count { slot } => {
@@ -575,7 +576,12 @@ impl ApexExecutor {
                             let value = string_fingerprint(array.value(row));
                             let seen = &mut state.distinct[*slot];
                             if !seen.contains(&value) {
+                                let before = seen.capacity();
                                 seen.push(value);
+                                if seen.capacity() != before {
+                                    *pending += (seen.capacity() - before)
+                                        * std::mem::size_of::<u64>();
+                                }
                             }
                         }
                     }
@@ -584,7 +590,12 @@ impl ApexExecutor {
                             let value = Self::hash_array_value_fast(array, row);
                             let seen = &mut state.distinct[*slot];
                             if !seen.contains(&value) {
+                                let before = seen.capacity();
                                 seen.push(value);
+                                if seen.capacity() != before {
+                                    *pending += (seen.capacity() - before)
+                                        * std::mem::size_of::<u64>();
+                                }
                             }
                         }
                     }
@@ -641,6 +652,11 @@ impl ApexExecutor {
         let estimated_groups = (batch.num_rows() / 100).clamp(16, batch.num_rows().max(16));
         let mut states = Vec::with_capacity(estimated_groups);
         let mut group_index: AHashMap<&str, usize> = AHashMap::with_capacity(estimated_groups);
+        // S1: one state per distinct group key; charge its growth against the
+        // per-query budget at a row interval.
+        let budget = crate::query::executor::query_memory_budget();
+        let mut pending: usize = 0;
+        let mut next_budget_check = GROUP_BUDGET_CHECK_INTERVAL;
         for row in 0..batch.num_rows() {
             let key = group_values.value(row);
             let group = if let Some(group) = group_index.get(key) {
@@ -648,6 +664,14 @@ impl ApexExecutor {
             } else {
                 let group = states.len();
                 group_index.insert(key, group);
+                pending += GROUP_STATE_ENTRY_BYTES
+                    + std::mem::size_of::<String>()
+                    + key.len()
+                    + count_slots * std::mem::size_of::<i64>()
+                    + sum_slots * std::mem::size_of::<f64>()
+                    + sum_slots * std::mem::size_of::<i64>()
+                    + avg_count_slots * std::mem::size_of::<i64>()
+                    + distinct_slots * std::mem::size_of::<Vec<u64>>();
                 states.push(State {
                     key: key.to_string(),
                     counts: vec![0; count_slots],
@@ -659,7 +683,17 @@ impl ApexExecutor {
                 group
             };
             let state = unsafe { states.get_unchecked_mut(group) };
-            apply_row_ops(row, state);
+            apply_row_ops(row, state, &mut pending);
+            if row + 1 >= next_budget_check {
+                next_budget_check += GROUP_BUDGET_CHECK_INTERVAL;
+                if let Some(budget) = budget.as_deref() {
+                    budget.reserve(pending)?;
+                }
+                pending = 0;
+            }
+        }
+        if let Some(budget) = budget.as_deref() {
+            budget.reserve(pending)?;
         }
 
         let mut fields = Vec::with_capacity(outputs.len());
@@ -815,6 +849,7 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         group_col_name: &str,
     ) -> io::Result<ApexResult> {
+
         use crate::query::vectorized::{execute_vectorized_group_by, VectorizedHashAgg};
         use crate::query::AggregateFunc;
 
@@ -850,6 +885,13 @@ impl ApexExecutor {
 
                     if is_count_only {
                         // OPTIMIZED: Direct aggregation without building indices Vec
+                        // S1: the count array covers every dictionary value.
+                        if let Some(budget) = crate::query::executor::query_memory_budget().as_deref()
+                        {
+                            budget.reserve(
+                                dict_size.saturating_mul(std::mem::size_of::<i64>()),
+                            )?;
+                        }
                         let mut counts: Vec<i64> = vec![0; dict_size];
 
                         for row_idx in 0..num_rows {
@@ -1315,6 +1357,10 @@ impl ApexExecutor {
         let cond = Self::evaluate_predicate(batch, &cond_expr)?;
 
         let dict_size = str_values.len() + 1;
+        // S1: the count array covers every dictionary value.
+        if let Some(budget) = crate::query::executor::query_memory_budget().as_deref() {
+            budget.reserve(dict_size.saturating_mul(std::mem::size_of::<i64>()))?;
+        }
         let mut counts: Vec<i64> = vec![0; dict_size];
         let keys = dict_arr.keys();
         for row in 0..batch.num_rows() {
@@ -1380,6 +1426,14 @@ impl ApexExecutor {
         use crate::query::AggregateFunc;
 
         let num_rows = batch.num_rows();
+
+        // S1: direct-indexed state is pre-allocated for every dictionary
+        // value, so a high-cardinality dictionary must be charged even when
+        // only a few groups are active.
+        let budget = crate::query::executor::query_memory_budget();
+        if let Some(budget) = budget.as_deref() {
+            budget.reserve(dict_size.saturating_mul(DIRECT_INDEX_SLOT_BYTES))?;
+        }
 
         // Direct-indexed aggregate state - pre-allocated for all possible groups
         let mut counts: Vec<i64> = vec![0; dict_size];
@@ -1680,6 +1734,7 @@ impl ApexExecutor {
         min_val: usize,
         range: usize,
     ) -> io::Result<ApexResult> {
+
         use crate::query::AggregateFunc;
 
         let num_rows = batch.num_rows();
@@ -1960,6 +2015,7 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         group_cols: &[String],
     ) -> io::Result<ApexResult> {
+
         use crate::query::AggregateFunc;
 
         let num_rows = batch.num_rows();
@@ -3343,21 +3399,31 @@ impl ApexExecutor {
         use rayon::prelude::*;
         let use_parallel = num_rows > 50_000;
 
+        // S1: the generic keyed accumulator holds one state per distinct key.
+        // Charge its growth (and each partition's local state while partials
+        // are alive) against the per-query budget.
+        let budget = crate::query::executor::query_memory_budget();
+        let group_entry_bytes = std::mem::size_of::<u64>() + std::mem::size_of::<GroupState>() + 8;
+
         let groups: AHashMap<u64, GroupState> = if use_parallel {
             let num_partitions = rayon::current_num_threads().max(4);
             let partition_size = (num_rows + num_partitions - 1) / num_partitions;
+            let budget_ref = budget.as_deref();
 
             // Each partition aggregates independently
             let partition_results: Vec<AHashMap<u64, GroupState>> = (0..num_partitions)
                 .into_par_iter()
-                .map(|p| {
+                .map(|p| -> io::Result<AHashMap<u64, GroupState>> {
                     let start = p * partition_size;
                     let end = ((p + 1) * partition_size).min(num_rows);
                     let mut local: AHashMap<u64, GroupState> =
                         AHashMap::with_capacity(estimated_groups / num_partitions + 1);
+                    let mut pending: usize = 0;
+                    let mut next_budget_check = GROUP_BUDGET_CHECK_INTERVAL;
 
                     for row_idx in start..end {
                         let key = group_keys[row_idx];
+                        let len_before = local.len();
                         let state = local.entry(key).or_insert_with(|| GroupState::new(row_idx));
                         state.count += 1;
 
@@ -3375,14 +3441,29 @@ impl ApexExecutor {
                                 state.max_float = Some(state.max_float.map_or(val, |m| m.max(val)));
                             }
                         }
+                        if local.len() != len_before {
+                            pending += group_entry_bytes;
+                        }
+                        if row_idx + 1 >= next_budget_check {
+                            next_budget_check += GROUP_BUDGET_CHECK_INTERVAL;
+                            if let Some(budget) = budget_ref {
+                                budget.reserve(pending)?;
+                            }
+                            pending = 0;
+                        }
                     }
-                    local
+                    if let Some(budget) = budget_ref {
+                        budget.reserve(pending)?;
+                    }
+                    Ok(local)
                 })
-                .collect();
+                .collect::<io::Result<Vec<_>>>()?;
 
             // Merge partition results
             let mut merged: AHashMap<u64, GroupState> = AHashMap::with_capacity(estimated_groups);
+            let mut pending: usize = 0;
             for local in partition_results {
+                let len_before = merged.len();
                 for (key, state) in local {
                     merged
                         .entry(key)
@@ -3405,13 +3486,20 @@ impl ApexExecutor {
                         })
                         .or_insert(state);
                 }
+                pending += (merged.len() - len_before) * group_entry_bytes;
+            }
+            if let Some(budget) = budget.as_deref() {
+                budget.reserve(pending)?;
             }
             merged
         } else {
             // Sequential for small datasets
             let mut groups: AHashMap<u64, GroupState> = AHashMap::with_capacity(estimated_groups);
+            let mut pending: usize = 0;
+            let mut next_budget_check = GROUP_BUDGET_CHECK_INTERVAL;
             for row_idx in 0..num_rows {
                 let key = group_keys[row_idx];
+                let len_before = groups.len();
                 let state = groups
                     .entry(key)
                     .or_insert_with(|| GroupState::new(row_idx));
@@ -3431,6 +3519,19 @@ impl ApexExecutor {
                         state.max_float = Some(state.max_float.map_or(val, |m| m.max(val)));
                     }
                 }
+                if groups.len() != len_before {
+                    pending += group_entry_bytes;
+                }
+                if row_idx + 1 >= next_budget_check {
+                    next_budget_check += GROUP_BUDGET_CHECK_INTERVAL;
+                    if let Some(budget) = budget.as_deref() {
+                        budget.reserve(pending)?;
+                    }
+                    pending = 0;
+                }
+            }
+            if let Some(budget) = budget.as_deref() {
+                budget.reserve(pending)?;
             }
             groups
         };
@@ -3631,10 +3732,19 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         group_cols: &[String],
     ) -> io::Result<ApexResult> {
+
         // Create groups: key -> row indices (using AHashMap for speed)
         let num_rows = batch.num_rows();
         let estimated_groups = (num_rows / 10).max(16); // Estimate ~10 rows per group
         let mut groups: AHashMap<u64, Vec<usize>> = AHashMap::with_capacity(estimated_groups);
+
+        // S1: this fallback stores one row index per input row, so a
+        // high-cardinality GROUP BY grows with the table. Charge the map and
+        // index storage growth against the per-query budget, at batch-row
+        // granularity rather than per row.
+        let budget = crate::query::executor::query_memory_budget();
+        let mut pending: usize = 0;
+        let mut next_budget_check = GROUP_BUDGET_CHECK_INTERVAL;
 
         // OPTIMIZATION: Pre-downcast columns to typed arrays for faster access
         // This avoids repeated dynamic dispatch in the hot loop
@@ -3720,10 +3830,34 @@ impl ApexExecutor {
                 }
             }
             let key = hasher.finish();
-            groups
-                .entry(key)
-                .or_insert_with(|| Vec::with_capacity(16))
-                .push(row_idx);
+            match groups.entry(key) {
+                std::collections::hash_map::Entry::Occupied(mut slot) => {
+                    let indices = slot.get_mut();
+                    let before = indices.capacity();
+                    indices.push(row_idx);
+                    if indices.capacity() != before {
+                        pending +=
+                            (indices.capacity() - before) * std::mem::size_of::<usize>();
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    pending += GROUP_INDEX_ENTRY_BYTES
+                        + GROUP_INDEX_INITIAL_CAPACITY * std::mem::size_of::<usize>();
+                    let mut indices = Vec::with_capacity(GROUP_INDEX_INITIAL_CAPACITY);
+                    indices.push(row_idx);
+                    slot.insert(indices);
+                }
+            }
+            if row_idx + 1 >= next_budget_check {
+                next_budget_check += GROUP_BUDGET_CHECK_INTERVAL;
+                if let Some(budget) = budget.as_deref() {
+                    budget.reserve(pending)?;
+                }
+                pending = 0;
+            }
+        }
+        if let Some(budget) = budget.as_deref() {
+            budget.reserve(pending)?;
         }
 
         // Build result arrays

@@ -138,6 +138,8 @@ pub struct VectorizedHashAgg {
     /// Group keys (for result building)
     group_keys_int: Vec<i64>,
     group_keys_str: Vec<String>,
+    /// Running heap footprint of the group state (S1 budget accounting).
+    bytes: usize,
 }
 
 /// Fast counting aggregation for low-cardinality integer keys
@@ -250,7 +252,19 @@ impl VectorizedHashAgg {
             } else {
                 Vec::new()
             },
+            bytes: 0,
         }
+    }
+
+    /// Bytes charged per distinct group: hash-table slot, aggregate state and
+    /// the key vector slot. String keys add their owned bytes separately.
+    const GROUP_BYTES: usize =
+        std::mem::size_of::<GroupHash>() + std::mem::size_of::<u32>() + 8 + std::mem::size_of::<AggregateState>();
+
+    /// Running heap footprint of the accumulated group state.
+    #[inline]
+    pub fn state_bytes(&self) -> usize {
+        self.bytes
     }
 
     /// Get or create a group, returns the group_id
@@ -264,6 +278,7 @@ impl VectorizedHashAgg {
             self.hash_table.insert(hash, group_id);
             self.states.push(AggregateState::new(row_idx));
             self.group_keys_int.push(key);
+            self.bytes += Self::GROUP_BYTES + std::mem::size_of::<i64>();
             group_id
         }
     }
@@ -279,6 +294,8 @@ impl VectorizedHashAgg {
             self.hash_table.insert(hash, group_id);
             self.states.push(AggregateState::new(row_idx));
             self.group_keys_str.push(key.to_string());
+            self.bytes +=
+                Self::GROUP_BYTES + std::mem::size_of::<String>() + key.len();
             group_id
         }
     }
@@ -299,6 +316,8 @@ impl VectorizedHashAgg {
             self.hash_table.insert(hash, group_id);
             self.states.push(AggregateState::new(row_idx));
             self.group_keys_str.push(key_str.to_string());
+            self.bytes +=
+                Self::GROUP_BYTES + std::mem::size_of::<String>() + key_str.len();
             group_id
         }
     }
@@ -718,6 +737,12 @@ pub fn execute_vectorized_group_by(
     let dict_values_ref: Option<Vec<&str>> = group_col_dict_values;
     let dict_values_slice: Option<&[&str]> = dict_values_ref.as_deref();
 
+    // S1: charge the single-key group state against the per-query budget at
+    // vector granularity, so high-cardinality GROUP BY fails with an explicit
+    // error instead of growing until allocation fails.
+    let budget = crate::query::executor::memory::query_memory_budget();
+    let mut charged = hash_agg.state_bytes();
+
     for batch_start in (0..num_rows).step_by(VECTOR_SIZE) {
         let batch_end = (batch_start + VECTOR_SIZE).min(num_rows);
 
@@ -733,6 +758,12 @@ pub fn execute_vectorized_group_by(
             batch_end,
             count_only,
         );
+
+        let current = hash_agg.state_bytes();
+        if let Some(budget) = budget.as_deref() {
+            budget.reserve(current - charged)?;
+        }
+        charged = current;
     }
 
     Ok(hash_agg)

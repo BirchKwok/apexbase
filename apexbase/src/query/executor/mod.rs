@@ -52,6 +52,13 @@ use ahash::AHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 
+pub(crate) mod memory;
+pub(in crate::query::executor) use memory::{
+    install_query_memory_budget, query_memory_budget, QueryMemoryBudget,
+    QueryMemoryBudgetGuard, DIRECT_INDEX_SLOT_BYTES, GROUP_BUDGET_CHECK_INTERVAL,
+    GROUP_INDEX_ENTRY_BYTES, GROUP_INDEX_INITIAL_CAPACITY, GROUP_STATE_ENTRY_BYTES,
+};
+
 // ============================================================================
 // Global SQL parse cache — avoids re-tokenizing/parsing the same SQL across cold iterations
 // ============================================================================
@@ -1585,6 +1592,11 @@ impl ApexExecutor {
         default_table_path: &Path,
     ) -> io::Result<ApexResult> {
         use crate::query::query_signature::QuerySignature;
+
+        // Per-query aggregation budget (S1). Installed once for the top-level
+        // query; nested queries share it, and every exit path (success,
+        // cancel, error) restores the previous context through the guard.
+        let _memory_budget = QueryMemoryBudgetGuard::ensure();
 
         // ── Pre-parse fast paths (bypass SQL parser entirely) ──
         if let Some(read) = sig.read_signature() {

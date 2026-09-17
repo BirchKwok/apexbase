@@ -37,15 +37,19 @@ impl<'a> BatchKeyView<'a> {
 }
 
 /// Interned distinct values of one group key column across all batches.
-/// Slot 0 is always the NULL group.
+/// Slot 0 is always the NULL group. `bytes` is the running heap footprint of
+/// the interning structures, maintained incrementally so the per-query
+/// memory budget can be charged without rescanning the maps (S1).
 enum BatchKeyLane {
     Int {
         dict: AHashMap<i64, u32>,
         values: Vec<Option<i64>>,
+        bytes: usize,
     },
     Float {
         dict: AHashMap<u64, u32>,
         values: Vec<Option<u64>>,
+        bytes: usize,
     },
     // Slot 0 is the NULL group; slot 1 is false; slot 2 is true. The slot
     // number is the value, so no per-slot storage is needed.
@@ -53,14 +57,25 @@ enum BatchKeyLane {
     String {
         dict: AHashMap<String, u32>,
         values: Vec<Option<String>>,
+        bytes: usize,
     },
 }
+
+/// Bytes of one interned integer/float group-key value: dictionary entry plus
+/// the value slot.
+const LANE_SCALAR_VALUE_BYTES: usize =
+    std::mem::size_of::<u64>() + std::mem::size_of::<u32>() + std::mem::size_of::<Option<u64>>() + 8;
+/// Fixed bytes of one interned string group-key value (the two owned copies
+/// are charged separately by length).
+const LANE_STRING_VALUE_BYTES: usize =
+    std::mem::size_of::<String>() + std::mem::size_of::<u32>() + std::mem::size_of::<Option<String>>() + 8;
 
 impl BatchKeyLane {
     fn new_int() -> Self {
         Self::Int {
             dict: AHashMap::new(),
             values: vec![None],
+            bytes: 0,
         }
     }
 
@@ -68,6 +83,7 @@ impl BatchKeyLane {
         Self::Float {
             dict: AHashMap::new(),
             values: vec![None],
+            bytes: 0,
         }
     }
 
@@ -79,6 +95,17 @@ impl BatchKeyLane {
         Self::String {
             dict: AHashMap::new(),
             values: vec![None],
+            bytes: 0,
+        }
+    }
+
+    /// Running footprint of this lane's interning state.
+    fn bytes(&self) -> usize {
+        match self {
+            Self::Int { bytes, .. } | Self::Float { bytes, .. } | Self::String { bytes, .. } => {
+                *bytes
+            }
+            Self::Bool => 0,
         }
     }
 
@@ -96,7 +123,7 @@ impl BatchKeyLane {
     /// Intern the row value and return its group ID (0 = NULL group).
     fn id_at(&mut self, view: &BatchKeyView, row: usize) -> u32 {
         match (self, view) {
-            (Self::Int { dict, values }, BatchKeyView::Int(arr)) => {
+            (Self::Int { dict, values, bytes }, BatchKeyView::Int(arr)) => {
                 if arr.is_null(row) {
                     0
                 } else {
@@ -104,11 +131,12 @@ impl BatchKeyLane {
                     *dict.entry(value).or_insert_with(|| {
                         let id = values.len() as u32;
                         values.push(Some(value));
+                        *bytes += LANE_SCALAR_VALUE_BYTES;
                         id
                     })
                 }
             }
-            (Self::Float { dict, values }, BatchKeyView::Float(arr)) => {
+            (Self::Float { dict, values, bytes }, BatchKeyView::Float(arr)) => {
                 if arr.is_null(row) {
                     0
                 } else {
@@ -119,6 +147,7 @@ impl BatchKeyLane {
                     *dict.entry(bits).or_insert_with(|| {
                         let id = values.len() as u32;
                         values.push(Some(bits));
+                        *bytes += LANE_SCALAR_VALUE_BYTES;
                         id
                     })
                 }
@@ -132,7 +161,7 @@ impl BatchKeyLane {
                     1
                 }
             }
-            (Self::String { dict, values }, BatchKeyView::Str(arr)) => {
+            (Self::String { dict, values, bytes }, BatchKeyView::Str(arr)) => {
                 if arr.is_null(row) {
                     0
                 } else {
@@ -140,11 +169,12 @@ impl BatchKeyLane {
                     *dict.entry(value.to_string()).or_insert_with(|| {
                         let id = values.len() as u32;
                         values.push(Some(value.to_string()));
+                        *bytes += LANE_STRING_VALUE_BYTES + 2 * value.len();
                         id
                     })
                 }
             }
-            (Self::String { dict, values }, BatchKeyView::LargeStr(arr)) => {
+            (Self::String { dict, values, bytes }, BatchKeyView::LargeStr(arr)) => {
                 if arr.is_null(row) {
                     0
                 } else {
@@ -152,6 +182,7 @@ impl BatchKeyLane {
                     *dict.entry(value.to_string()).or_insert_with(|| {
                         let id = values.len() as u32;
                         values.push(Some(value.to_string()));
+                        *bytes += LANE_STRING_VALUE_BYTES + 2 * value.len();
                         id
                     })
                 }
@@ -242,26 +273,29 @@ impl BatchKeyLane {
     /// does not match (the caller falls back to the serial fold).
     fn intern_value(&mut self, value: Option<BatchKeyValue>) -> Option<u32> {
         match (self, value) {
-            (Self::Int { dict, values }, Some(BatchKeyValue::Int(value))) => Some(
+            (Self::Int { dict, values, bytes }, Some(BatchKeyValue::Int(value))) => Some(
                 *dict.entry(value).or_insert_with(|| {
                     let id = values.len() as u32;
                     values.push(Some(value));
+                    *bytes += LANE_SCALAR_VALUE_BYTES;
                     id
                 }),
             ),
-            (Self::Float { dict, values }, Some(BatchKeyValue::FloatBits(bits))) => Some(
+            (Self::Float { dict, values, bytes }, Some(BatchKeyValue::FloatBits(bits))) => Some(
                 *dict.entry(bits).or_insert_with(|| {
                     let id = values.len() as u32;
                     values.push(Some(bits));
+                    *bytes += LANE_SCALAR_VALUE_BYTES;
                     id
                 }),
             ),
             (Self::Bool, Some(BatchKeyValue::Bool(value))) => {
                 Some(if value { 2 } else { 1 })
             }
-            (Self::String { dict, values }, Some(BatchKeyValue::Str(value))) => {
+            (Self::String { dict, values, bytes }, Some(BatchKeyValue::Str(value))) => {
                 let id = *dict.entry(value.clone()).or_insert_with(|| {
                     let id = values.len() as u32;
+                    *bytes += LANE_STRING_VALUE_BYTES + 2 * value.len();
                     values.push(Some(value));
                     id
                 });
@@ -342,6 +376,30 @@ struct BatchGroupAggregator {
     source_name: Option<String>,
     source_is_int: Option<bool>,
     groups: AHashMap<u64, BatchGroupState>,
+    /// Bytes of `groups` entries, maintained incrementally (S1 budget).
+    groups_bytes: usize,
+}
+
+/// Bytes charged per distinct group entry: the key plus the aggregate state
+/// and hash-map control overhead.
+const GROUP_ENTRY_BYTES: usize =
+    std::mem::size_of::<u64>() + std::mem::size_of::<BatchGroupState>() + 8;
+
+/// Charge aggregation-state growth against the optional query budget (S1).
+#[inline]
+fn charge_state(budget: Option<&QueryMemoryBudget>, bytes: usize) -> io::Result<()> {
+    match budget {
+        Some(budget) => budget.reserve(bytes),
+        None => Ok(()),
+    }
+}
+
+/// Release a charge whose operator state was dropped before the query ended.
+#[inline]
+fn release_state(budget: Option<&QueryMemoryBudget>, bytes: usize) {
+    if let Some(budget) = budget {
+        budget.release(bytes);
+    }
 }
 
 impl BatchGroupAggregator {
@@ -418,7 +476,16 @@ impl BatchGroupAggregator {
             source_name,
             source_is_int: None,
             groups: AHashMap::new(),
+            groups_bytes: 0,
         })
+    }
+
+    /// Footprint of the accumulated group state plus the interned key lanes.
+    /// O(1): every component is maintained incrementally as groups are added.
+    fn state_bytes(&self) -> usize {
+        self.groups_bytes
+            + self.key1.as_ref().map_or(0, BatchKeyLane::bytes)
+            + self.key2.as_ref().map_or(0, BatchKeyLane::bytes)
     }
 
     fn resolve_key<'b>(
@@ -509,6 +576,7 @@ impl BatchGroupAggregator {
         }
 
         let num_rows = batch.num_rows();
+        let groups_before = self.groups.len();
         match (source_int, source_float) {
             (Some(int_arr), None) => {
                 for row in 0..num_rows {
@@ -557,6 +625,7 @@ impl BatchGroupAggregator {
             }
             _ => return None,
         }
+        self.groups_bytes += (self.groups.len() - groups_before) * GROUP_ENTRY_BYTES;
         Some(())
     }
 
@@ -906,6 +975,8 @@ impl ApexExecutor {
         // so oversubscription stays bounded.
         let granted = Self::parallel_workers_requested(table_key, stmt)
             .and_then(|requested| Self::try_acquire_parallel_tokens(requested));
+        // Per-query aggregation budget (S1); shared by every worker fold.
+        let budget = crate::query::executor::query_memory_budget();
         let (agg, batch_count, parallel_threads) = match granted {
             Some(threads) => {
                 let _token_guard = ParallelTokenGuard { count: threads };
@@ -917,8 +988,12 @@ impl ApexExecutor {
                     // cancel slot; capture the shared token before
                     // dispatching.
                     let cancel = crate::query::executor::query_cancel_token();
-                    let Some((agg, count)) =
-                        Self::parallel_fused_scan_fold(ranges, effective_stmt, cancel)?
+                    let Some((agg, count)) = Self::parallel_fused_scan_fold(
+                        ranges,
+                        effective_stmt,
+                        cancel,
+                        budget.as_deref(),
+                    )?
                     else {
                         return Ok(None);
                     };
@@ -926,7 +1001,7 @@ impl ApexExecutor {
                 } else {
                     // A single row group has nothing to parallelize.
                     let Some((agg, count)) =
-                        Self::serial_fold_stream(&mut ranges[0], effective_stmt)?
+                        Self::serial_fold_stream(&mut ranges[0], effective_stmt, budget.as_deref())?
                     else {
                         return Ok(None);
                     };
@@ -938,7 +1013,7 @@ impl ApexExecutor {
                     return Ok(None);
                 };
                 let Some((agg, count)) =
-                    Self::serial_fold_stream(&mut stream, effective_stmt)?
+                    Self::serial_fold_stream(&mut stream, effective_stmt, budget.as_deref())?
                 else {
                     return Ok(None);
                 };
@@ -1102,10 +1177,12 @@ impl ApexExecutor {
     fn serial_fold_stream(
         stream: &mut crate::storage::BatchMorselStream,
         stmt: &SelectStatement,
+        budget: Option<&QueryMemoryBudget>,
     ) -> io::Result<Option<(BatchGroupAggregator, u64)>> {
         let Some(mut agg) = BatchGroupAggregator::new(stmt) else {
             return Ok(None);
         };
+        let mut charged = agg.state_bytes();
         let mut batch_count: u64 = 0;
         loop {
             if crate::query::executor::query_cancelled() {
@@ -1119,10 +1196,20 @@ impl ApexExecutor {
                     batch_count += 1;
                     let batch = morsel.into_record_batch()?;
                     if agg.consume_batch(&batch).is_none() {
+                        // The single-batch path continues this query; release
+                        // what this kernel reserved so it is not double-counted.
+                        release_state(budget, charged);
                         return Ok(None);
                     }
+                    let current = agg.state_bytes();
+                    if let Err(error) = charge_state(budget, current - charged) {
+                        release_state(budget, charged);
+                        return Err(error);
+                    }
+                    charged = current;
                 }
                 Some(Ok(crate::storage::BatchMorselOutcome::Unsupported)) => {
+                    release_state(budget, charged);
                     return Ok(None);
                 }
                 Some(Err(error)) => return Err(error),
@@ -1141,6 +1228,7 @@ impl ApexExecutor {
     ) -> Option<()> {
         merged.source_is_int = merged.source_is_int.or(partial.source_is_int);
         let two_keys = partial.group_cols.len() == 2;
+        let groups_before = merged.groups.len();
         for (key, state) in partial.groups.iter() {
             let id1 = (*key >> 32) as u32;
             let value1 = partial.key1.as_ref().and_then(|lane| lane.value_at(id1));
@@ -1164,6 +1252,7 @@ impl ApexExecutor {
                 .or_insert_with(BatchGroupState::new)
                 .merge_from(state);
         }
+        merged.groups_bytes += (merged.groups.len() - groups_before) * GROUP_ENTRY_BYTES;
         Some(())
     }
 
@@ -1179,6 +1268,7 @@ impl ApexExecutor {
         ranges: Vec<crate::storage::BatchMorselStream>,
         stmt: &SelectStatement,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        budget: Option<&QueryMemoryBudget>,
     ) -> io::Result<Option<(BatchGroupAggregator, u64)>> {
         use rayon::prelude::*;
 
@@ -1190,7 +1280,10 @@ impl ApexExecutor {
                 std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
             })?;
         // Each worker scans+folds its range into a partial state;
-        // collect keeps range order for the deterministic merge.
+        // collect keeps range order for the deterministic merge. Every
+        // partial charges the query budget as it grows, so the peak across
+        // all live partials (which is where parallel state amplifies) is
+        // bounded, not just the merged result.
         let partials: Vec<ParallelFusedOutcome> = pool.install(|| {
             ranges
                 .into_par_iter()
@@ -1199,6 +1292,7 @@ impl ApexExecutor {
                         Some(agg) => agg,
                         None => return ParallelFusedOutcome::FallBack,
                     };
+                    let mut charged = agg.state_bytes();
                     let mut batch_count: u64 = 0;
                     for outcome in &mut stream {
                         // Cancellation is checked at batch boundaries (one
@@ -1207,6 +1301,7 @@ impl ApexExecutor {
                             .as_ref()
                             .is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire))
                         {
+                            release_state(budget, charged);
                             return ParallelFusedOutcome::Cancelled;
                         }
                         match outcome {
@@ -1215,45 +1310,86 @@ impl ApexExecutor {
                                 let batch = match morsel.into_record_batch() {
                                     Ok(batch) => batch,
                                     Err(error) => {
+                                        release_state(budget, charged);
                                         return ParallelFusedOutcome::Err(error)
                                     }
                                 };
                                 if agg.consume_batch(&batch).is_none() {
+                                    release_state(budget, charged);
                                     return ParallelFusedOutcome::FallBack;
                                 }
+                                let current = agg.state_bytes();
+                                if let Err(error) = charge_state(budget, current - charged) {
+                                    release_state(budget, charged);
+                                    return ParallelFusedOutcome::Err(error);
+                                }
+                                charged = current;
                             }
                             Ok(crate::storage::BatchMorselOutcome::Unsupported) => {
+                                release_state(budget, charged);
                                 return ParallelFusedOutcome::FallBack;
                             }
-                            Err(error) => return ParallelFusedOutcome::Err(error),
+                            Err(error) => {
+                                release_state(budget, charged);
+                                return ParallelFusedOutcome::Err(error);
+                            }
                         }
                     }
                     ParallelFusedOutcome::Folded(agg, batch_count)
                 })
                 .collect()
         });
+        // Charges held by partial folds that have not been merged yet.
+        let mut unmerged: usize = partials
+            .iter()
+            .map(|outcome| match outcome {
+                ParallelFusedOutcome::Folded(partial, _) => partial.state_bytes(),
+                _ => 0,
+            })
+            .sum();
+        let mut merged_charge: usize = 0;
         let mut merged: Option<BatchGroupAggregator> = None;
         let mut batch_count: u64 = 0;
         for outcome in partials {
             match outcome {
                 ParallelFusedOutcome::Cancelled => {
+                    release_state(budget, unmerged + merged_charge);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "query cancelled",
                     ));
                 }
-                ParallelFusedOutcome::Err(error) => return Err(error),
-                ParallelFusedOutcome::FallBack => return Ok(None),
+                ParallelFusedOutcome::Err(error) => {
+                    release_state(budget, unmerged + merged_charge);
+                    return Err(error);
+                }
+                ParallelFusedOutcome::FallBack => {
+                    release_state(budget, unmerged + merged_charge);
+                    return Ok(None);
+                }
                 ParallelFusedOutcome::Folded(partial, count) => {
                     batch_count += count;
+                    let partial_bytes = partial.state_bytes();
+                    unmerged = unmerged.saturating_sub(partial_bytes);
                     let merged = merged.get_or_insert_with(|| {
                         BatchGroupAggregator::new(stmt).expect(
                             "the shape gate verified this statement before the fold"
                         )
                     });
+                    let before = merged.state_bytes();
                     if Self::merge_partial_into(merged, &partial).is_none() {
+                        release_state(budget, unmerged + merged_charge + partial_bytes);
                         return Ok(None);
                     }
+                    let growth = merged.state_bytes() - before;
+                    if let Err(error) = charge_state(budget, growth) {
+                        release_state(budget, unmerged + merged_charge + partial_bytes);
+                        return Err(error);
+                    }
+                    merged_charge += growth;
+                    // The partial is dropped after this iteration; only the
+                    // merged state stays resident.
+                    release_state(budget, partial_bytes);
                 }
             }
         }
