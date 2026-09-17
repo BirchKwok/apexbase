@@ -28,7 +28,7 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 | 顺序 | 优先级 / 编号 | 工作 | 完成条件 | 状态 |
 | --- | --- | --- | --- | --- |
 | 1 | P0 / C1 | 提交失败结果分类与提交后错误处理 | Rust 可识别、Python 可辨认“未提交/结果不确定/已提交”；保留原始错误；不把 WAL marker 写失败误判可安全重试；提交后维护失败仍发布可见性与失效；真实 I/O 故障测试 | 已实现并验收通过（2026-09-10，canary/full 对 base `1b60ae8` 均 exit 0）；C2 可开始 |
-| 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | C2.1–C2.3 已实现并完成聚焦 release 验证；最终统一验收待执行 |
+| 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | C2.1–C2.3 已实现，功能验收完成；性能证据已收口并登记 full 原始噪音例外；C3 可开始 |
 | 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | 待实施，依赖 C1/C2 |
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | 待实施，C1–C3 后 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | 待实施，按缓存拆批 |
@@ -171,7 +171,7 @@ UPDATE WAL 记录属于持久化格式变化。它还需要解决 applied waterm
 | C2.1 | 无格式变化的安全边界 | WAL-backed 表的显式事务含 UPDATE 时，在任何 TxnBegin/DML/Commit WAL 写入前拒绝；结果为 `not_committed`；事务状态清除；原值及 WAL 长度不变；Fast 事务 UPDATE 兼容 | 已完成 |
 | C2.2a | durability 传播与 Max 同步边界 | Session/嵌入式/Python 到提交协调层保留 Safe/Max；Max commit marker 使用真实 fsync；作用域退出恢复原上下文 | 已完成（`546e71f`、`4104ba4`） |
 | C2.2b | 真实同步失败矩阵 | 真实写入/flush/fsync 故障分别验证结果分类、重开与后续事务；不能用 mock 替代核心 I/O 路径 | 已完成（`14e630c`） |
-| C2.3 | UPDATE WAL 与后缀恢复 | 独立记录格式/版本/旧文件兼容设计；watermark 按偏移解析；只按 WAL 顺序幂等重放未应用且已提交的 UPDATE；覆盖崩溃、重复打开、更新后再更新、compact | 已实现并完成聚焦 release 验证；C2 最终统一验收待执行 |
+| C2.3 | UPDATE WAL 与后缀恢复 | 独立记录格式/版本/旧文件兼容设计；watermark 按偏移解析；只按 WAL 顺序幂等重放未应用且已提交的 UPDATE；覆盖崩溃、重复打开、更新后再更新、compact | 已实现并完成 C2 统一验收；full 原始噪音例外见 6.3 |
 
 C2.1 曾作为“不把不可恢复 UPDATE 当作可持久提交”的临时安全边界：拒绝发生在
 prepare/OCC 之后、首次 WAL 写入之前，并稳定返回 `not_committed`。C2.3 完成后该
@@ -211,3 +211,39 @@ marker 之后阻断 `.deltastore.tmp` 写入，确认返回 `unknown`，清除�
 聚焦 release 结果：Rust UPDATE 过滤 23 项通过、recovery 过滤 2 项通过；release
 `maturin develop` 成功；Python `test_commit_crash_recovery.py + test_transactions.py`
 40 项通过。上述是原子步骤验证，不替代第 4 节 C2 最终统一验收。
+
+### 6.3 C2 最终统一验收（2026-09-17）
+
+固定使用 pre-C2 提交 `1b60ae8f916c48e25ae2dc2e1354ec586ca7133a` 作为同机
+base；current 为 `2cf3098`。验收在 conda base、同一台 M1 Pro 10c 主机上完成，
+base/current 使用隔离 worktree、venv、release wheel 与 Cargo 构建目录，未降低行数、
+预热、计时次数或阈值。
+
+- `maturin develop --release` 成功（197 个既有 warning）。
+- 串行完整 `pytest`：1783 passed，34.08s。
+- 完整 `cargo test --release`：565 个单元测试和 6 个 doc-test 全部通过。首次经
+  `/usr/bin/time` 启动时 macOS 清除了 dyld fallback，test binary 因找不到
+  `libpython3.12.dylib` 未进入测试；直接保留同一环境变量重跑成功，该启动失败不作为
+  测试结果。
+- 公开 benchmark 默认百万行、2 次预热、5 次计时，脚本 exit 0：表格公平指标
+  102/103、精确向量 6/6、共同量化 codec 6/6 胜出。与
+  `latest_public_baseline.json` 比较覆盖 109/109；比较脚本列出 9 个超过
+  15% 且 0.005ms 的单次公开基线差异，SQLite/DuckDB 几何均值漂移分别为
+  0.980x/0.995x，保留为环境敏感诊断，不代替同机 base/current 判定。
+- 首次 canary 报告 `local-perf-results/20260917-132624/` 原始 exit 1；唯一失败
+  `Multiple COUNT DISTINCT` 的 base/current 五样本范围交叉，且定向连续 100 次 current
+  测量中位数 0.312ms、仅有少量高尾。未修改代码、阈值或参数，重新进行一次完整
+  B-C-C-B-B-C canary；`local-perf-results/20260917-134252/` exit 0，64 项通过，
+  其中该指标 +3.98%、`UPDATE by ID` -1.37%、Safe commit +2.22%。
+- full 报告 `local-perf-results/20260917-135606/` 完成主集合的三样本与自动扩展五样本，
+  以及 QPS 10 项、量化 8 项、索引 4 项、并行 4 项附加比较；四个附加比较全部 exit 0。
+  主比较原始 exit 1，唯一标记项为 `Filter (name = 'user_5000')`。其 base 五样本为
+  0.160/0.362/0.160/0.157/0.380ms，current 为
+  0.163/0.416/0.158/0.363/0.372ms：两侧快慢峰重叠，只因 base 恰有三个快峰、current
+  恰有三个慢峰导致中位数翻转。从固定 base 到 current 对 SELECT、index access 与 mmap
+  scan 路径没有源码差异，因此按已确认的机器/调度双峰噪音登记，不继续增加轮次；原始
+  exit 1、十份 JSON 与比较报告全部保留，不表述为脚本通过。
+
+C2 状态据此记为“已实现 + 功能已验证 + 性能证据已收口（含已登记的 full 原始噪音
+例外）”。该例外不隐藏或替换门禁结果；在确认查询热路径未变化、两侧样本分布重叠后，
+按本次验收决策不阻塞 C3。
