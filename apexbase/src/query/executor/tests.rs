@@ -77,11 +77,9 @@ fn commit_contract_real_io_failures_and_recovery() {
 }
 
 #[test]
-fn wal_backed_transaction_update_is_rejected_before_wal_write() {
-    use crate::txn::{CommitError, CommitOutcome};
-
+fn wal_backed_transaction_update_commits_and_survives_reopen() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("t.apex");
+    let path = dir.path().join("wal_update_t.apex");
     let storage = OnDemandStorage::create_with_schema_and_durability(
         &path,
         crate::storage::DurabilityLevel::Safe,
@@ -101,27 +99,99 @@ fn wal_backed_transaction_update_is_rejected_before_wal_write() {
     let txn_id = mgr.begin();
     session.execute_in_txn(
         txn_id,
-        SqlParser::parse("UPDATE t SET value = 9 WHERE _id = 1").unwrap(),
+        SqlParser::parse("UPDATE wal_update_t SET value = 9 WHERE _id = 1").unwrap(),
     ).unwrap();
 
-    let error = session.commit_txn(txn_id).err()
-        .expect("WAL-backed UPDATE must be rejected before commit");
-    let detail = error.get_ref().unwrap().downcast_ref::<CommitError>().unwrap();
-    assert_eq!(detail.outcome, CommitOutcome::NotCommitted);
-    assert!(error.to_string().contains("UPDATE WAL recovery"));
+    session.commit_txn(txn_id).unwrap();
     assert!(!mgr.is_active(txn_id));
-    assert_eq!(std::fs::metadata(&wal_path).unwrap().len(), wal_len);
+    assert!(std::fs::metadata(&wal_path).unwrap().len() > wal_len);
 
-    let result = session.execute("SELECT value FROM t WHERE _id = 1").unwrap();
+    let reopened = crate::Session::new(dir.path(), &path);
+    let result = reopened
+        .execute("SELECT value FROM wal_update_t WHERE _id = 1")
+        .unwrap();
     let batch = result.to_record_batch().unwrap();
     let values = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
-    assert_eq!(values.value(0), 7);
+    assert_eq!(values.value(0), 9);
+}
+
+#[test]
+fn wal_backed_transaction_update_apply_failure_recovers() {
+    use crate::txn::{CommitError, CommitOutcome};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wal_update_recovery_t.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Safe,
+        &[
+            ("value".to_string(), crate::storage::ColumnType::Int64),
+            ("other".to_string(), crate::storage::ColumnType::Int64),
+        ],
+    )
+    .unwrap();
+    storage
+        .insert_rows(&[HashMap::from([
+            (
+                "value".to_string(),
+                crate::storage::ColumnValue::Int64(7),
+            ),
+            (
+                "other".to_string(),
+                crate::storage::ColumnValue::Int64(1),
+            ),
+        ])])
+        .unwrap();
+    storage.save_full().unwrap();
+    drop(storage);
+
+    let session = crate::Session::new(dir.path(), &path);
+    let mgr = crate::txn::txn_manager();
+    let txn_id = mgr.begin();
+    session
+        .execute_in_txn(
+            txn_id,
+            SqlParser::parse(
+                "UPDATE wal_update_recovery_t SET value = 9, other = 2 WHERE _id = 1",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+
+    let deltastore_tmp_path = dir
+        .path()
+        .join("wal_update_recovery_t.apex.deltastore.tmp");
+    std::fs::create_dir(&deltastore_tmp_path).unwrap();
+    let error = session
+        .commit_txn(txn_id)
+        .err()
+        .expect("post-marker UPDATE apply failure must be reported");
+    let detail = error
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<CommitError>()
+        .unwrap();
+    assert_eq!(detail.outcome, CommitOutcome::Unknown);
+    assert!(!mgr.is_active(txn_id));
+    std::fs::remove_dir(&deltastore_tmp_path).unwrap();
+
+    let reopened = crate::Session::new(dir.path(), &path);
+    let result = reopened
+        .execute("SELECT value FROM wal_update_recovery_t WHERE _id = 1")
+        .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let values = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    assert_eq!(values.value(0), 9);
 }
 
 #[test]
 fn fast_transaction_update_remains_supported() {
     let dir = tempdir().unwrap();
-    let path = dir.path().join("t.apex");
+    let path = dir.path().join("fast_update_t.apex");
     let storage = OnDemandStorage::create_with_schema_and_durability(
         &path,
         crate::storage::DurabilityLevel::Fast,
@@ -138,11 +208,13 @@ fn fast_transaction_update_remains_supported() {
     let txn_id = crate::txn::txn_manager().begin();
     session.execute_in_txn(
         txn_id,
-        SqlParser::parse("UPDATE t SET value = 9 WHERE _id = 1").unwrap(),
+        SqlParser::parse("UPDATE fast_update_t SET value = 9 WHERE _id = 1").unwrap(),
     ).unwrap();
     session.commit_txn(txn_id).unwrap();
 
-    let result = session.execute("SELECT value FROM t WHERE _id = 1").unwrap();
+    let result = session
+        .execute("SELECT value FROM fast_update_t WHERE _id = 1")
+        .unwrap();
     let batch = result.to_record_batch().unwrap();
     let values = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
     assert_eq!(values.value(0), 9);

@@ -2655,6 +2655,124 @@ fn committed_txn_delete_is_reapplied_on_open() {
 }
 
 #[test]
+fn committed_txn_update_recovery_respects_applied_wal_offset() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("update_replay.apex");
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+            &[("value".to_string(), ColumnType::Int64)],
+        )
+        .unwrap();
+        storage
+            .insert_rows(&[HashMap::from([(
+                "value".to_string(),
+                ColumnValue::Int64(7),
+            )])])
+            .unwrap();
+        storage.save_full().unwrap();
+    }
+
+    // The commit marker reached the WAL, but the update did not reach the
+    // DeltaStore. Opening must replay the unapplied suffix.
+    append_wal_records(
+        &path,
+        &[
+            crate::storage::incremental::WalRecord::TxnBegin { txn_id: 31 },
+            crate::storage::incremental::WalRecord::Update {
+                id: 1,
+                data: HashMap::from([("value".to_string(), crate::data::Value::Int64(9))]),
+                txn_id: 31,
+            },
+            crate::storage::incremental::WalRecord::TxnCommit { txn_id: 31 },
+        ],
+    );
+
+    let assert_overlay = |storage: &OnDemandStorage, expected| {
+        assert_eq!(
+            storage
+                .delta_store
+                .read()
+                .get_updated_value(1, "value"),
+            Some(&crate::data::Value::Int64(expected)),
+        );
+    };
+    {
+        let storage = OnDemandStorage::open_with_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+        )
+        .unwrap();
+        assert_overlay(&storage, 9);
+    }
+    {
+        let storage = OnDemandStorage::open_with_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+        )
+        .unwrap();
+        assert_overlay(&storage, 9);
+
+        // A later ordinary update must not be overwritten by an older WAL
+        // UPDATE once the applied offset covers that record.
+        storage.delta_update_row(
+            1,
+            &HashMap::from([("value".to_string(), crate::data::Value::Int64(11))]),
+        );
+        storage.save_delta_store().unwrap();
+    }
+    {
+        let storage = OnDemandStorage::open_with_durability(
+            &path,
+            crate::storage::DurabilityLevel::Safe,
+        )
+        .unwrap();
+        assert_overlay(&storage, 11);
+        storage.compact().unwrap();
+    }
+    let storage = OnDemandStorage::open_with_durability(
+        &path,
+        crate::storage::DurabilityLevel::Safe,
+    )
+    .unwrap();
+    let columns = storage.read_columns(Some(&["value"]), 0, None).unwrap();
+    match &columns["value"] {
+        ColumnData::Int64(values) => assert_eq!(values, &[11]),
+        other => panic!("expected int64 column, got {other:?}"),
+    }
+    drop(storage);
+
+    // Transaction ids restart after a process restart. An old Commit for the
+    // same id must not make a new, uncommitted UPDATE replayable.
+    append_wal_records(
+        &path,
+        &[
+            crate::storage::incremental::WalRecord::TxnBegin { txn_id: 31 },
+            crate::storage::incremental::WalRecord::Update {
+                id: 1,
+                data: HashMap::from([("value".to_string(), crate::data::Value::Int64(13))]),
+                txn_id: 31,
+            },
+        ],
+    );
+    let storage = OnDemandStorage::open_with_durability(
+        &path,
+        crate::storage::DurabilityLevel::Safe,
+    )
+    .unwrap();
+    assert_eq!(
+        storage.delta_store.read().get_updated_value(1, "value"),
+        None,
+    );
+    let columns = storage.read_columns(Some(&["value"]), 0, None).unwrap();
+    match &columns["value"] {
+        ColumnData::Int64(values) => assert_eq!(values, &[11]),
+        other => panic!("expected int64 column, got {other:?}"),
+    }
+}
+
+#[test]
 fn auto_commit_insert_missing_from_delta_is_reconstructed() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("autocommit.apex");

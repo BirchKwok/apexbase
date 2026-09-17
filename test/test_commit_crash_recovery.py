@@ -253,9 +253,7 @@ def test_cross_table_apply_failure_is_unknown(tmp_path):
 
 
 @pytest.mark.parametrize("durability", ["safe", "max"])
-def test_wal_backed_transaction_update_is_rejected_before_wal_write(
-    tmp_path, durability
-):
+def test_wal_backed_transaction_update_commits_and_survives_reopen(tmp_path, durability):
     c = ApexClient(str(tmp_path), _auto_manage=False, durability=durability)
     c.create_table("t", {"name": "string", "value": "int"})
     c.use_table("t")
@@ -267,14 +265,10 @@ def test_wal_backed_transaction_update_is_rejected_before_wal_write(
     c._storage.execute("BEGIN")
     c._in_txn = True
     c.execute("UPDATE t SET value = 9 WHERE _id = 1")
-    with pytest.raises(
-        RuntimeError,
-        match="commit_outcome=not_committed.*UPDATE WAL recovery",
-    ):
-        c.execute("COMMIT")
+    c.execute("COMMIT")
     assert c._in_txn is False
-    assert wal_path.stat().st_size == wal_len
-    assert c.execute("SELECT value FROM t WHERE _id = 1").scalar() == 7
+    assert wal_path.stat().st_size > wal_len
+    assert c.execute("SELECT value FROM t WHERE _id = 1").scalar() == 9
 
     c._storage.execute("BEGIN")
     c._in_txn = True
@@ -287,6 +281,33 @@ def test_wal_backed_transaction_update_is_rejected_before_wal_write(
     ) as reopened:
         reopened.use_table("t")
         assert reopened.execute("SELECT name, value FROM t ORDER BY _id").to_dict() == [
-            {"name": "seed", "value": 7},
+            {"name": "seed", "value": 9},
             {"name": "next", "value": 8},
+        ]
+
+
+def test_wal_backed_transaction_update_apply_failure_recovers(tmp_path):
+    c = ApexClient(str(tmp_path), _auto_manage=False, durability="safe")
+    c.create_table("t", {"value": "int", "other": "int"})
+    c.use_table("t")
+    c.store([{"value": 7, "other": 1}])
+    c.flush()
+
+    c._storage.execute("BEGIN")
+    c._in_txn = True
+    c.execute("UPDATE t SET value = 9, other = 2 WHERE _id = 1")
+    fault = tmp_path / "t.apex.deltastore.tmp"
+    fault.mkdir()
+    try:
+        with pytest.raises(RuntimeError, match="commit_outcome=unknown"):
+            c.execute("COMMIT")
+        assert c._in_txn is False
+    finally:
+        fault.rmdir()
+    c.close()
+
+    with ApexClient(str(tmp_path), _auto_manage=False, durability="safe") as reopened:
+        reopened.use_table("t")
+        assert reopened.execute("SELECT value, other FROM t WHERE _id = 1").to_dict() == [
+            {"value": 9, "other": 2},
         ]

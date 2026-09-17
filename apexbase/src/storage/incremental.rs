@@ -1700,6 +1700,53 @@ mod tests {
     }
 
     #[test]
+    fn test_wal_update_record_roundtrip_preserves_value_types() {
+        let values = HashMap::from([
+            ("null".to_string(), Value::Null),
+            ("bool".to_string(), Value::Bool(true)),
+            ("i8".to_string(), Value::Int8(-8)),
+            ("i16".to_string(), Value::Int16(-16)),
+            ("i32".to_string(), Value::Int32(-32)),
+            ("i64".to_string(), Value::Int64(-64)),
+            ("u8".to_string(), Value::UInt8(8)),
+            ("u16".to_string(), Value::UInt16(16)),
+            ("u32".to_string(), Value::UInt32(32)),
+            ("u64".to_string(), Value::UInt64(u64::MAX)),
+            ("f32".to_string(), Value::Float32(1.25)),
+            ("f64".to_string(), Value::Float64(2.5)),
+            ("string".to_string(), Value::String("value".to_string())),
+            ("binary".to_string(), Value::Binary(vec![0, 1, 2])),
+            ("blob".to_string(), Value::Blob(vec![3, 4, 5])),
+            ("fixed".to_string(), Value::FixedList(vec![6, 7, 8, 9])),
+            ("json".to_string(), Value::Json(serde_json::json!({"k": 1}))),
+            ("timestamp".to_string(), Value::Timestamp(123456)),
+            ("date".to_string(), Value::Date(42)),
+            (
+                "array".to_string(),
+                Value::Array(vec![Value::Int64(1), Value::String("two".to_string())]),
+            ),
+        ]);
+        let record = WalRecord::Update {
+            id: 17,
+            data: values.clone(),
+            txn_id: 23,
+        };
+
+        let bytes = record.to_bytes();
+        let (parsed, consumed) =
+            WalRecord::from_bytes_versioned(&bytes, WAL_VERSION).unwrap();
+        assert_eq!(consumed, bytes.len());
+        match parsed {
+            WalRecord::Update { id, data, txn_id } => {
+                assert_eq!(id, 17);
+                assert_eq!(txn_id, 23);
+                assert_eq!(data, values);
+            }
+            other => panic!("expected UPDATE record, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_incremental_storage_basic() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("test.apex");
