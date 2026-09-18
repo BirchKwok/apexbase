@@ -29,6 +29,9 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 最新 S2 最终验收见第 9.2 节：`local-perf-results/s2-acceptance-20260917/`
 （canary 首轮 exit 1 经 current 侧独立复测登记为瞬时干扰，canary 重跑与 full
 均 exit 0；G1 清单更正并关闭三项真实缺口）。
+最新 S3 见第 10 节：`local-perf-results/s3-acceptance-20260917/`（功能链全过；
+canary 两轮与 full 主比较在 host load 5.7-12.0 下标记同一类聚合/集合形状，
+登记为环境受限原始例外，干净机器复核列为验收债务 V1）。
 
 ## 2. 优先级、依赖和交付边界
 
@@ -39,7 +42,7 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 | 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | C3.1–C3.2 已实现并完成最终统一验收（full 原始噪音例外见 7.3）；S1 可开始 |
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | S1.1–S1.3 已实现并完成最终统一验收（2026-09-17，canary/full 对 base `2c2e471` 均 exit 0）；S2/S3 可开始 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | G1 已逐项关闭（含清单更正、CTE 泄漏修复、planner 缓存上限），G2/G3 仍按独立评审保留；已通过最终统一验收（2026-09-17，canary/full 对 base `0059029` 均 exit 0）；S3 可开始 |
-| 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 待实施，依赖 S1 |
+| 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 已实现并功能验证（流式执行、有界通道、schema 缓存、Rust/Python 测试）；本轮性能门禁在机器高负载下登记为环境受限原始例外，待干净机器复核（V1）；Q1 可开始但需携带该债务 |
 | 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | 待实施，依赖 C/S 基础 |
 | 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 待实施，依赖 S1，文档澄清先做 |
 | 9 | P2 / M1 | 剩余职责与文档收敛 | 以重复决策/依赖减少为标准拆 backend 和路由；能力表、限制和 fallback 单源；不按行数制造抽象 | 待实施，与对应边界一起推进 |
@@ -167,6 +170,17 @@ canary/full 均须退出 0，A/B 仅用于诊断；指标集合随仓库扩展�
   首轮 exit 1 经复测登记为瞬时干扰）、full exit 0（main 109/109、qps 10/10、
   quant 8/8、idx 4/4、par 4/4）。完整记录见第 9 节。S2 状态：已实现 +
   功能已验证 + 性能已验收。
+- S3 实施与验证（2026-09-17）：新增 `execute_streaming_select`（单表投影
+  SELECT 按行组流式，门控只放行与 `execute` 逐值一致的形状），Session/
+  Database 暴露 `execute_streaming`；Flight `do_get` 经容量 2 的通道流式交付
+  （有界内存、慢消费者背压、断连取消），非流式形状回落物化并按 64K 行切片；
+  `get_flight_info`/`get_schema` 从首个行组取 schema 或执行一次并缓存（256
+  上限），`total_records=-1`。功能：pytest 1802 passed、cargo test 580+6、
+  `--features flight` 584 passed、公开 benchmark exit 0。性能：canary 两轮与
+  full 主比较在 host load 5.7-12.0（Spotlight/WindowServer/Chrome 等）下标记
+  同一类聚合/集合形状；原始 exit 1 与全部样本保留，登记为环境受限例外，干净
+  机器复核列为验收债务 V1。完整记录见第 10 节。S3 状态：已实现 + 功能已验证 +
+  性能证据待干净机器复核。
 
 ## 6. 第二批 C2：UPDATE、Safe/Max 与恢复一致性
 
@@ -531,3 +545,81 @@ G2（`STORAGE_CACHE` 与 `StorageEngine.cache` 双读 backend 缓存合并）与
 
 S2 状态据此记为“G1 已逐项关闭 + 功能已验证 + 性能已验收（canary 首轮原始
 噪音例外已登记）”；G2/G3 仍待独立评审。
+
+## 10. 第六批 S3：Flight 分批桥接与协议资源边界
+
+S3 依据 A5 与 R4 余项，把 `do_get` 从“整体物化 + 单批次编码”改为按行组流式
+交付，并让 schema 请求不再完整执行查询。起点（base）为 S2 验收提交
+`7ed760fbddf0eadcfd322ddbc37cbf98fc8a68ea`；current 为 `db971ee`。
+
+### 10.1 流式执行与门控
+
+- `ApexExecutor::execute_streaming_select`：对单表投影 SELECT 走
+  `TableStorageBackend::scan_batches` 的稳定持久化读视图，逐行组产出
+  `RecordBatch`；`emit` 返回 false 即停止（消费者断开）。
+- 门控只放行与 `execute` 输出逐值一致的形状：`SELECT *` 或按 SELECT 顺序的
+  纯列投影，WHERE 必须能转成 `ScanPredicateExpr`（类型化谓词下推）；聚合、
+  Join、排序、LIMIT/OFFSET、表达式、别名、EXCLUDE/REPLACE/COLUMNS、窗口、
+  delta/内存视图一律返回 `None` 回落物化路径。Rust A/B 测试把流式批次拼接
+  后与物化结果逐值比较（6 种形状），并覆盖“首个批次后拒绝即停止”。
+- `Session::execute_streaming` / `Database::execute_streaming` 暴露同一入口，
+  flight 模块继续只依赖 session façade（phase23 契约测试保持通过），嵌入式
+  点查路径不新增任何锁或预算安装。
+
+### 10.2 Flight 输出端
+
+- `do_get` 在 `spawn_blocking` 里运行生产者，经容量 2 的 `tokio::sync::mpsc`
+  通道喂给 gRPC 流：服务端内存由“一个行组 + 通道”封顶，慢消费者形成背压，
+  断连 drop 接收端后生产者在下个批次边界停止。非流式形状回落物化结果，并按
+  65536 行切片交付，避免单个 Flight 消息过大。
+- `get_flight_info` / `get_schema` 不再执行完整查询：流式形状从首个行组批次
+  取 schema，其余形状执行一次；IPC schema 按 SQL 缓存（256 条上限）。
+  `total_records` 改为 `-1`（未计数），客户端从 `do_get` 得到精确结果。
+
+### 10.3 测试与验收（2026-09-17）
+
+新增测试：
+
+- Rust（默认特性）：`streaming_select_matches_materialized_result`（6 种形状
+  的流式/物化 A/B 逐值一致）、`streaming_select_rejects_shapes_outside_the_gate`、
+  `streaming_select_stops_when_the_consumer_rejects_a_batch`。
+- Rust（`--features flight`）：`do_get_streams_row_groups_in_order`、
+  `do_get_falls_back_for_non_streamable_shapes`、
+  `schema_requests_do_not_execute_the_result`（schema 与流式批次一致）、
+  `dropping_the_response_stream_stops_the_producer`。
+- 同时修正 S1 预算测试的进程级扫描开关竞争（持 `BATCH_SCAN_ENV_LOCK` 并固定
+  `APEX_BATCH_SCAN` / `APEX_PARALLEL_SCAN`）。
+
+功能验收：`maturin develop --release` 成功；完整串行 `pytest` 1802 passed
+（36.06 s）；完整 `cargo test --release` 580 单元 + 6 doc-test；`cargo test
+--release --features flight` 584 单元通过；公开 benchmark（1M/2/5）exit 0。
+
+性能验收：本轮未能取得可判定的干净结果，原始门禁按环境噪音登记：
+
+- 公开比较仍对旧基线 `492956bb` 列出 6 项单次差异（EXCEPT/INTERSECT ordered、
+  GROUP BY city、GROUP BY category ORDER BY count、Insert+COUNT visible、
+  UNION DISTINCT ordered），均为方差敏感的聚合/集合形状；S3 未改默认构建的
+  聚合逻辑（同套件在 S1 列 2 项、S2 列 6 项不同指标）。
+- canary（200K/2/7）两轮原始 exit 1：首轮 `Derived ratio GROUP BY` +64.85%、
+  `Multiple COUNT DISTINCT` +24.30%；重跑增加 `CSV filtered GROUP BY + HAVING`
+  +20.74% 与 `Numeric conjunction aggregation` +37.55%（每轮集合不同）。六次
+  current 侧独立 canary 复测显示其中 3 项中位数回到或接近 base（多个
+  COUNT DISTINCT +3%、CSV filtered +2.8%），`Derived ratio GROUP BY` 中位数
+  0.734ms（min 0.581 / max 1.076，base guard 0.627/0.598），且该指标历史上有
+  双侧双峰尖峰（S1 canary 原始样本 base 2.03ms、current 4.25ms）。
+- full（1M/2/5）原始 exit 1：qps 10/10、quant 8/8、idx 4/4、par 4/4 通过；
+  主比较五样本终判保留 `IN subquery COUNT` +19.29% 与 `UNION DISTINCT
+  (ordered)` +27.89%（初判的 `GROUP BY category ORDER BY count` +22.14% 已
+  恢复）。两侧样本都出现 2-3 倍尖峰（如 IN subquery COUNT base 3.047ms、
+  UNION DISTINCT base 1.749ms），低峰两侧一致，current 中位数落在高峰。
+- 环境：全部运行时 10 核主机 load 5.7-12.0，后台有 Spotlight `mds` 重建索引
+  （95 GiB 构建清理后）、WindowServer 57%、airportd 55%、Chrome/WeChat 等。
+  计划在 C1 记录里已登记过同类波动（EXISTS/IN subquery COUNT 0.757→2.700ms
+  经独立复测回到 0.66ms）。
+
+处理：不删除样本、不调阈值、不把失败门禁改称通过；两轮 canary 与 full 主比较
+的原始报告全部保留在 `local-perf-results/s3-acceptance-20260917/`，登记为
+**环境受限原始例外**。干净机器上对上述聚合/集合形状的复核列为验收债务 V1，
+在下一次架构阶段验收时一并执行。
+
+S3 状态：已实现 + 功能已验证 + 性能证据待干净机器复核（V1）。
