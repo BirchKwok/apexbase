@@ -120,6 +120,18 @@ impl<'a> Session<'a> {
         Database::execute(sql, self.base_dir, self.table_path)
     }
 
+    /// Stream a simple SELECT in row-group batches (S3); `emit` returns false
+    /// to stop early. `Ok(None)` means the query must run through `execute`.
+    #[inline]
+    pub fn execute_streaming(
+        &self,
+        sql: &str,
+        emit: &mut dyn FnMut(RecordBatch) -> bool,
+    ) -> io::Result<Option<u64>> {
+        let _scope = self.enter();
+        Database::execute_streaming(sql, self.base_dir, self.table_path, emit)
+    }
+
     #[inline]
     pub(crate) fn execute_classified(
         &self,
@@ -519,6 +531,19 @@ impl Database {
     #[inline]
     pub fn query(sql: &str, base_dir: &Path, table_path: &Path) -> io::Result<RecordBatch> {
         Self::execute(sql, base_dir, table_path)?.to_record_batch()
+    }
+
+    /// Stream a simple SELECT in row-group batches (S3). `emit` returns false
+    /// to stop early; `Ok(None)` means the shape is outside the streaming gate
+    /// and the caller must use [`Database::execute`].
+    #[inline]
+    pub(crate) fn execute_streaming(
+        sql: &str,
+        base_dir: &Path,
+        table_path: &Path,
+        emit: &mut dyn FnMut(RecordBatch) -> bool,
+    ) -> io::Result<Option<u64>> {
+        ApexExecutor::execute_streaming_select(sql, base_dir, table_path, emit)
     }
 
     #[inline]

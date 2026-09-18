@@ -5440,3 +5440,104 @@ fn failed_shared_cte_releases_its_materialized_batch() {
     let batch = session.execute(ok).unwrap().to_record_batch().unwrap();
     assert_eq!(batch.num_rows(), 2);
 }
+
+// ============================================================================
+// S3: streaming SELECT over the stable read view
+// ============================================================================
+
+fn stream_select(path: &Path, sql: &str) -> Option<Vec<RecordBatch>> {
+    let base_dir = path.parent().unwrap();
+    let mut batches: Vec<RecordBatch> = Vec::new();
+    let rows = ApexExecutor::execute_streaming_select(sql, base_dir, path, &mut |batch| {
+        batches.push(batch);
+        true
+    })
+    .unwrap();
+    rows.map(|_| batches)
+}
+
+#[test]
+fn streaming_select_matches_materialized_result() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("stream_select_ab.apex");
+    create_batch_scan_fixture(&path);
+
+    let queries = [
+        // Whole table: exercises the all-columns projection across row groups.
+        "SELECT * FROM default",
+        // Plain projection.
+        "SELECT code, city FROM default",
+        // Pushed-down typed predicate.
+        "SELECT code, amount FROM default WHERE code >= 1 AND amount IS NOT NULL",
+        // Range predicate and float column.
+        "SELECT city, score FROM default WHERE score BETWEEN 20 AND 40",
+        // IN predicate is pushed down into the scan as well.
+        "SELECT code, city FROM default WHERE code IN (1, 2)",
+        // Explicit _id projection keeps the internal column.
+        "SELECT _id, code FROM default",
+    ];
+    for sql in queries {
+        let streamed = stream_select(&path, sql)
+            .unwrap_or_else(|| panic!("{sql} must take the streaming gate"));
+        assert!(
+            !streamed.is_empty(),
+            "{sql} must produce at least one batch"
+        );
+        let schema = streamed[0].schema();
+        let combined = arrow::compute::concat_batches(&schema, &streamed).unwrap();
+        let expected = ApexExecutor::execute(sql, &path)
+            .unwrap()
+            .to_record_batch()
+            .unwrap();
+        assert_batches_logically_equal(&expected, &combined, sql);
+    }
+}
+
+#[test]
+fn streaming_select_rejects_shapes_outside_the_gate() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("stream_select_gate.apex");
+    create_batch_scan_fixture(&path);
+    let base_dir = dir.path();
+
+    for sql in [
+        "SELECT COUNT(*) FROM default",
+        "SELECT code, COUNT(*) FROM default GROUP BY code",
+        "SELECT * FROM default ORDER BY code",
+        "SELECT * FROM default LIMIT 10",
+    ] {
+        let mut emitted = 0usize;
+        let result = ApexExecutor::execute_streaming_select(sql, base_dir, &path, &mut |_| {
+            emitted += 1;
+            true
+        })
+        .unwrap();
+        assert!(result.is_none(), "{sql} must fall back to the materialized path");
+        assert_eq!(emitted, 0, "{sql} must not emit before falling back");
+    }
+}
+
+#[test]
+fn streaming_select_stops_when_the_consumer_rejects_a_batch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("stream_select_stop.apex");
+    create_batch_scan_fixture(&path);
+    let base_dir = dir.path();
+
+    let mut batches = 0usize;
+    let mut seen_rows = 0u64;
+    let rows = ApexExecutor::execute_streaming_select(
+        "SELECT * FROM default",
+        base_dir,
+        &path,
+        &mut |batch| {
+            batches += 1;
+            seen_rows += batch.num_rows() as u64;
+            false
+        },
+    )
+    .unwrap()
+    .expect("streamable shape");
+    assert_eq!(batches, 1, "a rejected batch must stop the stream");
+    assert_eq!(rows, seen_rows);
+}

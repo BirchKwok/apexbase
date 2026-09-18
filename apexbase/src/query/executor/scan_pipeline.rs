@@ -1,6 +1,146 @@
 // Scan-predicate GROUP BY fast paths: filter+group+order, cached transform/ratio/numeric, v4.
 
 impl ApexExecutor {
+    /// Stream a single-table projection SELECT in row-group batches over the
+    /// stable persisted read view (S3).
+    ///
+    /// `emit` receives one `RecordBatch` per row group and returns `false` to
+    /// stop early (the consumer disconnected or rejected the batch). Returns
+    /// `Ok(None)` when the statement shape, projection or table state is
+    /// outside the streaming gate, so the caller falls back to the
+    /// materialized path. Only shapes whose output is identical to
+    /// `execute` (verified by the parity test) are admitted.
+    pub(crate) fn execute_streaming_select(
+        sql: &str,
+        base_dir: &Path,
+        default_table_path: &Path,
+        emit: &mut dyn FnMut(RecordBatch) -> bool,
+    ) -> io::Result<Option<u64>> {
+        use crate::query::sql_parser::{FromItem, SqlStatement};
+
+        // Keep the per-query context consistent with the materialized path;
+        // a streamed scan holds one row group, so the budget is not charged.
+        let _memory_budget = QueryMemoryBudgetGuard::ensure();
+
+        let stmt = match crate::query::sql_parser::SqlParser::parse(sql) {
+            Ok(SqlStatement::Select(stmt)) => stmt,
+            _ => return Ok(None),
+        };
+        if stmt.distinct
+            || stmt.distinct_on.is_some()
+            || !stmt.joins.is_empty()
+            || !stmt.group_by.is_empty()
+            || stmt.group_by_exprs.iter().any(Option::is_some)
+            || stmt.having.is_some()
+            || !stmt.order_by.is_empty()
+            || stmt.limit.is_some()
+            || stmt.offset.is_some()
+            || stmt.window_row_number_limit.is_some()
+        {
+            return Ok(None);
+        }
+        // Projection: `SELECT *` or plain columns in SELECT order. Aliases
+        // would rename output fields, and expressions/aggregates/EXCLUDE/
+        // REPLACE/COLUMNS/windows keep their materialized path. The
+        // materialized path reads the sorted `required_columns`, so it is the
+        // scan projection order here that must match the SELECT list.
+        let mut all_columns = false;
+        let mut projection_names: Vec<String> = Vec::new();
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::All => {
+                    if !projection_names.is_empty() {
+                        return Ok(None);
+                    }
+                    all_columns = true;
+                }
+                SelectColumn::Column(name) => {
+                    if all_columns {
+                        return Ok(None);
+                    }
+                    let clean = name.trim_matches('"');
+                    let clean = clean.rsplit('.').next().unwrap_or(clean);
+                    projection_names.push(clean.trim_matches('"').to_string());
+                }
+                _ => return Ok(None),
+            }
+        }
+        let Some(FromItem::Table { table, .. }) = &stmt.from else {
+            return Ok(None);
+        };
+        let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
+        if !table_path.exists() {
+            return Ok(None);
+        }
+        let backend = match get_cached_backend(&table_path) {
+            Ok(backend) => backend,
+            Err(_) => return Ok(None),
+        };
+        let predicate = match &stmt.where_clause {
+            None => None,
+            Some(expr) => match Self::build_scan_predicate(expr) {
+                Some(predicate) => Some(predicate),
+                None => return Ok(None),
+            },
+        };
+        let projection: Option<Vec<String>> = if all_columns {
+            None
+        } else {
+            let mut seen = std::collections::HashSet::new();
+            if !projection_names
+                .iter()
+                .all(|name| seen.insert(name.clone()))
+            {
+                return Ok(None);
+            }
+            let refs: Vec<&str> = projection_names.iter().map(String::as_str).collect();
+            match Self::filter_columns_for_backend(&backend, &refs) {
+                Some(filtered) if filtered.len() == refs.len() => {
+                    Some(filtered.into_iter().map(str::to_string).collect())
+                }
+                _ => return Ok(None),
+            }
+        };
+        let projection_refs: Option<Vec<&str>> = projection
+            .as_ref()
+            .map(|columns| columns.iter().map(String::as_str).collect());
+        let request = crate::storage::ScanRequest {
+            projection: projection_refs.as_deref(),
+            predicate: predicate.as_ref(),
+        };
+        let Some(stream) = backend.scan_batches(&request)? else {
+            return Ok(None);
+        };
+
+        // Pull the first morsel before emitting: an unsupported batch can
+        // still fall back without having produced partial output. A later
+        // `Unsupported` is an error, because falling back would duplicate the
+        // rows already emitted.
+        let mut emitted_any = false;
+        let mut rows: u64 = 0;
+        for outcome in stream {
+            match outcome? {
+                crate::storage::BatchMorselOutcome::Morsel(morsel) => {
+                    let batch = morsel.into_record_batch()?;
+                    rows = rows.saturating_add(batch.num_rows() as u64);
+                    emitted_any = true;
+                    if !emit(batch) {
+                        return Ok(Some(rows));
+                    }
+                }
+                crate::storage::BatchMorselOutcome::Unsupported => {
+                    if emitted_any {
+                        return Err(err_data(
+                            "streaming scan met an unsupported batch after output started",
+                        ));
+                    }
+                    return Ok(None);
+                }
+            }
+        }
+        Ok(Some(rows))
+    }
+
     /// FAST PATH for Complex (Filter+Group+Order) queries.
     /// Uses single-pass execution with direct dictionary indexing.
     fn try_fast_filter_group_order(

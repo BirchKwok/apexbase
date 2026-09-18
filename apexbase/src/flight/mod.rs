@@ -61,3 +61,6 @@ pub async fn start_flight_server(config: FlightConfig) -> Result<(), Box<dyn std
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

@@ -6,8 +6,21 @@
 //!                       body: sql_bytes })
 //!   list_actions()                         → describes available actions
 //!   get_flight_info(FlightDescriptor{cmd}) → returns schema + ticket for a query
+//!
+//! `do_get` streams simple single-table SELECTs as the executor produces
+//! row-group batches (S3): the blocking producer runs inside a
+//! `spawn_blocking` task and feeds a small bounded channel, so server memory
+//! is bounded by the row group plus the channel, a slow consumer applies
+//! backpressure, and a disconnect drops the receiver so the producer stops at
+//! the next batch boundary. Shapes outside the streaming gate (aggregation,
+//! joins, sort, expressions, deltas) fall back to the materialized path and
+//! are delivered in bounded row chunks. Schema requests never materialize the
+//! result: streamable shapes take the schema from the first row-group batch,
+//! other shapes execute once and the IPC schema is cached per SQL.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use arrow_flight::{
     encode::FlightDataEncoderBuilder, flight_service_server::FlightService, Action, ActionType,
@@ -15,8 +28,21 @@ use arrow_flight::{
     HandshakeResponse, PollInfo, PutResult, SchemaResult, Ticket,
 };
 use futures::stream::BoxStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
+
 use tonic::{Request, Response, Status, Streaming};
+
+// ── tunables ─────────────────────────────────────────────────────────────────
+
+/// In-flight batches between the blocking producer and the gRPC stream. Small
+/// on purpose: it bounds server-side delivery buffering and turns a slow
+/// consumer into backpressure instead of unbounded queueing.
+const STREAM_CHANNEL_CAPACITY: usize = 2;
+/// Row cap for the materialized fallback: the result is one batch in memory,
+/// but it is sliced before encoding so no single Flight message is huge.
+const DELIVERY_CHUNK_ROWS: usize = 65_536;
+/// Bounded per-SQL IPC schema cache (the schema is immutable for a SQL text).
+const SCHEMA_CACHE_CAP: usize = 256;
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -28,27 +54,45 @@ fn invalid(msg: impl Into<String>) -> Status {
     Status::invalid_argument(msg.into())
 }
 
-/// Execute SQL through the shared session façade. Runs synchronously (for spawn_blocking).
+/// Execute SQL through the shared session façade. Runs synchronously (for
+/// spawn_blocking).
 fn execute_sql(sql: &str, base_dir: &PathBuf) -> Result<arrow::record_batch::RecordBatch, Status> {
     let default_table_path = base_dir.join("apexbase.apex");
-    let result = crate::Session::new(base_dir, &default_table_path)
+    crate::Session::new(base_dir, &default_table_path)
         .with_root_dir(base_dir)
-        .execute(sql);
-    result
+        .execute(sql)
         .map_err(apex_err)?
         .to_record_batch()
         .map_err(apex_err)
 }
 
-/// Encode a RecordBatch as a stream of Arrow IPC FlightData messages.
-fn batch_to_flight_data(
-    batch: arrow::record_batch::RecordBatch,
-) -> BoxStream<'static, Result<FlightData, Status>> {
-    let batch_stream = futures::stream::once(futures::future::ready(Ok(batch)));
-    FlightDataEncoderBuilder::new()
-        .build(batch_stream)
-        .map_err(|e| Status::internal(e.to_string()))
-        .boxed()
+/// Derive a result schema without materializing the result. Streamable shapes
+/// stop at the first row-group batch; everything else executes once (the IPC
+/// schema is then cached by the caller).
+fn derive_schema(
+    sql: &str,
+    base_dir: &PathBuf,
+) -> Result<arrow::datatypes::SchemaRef, Status> {
+    let default_table_path = base_dir.join("apexbase.apex");
+    let session = crate::Session::new(base_dir, &default_table_path).with_root_dir(base_dir);
+    let mut schema: Option<arrow::datatypes::SchemaRef> = None;
+    let streamed = session
+        .execute_streaming(sql, &mut |batch| {
+            schema = Some(batch.schema());
+            false
+        })
+        .map_err(apex_err)?;
+    if streamed.is_some() {
+        if let Some(schema) = schema {
+            return Ok(schema);
+        }
+    }
+    let batch = session
+        .execute(sql)
+        .map_err(apex_err)?
+        .to_record_batch()
+        .map_err(apex_err)?;
+    Ok(batch.schema())
 }
 
 /// Encode an Arrow Schema as IPC bytes (for FlightInfo / SchemaResult).
@@ -61,15 +105,77 @@ fn schema_ipc_bytes(schema: &arrow::datatypes::Schema) -> Result<bytes::Bytes, S
     Ok(encoded.ipc_message.into())
 }
 
+/// Map an encoder error back onto the gRPC status, preserving a status that
+/// came from the producer.
+fn flight_error_to_status(error: arrow_flight::error::FlightError) -> Status {
+    match error {
+        arrow_flight::error::FlightError::Tonic(status) => *status,
+        other => Status::internal(other.to_string()),
+    }
+}
+
+/// Encode a stream of RecordBatches as Arrow IPC FlightData messages.
+fn encode_batches<S>(stream: S) -> BoxStream<'static, Result<FlightData, Status>>
+where
+    S: Stream<Item = Result<arrow::record_batch::RecordBatch, arrow_flight::error::FlightError>>
+        + Send
+        + 'static,
+{
+    FlightDataEncoderBuilder::new()
+        .build(stream)
+        .map_err(flight_error_to_status)
+        .boxed()
+}
+
+/// Slice one materialized batch into bounded delivery chunks.
+fn chunk_batch(batch: &arrow::record_batch::RecordBatch) -> Vec<arrow::record_batch::RecordBatch> {
+    if batch.num_rows() <= DELIVERY_CHUNK_ROWS {
+        return vec![batch.clone()];
+    }
+    (0..batch.num_rows())
+        .step_by(DELIVERY_CHUNK_ROWS)
+        .map(|start| {
+            batch.slice(
+                start,
+                DELIVERY_CHUNK_ROWS.min(batch.num_rows().saturating_sub(start)),
+            )
+        })
+        .collect()
+}
+
 // ── service ───────────────────────────────────────────────────────────────────
 
 pub struct ApexFlightService {
     base_dir: PathBuf,
+    schema_cache: Mutex<HashMap<String, bytes::Bytes>>,
 }
 
 impl ApexFlightService {
     pub fn new(base_dir: PathBuf) -> Self {
-        Self { base_dir }
+        Self {
+            base_dir,
+            schema_cache: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// IPC schema bytes for `sql`, cached per SQL text. Does not materialize
+    /// the result for streamable shapes.
+    async fn schema_for(&self, sql: &str) -> Result<bytes::Bytes, Status> {
+        if let Some(bytes) = self.schema_cache.lock().unwrap().get(sql).cloned() {
+            return Ok(bytes);
+        }
+        let base_dir = self.base_dir.clone();
+        let sql_owned = sql.to_string();
+        let schema = tokio::task::spawn_blocking(move || derive_schema(&sql_owned, &base_dir))
+            .await
+            .map_err(apex_err)??;
+        let bytes = schema_ipc_bytes(&schema)?;
+        let mut cache = self.schema_cache.lock().unwrap();
+        if cache.len() >= SCHEMA_CACHE_CAP {
+            cache.clear();
+        }
+        cache.insert(sql.to_string(), bytes.clone());
+        Ok(bytes)
     }
 }
 
@@ -113,12 +219,7 @@ impl FlightService for ApexFlightService {
             return Err(invalid("Empty SQL"));
         }
 
-        let base_dir = self.base_dir.clone();
-        let batch = tokio::task::spawn_blocking(move || execute_sql(&sql, &base_dir))
-            .await
-            .map_err(apex_err)??;
-
-        let schema_bytes = schema_ipc_bytes(batch.schema_ref())?;
+        let schema_bytes = self.schema_for(&sql).await?;
         let ticket = Ticket {
             ticket: descriptor.cmd.clone().into(),
         };
@@ -133,7 +234,10 @@ impl FlightService for ApexFlightService {
             schema: schema_bytes,
             flight_descriptor: Some(descriptor),
             endpoint: vec![endpoint],
-            total_records: batch.num_rows() as i64,
+            // The row count is no longer computed here: reporting it would
+            // require the full execution this metadata path avoids. Clients
+            // get the exact count from `do_get`.
+            total_records: -1,
             total_bytes: -1,
             ordered: false,
             app_metadata: Default::default(),
@@ -163,13 +267,7 @@ impl FlightService for ApexFlightService {
         let sql = std::str::from_utf8(&descriptor.cmd)
             .map_err(|_| invalid("cmd must be valid UTF-8 SQL"))?
             .to_string();
-
-        let base_dir = self.base_dir.clone();
-        let batch = tokio::task::spawn_blocking(move || execute_sql(&sql, &base_dir))
-            .await
-            .map_err(apex_err)??;
-
-        let schema_bytes = schema_ipc_bytes(batch.schema_ref())?;
+        let schema_bytes = self.schema_for(&sql).await?;
         Ok(Response::new(SchemaResult {
             schema: schema_bytes,
         }))
@@ -188,12 +286,47 @@ impl FlightService for ApexFlightService {
 
         log::debug!("Flight do_get: {}", sql);
 
+        let (sender, receiver) = tokio::sync::mpsc::channel(STREAM_CHANNEL_CAPACITY);
         let base_dir = self.base_dir.clone();
-        let batch = tokio::task::spawn_blocking(move || execute_sql(&sql, &base_dir))
-            .await
-            .map_err(apex_err)??;
+        // The blocking producer owns the read view and stops as soon as the
+        // receiver is gone (disconnect) or the consumer keeps up.
+        tokio::task::spawn_blocking(move || {
+            let default_table_path = base_dir.join("apexbase.apex");
+            let session = crate::Session::new(&base_dir, &default_table_path).with_root_dir(&base_dir);
+            let streamed = session.execute_streaming(&sql, &mut |batch| {
+                sender.blocking_send(Ok(batch)).is_ok()
+            });
+            match streamed {
+                Ok(Some(_)) => {}
+                Ok(None) => match session
+                    .execute(&sql)
+                    .map_err(apex_err)
+                    .and_then(|result| result.to_record_batch().map_err(apex_err))
+                {
+                    Ok(batch) => {
+                        for chunk in chunk_batch(&batch) {
+                            if sender.blocking_send(Ok(chunk)).is_err() {
+                                break;
+                            }
+                        }
+                    }
+                    Err(status) => {
+                        let _ = sender.blocking_send(Err(status));
+                    }
+                },
+                Err(error) => {
+                    let _ = sender.blocking_send(Err(apex_err(error)));
+                }
+            }
+        });
 
-        Ok(Response::new(batch_to_flight_data(batch)))
+        let batch_stream = futures::stream::unfold(receiver, |mut receiver| async move {
+            receiver
+                .recv()
+                .await
+                .map(|item| (item.map_err(arrow_flight::error::FlightError::from), receiver))
+        });
+        Ok(Response::new(encode_batches(batch_stream)))
     }
 
     // ── do_put: not yet implemented ───────────────────────────────────────────
