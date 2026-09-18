@@ -20,8 +20,8 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `STORAGE_CACHE` | 执行器 | `PathBuf`（表路径） | 打开的 `TableStorageBackend`（mmap 所有者之一） | 64 条，LRU | 写入后 `invalidate_storage_cache[_dir]`；epoch/mtime 变化时读路径自动重建 | 进程退出（mmap 随进程释放） | 无（进程本地）；跨进程写序列化靠 `TABLE_WRITE_LOCKS` 的 flock |
 | `TABLE_WRITE_LOCKS` | 执行器 | `PathBuf`（表路径） | 每表 `Mutex` + 常驻 `.lock` 文件句柄 | 无上限（随表数增长） | 不失效（锁文件持久存在） | 进程退出 | fs2 `flock_exclusive`，跨进程互斥 |
-| `SQL_PARSE_CACHE` | 执行器 | SQL 文本 | `Vec<SqlStatement>` 解析结果 | **无上限**（见 §2 缺口 G1） | 不失效（SQL 文本不可变） | 进程退出 | 无 |
-| `CTE_BATCH_CACHE` | 执行器 | CTE 临时文件路径 | CTE 子查询的 Arrow 批次 | 无上限（见 G1） | 语句结束时按路径移除 | 进程退出 | 无 |
+| `SQL_PARSE_CACHE` | 执行器 | SQL 文本 | `Vec<SqlStatement>` 解析结果 | 1024 条；满后停止收录（S2 审计确认） | 不失效（SQL 文本不可变） | 进程退出 | 无 |
+| `CTE_BATCH_CACHE` | 执行器 | CTE 临时文件路径 | CTE 子查询的 Arrow 批次 | 语句作用域（同时在飞的共享 CTE 数）；S2 起 RAII 保证成功/失败都移除 | 语句结束/失败时按路径移除 | 进程退出 | 无 |
 | `INDEX_CACHE` | 执行器 | `base_dir/table_name` | `IndexManager`（磁盘索引目录） | 32 容量提示 | 写入后 `invalidate_index_cache[_dir]`；epoch 变化时读路径自动重载 | 进程退出 | 无 |
 | `FTS_MANAGER_CACHE` / `FTS_BACKFILL_TASKS` | 执行器 | 表路径 / (表路径, 列) | FTS 索引管理器、后台回填任务 | 随表数增长（见 G1） | FTS 重建/失效入口 | 进程退出（回填线程为 detached） | 无 |
 | `QUERY_ROOT_DIR` / `TEMP_DIR`（thread-local） | `Session`（façade） | 当前线程 | 调用方传入的 root/temp 目录 | — | `Session` drop 时 RAII 恢复 | 每查询 | 无（线程本地；R4 起调度器工作线程也会收到，见 §3） |
@@ -34,9 +34,9 @@
 
 | 状态 | owner | key | 数据来源 | 容量 | 失效时机 | 关闭时机 | 跨进程 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `CLASSIFY_CACHE`（query_signature.rs） | 查询签名分类器 | SQL 文本 | `QuerySignature` | 无上限（见 G1） | 不失效 | 进程退出 | 无 |
-| `STATS_CACHE`（planner.rs） | 查询规划器 | 表 key | 表统计 + 观察时间 | 无上限（见 G1） | 写入后 `invalidate_table_stats` | 进程退出 | 无 |
-| `PLAN_FEEDBACK`（planner.rs） | 查询规划器 | (表 key, 查询形状) | 计划反馈：行维度估计/实际行数滑动均值 + 按实际执行成本类（scan/index/parallel，R5.12 并行批量扫描独立成本类）的模型成本与实测时间滑动均值（R5.3 时间校准）；持久化于每表 sidecar `<table>.plan_feedback`（bincode + 版本，R5.12 起版本 2），每进程惰性加载一次，随表文件回收（R5.8） | 无上限（见 G1；sidecar 条目数 = 曾 EXPLAIN ANALYZE 的形状数） | 仅 EXPLAIN ANALYZE 记录（记录时同步写 sidecar） | 进程退出（内存态）；sidecar 跨会话持久 | 有（sidecar 文件；他进程更新仅在本进程下次启动时可见） |
+| `CLASSIFY_CACHE`（query_signature.rs） | 查询签名分类器 | SQL 文本 | `QuerySignature` | 512 条；满后整体清空（S2 审计确认） | 不失效 | 进程退出 | 无 |
+| `STATS_CACHE`（planner.rs） | 查询规划器 | 表 key | 表统计 + 观察 epoch + 插入序号 | 1024 条 FIFO（S2 起；被逐出表在下次访问时从 sidecar 重读） | 写入后 `invalidate_table_stats` | 进程退出 | 无 |
+| `PLAN_FEEDBACK`（planner.rs） | 查询规划器 | (表 key, 查询形状) | 计划反馈：行维度估计/实际行数滑动均值 + 按实际执行成本类（scan/index/parallel，R5.12 并行批量扫描独立成本类）的模型成本与实测时间滑动均值（R5.3 时间校准）；持久化于每表 sidecar `<table>.plan_feedback`（bincode + 版本，R5.12 起版本 2），每进程惰性加载一次，随表文件回收（R5.8） | 每表 256 个形状、进程内 256 张表（S2 起）；逐出观测样本最少者，sidecar 随内存快照一起收缩 | 仅 EXPLAIN ANALYZE 记录（记录时同步写 sidecar） | 进程退出（内存态）；sidecar 跨会话持久 | 有（sidecar 文件；他进程更新仅在本进程下次启动时可见） |
 | `JIT_FILTER_CACHE`（jit.rs） | JIT 过滤器 | 谓词模式 | 编译后的过滤闭包 | 有界（内部 LRU） | 内部驱逐 | 进程退出 | 无 |
 | `PARALLEL_SCAN_TOKENS`（executor/batch_group.rs） | 查询执行器（并行批量管道 worker 预算，R5.7/R5.11） | —（进程级计数） | 在飞并行扫描+折叠 worker token 池（`APEX_PARALLEL_SCAN` 显式诊断路径 + R5.12 成本自动启用路径，后两者共用同一预算） | `min(hardware_concurrency - 1, 8)`（R5.11 实测曲线/矩阵定案），惰性初始化（首次并行请求前零状态） | 每查询取 `min(请求, 可用)`，<2 退串行；RAII guard 查询结束归还 | 进程退出 | 无（仅计数，不保留查询数据） |
 
@@ -50,8 +50,8 @@
 | `StorageEngine.memory_tables` | 同上 | `PathBuf` | 内存表 backend（权威，非缓存） | 无上限（见 G1） | `drop_memory_table` / `drop_memory_database` | 内存库 drop；进程退出 | 无 |
 | `TABLE_EPOCHS` / `GLOBAL_EPOCH`（epoch.rs） | 存储 epoch 模块 | `PathBuf` | 逻辑写入发布计数 | 随表数增长 | 逻辑写入提交时发布 | 进程退出 | 无（每进程独立计数；跨进程可见性靠文件 mtime+flock） |
 | `GLOBAL_DICT_CACHE` + 字节/时钟计数器（backend.rs） | 存储 backend | `(PathBuf, 列)` | 全局字典（低基数列） | 字节上限 + 时钟驱逐 | `invalidate_global_dict_cache`（写入后） | 进程退出 | 无 |
-| `GLOBAL_COLUMN_NULL_CACHE` | 存储 backend | `(PathBuf, 列)` | NULL 判定 + mtime + epoch | 无上限（见 G1） | mtime/epoch 变化时读路径失效 | 进程退出 | 无 |
-| `GLOBAL_DICT_HIGH_CARD_CACHE` | 存储 backend | `(PathBuf, 列)` | 高基数负缓存 | 无上限（见 G1） | mtime/epoch 变化时读路径失效 | 进程退出 | 无 |
+| `GLOBAL_COLUMN_NULL_CACHE` | 存储 backend | `(PathBuf, 列)` | NULL 判定 + mtime + epoch | `GLOBAL_DICT_CACHE_MAX_ENTRIES * 2` 条，满后不再收录新键（S2 审计确认） | mtime/epoch 变化时读路径失效 | 进程退出 | 无 |
+| `GLOBAL_DICT_HIGH_CARD_CACHE` | 存储 backend | `(PathBuf, 列)` | 高基数负缓存 | `GLOBAL_DICT_CACHE_MAX_ENTRIES * 2` 条，满后不再收录新键（S2 审计确认） | mtime/epoch 变化时读路径失效 | 进程退出 | 无 |
 | `DELTA_*_CACHE`（on_demand/storage_core.rs：字符串索引、数值范围、行数、批次） | on-demand 存储 | `PathBuf` / `(PathBuf, 列)` | delta 文件内容 | 字节/条目上限（内部） | delta 落盘/合并后失效 | 进程退出 | 无 |
 | `CATALOGS`（table_catalog.rs） | 表目录模块 | `PathBuf`（base dir） | 映射的 catalog 文件 | 随库数增长 | 目录变更入口 | 进程退出 | 无 |
 | 每 backend 页缓存（on_demand 内部） | `TableStorageBackend` 实例 | backend 内部 | mmap/页读 | 内部有界 | backend 自身 `invalidate_page_cache` / footer 失效 | backend drop（mmap 释放） | 无 |
@@ -70,7 +70,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `_query_result_cache` | `ApexClient` 实例 | (路由, SQL, token) | 查询结果（缓存值含数据代际 token） | FIFO 上限（超限弹最旧） | 本地写入后按 token/路由失效（见 `test_cache_invalidation_contract.py`） | 实例 drop | 无 |
 | `_query_result_cacheability` | 同上 | SQL | 可缓存性判定 | 256（超限整体清空） | 同上 | 实例 drop | 无 |
-| `_simple_sql_cache` | 同上 | SQL | 简单 SQL 路由 | 无上限（见 G1） | 本地写入后清空相关项 | 实例 drop | 无 |
+| `_simple_sql_cache` | 同上 | SQL | 简单 SQL 路由 | 256 条；满后整体清空（S2 审计确认） | 本地写入后清空相关项 | 实例 drop | 无 |
 | 模块级 `_auto_scheduler_*` | 模块 | — | 自动调度器开关 | — | `_disable_auto_scheduler` | 进程退出 | 无 |
 
 ### 1.6 调度器（`apexbase/src/query/scheduler.rs`）
@@ -107,11 +107,12 @@
 
 ### 缺口（G*）
 
-- **G1 无上限缓存**：`SQL_PARSE_CACHE`、`CTE_BATCH_CACHE`、
-  `CLASSIFY_CACHE`、`STATS_CACHE`、`PLAN_FEEDBACK`、
-  `GLOBAL_COLUMN_NULL_CACHE`、`GLOBAL_DICT_HIGH_CARD_CACHE`、
-  Python `_simple_sql_cache`。对嵌入式长进程存在缓慢性增长风险。
-  本轮只登记，不改行为；加容量上限属于行为变化，需独立评审。
+- **G1 无上限缓存 → S2 已逐项关闭**（审计与证据见 §6）。其中
+  `SQL_PARSE_CACHE`、`CLASSIFY_CACHE`、`GLOBAL_COLUMN_NULL_CACHE`、
+  `GLOBAL_DICT_HIGH_CARD_CACHE` 与 Python `_simple_sql_cache` 在 S2 审计时
+  已实际有界（本清单早期结论过时）；S2 修复了 `CTE_BATCH_CACHE` 失败路径
+  泄漏，并为 `STATS_CACHE`、`PLAN_FEEDBACK` / `FEEDBACK_LOADED` 增加容量
+  上限与逐出。
 - **G2 双 backend 缓存**：见上文结论。
 - **G3 调度器 thread-local**：见 §1.6 约束。
 
@@ -161,3 +162,24 @@
   上限 65536 组）或存储原生 `execute_group_agg`（结果本身 O(组数)），其内存属于全局缓存
   容量（G1）与输出物化，按 S2/G1 单独处理，不用查询预算重复计量。
 
+
+## 6. S2 缓存容量审计与 G1 关闭（2026-09-17）
+
+§2 的 G1 逐项复核如下（`capacity` 列为当前源码事实，非计划值）。审计原则：
+每种缓存独立处理、保留 epoch 引用缓存、不引入新的全局大锁。
+
+| 缓存 | 审计结论 | 处理 |
+| --- | --- | --- |
+| `SQL_PARSE_CACHE` | 已有 1024 条上限（满后停止收录，不再写入） | 无需改动；本清单旧结论更正 |
+| `CLASSIFY_CACHE` | 已有 512 条上限（满后整体清空） | 无需改动；旧结论更正 |
+| `GLOBAL_COLUMN_NULL_CACHE` | 已有 `MAX_ENTRIES*2` 上限（满后不收录新键） | 无需改动；旧结论更正 |
+| `GLOBAL_DICT_HIGH_CARD_CACHE` | 已有 `MAX_ENTRIES*2` 上限（满后不收录新键） | 无需改动；旧结论更正 |
+| Python `_simple_sql_cache` | 已有 256 条上限（满后整体清空） | 无需改动；旧结论更正 |
+| `CTE_BATCH_CACHE` | 条目按“每次执行唯一”的临时路径键控；主语句失败时原实现跳过移除，条目永不再被查询并长期占用 Arrow 批次 | **S2 修复**：改为 RAII guard，成功/失败/取消都移除 |
+| `STATS_CACHE` | 真无上限：仅按表 key 增长，长进程访问大量表时持续累积 | **S2 新增**：1024 条 FIFO 逐出（读路径仍只取读锁，不触碰逐出元数据；逐出后按 sidecar 重读） |
+| `PLAN_FEEDBACK` / `FEEDBACK_LOADED` | 真无上限：每个 EXPLAIN ANALYZE 形状与每张加载过的表各占一条 | **S2 新增**：每表 256 形状、进程内 256 表，逐出观测样本最少者；`FEEDBACK_LOADED` 上限 1024，逐出只允许后续从 sidecar 重新加载（内存条目优先合并，不会覆盖新记录） |
+
+未改动的 G2（双读 backend 缓存合并）与 G3（调度器进程级共享）仍按“每项独立评审”
+保留；二者都涉及跨入口状态迁移，不以本轮缓存容量工作夹带。既有生命周期覆盖
+（`test_lifecycle_management.py`、`test_cache_invalidation_contract.py` 的 close/reopen、
+跨客户端、持有结果视图、外部进程改写）在 S2 验收中复跑，新增容量边界行为测试。

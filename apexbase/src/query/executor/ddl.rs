@@ -1147,9 +1147,13 @@ impl ApexExecutor {
                 cte_batch = Self::remap_batch_columns(&cte_batch, column_aliases)?;
             }
             CTE_BATCH_CACHE.insert(temp_path.clone(), cte_batch);
+            // Release the batch on the error path too: the temp path is unique
+            // per execution, so a leaked entry would never be reused.
+            let _cte_cleanup = CteBatchCacheGuard {
+                path: temp_path.clone(),
+            };
             let result =
                 Self::execute_main_with_cte(name, main, base_dir, default_table_path, &temp_path)?;
-            CTE_BATCH_CACHE.remove(&temp_path);
             result
         }
     }

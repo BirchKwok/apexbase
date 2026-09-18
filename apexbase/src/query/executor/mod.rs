@@ -96,6 +96,25 @@ fn get_cached_cte_batch(path: &Path) -> Option<RecordBatch> {
     CTE_BATCH_CACHE.get(path).map(|entry| entry.value().clone())
 }
 
+/// Removes the statement-scoped CTE batch on every exit path (success, error,
+/// cancellation). The batch is keyed by a per-execution temp path, so a path
+/// left behind by a failing statement would never be looked up again and
+/// would pin its Arrow buffers for the life of the process.
+struct CteBatchCacheGuard {
+    path: PathBuf,
+}
+
+impl Drop for CteBatchCacheGuard {
+    fn drop(&mut self) {
+        CTE_BATCH_CACHE.remove(&self.path);
+    }
+}
+
+#[cfg(test)]
+pub(in crate::query::executor) fn cte_batch_cache_len_for_tests() -> usize {
+    CTE_BATCH_CACHE.len()
+}
+
 // ============================================================================
 // Thread-local root directory for multi-database cross-db table resolution
 // Set by Python bindings before calling execute_with_base_dir when a named

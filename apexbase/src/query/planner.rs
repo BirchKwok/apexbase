@@ -99,9 +99,49 @@ pub struct TableStats {
     pub source_size: u64,
 }
 
-/// Global stats cache: table_path → (TableStats, observed table epoch)
-static STATS_CACHE: Lazy<RwLock<HashMap<String, (TableStats, u64)>>> =
+/// Global stats cache: table_path → entry. Bounded (S2): a long-lived process
+/// that touches many tables must not grow this without limit. Eviction is
+/// FIFO by insertion, and because a read only clones the entry it adds no
+/// write-lock traffic to the planning hot path.
+const STATS_CACHE_CAP: usize = 1024;
+static STATS_CACHE: Lazy<RwLock<HashMap<String, StatsCacheEntry>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
+static STATS_CACHE_CLOCK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
+struct StatsCacheEntry {
+    stats: TableStats,
+    observed_epoch: u64,
+    inserted_at: u64,
+}
+
+/// Insert with a FIFO cap: when full, the oldest inserted table is dropped and
+/// its stats are re-read from the sidecar on the next planning access.
+fn stats_cache_insert(
+    cache: &mut HashMap<String, StatsCacheEntry>,
+    table_key: &str,
+    stats: TableStats,
+    observed_epoch: u64,
+) {
+    if !cache.contains_key(table_key) && cache.len() >= STATS_CACHE_CAP {
+        if let Some(victim) = cache
+            .iter()
+            .min_by_key(|(_, entry)| entry.inserted_at)
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&victim);
+        }
+    }
+    let inserted_at = STATS_CACHE_CLOCK.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    cache.insert(
+        table_key.to_string(),
+        StatsCacheEntry {
+            stats,
+            observed_epoch,
+            inserted_at,
+        },
+    );
+}
 
 const STATS_SCHEMA_VERSION: u32 = 1;
 
@@ -150,6 +190,66 @@ static FEEDBACK_PERSIST_LOCK: Lazy<std::sync::Mutex<()>> =
 // feedback" (their shape re-calibrates on the next EXPLAIN ANALYZE).
 const FEEDBACK_SCHEMA_VERSION: u32 = 2;
 
+/// Bounds for process-global plan feedback (S2). Only EXPLAIN ANALYZE records
+/// feedback, so growth needs explicit user action; the caps keep a long-lived
+/// process (or an automated calibration sweep over many shapes) bounded.
+/// Eviction drops the least-observed entry, which recalibrates on its next
+/// EXPLAIN ANALYZE.
+const PLAN_FEEDBACK_SHAPES_PER_TABLE: usize = 256;
+const PLAN_FEEDBACK_TABLES: usize = 256;
+/// Loaded-marker bound; dropping a marker only allows a later sidecar reload
+/// (in-process entries always win on merge).
+const FEEDBACK_LOADED_CAP: usize = PLAN_FEEDBACK_TABLES * 4;
+
+fn feedback_samples(inner: &HashMap<u64, PlanFeedback>) -> u64 {
+    inner.values().map(|entry| entry.samples).sum()
+}
+
+/// Evict the least-observed shape when a new shape would exceed the per-table
+/// cap.
+fn feedback_evict_shape_if_full(inner: &mut HashMap<u64, PlanFeedback>, incoming: u64) {
+    if !inner.contains_key(&incoming) && inner.len() >= PLAN_FEEDBACK_SHAPES_PER_TABLE {
+        if let Some(victim) = inner
+            .iter()
+            .min_by_key(|(_, entry)| entry.samples)
+            .map(|(shape, _)| *shape)
+        {
+            inner.remove(&victim);
+        }
+    }
+}
+
+/// Borrow one table's feedback map, dropping the least-observed table when a
+/// new table would exceed the table cap. The dropped table's loaded marker is
+/// intentionally left alone: feedback is advisory and a later EXPLAIN ANALYZE
+/// re-records it in-process.
+fn feedback_table_mut<'a>(
+    cache: &'a mut HashMap<String, HashMap<u64, PlanFeedback>>,
+    table_key: &str,
+) -> &'a mut HashMap<u64, PlanFeedback> {
+    if !cache.contains_key(table_key) && cache.len() >= PLAN_FEEDBACK_TABLES {
+        if let Some(victim) = cache
+            .iter()
+            .min_by_key(|(_, inner)| feedback_samples(inner))
+            .map(|(key, _)| key.clone())
+        {
+            cache.remove(&victim);
+        }
+    }
+    cache.entry(table_key.to_string()).or_default()
+}
+
+/// Bound the loaded-marker set; eviction allows a later sidecar reload.
+fn feedback_mark_loaded(table_key: &str) {
+    let mut loaded = FEEDBACK_LOADED.write();
+    if !loaded.contains(table_key) && loaded.len() >= FEEDBACK_LOADED_CAP {
+        if let Some(victim) = loaded.iter().next().cloned() {
+            loaded.remove(&victim);
+        }
+    }
+    loaded.insert(table_key.to_string());
+}
+
 /// On-disk form of one table's plan feedback entries.
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedPlanFeedback {
@@ -173,26 +273,27 @@ fn ensure_feedback_loaded(table_key: &str) {
     if FEEDBACK_LOADED.read().contains(table_key) {
         return;
     }
-    let mark_loaded = || {
-        FEEDBACK_LOADED.write().insert(table_key.to_string());
-    };
     let data = match std::fs::read(feedback_sidecar_path(table_key)) {
         Ok(data) => data,
-        Err(_) => return mark_loaded(),
+        Err(_) => return feedback_mark_loaded(table_key),
     };
     let file: PersistedPlanFeedback =
         match bincode::deserialize::<PersistedPlanFeedback>(&data) {
-        Ok(file) if file.version == FEEDBACK_SCHEMA_VERSION => file,
-        _ => return mark_loaded(),
-    };
+            Ok(file) if file.version == FEEDBACK_SCHEMA_VERSION => file,
+            _ => return feedback_mark_loaded(table_key),
+        };
     if !file.entries.is_empty() {
         let mut cache = PLAN_FEEDBACK.write();
-        let inner = cache.entry(table_key.to_string()).or_default();
+        let inner = feedback_table_mut(&mut cache, table_key);
         for (key, entry) in file.entries {
-            inner.entry(key).or_insert(entry);
+            if inner.contains_key(&key) {
+                continue;
+            }
+            feedback_evict_shape_if_full(inner, key);
+            inner.insert(key, entry);
         }
     }
-    mark_loaded();
+    feedback_mark_loaded(table_key);
 }
 
 /// Store ANALYZE results into the stats cache
@@ -204,20 +305,28 @@ pub fn store_table_stats(table_key: &str, mut stats: TableStats) {
         let _ = std::fs::write(stats_sidecar_path(table_key), data);
     }
     let epoch = crate::storage::epoch::current(std::path::Path::new(table_key));
-    STATS_CACHE
-        .write()
-        .insert(table_key.to_string(), (stats, epoch));
+    stats_cache_insert(&mut STATS_CACHE.write(), table_key, stats, epoch);
 }
 
 /// Retrieve cached stats for a table
 pub fn get_table_stats(table_key: &str) -> Option<TableStats> {
     let epoch = crate::storage::epoch::current(std::path::Path::new(table_key));
-    if let Some((stats, observed_epoch)) = STATS_CACHE.read().get(table_key).cloned() {
-        if observed_epoch == epoch {
-            return stats_are_fresh(table_key, &stats).then_some(stats);
+    let cached = {
+        let cache = STATS_CACHE.read();
+        match cache.get(table_key) {
+            Some(entry) if entry.observed_epoch == epoch => {
+                if !stats_are_fresh(table_key, &entry.stats) {
+                    return None;
+                }
+                Some(entry.stats.clone())
+            }
+            _ => None,
         }
-        STATS_CACHE.write().remove(table_key);
+    };
+    if let Some(stats) = cached {
+        return Some(stats);
     }
+    STATS_CACHE.write().remove(table_key);
 
     let sidecar = stats_sidecar_path(table_key);
     let data = std::fs::read(sidecar).ok()?;
@@ -225,9 +334,7 @@ pub fn get_table_stats(table_key: &str) -> Option<TableStats> {
     if !stats_are_fresh(table_key, &stats) {
         return None;
     }
-    STATS_CACHE
-        .write()
-        .insert(table_key.to_string(), (stats.clone(), epoch));
+    stats_cache_insert(&mut STATS_CACHE.write(), table_key, stats.clone(), epoch);
     Some(stats)
 }
 
@@ -311,7 +418,8 @@ pub fn record_plan_feedback(
     let key = feedback_key(table_key, select);
     let snapshot = {
         let mut cache = PLAN_FEEDBACK.write();
-        let inner = cache.entry(table_key.to_string()).or_default();
+        let inner = feedback_table_mut(&mut cache, table_key);
+        feedback_evict_shape_if_full(inner, key);
         let entry = inner.entry(key).or_insert_with(|| PlanFeedback {
             strategy: strategy.clone(),
             estimated_rows: 0.0,
@@ -1808,5 +1916,75 @@ mod tests {
             .unwrap();
         assert_eq!(QueryPlanner::estimate_selectivity(&common, &stats), 0.6);
         assert_eq!(QueryPlanner::estimate_selectivity(&rare, &stats), 0.01);
+    }
+
+    #[test]
+    fn stats_cache_is_bounded_and_evicts_oldest() {
+        let mut cache: HashMap<String, StatsCacheEntry> = HashMap::new();
+        let stats = TableStats {
+            schema_version: STATS_SCHEMA_VERSION,
+            schema_generation: 0,
+            data_generation: 0,
+            row_count: 1,
+            columns: HashMap::new(),
+            collected_at: 0,
+            source_size: 0,
+        };
+        for i in 0..STATS_CACHE_CAP + 32 {
+            stats_cache_insert(&mut cache, &format!("table_{i}"), stats.clone(), i as u64);
+        }
+        assert_eq!(cache.len(), STATS_CACHE_CAP);
+        // The oldest insertions are evicted; recent tables stay cached.
+        assert!(!cache.contains_key("table_0"));
+        assert!(cache.contains_key(&format!("table_{}", STATS_CACHE_CAP + 31)));
+        // A replacement of an existing key does not evict anything.
+        let before = cache.len();
+        stats_cache_insert(&mut cache, "table_1", stats, 999);
+        assert_eq!(cache.len(), before);
+    }
+
+    #[test]
+    fn plan_feedback_shape_and_table_caps_evict_least_observed() {
+        fn entry(samples: u64) -> PlanFeedback {
+            PlanFeedback {
+                strategy: ExecutionStrategy::OlapFullScan,
+                estimated_rows: 0.0,
+                actual_rows: 0.0,
+                samples,
+                scan_cost_avg: 0.0,
+                scan_time_avg_us: 0.0,
+                scan_samples: 0,
+                index_cost_avg: 0.0,
+                index_time_avg_us: 0.0,
+                index_samples: 0,
+                parallel_cost_avg: 0.0,
+                parallel_time_avg_us: 0.0,
+                parallel_samples: 0,
+            }
+        }
+
+        // Per-table shape cap: the least-observed shape is dropped first.
+        let mut shapes: HashMap<u64, PlanFeedback> = HashMap::new();
+        for shape in 0..PLAN_FEEDBACK_SHAPES_PER_TABLE as u64 {
+            shapes.insert(shape, entry(shape + 1));
+        }
+        feedback_evict_shape_if_full(&mut shapes, u64::MAX);
+        assert_eq!(shapes.len(), PLAN_FEEDBACK_SHAPES_PER_TABLE - 1);
+        assert!(!shapes.contains_key(&0), "shape with the fewest samples is evicted");
+        // Recording an existing shape never evicts.
+        feedback_evict_shape_if_full(&mut shapes, 7);
+        assert!(shapes.contains_key(&7));
+
+        // Table cap: the table with the fewest total samples is dropped.
+        let mut cache: HashMap<String, HashMap<u64, PlanFeedback>> = HashMap::new();
+        for table in 0..PLAN_FEEDBACK_TABLES {
+            let mut inner = HashMap::new();
+            inner.insert(0u64, entry(table as u64 + 1));
+            cache.insert(format!("table_{table}"), inner);
+        }
+        let _ = feedback_table_mut(&mut cache, "table_new");
+        assert_eq!(cache.len(), PLAN_FEEDBACK_TABLES);
+        assert!(!cache.contains_key("table_0"));
+        assert!(cache.contains_key("table_new"));
     }
 }

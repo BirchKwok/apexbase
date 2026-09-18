@@ -5396,3 +5396,47 @@ fn vectorized_hash_agg_tracks_group_state_bytes() {
     assert_eq!(int_agg.state_bytes(), one_int_group);
 }
 
+
+// ============================================================================
+// S2: cache capacity and lifecycle
+// ============================================================================
+
+#[test]
+fn failed_shared_cte_releases_its_materialized_batch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cte_cache_t.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Fast,
+        &[("value".to_string(), crate::storage::ColumnType::Int64)],
+    )
+    .unwrap();
+    storage
+        .insert_rows(&[
+            HashMap::from([("value".to_string(), crate::storage::ColumnValue::Int64(1))]),
+            HashMap::from([("value".to_string(), crate::storage::ColumnValue::Int64(2))]),
+        ])
+        .unwrap();
+    storage.save_full().unwrap();
+    drop(storage);
+
+    let session = crate::Session::new(dir.path(), &path);
+    let before = crate::query::executor::cte_batch_cache_len_for_tests();
+    // Two references take the shared-CTE materialization path; the main
+    // statement then fails, which used to skip the cache removal.
+    let sql = "WITH c AS (SELECT value FROM cte_cache_t) \
+               SELECT x.value FROM c x JOIN c y ON x.value = y.value \
+               JOIN no_such_table z ON x.value = z.value";
+    assert!(session.execute(sql).is_err());
+    assert_eq!(
+        crate::query::executor::cte_batch_cache_len_for_tests(),
+        before,
+        "a failing shared CTE must not leak its materialized batch"
+    );
+
+    // The same CTE still works after the failure.
+    let ok = "WITH c AS (SELECT value FROM cte_cache_t) \
+              SELECT x.value FROM c x JOIN c y ON x.value = y.value ORDER BY x.value";
+    let batch = session.execute(ok).unwrap().to_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 2);
+}
