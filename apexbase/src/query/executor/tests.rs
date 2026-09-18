@@ -5304,6 +5304,13 @@ fn batch_pipeline_rejects_high_cardinality_state_over_budget() {
     let sql = "SELECT city, code, COUNT(*) AS n FROM default \
                WHERE amount IS NOT NULL AND code >= 1 GROUP BY city, code";
 
+    // Pipeline selection is process-global: hold the env lock and pin both
+    // switches so concurrent APEX_BATCH_SCAN / APEX_PARALLEL_SCAN tests
+    // cannot route this query outside the charged kernel.
+    let _env_guard = BATCH_SCAN_ENV_LOCK.lock().unwrap();
+    std::env::set_var("APEX_BATCH_SCAN", "1");
+    std::env::set_var("APEX_PARALLEL_SCAN", "0");
+
     // The fixture's distinct (city, code) groups need more than 512 bytes of
     // tracked state.
     {
@@ -5326,6 +5333,8 @@ fn batch_pipeline_rejects_high_cardinality_state_over_budget() {
             .unwrap();
         assert!(batch.num_rows() > 0);
     }
+    std::env::remove_var("APEX_BATCH_SCAN");
+    std::env::remove_var("APEX_PARALLEL_SCAN");
     assert!(
         budget.used() > 0,
         "the fixture must reach the batched aggregation kernel"
