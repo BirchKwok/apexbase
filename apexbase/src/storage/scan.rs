@@ -172,12 +172,20 @@ pub(crate) enum SelectionVector {
 }
 
 impl SelectionVector {
-    #[cfg(test)]
     #[inline]
     pub(crate) fn len(&self) -> usize {
         match self {
             Self::All(len) => *len,
             Self::Indices(indices) => indices.len(),
+        }
+    }
+
+    /// Physical row index of the `position`-th selected row.
+    #[inline]
+    pub(crate) fn row(&self, position: usize) -> usize {
+        match self {
+            Self::All(_) => position,
+            Self::Indices(indices) => indices[position] as usize,
         }
     }
 }
@@ -218,6 +226,23 @@ impl Morsel {
     #[inline]
     pub(crate) fn selection(&self) -> &SelectionVector {
         &self.selection
+    }
+
+    /// Selected row positions in the physical batch space. Operators that can
+    /// consume a selection directly (no gather into a compacted batch) read
+    /// the physical column arrays through this map.
+    #[inline]
+    pub(crate) fn selection_for_operators(&self) -> &SelectionVector {
+        &self.selection
+    }
+
+    /// Physical column array by name (before the selection is applied).
+    #[inline]
+    pub(crate) fn column_by_name(&self, name: &str) -> Option<&ArrayRef> {
+        self.columns
+            .iter()
+            .find(|column| column.field.name() == name)
+            .map(|column| &column.values)
     }
 
     /// Resolve predicate columns and scalar coercions once, then evaluate the

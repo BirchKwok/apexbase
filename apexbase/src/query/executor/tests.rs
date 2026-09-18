@@ -5550,3 +5550,121 @@ fn streaming_select_stops_when_the_consumer_rejects_a_batch() {
     assert_eq!(batches, 1, "a rejected batch must stop the stream");
     assert_eq!(rows, seen_rows);
 }
+
+// ============================================================================
+// Q1: batched physical execution validation matrix
+// ============================================================================
+
+#[test]
+fn batched_pipeline_matches_single_batch_across_overlay_states() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("batch_overlay_parity.apex");
+    create_batch_scan_fixture(&path);
+    let sql = "SELECT city, code, COUNT(*) AS n, SUM(amount) AS s \
+               FROM default WHERE amount IS NOT NULL AND code >= 1 \
+               GROUP BY city, code ORDER BY city, code LIMIT 20";
+
+    let parity = |label: &str| {
+        let off = run_with_batch_scan(false, &path, sql);
+        let on = run_with_batch_scan(true, &path, sql);
+        assert_batches_logically_equal(&off, &on, &format!("{label}: {sql}"));
+    };
+
+    // Clean persisted view.
+    parity("clean");
+
+    // Delete overlay: the batched stream applies the base deletion vector.
+    ApexExecutor::execute("DELETE FROM default WHERE code = 1", &path).unwrap();
+    parity("delete");
+
+    // Update overlay: DeltaStore cell updates either stream or fall back, but
+    // the two paths must agree.
+    ApexExecutor::execute("UPDATE default SET amount = 777 WHERE code = 2", &path).unwrap();
+    parity("update");
+
+    // Insert overlay: appended delta rows must be visible to both paths.
+    ApexExecutor::execute(
+        "INSERT INTO default (city, code, flag, score, amount, pad) \
+         VALUES ('city1', 1, true, 1.0, 42, 'p')",
+        &path,
+    )
+    .unwrap();
+    parity("insert");
+}
+
+#[test]
+fn batched_pipeline_matches_single_batch_for_exact_integers_and_nan() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("batch_exact_int.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Fast,
+        &[
+            ("k".to_string(), crate::storage::ColumnType::Int64),
+            ("v".to_string(), crate::storage::ColumnType::Int64),
+            ("f".to_string(), crate::storage::ColumnType::Float64),
+        ],
+    )
+    .unwrap();
+    let rows: Vec<HashMap<String, crate::storage::ColumnValue>> = (0..3000)
+        .map(|i| {
+            HashMap::from([
+                ("k".to_string(), crate::storage::ColumnValue::Int64((i % 3) as i64)),
+                (
+                    "v".to_string(),
+                    crate::storage::ColumnValue::Int64(i64::MAX - i as i64),
+                ),
+                (
+                    "f".to_string(),
+                    crate::storage::ColumnValue::Float64(if i % 7 == 0 {
+                        f64::NAN
+                    } else {
+                        (i as f64) * 0.5
+                    }),
+                ),
+            ])
+        })
+        .collect();
+    storage.insert_rows(&rows).unwrap();
+    storage.save_full().unwrap();
+    drop(storage);
+
+    // Values beyond 2^53 keep their exact i64 identity and wrapping SUM.
+    let int_sql = "SELECT k, COUNT(*) AS n, SUM(v) AS s, MIN(v) AS mn, MAX(v) AS mx \
+                   FROM batch_exact_int WHERE k >= 0 GROUP BY k ORDER BY k";
+    let off = run_with_batch_scan(false, &path, int_sql);
+    let on = run_with_batch_scan(true, &path, int_sql);
+    assert_batches_logically_equal(&off, &on, int_sql);
+
+    // NaN and finite floats agree by bit pattern.
+    let float_sql = "SELECT k, SUM(f) AS sf FROM batch_exact_int WHERE k >= 0 GROUP BY k ORDER BY k";
+    let off = run_with_batch_scan(false, &path, float_sql);
+    let on = run_with_batch_scan(true, &path, float_sql);
+    assert_batches_logically_equal(&off, &on, float_sql);
+}
+
+#[test]
+fn batched_pipeline_result_schema_matches_single_batch() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("batch_schema_parity.apex");
+    create_batch_scan_fixture(&path);
+
+    for sql in [
+        "SELECT city, code, COUNT(*) AS n FROM default WHERE amount IS NOT NULL GROUP BY city, code",
+        "SELECT city, COUNT(*) AS n, SUM(score) AS s FROM default WHERE score IS NOT NULL GROUP BY city",
+        "SELECT flag, COUNT(*) AS n FROM default WHERE amount > 0 GROUP BY flag",
+        "SELECT score, MIN(amount) AS mn FROM default WHERE score >= 0 GROUP BY score",
+    ] {
+        let off = run_with_batch_scan(false, &path, sql);
+        let on = run_with_batch_scan(true, &path, sql);
+        assert_eq!(
+            off.schema().fields().len(),
+            on.schema().fields().len(),
+            "{sql}: field count"
+        );
+        for (left, right) in off.schema().fields().iter().zip(on.schema().fields()) {
+            assert_eq!(left.name(), right.name(), "{sql}: field name");
+            assert_eq!(left.data_type(), right.data_type(), "{sql}: field type");
+        }
+    }
+}

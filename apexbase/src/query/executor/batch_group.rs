@@ -8,6 +8,7 @@
 // group row count, and NULL group keys form a single NULL group.
 
 use arrow::array::LargeStringArray;
+use crate::storage::Morsel;
 
 /// Per-batch view of one group key column.
 enum BatchKeyView<'a> {
@@ -491,10 +492,10 @@ impl BatchGroupAggregator {
     fn resolve_key<'b>(
         &mut self,
         slot: usize,
-        batch: &'b RecordBatch,
+        morsel: &'b Morsel,
     ) -> Option<BatchKeyView<'b>> {
         let name = &self.group_cols[slot];
-        let column = batch.column_by_name(name)?;
+        let column = morsel.column_by_name(name)?;
         let view = BatchKeyView::new(column)?;
         let lane = match (slot, &mut self.key1, &mut self.key2) {
             (0, lane @ None, _) => {
@@ -537,13 +538,15 @@ impl BatchGroupAggregator {
         Some(view)
     }
 
-    /// Consume one selected batch. Returns None when a required column is
-    /// missing or unresolvable; the caller falls back to the single-batch
-    /// path for the whole query.
-    fn consume_batch(&mut self, batch: &RecordBatch) -> Option<()> {
-        let view1 = self.resolve_key(0, batch)?;
+    /// Consume one selected morsel directly: rows come from the morsel's
+    /// selection map instead of a gathered, compacted batch, so the kernel
+    /// never pays an extra `take` copy for a pushed-down predicate (Q1).
+    /// Returns None when a required column is missing or unresolvable; the
+    /// caller falls back to the single-batch path for the whole query.
+    fn consume_morsel(&mut self, morsel: &Morsel) -> Option<()> {
+        let view1 = self.resolve_key(0, morsel)?;
         let view2 = if self.group_cols.len() == 2 {
-            Some(self.resolve_key(1, batch)?)
+            Some(self.resolve_key(1, morsel)?)
         } else {
             None
         };
@@ -551,7 +554,7 @@ impl BatchGroupAggregator {
         let source_int: Option<&Int64Array> = match &self.source_name {
             None => None,
             Some(name) => {
-                let column = batch.column_by_name(name)?;
+                let column = morsel.column_by_name(name)?;
                 column.as_any().downcast_ref::<Int64Array>()
             }
         };
@@ -559,7 +562,7 @@ impl BatchGroupAggregator {
             match &self.source_name {
                 None => None,
                 Some(name) => {
-                    let column = batch.column_by_name(name)?;
+                    let column = morsel.column_by_name(name)?;
                     let Some(arr) = column.as_any().downcast_ref::<Float64Array>() else {
                         return None;
                     };
@@ -575,11 +578,13 @@ impl BatchGroupAggregator {
             _ => self.source_is_int = Some(is_int_source),
         }
 
-        let num_rows = batch.num_rows();
+        let selection = morsel.selection_for_operators();
+        let selected = selection.len();
         let groups_before = self.groups.len();
         match (source_int, source_float) {
             (Some(int_arr), None) => {
-                for row in 0..num_rows {
+                for position in 0..selected {
+                    let row = selection.row(position);
                     let id1 = self.lane_id(0, &view1, row);
                     let key = match &view2 {
                         Some(view2) => ((id1 as u64) << 32) | self.lane_id(1, view2, row) as u64,
@@ -596,7 +601,8 @@ impl BatchGroupAggregator {
                 }
             }
             (None, Some(float_arr)) => {
-                for row in 0..num_rows {
+                for position in 0..selected {
+                    let row = selection.row(position);
                     let id1 = self.lane_id(0, &view1, row);
                     let key = match &view2 {
                         Some(view2) => ((id1 as u64) << 32) | self.lane_id(1, view2, row) as u64,
@@ -613,7 +619,8 @@ impl BatchGroupAggregator {
                 }
             }
             (None, None) => {
-                for row in 0..num_rows {
+                for position in 0..selected {
+                    let row = selection.row(position);
                     let id1 = self.lane_id(0, &view1, row);
                     let key = match &view2 {
                         Some(view2) => ((id1 as u64) << 32) | self.lane_id(1, view2, row) as u64,
@@ -1194,8 +1201,7 @@ impl ApexExecutor {
             match stream.next() {
                 Some(Ok(crate::storage::BatchMorselOutcome::Morsel(morsel))) => {
                     batch_count += 1;
-                    let batch = morsel.into_record_batch()?;
-                    if agg.consume_batch(&batch).is_none() {
+                    if agg.consume_morsel(&morsel).is_none() {
                         // The single-batch path continues this query; release
                         // what this kernel reserved so it is not double-counted.
                         release_state(budget, charged);
@@ -1307,14 +1313,7 @@ impl ApexExecutor {
                         match outcome {
                             Ok(crate::storage::BatchMorselOutcome::Morsel(morsel)) => {
                                 batch_count += 1;
-                                let batch = match morsel.into_record_batch() {
-                                    Ok(batch) => batch,
-                                    Err(error) => {
-                                        release_state(budget, charged);
-                                        return ParallelFusedOutcome::Err(error)
-                                    }
-                                };
-                                if agg.consume_batch(&batch).is_none() {
+                                if agg.consume_morsel(&morsel).is_none() {
                                     release_state(budget, charged);
                                     return ParallelFusedOutcome::FallBack;
                                 }
