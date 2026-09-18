@@ -26,6 +26,9 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 （canary exit 0；full 原始 exit 1，标记项经 current 侧独立复测登记为已证实噪音）。
 最新 S1 最终验收见第 8.3 节：`local-perf-results/s1-acceptance-20260917/`
 （canary/full 对 base `2c2e471` 均 exit 0，S1 触及的聚合形状无回退）。
+最新 S2 最终验收见第 9.2 节：`local-perf-results/s2-acceptance-20260917/`
+（canary 首轮 exit 1 经 current 侧独立复测登记为瞬时干扰，canary 重跑与 full
+均 exit 0；G1 清单更正并关闭三项真实缺口）。
 
 ## 2. 优先级、依赖和交付边界
 
@@ -35,7 +38,7 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 | 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | C2.1–C2.3 已实现，功能验收完成；性能证据已收口并登记 full 原始噪音例外；C3 可开始 |
 | 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | C3.1–C3.2 已实现并完成最终统一验收（full 原始噪音例外见 7.3）；S1 可开始 |
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | S1.1–S1.3 已实现并完成最终统一验收（2026-09-17，canary/full 对 base `2c2e471` 均 exit 0）；S2/S3 可开始 |
-| 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | 待实施，按缓存拆批 |
+| 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | G1 已逐项关闭（含清单更正、CTE 泄漏修复、planner 缓存上限），G2/G3 仍按独立评审保留；已通过最终统一验收（2026-09-17，canary/full 对 base `0059029` 均 exit 0）；S3 可开始 |
 | 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 待实施，依赖 S1 |
 | 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | 待实施，依赖 C/S 基础 |
 | 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 待实施，依赖 S1，文档澄清先做 |
@@ -155,6 +158,15 @@ canary/full 均须退出 0，A/B 仅用于诊断；指标集合随仓库扩展�
   canary exit 0（64 项五样本收敛）、full exit 0（main 109/109、qps 10/10、
   quant 8/8、idx 4/4、par 4/4，无五样本扩展）。完整记录见第 8 节。
   S1 状态：已实现 + 功能已验证 + 性能已验收。
+- S2 实施与最终验收（2026-09-17）：复核 G1 清单（多数缓存早已有界，清单过时），
+  修复 `CTE_BATCH_CACHE` 失败路径泄漏（RAII），为 `STATS_CACHE`（1024 FIFO）与
+  `PLAN_FEEDBACK`/`FEEDBACK_LOADED`（每表 256 形状 / 256 表 / 1024 标记，逐出
+  观测最少者）加容量上限；G2/G3 保留独立评审，无新全局锁。验收报告
+  `local-perf-results/s2-acceptance-20260917/`：pytest 1802 passed、
+  cargo test 577+6 passed、公开 benchmark exit 0、canary 重跑 exit 0（64 项；
+  首轮 exit 1 经复测登记为瞬时干扰）、full exit 0（main 109/109、qps 10/10、
+  quant 8/8、idx 4/4、par 4/4）。完整记录见第 9 节。S2 状态：已实现 +
+  功能已验证 + 性能已验收。
 
 ## 6. 第二批 C2：UPDATE、Safe/Max 与恢复一致性
 
@@ -449,3 +461,73 @@ distinct 集合）、`execute_group_by_incremental` 通用键路径（rayon 分�
   JSON/比较/日志、退出状态）。
 
 S1 状态据此记为“已实现 + 功能已验证 + 性能已验收”。
+
+## 9. 第五批 S2：缓存容量与状态 owner
+
+S2 依据 `docs/RESOURCE_OWNERSHIP.md` 的 G1 清单逐项复核并关闭真实缺口，保留
+G2/G3 的独立评审边界。起点（base）为 S1 验收提交
+`0059029cf0a104436d50e2fd12b9f5ef599f8952`；current 为 `f5a892d`。
+
+### 9.1 G1 审计结论
+
+审计发现清单本身过时：`SQL_PARSE_CACHE`（1024 条，满后停止收录）、
+`CLASSIFY_CACHE`（512 条，满后整体清空）、`GLOBAL_COLUMN_NULL_CACHE` 与
+`GLOBAL_DICT_HIGH_CARD_CACHE`（`MAX_ENTRIES*2`，满后不收录新键）、Python
+`_simple_sql_cache`（256 条，满后整体清空）在 S2 之前就已有界。真实缺口只有
+三项：
+
+- `CTE_BATCH_CACHE`：条目按“每次执行唯一”的临时路径键控。主语句失败时原实现
+  `?` 跳过移除，条目永不再被查询，却长期占用物化 Arrow 批次。改为 RAII guard，
+  成功/失败/取消都移除。
+- `STATS_CACHE`：真无上限，随访问过的表持续累积。加 1024 条 FIFO 逐出；读路径
+  仍只取读锁、不写逐出元数据，被逐出的表在下次访问时从 sidecar 重读。
+- `PLAN_FEEDBACK` / `FEEDBACK_LOADED`：真无上限。加每表 256 形状、进程内
+  256 表、加载标记 1024；逐出观测样本最少者，sidecar 随内存快照一起收缩，
+  被逐出形状在下次 EXPLAIN ANALYZE 重新校准。
+
+G2（`STORAGE_CACHE` 与 `StorageEngine.cache` 双读 backend 缓存合并）与 G3
+（调度器 thread-local 共享）仍按“每项独立评审”保留，不在本批夹带；S2 未引入
+任何新的全局锁，也未删除仍被引用的 epoch 引用缓存。`RESOURCE_OWNERSHIP.md`
+§2 的 G1 结论与 §1 各表容量列已按源码事实更正，并新增 §6 审计表。
+
+### 9.2 测试与验收（2026-09-17）
+
+新增测试：
+
+- Rust：`stats_cache_is_bounded_and_evicts_oldest`（1024 条 FIFO、替换不逐出）、
+  `plan_feedback_shape_and_table_caps_evict_least_observed`（形状/表两级上限、
+  已有形状不逐出）、`failed_shared_cte_releases_its_materialized_batch`（失败
+  共享 CTE 后缓存长度回到查询前，且同一 CTE 之后仍可正确执行）。
+- Python：`test/test_cache_capacity_bounds.py` 用超过 Python 简单 SQL（256）、
+  分类器（512）与解析（1024）上限的 1200 个不同 SQL 文本验证逐出/清空不改变
+  结果，并在溢出后复跑被逐出语句、聚合与写入形状；既有
+  `test_lifecycle_management.py` 与 `test_cache_invalidation_contract.py`
+  的 close/reopen、跨客户端失效、持有结果视图、外部进程改写用例在验收中复跑。
+
+验收链（conda base，M1 Pro 10c，release，隔离 worktree/venv/Cargo target，
+30 s 静置，B-C-C-B-B-C，未降低行数/预热/计时/阈值）：
+
+- `maturin develop --release` 成功；完整串行 `pytest` 1802 passed（36.53 s）；
+  完整 `cargo test --release` 577 单元 + 6 doc-test 通过。
+- 公开 benchmark（1M/2/5，109 指标）exit 0；对比 `latest_public_baseline.json`
+  覆盖 109/109，6 项单次指标超过 15% 且 0.005ms（EXCEPT/INTERSECT ordered、
+  GROUP BY + HAVING、GROUP BY category ORDER BY count、Filtered aggregation
+  (city)、IN subquery COUNT），均为旧基线漂移与方差，且 S2 不触及这些
+  聚合/集合算子路径；不作门禁判定。
+- canary（200K/2/7，64 项）：首轮原始 exit 1，唯一标记 `Numeric GROUP BY
+  (5 funcs)` base 五样本中位数 0.9603ms / current 1.5112ms；current 侧三次
+  独立 canary 复测为 0.9910/0.9836/0.9604ms（中位数 0.9836，回到 base），
+  guard 的 current 样本含 5.2335ms 孤立高尾，判定为瞬时干扰而非代码路径
+  变化（S2 不改聚合）。按已证实噪音登记首轮 exit 1 并保留原始报告；随后一次
+  完整 B-C-C-B-B-C canary（`canary-rerun/`）exit 0，64/64，无五样本扩展，
+  该指标 -11.52%。
+- full（1M/2/5）exit 0：main 109/109、qps 10/10、quant 8/8、idx 4/4、
+  par 4/4。par 初判标记 `Parallel batch scan (8 threads)` +18.37%
+  （7.726→9.145ms），自动五样本终判 -21.79%（9.235→7.222ms）；聚合形状
+  持平或更快（GROUP BY + HAVING -27.02%、GROUP BY category -7.24%、
+  GROUP BY category + HAVING -9.12%）。
+- 报告目录 `local-perf-results/s2-acceptance-20260917/`（README、全部
+  JSON/比较/日志、诊断样本、退出状态）。
+
+S2 状态据此记为“G1 已逐项关闭 + 功能已验证 + 性能已验收（canary 首轮原始
+噪音例外已登记）”；G2/G3 仍待独立评审。
