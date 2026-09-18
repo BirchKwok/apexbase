@@ -32,6 +32,11 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 最新 S3 见第 10 节：`local-perf-results/s3-acceptance-20260917/`（功能链全过；
 canary 两轮与 full 主比较在 host load 5.7-12.0 下标记同一类聚合/集合形状，
 登记为环境受限原始例外，干净机器复核列为验收债务 V1）。
+最新 Q1 见第 11 节：`local-perf-results/q1-acceptance-20260917/`（selection
+直接消费 + 验证矩阵，canary/full 全过；base+delta 行组流式读视图留待下一批）。
+V1 复核见 `local-perf-results/v1-reverify-20260917/`：S3 的 canary/full 复跑在
+持续 host load 6-12 下分别标记第三组不同指标与一个重叠的排序指标，qps/quant/
+idx/par 全过；噪音结论得到强化，但空闲机器上的绿色门禁仍待补。
 
 ## 2. 优先级、依赖和交付边界
 
@@ -43,7 +48,7 @@ canary 两轮与 full 主比较在 host load 5.7-12.0 下标记同一类聚合/�
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | S1.1–S1.3 已实现并完成最终统一验收（2026-09-17，canary/full 对 base `2c2e471` 均 exit 0）；S2/S3 可开始 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | G1 已逐项关闭（含清单更正、CTE 泄漏修复、planner 缓存上限），G2/G3 仍按独立评审保留；已通过最终统一验收（2026-09-17，canary/full 对 base `0059029` 均 exit 0）；S3 可开始 |
 | 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 已实现并功能验证（流式执行、有界通道、schema 缓存、Rust/Python 测试）；本轮性能门禁在机器高负载下登记为环境受限原始例外，待干净机器复核（V1）；Q1 可开始但需携带该债务 |
-| 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | 待实施，依赖 C/S 基础 |
+| 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | selection 直接消费与验证矩阵已实现并验收通过（2026-09-17，canary/full 对 base `eb44b85` 均 exit 0，parallel batch scan 快 7.0–9.5%）；base+delta 行组流式读视图未实现，设计与前提见第 11.3 节，成为下一批前置 |
 | 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 待实施，依赖 S1，文档澄清先做 |
 | 9 | P2 / M1 | 剩余职责与文档收敛 | 以重复决策/依赖减少为标准拆 backend 和路由；能力表、限制和 fallback 单源；不按行数制造抽象 | 待实施，与对应边界一起推进 |
 | 10 | P2 / E1 | 需求驱动扩展 | 有容量/工作负载证据后独立设计外部执行、复杂 Join、向量组合等 | 按需 |
@@ -181,6 +186,18 @@ canary/full 均须退出 0，A/B 仅用于诊断；指标集合随仓库扩展�
   同一类聚合/集合形状；原始 exit 1 与全部样本保留，登记为环境受限例外，干净
   机器复核列为验收债务 V1。完整记录见第 10 节。S3 状态：已实现 + 功能已验证 +
   性能证据待干净机器复核。
+- Q1 实施与验收（2026-09-17）：`Morsel` 暴露 selection 映射与命名物理列，
+  `BatchGroupAggregator::consume_morsel` 直接按选中行折叠，串行/并行分批管道
+  不再 `arrow::compute::take` 汇成紧凑批次；新增覆盖层（clean/删除/更新/插入）
+  分批与单批 parity、超 2^53 精确整数与 NaN、输出 schema 一致性三组验证测试。
+  验收：pytest 1802 passed、cargo test 583+6、`--features flight` 587、canary
+  exit 0（64 项）、full exit 0（main 109/109、qps 10/10、quant 8/8、idx 4/4、
+  par 4/4，parallel batch scan 快 7.0–9.5%）。base+delta 行组流式读视图未实现，
+  见 11.3，作为下一批前置。完整记录见第 11 节。
+- V1 复核（2026-09-17）：对 S3 提交 `eb44b85` 复跑 canary/full。三次 S3 canary
+  分别标记三组不同指标，full 复跑初判 7 项（含 CSV Read、向量 TopK）五样本
+  终判仅剩 1 项重叠的 `ORDER BY expression (LENGTH)` +15.03%，qps/quant/idx/par
+  全过；主机负载始终 6-12，结论登记为环境噪音强化，空闲机器绿色门禁仍待补。
 
 ## 6. 第二批 C2：UPDATE、Safe/Max 与恢复一致性
 
@@ -619,7 +636,91 @@ S3 依据 A5 与 R4 余项，把 `do_get` 从“整体物化 + 单批次编码�
 
 处理：不删除样本、不调阈值、不把失败门禁改称通过；两轮 canary 与 full 主比较
 的原始报告全部保留在 `local-perf-results/s3-acceptance-20260917/`，登记为
-**环境受限原始例外**。干净机器上对上述聚合/集合形状的复核列为验收债务 V1，
-在下一次架构阶段验收时一并执行。
+**环境受限原始例外**。干净机器上对上述聚合/集合形状的复核列为验收债务 V1；
+2026-09-17 的复核（第 12 节）在持续高负载下再次确认指标集合互不重复，噪音结论
+得到强化，但空闲窗口的绿色门禁仍待补。
 
 S3 状态：已实现 + 功能已验证 + 性能证据待干净机器复核（V1）。
+
+## 11. 第七批 Q1：完善分批物理执行
+
+Q1 依据 A2 与 R3 余项，落地“selection 直接消费、减少 gather”与分批形状的验证
+矩阵；base+delta 的行组流式读视图留作后续（见 11.3）。起点（base）为 S3 验收
+提交 `eb44b85`；current 为 `041b493`。
+
+### 11.1 selection 直接消费
+
+- `Morsel` 新增 `selection_for_operators()` 与 `column_by_name()`：物理列数组
+  与选择映射对外可见；`SelectionVector::row(position)` 把“第 i 个选中行”映射回
+  物理行（`All` 为恒等映射，零成本）。
+- `BatchGroupAggregator::consume_batch(&RecordBatch)` 改为
+  `consume_morsel(&Morsel)`：分组键、聚合源列与行迭代都直接读物理数组 +
+  选择映射，不再先 `arrow::compute::take` 汇成一个紧凑批次。串行 fold 与并行
+  partial fold 都改为直接传 morsel。
+- 语义不变：已有分批/单批 A/B、并行 A/B、S1 预算测试与 S3 流式 parity 全部
+  保持通过。并行分批扫描因此快 7.0–9.5%（2/4/8 线程与 auto），聚合形状持平。
+
+### 11.2 形状验证矩阵
+
+- `batched_pipeline_matches_single_batch_across_overlay_states`：clean、DELETE、
+  UPDATE（DeltaStore 单元更新）、INSERT（delta 行）四种覆盖层状态下，分批开/
+  关结果逐值一致（覆盖“更新删除”与 schema 一致性）。
+- `batched_pipeline_matches_single_batch_for_exact_integers_and_nan`：超过 2^53
+  的 i64 精确值（含回绕 SUM/MIN/MAX）与 NaN/有限浮点按位一致。
+- `batched_pipeline_result_schema_matches_single_batch`：多组键/聚合形状的
+  输出字段数与字段名/类型逐项一致。
+- 未支持类型（UInt64 组键等）仍由 `BatchKeyView`/扫描谓词类型门控保守回落，
+  既有 `Unsupported` 回落测试与“覆盖层回落”一致。
+
+### 11.3 base+delta 行组流式读视图（未实现，保留）
+
+当前 `scan_batches` 门控要求纯持久化 V4；存在 `.delta` 行或 DeltaStore 单元
+更新时保守回落单批物化（结果正确，内存不有界）。扩为稳定流式读视图需要：
+
+1. 流创建时快照 overlay（DeltaStore 读守卫或紧凑快照 + 删除位图），保证批间
+   视图一致，避免重复/漏读与新旧 schema 混读。
+2. 每个基础行组批次按下 `_id` 应用 overlay 删除与单元更新（值需按列类型转换），
+   并把 `.delta` 追加行作为尾部批次；选择直接消费下 `_id` 必须可用。
+3. 长查询持有读守卫会阻塞写者，需要在“快照成本 vs 写停顿”之间定案；行级
+   overlay 规模已常驻内存，按批应用不放大峰值。
+
+该实现涉及存储流式路径的持久化语义，按“先文档化设计再落地”的规则留作下一批；
+Q1 本轮不声称完成该项，并把它登记为 `M1`/后续批的前置。
+
+### 11.4 测试与验收（2026-09-17）
+
+- `maturin develop --release` 成功；完整串行 `pytest` 1802 passed（33.30 s）；
+  完整 `cargo test --release` 583 单元 + 6 doc-test；`--features flight`
+  587 单元通过。
+- canary（200K/2/7，64 项）exit 0，初判直接通过，无五样本扩展；聚合形状与
+  分批指标全在阈值内（`Aggregation (5 funcs)` +3.49%、`Derived ratio GROUP BY`
+  -1.84%）。
+- full（1M/2/5）exit 0：main 109/109（初判 `UNION ALL (ordered)` +24.95% 在
+  五样本终判恢复），qps 10/10、quant 8/8、idx 4/4、par 4/4；`Parallel batch
+  scan` 2/4/8 线程与 auto 分别 -8.72%/-7.01%/-9.52%/-7.75%。
+- 报告目录 `local-perf-results/q1-acceptance-20260917/`。
+
+Q1 状态：selection 直接消费与验证矩阵已实现 + 功能已验证 + 性能已验收；
+base+delta 行组流式读视图未实现（11.3），不以此声称 Q1 整体完成。
+
+## 12. 验收债务 V1 复核（2026-09-17）
+
+对 S3 提交 `eb44b85`（未改动）复跑 canary/full，报告
+`local-perf-results/v1-reverify-20260917/`：
+
+- canary 原始 exit 1，但标记的是**第三组不同指标**（`Filtered numeric TopK`
+  +52.87%）；S3 两轮 canary 标记过的 `Derived ratio GROUP BY`、
+  `Multiple COUNT DISTINCT`、`CSV filtered GROUP BY + HAVING`、
+  `Numeric conjunction aggregation` 本次全部在阈值内。
+- full 原始 exit 1：初判 3 样本标记 7 项（含与 S3 无关的 `CSV Read + COUNT(*)`
+  与向量 `TopK L2`），自动五样本终判仅剩 `ORDER BY expression (LENGTH)`
+  +15.03%，其 base/current 样本分布高度重叠（base 中位数 1.722ms，current
+  1.981ms）。qps 10/10、quant 8/8、idx 4/4、par 4/4 全过。S3 验收时标记的
+  `IN subquery COUNT` 与 `UNION DISTINCT (ordered)` 本次在阈值内。
+- 主机负载全程 6-12（WindowServer ~50%、Chrome helpers ~40%、airportd ~39%、
+  CleanMyMac ~24%），从未进入空闲窗口。
+
+结论：五次 S3 canary/full 门禁标记的指标集合互不重复，且命中与 S3 无关的路径
+（CSV 读、向量 TopK、ORDER BY 表达式），两侧均有 2-3 倍尖峰、低峰重叠——
+环境噪音结论得到强化。但门禁仍未在空闲机器上取得绿色结果，V1 记为“已证实为
+环境噪音、仍需空闲窗口复核”，保留全部原始报告，不把失败门禁改称通过。
