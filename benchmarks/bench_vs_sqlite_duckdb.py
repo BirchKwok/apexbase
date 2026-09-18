@@ -670,17 +670,26 @@ def run_bench_gc_median(fn, warmup=2, iterations=5):
     return statistics.median(times)
 
 
-def run_bench_with_setup(setup_fn, bench_fn, warmup=2, iterations=5):
-    """Per-iteration setup without DB reopen; return median bench_fn latency."""
+def run_bench_with_setup(setup_fn, bench_fn, warmup=2, iterations=5, teardown_fn=None):
+    """Per-iteration setup without DB reopen; return median bench_fn latency.
+
+    `teardown_fn` runs after each call outside the timed region: it is harness
+    bookkeeping (for example ApexBase's client current-table switch, which has
+    no SQLite/DuckDB equivalent), not part of the statement under test.
+    """
     for _ in range(warmup):
         setup_fn()
         bench_fn()
+        if teardown_fn is not None:
+            teardown_fn()
     times = []
     for _ in range(iterations):
         setup_fn()
         t0 = time.perf_counter()
         bench_fn()
         times.append((time.perf_counter() - t0) * 1000)
+        if teardown_fn is not None:
+            teardown_fn()
     return statistics.median(times)
 
 
@@ -3281,9 +3290,6 @@ class ApexBaseBench:
 
     def bench_table_create(self):
         self.client.create_table(self.TABLE_OPS_NAME, {"k": "int64"})
-        # DDL changes the current table; restore the dataset table so later
-        # read-only sections (e.g. the OLAP Q/s harness) keep querying it.
-        self._restore_default_table()
 
     def bench_table_drop_setup(self):
         self._restore_default_table()
@@ -3292,13 +3298,11 @@ class ApexBaseBench:
 
     def bench_table_drop(self):
         self.client.drop_table(self.TABLE_OPS_NAME)
-        self._restore_default_table()
 
     def bench_table_create_drop_cycle(self):
         self._drop_table_ops()
         self.client.create_table(self.TABLE_OPS_NAME, {"k": "int64"})
         self.client.drop_table(self.TABLE_OPS_NAME)
-        self._restore_default_table()
 
     def bench_list_tables_setup(self):
         self._restore_default_table()
@@ -3309,9 +3313,7 @@ class ApexBaseBench:
             self.client.create_table(f"{self.TABLE_OPS_NAME}_{i}", {"k": "int64"})
 
     def bench_list_tables(self):
-        result = self.client.list_tables()
-        self._restore_default_table()
-        return result
+        return self.client.list_tables()
 
     def bench_alter_table_add_column_setup(self):
         self._restore_default_table()
@@ -3322,7 +3324,16 @@ class ApexBaseBench:
         self.client.execute(
             f"ALTER TABLE {self.TABLE_OPS_NAME} ADD COLUMN c INT64"
         )
-        self._restore_default_table()
+
+    # The current-table switch after each DDL keeps later read sections on the
+    # dataset table. It is harness bookkeeping unique to ApexBase's client API,
+    # so it runs as a teardown outside the timed region; SQLite/DuckDB methods
+    # contain only their DDL + commit.
+    bench_table_create_teardown = _restore_default_table
+    bench_table_drop_teardown = _restore_default_table
+    bench_table_create_drop_cycle_teardown = _restore_default_table
+    bench_list_tables_teardown = _restore_default_table
+    bench_alter_table_add_column_teardown = _restore_default_table
 
     def bench_window_row_number(self):
         return self._query_all(
@@ -5890,7 +5901,11 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
                     results[bench_name][eng_name] = None
                     continue
                 rss_before = measure_rss_mb()
-                ms = run_bench_with_setup(per_setup_fn, fn, warmup=WARMUP, iterations=ITERS)
+                teardown_fn = getattr(bench, f"{method_name}_teardown", None)
+                ms = run_bench_with_setup(
+                    per_setup_fn, fn, warmup=WARMUP, iterations=ITERS,
+                    teardown_fn=teardown_fn,
+                )
                 rss_after = measure_rss_mb()
                 results[bench_name][eng_name] = ms
                 if rss_before and rss_after:

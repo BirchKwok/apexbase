@@ -343,9 +343,21 @@ pub fn invalidate_table_stats(table_key: &str) {
     STATS_CACHE.write().remove(table_key);
 }
 
-/// Invalidate statistics after a schema-changing DDL operation.
+/// Invalidate statistics after a schema-changing DDL operation. Plan feedback
+/// is calibrated per query shape against the old schema and table shape, so it
+/// is dropped as well (memory and sidecar); each shape recalibrates on its next
+/// EXPLAIN ANALYZE (Q2). Data-only writes keep their calibration because the
+/// per-shape sliding averages are meant to age with the table.
 pub fn invalidate_table_schema_stats(table_key: &str) {
     STATS_CACHE.write().remove(table_key);
+    invalidate_table_plan_feedback(table_key);
+}
+
+/// Forget one table's plan feedback in memory and on disk.
+pub fn invalidate_table_plan_feedback(table_key: &str) {
+    PLAN_FEEDBACK.write().remove(table_key);
+    FEEDBACK_LOADED.write().remove(table_key);
+    let _ = std::fs::remove_file(feedback_sidecar_path(table_key));
 }
 
 fn feedback_key(table_key: &str, select: &SelectStatement) -> u64 {
@@ -1986,5 +1998,40 @@ mod tests {
         assert_eq!(cache.len(), PLAN_FEEDBACK_TABLES);
         assert!(!cache.contains_key("table_0"));
         assert!(cache.contains_key("table_new"));
+    }
+
+    #[test]
+    fn schema_change_clears_table_plan_feedback() {
+        let dir = std::env::temp_dir().join(format!(
+            "apex_planner_feedback_invalidate_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table_key = dir.join("t.apex").to_string_lossy().to_string();
+        let sidecar = format!("{table_key}.plan_feedback");
+        let select = select_statement("SELECT k, COUNT(*) FROM t WHERE k >= 1 GROUP BY k");
+
+        record_plan_feedback(
+            &table_key,
+            &select,
+            &ExecutionStrategy::OlapAggregation,
+            100.0,
+            100.0,
+            ExecutedCostClass::Scan,
+            1.0,
+            10.0,
+        );
+        assert!(std::path::Path::new(&sidecar).exists());
+        let recorded = feedback_lookup_for_tests(&table_key, &select).unwrap();
+        assert_eq!(recorded.samples, 1);
+
+        // A schema change drops the calibration in memory and on disk; data-only
+        // writes keep it.
+        invalidate_table_schema_stats(&table_key);
+        assert!(feedback_lookup_for_tests(&table_key, &select).is_none());
+        assert!(!std::path::Path::new(&sidecar).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
