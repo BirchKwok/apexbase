@@ -24,6 +24,8 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 专项 A/B 是归因证据，不能把失败门禁改称通过。同构建自 A/B 只能解释波动，不能替代旧版/新版比较。
 最新 C3 最终验收见第 7.3 节：`local-perf-results/c3-acceptance-20260917/`
 （canary exit 0；full 原始 exit 1，标记项经 current 侧独立复测登记为已证实噪音）。
+最新 S1 最终验收见第 8.3 节：`local-perf-results/s1-acceptance-20260917/`
+（canary/full 对 base `2c2e471` 均 exit 0，S1 触及的聚合形状无回退）。
 
 ## 2. 优先级、依赖和交付边界
 
@@ -32,7 +34,7 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 | 1 | P0 / C1 | 提交失败结果分类与提交后错误处理 | Rust 可识别、Python 可辨认“未提交/结果不确定/已提交”；保留原始错误；不把 WAL marker 写失败误判可安全重试；提交后维护失败仍发布可见性与失效；真实 I/O 故障测试 | 已实现并验收通过（2026-09-10，canary/full 对 base `1b60ae8` 均 exit 0）；C2 可开始 |
 | 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | C2.1–C2.3 已实现，功能验收完成；性能证据已收口并登记 full 原始噪音例外；C3 可开始 |
 | 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | C3.1–C3.2 已实现并完成最终统一验收（full 原始噪音例外见 7.3）；S1 可开始 |
-| 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | 待实施，C1–C3 后 |
+| 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | S1.1–S1.3 已实现并完成最终统一验收（2026-09-17，canary/full 对 base `2c2e471` 均 exit 0）；S2/S3 可开始 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | 待实施，按缓存拆批 |
 | 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 待实施，依赖 S1 |
 | 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | 待实施，依赖 C/S 基础 |
@@ -143,6 +145,16 @@ canary/full 均须退出 0，A/B 仅用于诊断；指标集合随仓库扩展�
   经 current 侧独立复测证实为噪音，qps/quant/idx 全部通过）。完整记录与后续
   事项见 7.3。C3 状态：已实现 + 功能已验证 + 性能证据已收口（含 full 原始
   噪音例外）。
+- S1 实施与最终验收（2026-09-17）：新增按查询的字节内存预算
+  （`executor/memory.rs`，`APEX_QUERY_MEMORY_MB`），覆盖分批管道（串行流 +
+  并行 partial 与合并）、行索引回退、单键 streaming（含 COUNT DISTINCT）、
+  通用键增量路径（rayon 分区与合并）、`VectorizedHashAgg` 与字典直索引路径；
+  超预算返回 `OutOfMemory`，失败回退释放预留，guard 在成功/取消/失败时恢复
+  上下文。最终验收报告 `local-perf-results/s1-acceptance-20260917/`：
+  pytest 1801 passed、cargo test 574+6 passed、公开 benchmark exit 0、
+  canary exit 0（64 项五样本收敛）、full exit 0（main 109/109、qps 10/10、
+  quant 8/8、idx 4/4、par 4/4，无五样本扩展）。完整记录见第 8 节。
+  S1 状态：已实现 + 功能已验证 + 性能已验收。
 
 ## 6. 第二批 C2：UPDATE、Safe/Max 与恢复一致性
 
@@ -358,3 +370,82 @@ C3 状态据此记为“已实现 + 功能已验证 + 性能证据已收口（�
   会留下已持久行（读取因 stale 标记仍正确，但写入非原子）；需要改为变更前预校验。
 - DROP TABLE 不清理 `<base>/indexes/<table>_*.hashidx` / `.idxcat`，同名重建索引
   会报 "already exists"（既有行为，已用探针复现）。
+
+## 8. 第四批 S1：查询内存预算与资源准入
+
+S1 依据 A5（按需存储与查询内存上限未打通）与 `docs/RESOURCE_OWNERSHIP.md`
+的所有权结论落地：先约束查询自身持有的高基数聚合状态与并行局部状态，再谈
+全局缓存容量（G1/S2）。起点（base）为 C3 验收提交
+`2c2e471f038dadc8083720a2d5b16c00ae688f75`；current 为 `0bd0e21`。
+
+### 8.1 预算口径与实现
+
+- 每个顶层查询一个按字节计量的预算：`QueryMemoryBudget { limit, used:
+  AtomicUsize }`；并行 worker 折叠通过捕获同一 `Arc` 共享计数，因此并行
+  partial 与合并结果都计入同一个池。
+- `QueryMemoryBudgetGuard` 在 `execute_classified_with_base_dir` 入口安装；
+  嵌套查询沿用外层预算，Drop 恢复上一层上下文（成功/取消/失败一致），
+  失败的内核在回退到其他算子前释放自己的预留。
+- 配置 `APEX_QUERY_MEMORY_MB`：正整数 MiB；`0` = 不限；未设置或非法值使用
+  默认 1 GiB。每个顶层查询安装时读取，可逐查询切换（与 `APEX_BATCH_SCAN`
+  同一风格）。
+- 超预算返回 `io::ErrorKind::OutOfMemory`，错误文本给出已用与上限字节；
+  Python 侧为 `RuntimeError`，文本包含 `query memory budget exceeded`。
+- 计量按状态增量维护，不在热路径重扫容器：分组 map 记录条目字节、键 lane
+  记录字典与字符串字节、行索引向量按容量增长、`VectorizedHashAgg` 在
+  `get_or_create_group_*` 内累加 `bytes`；逐行累加循环每
+  `GROUP_BUDGET_CHECK_INTERVAL`（4096）行做一次原子预留，把开销与超调都
+  限制在批次级别。
+
+### 8.2 已覆盖与不在范围内的入口
+
+已覆盖：分批聚合管道（串行流、并行 partial 与合并）、
+`execute_group_by_with_indices`（每组行索引）、
+`try_execute_single_key_streaming_group_by`（含 COUNT DISTINCT 的每组
+distinct 集合）、`execute_group_by_incremental` 通用键路径（rayon 分区局部
+状态与合并）、`VectorizedHashAgg` 单键哈希、字典直索引路径
+（`execute_group_by_string_dict`、dict case count、vectorized dict count）。
+
+不在本预算内（已在 `RESOURCE_OWNERSHIP.md` §5 登记）：
+
+- 最终结果物化：完整结果 API 允许 O(输出)，不按扫描/聚合预算误判失败。
+- 无 WHERE 的整型键查询若命中存储层 numeric dict cache（u16 组 ID，上限
+  65536 组）或存储原生 `execute_group_agg`（结果本身 O(组数)），其内存属于
+  全局缓存容量（G1）与输出物化，按 S2/G1 单独处理。
+
+### 8.3 测试与验收（2026-09-17）
+
+新增测试：
+
+- Rust：预算 `reserve/release/limit` 语义（拒绝不改变计数）、guard 上下文
+  恢复与嵌套共享、分批管道在 1 KiB 预算下明确报错并在合理预算下成功、
+  并行 partial 状态合计计入同一预算（以串行字节数 +50% 为界）、
+  `VectorizedHashAgg` 分组字节随新键增长。
+- Python（`test/test_query_memory_budget.py`，16 项）：分批形状超预算报错、
+  不限预算可跑通、失败后预算逐查询释放、无 WHERE 的 5 种通用形状
+  （单键 COUNT/SUM/COUNT DISTINCT、双键、ORDER BY+LIMIT）超预算报错且不限
+  预算结果正确、子进程峰值 RSS 有界（受限运行峰值明显低于物化全部组的
+  运行）、并发 4 线程下每线程预算互不泄漏（小查询始终成功、大查询始终
+  报错）。
+
+验收链（conda base，M1 Pro 10c，release，隔离 worktree/venv/Cargo target，
+30 s 静置，B-C-C-B-B-C，未降低行数/预热/计时/阈值）：
+
+- `maturin develop --release` 成功；完整串行 `pytest` 1801 passed（33.41 s）；
+  完整 `cargo test --release` 574 单元 + 6 doc-test 通过。
+- 公开 benchmark（1M/2/5，109 指标）exit 0；对比 `latest_public_baseline.json`
+  覆盖 109/109，2 项单次指标超过 15% 且 0.005ms（`Batch TopK Dot` 向量批次
+  查询 +22.19%、`SELECT * LIMIT 100 (warm cache)` +15.81%），均为旧基线
+  （`492956bb`）漂移与方差，且不在 S1 触及的聚合路径上；不作为门禁判定。
+- canary（200K/2/7，64 项）exit 0：初判 3 项（CSV integer GROUP BY numeric
+  agg +30.40%、NULL profile (2 cols) +24.50%、Two-key GROUP BY (5 funcs)
+  +19.63%）在自动五样本终判为 -2.93%/+6.13%/+2.11%。
+- full（1M/2/5）exit 0，未触发五样本扩展：main 109/109、qps 10/10、
+  quant 8/8、idx 4/4、par 4/4。聚合形状持平或更快（Aggregation (5 funcs)
+  -4.94%、GROUP BY category + HAVING -20.10%、GROUP BY city ORDER BY count
+  -43.27%、Parallel batch scan (8 threads) -16.28%）；点查 0.003/0.002 ms
+  不变，说明每查询预算安装没有可测量的固定成本。
+- 报告目录 `local-perf-results/s1-acceptance-20260917/`（README、全部
+  JSON/比较/日志、退出状态）。
+
+S1 状态据此记为“已实现 + 功能已验证 + 性能已验收”。
