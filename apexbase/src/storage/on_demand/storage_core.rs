@@ -2075,6 +2075,30 @@ impl OnDemandStorage {
         !self.delta_store.read().is_empty()
     }
 
+    /// Rows excluded by persisted V4 row-group deletion vectors.
+    ///
+    /// The batched overlay stream applies those vectors itself, so it must know
+    /// whether the persisted base is a pure physical view. The merged
+    /// `read_columns` lane still reads the physical row space, so a table with
+    /// persisted deletions must stay on the single-shot fallback until that
+    /// lane is reconciled (see ARCHITECTURE_REFACTOR_REMAINING 11.5).
+    pub(crate) fn persisted_deletion_count(&self) -> io::Result<u64> {
+        Ok(match self.get_or_load_footer()? {
+            Some(footer) => footer
+                .row_groups
+                .iter()
+                .map(|group| group.deletion_count as u64)
+                .sum(),
+            None => 0,
+        })
+    }
+
+    /// Persisted base row count in the row space used by `read_columns`
+    /// (active rows after row-group deletion vectors, before the delta file).
+    pub(crate) fn header_row_count(&self) -> u64 {
+        self.header.read().row_count
+    }
+
     /// Get the number of pending delta updates.
     pub fn delta_update_count(&self) -> usize {
         self.delta_store.read().update_count()

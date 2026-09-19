@@ -348,6 +348,23 @@ impl DeltaStore {
         &self.updates
     }
 
+    /// Copy the visible overlay (deletes plus collapsed cell updates) into a
+    /// standalone store with no sequential log.
+    ///
+    /// A batched reader snapshots the overlay once at stream creation so every
+    /// batch of one scan sees the same deletes and updates, without holding a
+    /// storage read guard for the whole query.
+    pub fn snapshot(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            delete_bitmap: self.delete_bitmap.clone(),
+            updates: self.updates.clone(),
+            log: Vec::new(),
+            dirty: false,
+            next_txn_id: self.next_txn_id,
+        }
+    }
+
     /// Return true when any pending update touches the given column.
     pub fn updates_column(&self, column_name: &str) -> bool {
         self.updates.values().any(|cols| {

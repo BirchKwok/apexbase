@@ -871,6 +871,137 @@ pub struct TableStorageBackend {
     first_string_row_id_cache: RwLock<HashMap<String, Arc<FirstStringRowIdCache>>>,
 }
 
+/// Drop the `_id` column the overlay stream carries for patching but the
+/// caller did not project. A batch that already lacks `_id` is returned as is,
+/// so the append-only overlay lane stays free of per-batch rebuilds.
+fn strip_id_column(
+    batch: arrow::record_batch::RecordBatch,
+) -> io::Result<arrow::record_batch::RecordBatch> {
+    use arrow::datatypes::Schema;
+    use std::sync::Arc;
+
+    let schema = batch.schema();
+    if schema.field_with_name("_id").is_err() {
+        return Ok(batch);
+    }
+    let mut fields = Vec::with_capacity(schema.fields().len().saturating_sub(1));
+    let mut columns = Vec::with_capacity(fields.capacity());
+    for (index, field) in schema.fields().iter().enumerate() {
+        if field.name() == "_id" {
+            continue;
+        }
+        fields.push(field.as_ref().clone());
+        columns.push(batch.column(index).clone());
+    }
+    arrow::record_batch::RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
+/// Batched read view over a V4 base file plus its visible overlay.
+///
+/// The base row groups stream straight from the mmap row-group reader, so an
+/// unaffected batch is handed on with no copy at all. A single DeltaStore
+/// snapshot taken at stream creation is applied per batch by `_id`; batches
+/// whose ids are not touched by the overlay stay zero-copy, and the appended
+/// delta rows are read once as a tail batch. Nothing re-reads a merged window,
+/// and the whole stream observes one stable overlay.
+struct OverlayBatchStream<'a> {
+    base: Option<Box<dyn Iterator<Item = io::Result<arrow::record_batch::RecordBatch>> + Send + 'a>>,
+    backend: &'a TableStorageBackend,
+    /// Column names (with `_id` when the stream carries it) for the tail read.
+    /// `None` means all columns.
+    tail_columns: Option<Vec<String>>,
+    /// Persisted base row count: where the appended delta rows start.
+    tail_start: usize,
+    /// Appended delta row count fixed at stream creation, so rows appended by a
+    /// concurrent writer are never observed mid-stream.
+    tail_rows: usize,
+    delta: Option<std::sync::Arc<crate::storage::delta::DeltaStore>>,
+    /// Whether the caller projected `_id`.
+    include_id: bool,
+    /// False only while the tail batch is still pending.
+    tail_done: bool,
+}
+
+impl OverlayBatchStream<'_> {
+    fn finish_batch(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        let batch = match &self.delta {
+            Some(delta) => self.patch_batch(batch, delta.as_ref())?,
+            None => batch,
+        };
+        if self.include_id {
+            Ok(batch)
+        } else {
+            strip_id_column(batch)
+        }
+    }
+
+    /// Apply overlay deletes and cell updates to one base or tail batch.
+    /// Batches whose ids the overlay does not touch are returned untouched.
+    fn patch_batch(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+        delta: &crate::storage::delta::DeltaStore,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        use arrow::array::{Array, Int64Array};
+
+        if delta.is_empty() || batch.num_rows() == 0 {
+            return Ok(batch);
+        }
+        let Some(column) = batch.column_by_name("_id") else {
+            return Ok(batch);
+        };
+        let Some(ids) = column.as_any().downcast_ref::<Int64Array>() else {
+            return Ok(batch);
+        };
+        let touched = ids.iter().any(|value| {
+            let id = value.unwrap_or(0) as u64;
+            delta.is_deleted(id) || delta.has_updates(id)
+        });
+        if !touched {
+            return Ok(batch);
+        }
+        let row_ids: Vec<u64> = ids.iter().map(|value| value.unwrap_or(0) as u64).collect();
+        crate::storage::DeltaMerger::merge(&batch, delta, &row_ids)
+    }
+}
+
+impl Iterator for OverlayBatchStream<'_> {
+    type Item = io::Result<arrow::record_batch::RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(base) = self.base.as_mut() {
+            match base.next() {
+                Some(Ok(batch)) => return Some(self.finish_batch(batch)),
+                Some(Err(error)) => return Some(Err(error)),
+                None => self.base = None,
+            }
+        }
+        if self.tail_done {
+            return None;
+        }
+        self.tail_done = true;
+        let refs: Option<Vec<&str>> = self
+            .tail_columns
+            .as_ref()
+            .map(|columns| columns.iter().map(String::as_str).collect());
+        let tail = self.backend.read_columns_to_arrow_inner(
+            refs.as_deref(),
+            self.tail_start,
+            Some(self.tail_rows),
+            false,
+        );
+        match tail {
+            Ok(batch) if batch.num_rows() == 0 => None,
+            Ok(batch) => Some(self.finish_batch(batch)),
+            Err(error) => Some(Err(error)),
+        }
+    }
+}
+
 impl TableStorageBackend {
     /// Read the persisted row count without opening the full table backend.
     ///
@@ -1555,11 +1686,7 @@ impl TableStorageBackend {
             return Ok(None);
         }
 
-        if self.storage.is_in_memory()
-            || self.has_delta()
-            || self.has_pending_deltas()
-            || self.pending_v4_in_memory_rows() > 0
-        {
+        if self.storage.is_in_memory() || self.pending_v4_in_memory_rows() > 0 {
             return Ok(None);
         }
 
@@ -1590,6 +1717,28 @@ impl TableStorageBackend {
             None => None,
         };
 
+        let has_overlay = self.has_delta() || self.has_pending_deltas();
+        if has_overlay {
+            // The base lane below is the V4 mmap row-group stream. Legacy V3
+            // files carry no footer and must keep the single-shot fallback.
+            if !self.storage.is_v4_format() {
+                return Ok(None);
+            }
+            // The merged single-shot lane reads the physical row space while
+            // its ids come from the active-row space, so a table with persisted
+            // row-group deletions stays on the fallback until those two spaces
+            // are reconciled (11.5). Everything else streams.
+            if self.storage.persisted_deletion_count()? > 0 {
+                return Ok(None);
+            }
+            return Ok(Some(self.overlay_batch_streams(
+                request,
+                projection_names.as_deref(),
+                include_id,
+                part,
+            )?));
+        }
+
         let streams = match self.storage.scan_rg_batches_ranges(
             projection_names.as_deref(),
             include_id,
@@ -1606,6 +1755,86 @@ impl TableStorageBackend {
                 .map(|stream| crate::storage::BatchMorselStream::new(stream, request.predicate))
                 .collect(),
         ))
+    }
+
+    /// Build the batched streams for a table with a delta file and/or pending
+    /// DeltaStore cells. The base row groups stream unchanged; a DeltaStore
+    /// snapshot (taken here, once) is applied per batch by `_id`, and the
+    /// appended delta rows are emitted once as a tail batch on the last range.
+    fn overlay_batch_streams<'a>(
+        &'a self,
+        request: &crate::storage::ScanRequest<'a>,
+        projection_names: Option<&[&str]>,
+        include_id: bool,
+        part: usize,
+    ) -> io::Result<Vec<crate::storage::BatchMorselStream<'a>>> {
+        let delta = if self.has_pending_deltas() {
+            Some(std::sync::Arc::new(self.storage.delta_store().snapshot()))
+        } else {
+            None
+        };
+        // The per-batch `_id` patch needs the id column even when the caller
+        // did not project it; append-only overlays keep the caller's schema.
+        let internal_id = include_id || delta.is_some();
+        let tail_columns: Option<Vec<String>> = request.projection.map(|_| {
+            let mut names = Vec::new();
+            if internal_id {
+                names.push("_id".to_string());
+            }
+            if let Some(projection) = projection_names {
+                names.extend(projection.iter().map(|name| (*name).to_string()));
+            }
+            names
+        });
+        let tail_start = self.storage.header_row_count() as usize;
+        // Fix the appended-row view at creation, like the base row groups.
+        let tail_rows = (self.storage.row_count() as usize).saturating_sub(tail_start);
+
+        let base = self.storage.scan_rg_batches_ranges(
+            projection_names,
+            internal_id,
+            request.predicate,
+            part,
+        )?;
+        let mut streams = Vec::new();
+        match base {
+            Some(base) => {
+                let last = base.len().saturating_sub(1);
+                for (index, stream) in base.into_iter().enumerate() {
+                    streams.push(crate::storage::BatchMorselStream::new(
+                        OverlayBatchStream {
+                            base: Some(Box::new(stream)),
+                            backend: self,
+                            tail_columns: if index == last {
+                                tail_columns.clone()
+                            } else {
+                                None
+                            },
+                            tail_start,
+                            tail_rows,
+                            delta: delta.clone(),
+                            include_id,
+                            tail_done: index != last,
+                        },
+                        request.predicate,
+                    ));
+                }
+            }
+            None => streams.push(crate::storage::BatchMorselStream::new(
+                OverlayBatchStream {
+                    base: None,
+                    backend: self,
+                    tail_columns,
+                    tail_start,
+                    tail_rows,
+                    delta,
+                    include_id,
+                    tail_done: false,
+                },
+                request.predicate,
+            )),
+        }
+        Ok(streams)
     }
 
     /// Get row count
@@ -2899,6 +3128,19 @@ impl TableStorageBackend {
         start_row: usize,
         row_count: Option<usize>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
+        self.read_columns_to_arrow_inner(column_names, start_row, row_count, true)
+    }
+
+    /// Shared reader body. `apply_delta_store` is false only for the tail batch
+    /// of the batched overlay stream, which applies its own DeltaStore snapshot
+    /// so every batch of one scan observes the same overlay.
+    fn read_columns_to_arrow_inner(
+        &self,
+        column_names: Option<&[&str]>,
+        start_row: usize,
+        row_count: Option<usize>,
+        apply_delta_store: bool,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
         use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
@@ -3015,7 +3257,7 @@ impl TableStorageBackend {
         if include_id {
             let ids = self.storage.read_ids(start_row, row_count)?;
             expected_row_count = ids.len();
-            let row_ids_for_delta = if self.has_pending_deltas() {
+            let row_ids_for_delta = if apply_delta_store && self.has_pending_deltas() {
                 Some(ids.clone())
             } else {
                 None
@@ -3034,7 +3276,7 @@ impl TableStorageBackend {
         } else {
             // If no _id, get row count from any column
             expected_row_count = col_data.values().next().map(|d| d.len()).unwrap_or(0);
-            pending_delta_row_ids = if self.has_pending_deltas() {
+            pending_delta_row_ids = if apply_delta_store && self.has_pending_deltas() {
                 Some(self.storage.read_ids(start_row, row_count)?)
             } else {
                 None
@@ -7234,8 +7476,28 @@ mod tests {
         );
     }
 
+    /// Drain a batch stream into record batches, failing loudly on a protocol
+    /// fallback because the parity tests only use typed predicates.
+    fn collect_stream_batches(
+        stream: &mut crate::storage::BatchMorselStream<'_>,
+    ) -> Vec<RecordBatch> {
+        let mut batches = Vec::new();
+        while let Some(outcome) = stream.next() {
+            match outcome.expect("batch stream error") {
+                crate::storage::BatchMorselOutcome::Morsel(morsel) => {
+                    batches.push(morsel.into_record_batch().unwrap());
+                }
+                crate::storage::BatchMorselOutcome::Unsupported => {
+                    panic!("typed predicate must be supported by the batch protocol");
+                }
+            }
+        }
+        batches
+    }
+
     #[test]
-    fn scan_batches_requires_a_clean_persisted_read_view() {
+    fn scan_batches_streams_overlay_and_rejects_in_memory_and_persisted_deletes() {
+        use arrow::array::Int64Array;
         let request = crate::storage::ScanRequest {
             projection: None,
             predicate: None,
@@ -7268,14 +7530,433 @@ mod tests {
             "clean V4 table must stream"
         );
 
-        // Delta state is overlay the row-group stream cannot express: the
-        // caller must fall back to the single-shot scan for the whole query.
+        // An append-only delta still streams: the base row groups are
+        // unchanged and the appended rows arrive as a tail batch.
         backend
             .insert_rows_to_delta(&[HashMap::from([("v".to_string(), Value::Int64(2))])])
             .unwrap();
+        assert!(backend.has_delta());
+        let mut stream = backend
+            .scan_batches(&request)
+            .unwrap()
+            .expect("an append-only overlay must stream");
+        let values: Vec<i64> = collect_stream_batches(&mut stream)
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("v")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                column.iter().flatten().collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, vec![1, 2]);
+
+        // DeltaStore cells are patched per batch by `_id`.
+        backend.delta_batch_update_rows(&[(1u64, "v", Value::Int64(3))]);
+        let mut stream = backend
+            .scan_batches(&request)
+            .unwrap()
+            .expect("a DeltaStore overlay must stream");
+        let values: Vec<i64> = collect_stream_batches(&mut stream)
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("v")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                column.iter().flatten().collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, vec![3, 2]);
+
+        // Persisted row-group deletions keep the single-shot fallback: the
+        // merged `read_columns` lane still reads the physical row space while
+        // its ids come from the active space (11.5), so streaming them would
+        // disagree with `scan()`.
+        let path2 = dir.path().join("batch_gate_persisted_delete.apex");
+        let builder = TableStorageBackend::create(&path2).unwrap();
+        builder.add_column("v", DataType::Int64).unwrap();
+        builder
+            .insert_rows(&[
+                HashMap::from([("v".to_string(), Value::Int64(1))]),
+                HashMap::from([("v".to_string(), Value::Int64(2))]),
+            ])
+            .unwrap();
+        builder.save().unwrap();
+        assert!(builder.delete(1));
+        builder.save().unwrap();
+        drop(builder);
+        let deleted = TableStorageBackend::open(&path2).unwrap();
+        assert!(deleted.storage.persisted_deletion_count().unwrap() > 0);
+        deleted
+            .insert_rows_to_delta(&[HashMap::from([("v".to_string(), Value::Int64(3))])])
+            .unwrap();
         assert!(
-            backend.scan_batches(&request).unwrap().is_none(),
-            "delta state must force the single-shot fallback"
+            deleted.scan_batches(&request).unwrap().is_none(),
+            "persisted deletions plus an overlay must stay on the fallback"
         );
+    }
+
+    /// Build a 70k-row, multi-row-group table with an overlay that has no
+    /// persisted row-group deletion: a DeltaStore delete, a DeltaStore cell
+    /// update and appended delta rows.
+    fn overlay_scan_fixture(dir: &Path, name: &str) -> std::path::PathBuf {
+        let path = dir.join(name);
+        let builder = TableStorageBackend::create(&path).unwrap();
+        builder.add_column("age", DataType::Int64).unwrap();
+        builder.add_column("score", DataType::Float64).unwrap();
+        builder.add_column("city", DataType::String).unwrap();
+        builder.add_column("pad", DataType::String).unwrap();
+        let rows = 70_000;
+        let mut ages = Vec::with_capacity(rows);
+        let mut scores = Vec::with_capacity(rows);
+        let mut cities = Vec::with_capacity(rows);
+        let mut pads = Vec::with_capacity(rows);
+        for i in 0..rows {
+            ages.push((i % 100) as i64);
+            scores.push((i % 97) as f64 * 0.5);
+            cities.push(format!("c{}", i % 13));
+            pads.push("x".repeat(110));
+        }
+        builder
+            .insert_typed_with_nulls(
+                HashMap::from([("age".to_string(), ages)]),
+                HashMap::from([("score".to_string(), scores)]),
+                HashMap::from([("city".to_string(), cities), ("pad".to_string(), pads)]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        builder.save().unwrap();
+        // `_id`s are 1-based; delete and update rows inside the first and
+        // second row groups.
+        builder.delta_delete_rows(&[200]);
+        builder.delta_batch_update_rows(&[(100u64, "age", Value::Int64(4242))]);
+        builder.save_delta_store().unwrap();
+        builder
+            .insert_rows_to_delta(&[
+                HashMap::from([
+                    ("age".to_string(), Value::Int64(555)),
+                    ("score".to_string(), Value::Float64(1.5)),
+                    ("city".to_string(), Value::String("cX".to_string())),
+                    ("pad".to_string(), Value::String("x".repeat(110))),
+                ]),
+                HashMap::from([
+                    ("age".to_string(), Value::Int64(556)),
+                    ("score".to_string(), Value::Float64(2.5)),
+                    ("city".to_string(), Value::String("cY".to_string())),
+                    ("pad".to_string(), Value::String("x".repeat(110))),
+                ]),
+            ])
+            .unwrap();
+        drop(builder);
+        path
+    }
+
+    #[test]
+    fn scan_batches_overlay_stream_matches_single_shot_scan() {
+        use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+
+        let dir = tempdir().unwrap();
+        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_equivalence.apex");
+        let backend = TableStorageBackend::open(&path).unwrap();
+        assert_eq!(backend.storage.persisted_deletion_count().unwrap(), 0);
+        assert!(backend.has_delta());
+        assert!(backend.has_pending_deltas());
+
+        let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "score".to_string(),
+            op: ScanComparison::Ge,
+            value: ScanValue::Float(0.0),
+        });
+        let projection: &[&str] = &["_id", "age", "score", "city"];
+        let request = crate::storage::ScanRequest {
+            projection: Some(projection),
+            predicate: Some(&predicate),
+        };
+
+        let single = backend
+            .scan(&request)
+            .unwrap()
+            .expect("single-shot scan must produce a morsel")
+            .into_record_batch()
+            .unwrap();
+        let mut stream = backend
+            .scan_batches(&request)
+            .unwrap()
+            .expect("an overlay must stream");
+        let batches = collect_stream_batches(&mut stream);
+        assert!(
+            batches.len() >= 2,
+            "a 70k-row overlay must span several row groups, got {}",
+            batches.len()
+        );
+        let merged = arrow::compute::concat_batches(&single.schema(), &batches).unwrap();
+        assert_eq!(merged.num_rows(), single.num_rows());
+        assert_eq!(
+            logical_scan_rows(&merged),
+            logical_scan_rows(&single),
+            "overlay batch stream differs from the single-shot scan"
+        );
+        let rows = logical_scan_rows(&merged);
+        assert!(
+            !rows.iter().any(|(id, _, _, _)| *id == 200),
+            "DeltaStore delete must be applied"
+        );
+        assert!(
+            rows.iter().any(|(_, age, _, _)| *age == 4242),
+            "DeltaStore cell update must be applied"
+        );
+        assert!(
+            rows.iter().any(|(_, age, _, _)| *age == 555)
+                && rows.iter().any(|(_, age, _, _)| *age == 556),
+            "appended delta rows must be visible"
+        );
+    }
+
+    #[test]
+    fn scan_batches_overlay_stream_matches_single_shot_for_updated_string_column() {
+        use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+
+        let dir = tempdir().unwrap();
+        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_string_update.apex");
+        let backend = TableStorageBackend::open(&path).unwrap();
+        backend.delta_batch_update_rows(&[(150u64, "city", Value::String("cZ".to_string()))]);
+
+        let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "age".to_string(),
+            op: ScanComparison::Ge,
+            value: ScanValue::Int(0),
+        });
+        let projection: &[&str] = &["_id", "age", "score", "city"];
+        let request = crate::storage::ScanRequest {
+            projection: Some(projection),
+            predicate: Some(&predicate),
+        };
+        let single = backend
+            .scan(&request)
+            .unwrap()
+            .expect("single-shot scan must produce a morsel")
+            .into_record_batch()
+            .unwrap();
+        let mut stream = backend.scan_batches(&request).unwrap().expect("overlay streams");
+        let batches = collect_stream_batches(&mut stream);
+        // Every batch must keep one schema: only touched batches are rebuilt,
+        // so a type-changing overlay would desynchronize the stream.
+        for batch in &batches {
+            assert_eq!(batch.schema(), single.schema());
+        }
+        let merged = arrow::compute::concat_batches(&single.schema(), &batches).unwrap();
+        let rows = logical_scan_rows(&merged);
+        assert_eq!(
+            rows,
+            logical_scan_rows(&single),
+            "string-column overlay stream differs from the single-shot scan"
+        );
+        assert!(
+            rows.iter().any(|(_, _, _, city)| city.as_deref() == Some("cZ")),
+            "string cell update must be applied"
+        );
+    }
+
+    #[test]
+    fn scan_batches_overlay_ranges_partition_rows() {
+        use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+
+        let dir = tempdir().unwrap();
+        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_ranges.apex");
+        let backend = TableStorageBackend::open(&path).unwrap();
+
+        let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "score".to_string(),
+            op: ScanComparison::Ge,
+            value: ScanValue::Float(0.0),
+        });
+        let projection: &[&str] = &["_id", "age", "score", "city"];
+        let request = crate::storage::ScanRequest {
+            projection: Some(projection),
+            predicate: Some(&predicate),
+        };
+
+        let single = backend
+            .scan(&request)
+            .unwrap()
+            .expect("single-shot scan must produce a morsel")
+            .into_record_batch()
+            .unwrap();
+        let mut ranges = backend
+            .scan_batches_ranges(&request, 3)
+            .unwrap()
+            .expect("an overlay must stream over ranges");
+        assert!(ranges.len() >= 2, "expected several ranges");
+        let mut batches = Vec::new();
+        for stream in ranges.iter_mut() {
+            batches.extend(collect_stream_batches(stream));
+        }
+        let merged = arrow::compute::concat_batches(&single.schema(), &batches).unwrap();
+        assert_eq!(merged.num_rows(), single.num_rows());
+        assert_eq!(
+            logical_scan_rows(&merged),
+            logical_scan_rows(&single),
+            "overlay range stream differs from the single-shot scan"
+        );
+    }
+
+    #[test]
+    fn scan_batches_overlay_strips_unprojected_id() {
+        use arrow::array::Int64Array;
+        use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+
+        let dir = tempdir().unwrap();
+        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_no_id.apex");
+        let backend = TableStorageBackend::open(&path).unwrap();
+
+        let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "age".to_string(),
+            op: ScanComparison::Ge,
+            value: ScanValue::Int(0),
+        });
+        // The projection omits `_id` but the overlay patch still needs it.
+        let projection: &[&str] = &["age", "city"];
+        let request = crate::storage::ScanRequest {
+            projection: Some(projection),
+            predicate: Some(&predicate),
+        };
+
+        let single = backend
+            .scan(&request)
+            .unwrap()
+            .expect("single-shot scan must produce a morsel")
+            .into_record_batch()
+            .unwrap();
+        assert!(single.column_by_name("_id").is_none());
+
+        let mut stream = backend
+            .scan_batches(&request)
+            .unwrap()
+            .expect("an overlay must stream");
+        let batches = collect_stream_batches(&mut stream);
+        for batch in &batches {
+            assert!(
+                batch.column_by_name("_id").is_none(),
+                "stream must not leak the patch-only _id column"
+            );
+            assert_eq!(batch.num_columns(), 2);
+        }
+        let merged = arrow::compute::concat_batches(&single.schema(), &batches).unwrap();
+        assert_eq!(merged.num_rows(), single.num_rows());
+        let ages = |batch: &RecordBatch| -> Vec<Option<i64>> {
+            batch
+                .column_by_name("age")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect()
+        };
+        assert_eq!(ages(&merged), ages(&single));
+    }
+
+    #[test]
+    fn scan_batches_overlay_tail_is_fixed_at_stream_creation() {
+        use arrow::array::Int64Array;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("batch_scan_overlay_tail_snapshot.apex");
+        let builder = TableStorageBackend::create(&path).unwrap();
+        builder.add_column("v", DataType::Int64).unwrap();
+        builder
+            .insert_rows(&[
+                HashMap::from([("v".to_string(), Value::Int64(1))]),
+                HashMap::from([("v".to_string(), Value::Int64(2))]),
+            ])
+            .unwrap();
+        builder.save().unwrap();
+        builder
+            .insert_rows_to_delta(&[HashMap::from([("v".to_string(), Value::Int64(3))])])
+            .unwrap();
+        drop(builder);
+
+        let backend = TableStorageBackend::open(&path).unwrap();
+        let request = crate::storage::ScanRequest {
+            projection: None,
+            predicate: None,
+        };
+        let mut stream = backend.scan_batches(&request).unwrap().expect("streams");
+        // A concurrent append after stream creation must not be observed: the
+        // tail row count is fixed with the base read view.
+        backend
+            .insert_rows_to_delta(&[HashMap::from([("v".to_string(), Value::Int64(4))])])
+            .unwrap();
+        let batches = collect_stream_batches(&mut stream);
+        let merged = arrow::compute::concat_batches(
+            &backend.read_columns_to_arrow(None, 0, None).unwrap().schema(),
+            &batches,
+        )
+        .unwrap();
+        let values: Vec<Option<i64>> = merged
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .iter()
+            .collect();
+        assert_eq!(values, vec![Some(1), Some(2), Some(3)]);
+    }
+
+    #[test]
+    fn scan_batches_overlay_streams_delta_rows_without_persisted_row_groups() {
+        use arrow::array::Int64Array;
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("batch_scan_overlay_tail_only.apex");
+        let builder = TableStorageBackend::create(&path).unwrap();
+        builder.add_column("v", DataType::Int64).unwrap();
+        builder.save().unwrap();
+        builder
+            .insert_rows_to_delta(&[
+                HashMap::from([("v".to_string(), Value::Int64(11))]),
+                HashMap::from([("v".to_string(), Value::Int64(12))]),
+            ])
+            .unwrap();
+        drop(builder);
+
+        let backend = TableStorageBackend::open(&path).unwrap();
+        assert!(backend.has_delta());
+        let request = crate::storage::ScanRequest {
+            projection: None,
+            predicate: None,
+        };
+        let single = backend
+            .scan(&request)
+            .unwrap()
+            .expect("single-shot scan must produce a morsel")
+            .into_record_batch()
+            .unwrap();
+        let mut stream = backend
+            .scan_batches(&request)
+            .unwrap()
+            .expect("tail-only overlay must stream");
+        let batches = collect_stream_batches(&mut stream);
+        let merged = arrow::compute::concat_batches(&single.schema(), &batches).unwrap();
+        let values = |batch: &RecordBatch| -> Vec<Option<i64>> {
+            batch
+                .column_by_name("v")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .iter()
+                .collect()
+        };
+        assert_eq!(merged.num_rows(), 2);
+        assert_eq!(values(&merged), values(&single));
     }
 }
