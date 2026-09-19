@@ -343,6 +343,24 @@ def test_cold_microbenchmark_calibrates_repeats_without_timing_setup(
     assert len(bench_calls) == 9
 
 
+def test_setup_benchmark_runs_teardown_outside_the_timer(benchmark, monkeypatch):
+    """The per-iteration teardown is harness bookkeeping, not timed work."""
+    timestamps = iter((0.0, 1.0))
+    monkeypatch.setattr(benchmark.time, "perf_counter", lambda: next(timestamps))
+
+    teardowns = []
+    elapsed_ms = benchmark.run_bench_with_setup(
+        lambda: None,
+        lambda: None,
+        warmup=0,
+        iterations=1,
+        teardown_fn=lambda: teardowns.append(None),
+    )
+
+    assert elapsed_ms == pytest.approx(1000.0)
+    assert len(teardowns) == 1
+
+
 def test_table_ops_metrics_leave_qps_dataset_table_selected(benchmark, tmp_path):
     """Table-operation metrics must restore the dataset table afterwards.
 
@@ -368,11 +386,16 @@ def test_table_ops_metrics_leave_qps_dataset_table_selected(benchmark, tmp_path)
         ("bench_alter_table_add_column", "bench_alter_table_add_column_setup"),
     ]
     for method_name, setup_name in table_ops:
+        # The runner resolves the same teardown method: the client switch runs
+        # outside the timed region but must still leave `default` selected.
+        teardown_fn = getattr(bench, f"{method_name}_teardown", None)
+        assert teardown_fn is not None, method_name
         benchmark.run_bench_with_setup(
             getattr(bench, setup_name),
             getattr(bench, method_name),
             warmup=1,
             iterations=1,
+            teardown_fn=teardown_fn,
         )
         assert bench.client.current_table == "default", method_name
 
