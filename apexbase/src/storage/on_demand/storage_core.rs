@@ -2075,26 +2075,45 @@ impl OnDemandStorage {
         !self.delta_store.read().is_empty()
     }
 
-    /// Rows excluded by persisted V4 row-group deletion vectors.
+    /// Physical base row count when persisted V4 row-group deletion vectors
+    /// make it differ from `header.row_count` (which counts *active* rows).
     ///
-    /// The batched overlay stream applies those vectors itself, so it must know
-    /// whether the persisted base is a pure physical view. The merged
-    /// `read_columns` lane still reads the physical row space, so a table with
-    /// persisted deletions must stay on the single-shot fallback until that
-    /// lane is reconciled (see ARCHITECTURE_REFACTOR_REMAINING 11.5).
-    pub(crate) fn persisted_deletion_count(&self) -> io::Result<u64> {
-        Ok(match self.get_or_load_footer()? {
-            Some(footer) => footer
-                .row_groups
-                .iter()
-                .map(|group| group.deletion_count as u64)
-                .sum(),
-            None => 0,
-        })
+    /// The V4 row-group scan, `read_ids` and `read_columns` all work in this
+    /// physical space; mixing it with the active count shifted the delta
+    /// boundary and leaked deleted rows. `None` means the two spaces coincide
+    /// (no persisted deletions, already-empty footer, or a non-V4 file).
+    pub(crate) fn persisted_physical_base_row_count(&self) -> io::Result<Option<usize>> {
+        if !self.is_v4_format() {
+            return Ok(None);
+        }
+        // Fast path: the footer is cached for every V4 backend that has been
+        // opened, so no footer clone is needed on the read path.
+        if let Some(result) = self.v4_footer.read().as_ref().map(physical_base_with_deletions) {
+            return Ok(result);
+        }
+        match self.get_or_load_footer()? {
+            Some(footer) => Ok(physical_base_with_deletions(&footer)),
+            // A V4 file whose footer is not written yet has no row groups.
+            None => Ok(None),
+        }
     }
 
-    /// Persisted base row count in the row space used by `read_columns`
-    /// (active rows after row-group deletion vectors, before the delta file).
+    /// Persisted physical deletion bitmap, aligned with the physical base rows
+    /// produced by the row-group scan. `None` when no persisted deletion vector
+    /// is present (see `persisted_physical_base_row_count`).
+    pub(crate) fn persisted_deletion_state(
+        &self,
+    ) -> io::Result<Option<(usize, Vec<u8>)>> {
+        let Some(physical_base) = self.persisted_physical_base_row_count()? else {
+            return Ok(None);
+        };
+        self.ensure_ids_loaded()?;
+        let deleted = self.deleted.read().clone();
+        Ok(Some((physical_base, deleted)))
+    }
+
+    /// Persisted base row count in the active-row space used by
+    /// `read_columns` when no row-group deletion vector is present.
     pub(crate) fn header_row_count(&self) -> u64 {
         self.header.read().row_count
     }
@@ -6025,6 +6044,11 @@ impl OnDemandStorage {
         total
     }
 
+    /// Appended rows in the `.delta` file (complete batches only).
+    pub(crate) fn appended_delta_rows(&self) -> usize {
+        self.delta_row_count()
+    }
+
     /// Get the total row count including delta rows (for accurate row_count reporting)
     fn delta_row_count(&self) -> usize {
         let delta_path = Self::delta_path(&self.path);
@@ -6105,4 +6129,23 @@ impl OnDemandStorage {
         );
         total
     }
+}
+
+/// Physical base row count for a footer that carries persisted deletion
+/// vectors; `None` when every row group is fully active (so the physical and
+/// active row spaces coincide).
+fn physical_base_with_deletions(footer: &V4Footer) -> Option<usize> {
+    if !footer
+        .row_groups
+        .iter()
+        .any(|group| group.deletion_count > 0)
+    {
+        return None;
+    }
+    let physical: usize = footer
+        .row_groups
+        .iter()
+        .map(|group| group.row_count as usize)
+        .sum();
+    (physical > 0).then_some(physical)
 }

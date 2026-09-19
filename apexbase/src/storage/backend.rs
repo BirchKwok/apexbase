@@ -871,6 +871,52 @@ pub struct TableStorageBackend {
     first_string_row_id_cache: RwLock<HashMap<String, Arc<FirstStringRowIdCache>>>,
 }
 
+/// Keep mask for a merged batch whose first `base_portion` rows are physical
+/// base rows starting at `base_start`. `None` when no row is deleted, so the
+/// caller can hand the batch on untouched.
+fn undeleted_row_mask(
+    total_rows: usize,
+    base_portion: usize,
+    base_start: usize,
+    bitmap: &[u8],
+) -> Option<Vec<bool>> {
+    let mut keep = vec![true; total_rows];
+    let mut removed = false;
+    for (index, slot) in keep.iter_mut().enumerate().take(base_portion) {
+        let row = base_start + index;
+        let byte = row / 8;
+        if byte < bitmap.len() && (bitmap[byte] >> (row % 8)) & 1 == 1 {
+            *slot = false;
+            removed = true;
+        }
+    }
+    removed.then_some(keep)
+}
+
+/// Drop the ids of physical base rows a persisted deletion vector excludes.
+fn retain_undeleted_rows(
+    ids: Vec<u64>,
+    base_start: usize,
+    base_portion: usize,
+    bitmap: &[u8],
+) -> Vec<u64> {
+    let mut ids = ids;
+    let remove: Vec<usize> = (0..base_portion.min(ids.len()))
+        .filter(|index| {
+            let row = base_start + index;
+            let byte = row / 8;
+            byte < bitmap.len() && (bitmap[byte] >> (row % 8)) & 1 == 1
+        })
+        .collect();
+    if remove.is_empty() {
+        return ids;
+    }
+    for index in remove.into_iter().rev() {
+        ids.remove(index);
+    }
+    ids
+}
+
 /// Drop the `_id` column the overlay stream carries for patching but the
 /// caller did not project. A batch that already lacks `_id` is returned as is,
 /// so the append-only overlay lane stays free of per-batch rebuilds.
@@ -911,10 +957,10 @@ struct OverlayBatchStream<'a> {
     /// Column names (with `_id` when the stream carries it) for the tail read.
     /// `None` means all columns.
     tail_columns: Option<Vec<String>>,
-    /// Persisted base row count: where the appended delta rows start.
+    /// Physical base row count (where the appended rows start) and appended row
+    /// count, both fixed at stream creation so rows appended by a concurrent
+    /// writer are never observed mid-stream.
     tail_start: usize,
-    /// Appended delta row count fixed at stream creation, so rows appended by a
-    /// concurrent writer are never observed mid-stream.
     tail_rows: usize,
     delta: Option<std::sync::Arc<crate::storage::delta::DeltaStore>>,
     /// Whether the caller projected `_id`.
@@ -988,11 +1034,10 @@ impl Iterator for OverlayBatchStream<'_> {
             .tail_columns
             .as_ref()
             .map(|columns| columns.iter().map(String::as_str).collect());
-        let tail = self.backend.read_columns_to_arrow_inner(
+        let tail = self.backend.read_delta_tail_to_arrow(
             refs.as_deref(),
             self.tail_start,
-            Some(self.tail_rows),
-            false,
+            self.tail_rows,
         );
         match tail {
             Ok(batch) if batch.num_rows() == 0 => None,
@@ -1724,13 +1769,6 @@ impl TableStorageBackend {
             if !self.storage.is_v4_format() {
                 return Ok(None);
             }
-            // The merged single-shot lane reads the physical row space while
-            // its ids come from the active-row space, so a table with persisted
-            // row-group deletions stays on the fallback until those two spaces
-            // are reconciled (11.5). Everything else streams.
-            if self.storage.persisted_deletion_count()? > 0 {
-                return Ok(None);
-            }
             return Ok(Some(self.overlay_batch_streams(
                 request,
                 projection_names.as_deref(),
@@ -1786,9 +1824,14 @@ impl TableStorageBackend {
             }
             names
         });
-        let tail_start = self.storage.header_row_count() as usize;
         // Fix the appended-row view at creation, like the base row groups.
-        let tail_rows = (self.storage.row_count() as usize).saturating_sub(tail_start);
+        // `storage.row_count()` counts *active* base rows plus the delta, so the
+        // delta size must be taken directly rather than by subtraction.
+        let physical_base = self
+            .storage
+            .persisted_physical_base_row_count()?
+            .unwrap_or_else(|| self.storage.header_row_count() as usize);
+        let tail_rows = self.storage.appended_delta_rows();
 
         let base = self.storage.scan_rg_batches_ranges(
             projection_names,
@@ -1810,7 +1853,7 @@ impl TableStorageBackend {
                             } else {
                                 None
                             },
-                            tail_start,
+                            tail_start: physical_base,
                             tail_rows,
                             delta: delta.clone(),
                             include_id,
@@ -1825,7 +1868,7 @@ impl TableStorageBackend {
                     base: None,
                     backend: self,
                     tail_columns,
-                    tail_start,
+                    tail_start: physical_base,
                     tail_rows,
                     delta,
                     include_id,
@@ -3131,9 +3174,14 @@ impl TableStorageBackend {
         self.read_columns_to_arrow_inner(column_names, start_row, row_count, true)
     }
 
-    /// Shared reader body. `apply_delta_store` is false only for the tail batch
-    /// of the batched overlay stream, which applies its own DeltaStore snapshot
-    /// so every batch of one scan observes the same overlay.
+    /// Active-row-space merged read.
+    ///
+    /// Without a persisted row-group deletion vector the physical and active
+    /// row spaces coincide and the caller's window is pushed straight into the
+    /// read. With one, the merged lane (`read_columns` + `read_ids`) emits the
+    /// physical base rows, so the complete active view is composed first
+    /// (physical base minus deleted rows, plus the delta rows) and the active
+    /// window is sliced on top of it. Slicing a `RecordBatch` is zero-copy.
     fn read_columns_to_arrow_inner(
         &self,
         column_names: Option<&[&str]>,
@@ -3141,13 +3189,70 @@ impl TableStorageBackend {
         row_count: Option<usize>,
         apply_delta_store: bool,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
+        let Some((physical_base, deleted)) = self.storage.persisted_deletion_state()? else {
+            return self.read_columns_to_arrow_physical(
+                column_names,
+                start_row,
+                row_count,
+                apply_delta_store,
+                None,
+            );
+        };
+        let batch = self.read_columns_to_arrow_physical(
+            column_names,
+            0,
+            None,
+            apply_delta_store,
+            Some((physical_base, &deleted)),
+        )?;
+        let total = batch.num_rows();
+        let start = start_row.min(total);
+        let count = row_count
+            .map(|limit| limit.min(total - start))
+            .unwrap_or(total - start);
+        if start == 0 && count == total {
+            Ok(batch)
+        } else {
+            Ok(batch.slice(start, count))
+        }
+    }
+
+    /// Appended `.delta` rows as an Arrow batch, read in the physical+delta row
+    /// space so a table with persisted deletion vectors never has to
+    /// materialize the base just to reach the appended rows. `start` and
+    /// `rows` come from the stream's creation-time snapshot.
+    fn read_delta_tail_to_arrow(
+        &self,
+        column_names: Option<&[&str]>,
+        start: usize,
+        rows: usize,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        self.read_columns_to_arrow_physical(column_names, start, Some(rows), false, None)
+    }
+
+    /// Shared reader body over the physical+delta row space. `apply_delta_store`
+    /// is false only for the tail batch of the batched overlay stream, which
+    /// applies its own DeltaStore snapshot so every batch of one scan observes
+    /// the same overlay. `deletion` carries the persisted physical base count
+    /// and deletion bitmap when the physical and active spaces differ.
+    fn read_columns_to_arrow_physical(
+        &self,
+        column_names: Option<&[&str]>,
+        start_row: usize,
+        row_count: Option<usize>,
+        apply_delta_store: bool,
+        deletion: Option<(usize, &[u8])>,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
         use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
-        let base_rows = self.base_row_count();
+        let base_rows = match deletion {
+            Some((physical, _)) => physical,
+            None => self.base_row_count() as usize,
+        };
         let has_delta =
-            self.has_delta() || self.row_count() > base_rows || self.active_row_count() > base_rows;
+            self.has_delta() || self.row_count() > base_rows as u64 || self.active_row_count() > base_rows as u64;
         // In-memory tables always read from the authoritative `columns` buffers
         // (deleted bitmap + nulls applied), never from mmap, so the delta-state
         // gate must not force them onto the file-backed fallback.
@@ -3187,7 +3292,11 @@ impl TableStorageBackend {
         if let Some(cols) = column_names {
             if cols.len() == 1 && cols[0] == "_id" {
                 // Only _id requested - return batch with just _id column
-                let ids = self.storage.read_ids(start_row, row_count)?;
+                let mut ids = self.storage.read_ids(start_row, row_count)?;
+                if let Some((_, bitmap)) = deletion {
+                    let base_portion = base_rows.saturating_sub(start_row).min(ids.len());
+                    ids = retain_undeleted_rows(ids, start_row, base_portion, bitmap);
+                }
                 let fields = vec![Field::new("_id", ArrowDataType::Int64, false)];
                 // OPTIMIZATION: Direct transmute from Vec<u64> to Vec<i64>
                 let ids_i64: Vec<i64> = unsafe {
@@ -3544,8 +3653,29 @@ impl TableStorageBackend {
         }
 
         let schema = Arc::new(arrow::datatypes::Schema::new(fields));
-        let batch = arrow::record_batch::RecordBatch::try_new(schema, arrays)
+        let mut batch = arrow::record_batch::RecordBatch::try_new(schema, arrays)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        let mut pending_delta_row_ids = pending_delta_row_ids;
+        if let Some((_, bitmap)) = deletion {
+            // Rows [0, base_portion) are physical base rows; the delta rows that
+            // follow carry no persisted deletion vector. Only filter when
+            // something is actually removed, so an unaffected batch stays
+            // zero-copy.
+            let base_portion = base_rows.saturating_sub(start_row).min(batch.num_rows());
+            let keep = undeleted_row_mask(batch.num_rows(), base_portion, start_row, bitmap);
+            if let Some(keep) = keep {
+                let mask = BooleanArray::from(keep.clone());
+                batch = arrow::compute::filter_record_batch(&batch, &mask)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                pending_delta_row_ids = pending_delta_row_ids.map(|ids| {
+                    ids.into_iter()
+                        .enumerate()
+                        .filter(|(index, _)| keep.get(*index).copied().unwrap_or(true))
+                        .map(|(_, id)| id)
+                        .collect()
+                });
+            }
+        }
         if let Some(row_ids) = pending_delta_row_ids {
             let delta = self.storage.delta_store();
             return crate::storage::DeltaMerger::merge(&batch, &delta, &row_ids);
@@ -7496,7 +7626,102 @@ mod tests {
     }
 
     #[test]
-    fn scan_batches_streams_overlay_and_rejects_in_memory_and_persisted_deletes() {
+    fn read_columns_to_arrow_keeps_active_rows_with_persisted_deletes_and_delta() {
+        use arrow::array::Int64Array;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("merged_read_deletes_delta.apex");
+        let builder = TableStorageBackend::create(&path).unwrap();
+        builder.add_column("v", DataType::Int64).unwrap();
+        let values: Vec<i64> = (1..=1000).collect();
+        builder
+            .insert_typed_with_nulls(
+                HashMap::from([("v".to_string(), values)]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        builder.save().unwrap();
+        assert!(builder.delete(7));
+        builder.save().unwrap();
+        builder
+            .insert_rows_to_delta(&[HashMap::from([("v".to_string(), Value::Int64(555))])])
+            .unwrap();
+        drop(builder);
+
+        let backend = TableStorageBackend::open(&path).unwrap();
+        let batch = backend
+            .read_columns_to_arrow(Some(&["_id", "v"]), 0, None)
+            .unwrap();
+        let ids = batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let vals = batch
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let pairs: Vec<(i64, i64)> = (0..batch.num_rows())
+            .map(|i| (ids.value(i), vals.value(i)))
+            .collect();
+        assert_eq!(pairs.len(), 1000, "999 active base rows plus one delta row");
+        assert!(
+            !pairs.iter().any(|(id, _)| *id == 7),
+            "persisted row-group deletion must be applied"
+        );
+        assert_eq!(
+            pairs.last().copied(),
+            Some((1001, 555)),
+            "the delta row must stay aligned at the tail"
+        );
+        assert!(
+            pairs.iter().all(|(id, value)| *id > 1000 || *id == *value),
+            "ids and values must stay aligned after the deletion"
+        );
+        assert_eq!(
+            pairs.iter().map(|(_, value)| *value).sum::<i64>(),
+            500_500 - 7 + 555
+        );
+
+        // `_id`-only reads take their own early path and must filter too.
+        let id_only = backend
+            .read_columns_to_arrow(Some(&["_id"]), 0, None)
+            .unwrap();
+        let ids = id_only
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(ids.len(), 1000);
+        assert!(ids.iter().all(|id| id != Some(7)));
+        assert_eq!(ids.value(999), 1001);
+
+        // Active-space windows must slice the active view, not the physical one.
+        let window = backend
+            .read_columns_to_arrow(Some(&["_id", "v"]), 998, Some(2))
+            .unwrap();
+        let window_ids = window
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        assert_eq!(
+            window_ids.iter().collect::<Vec<_>>(),
+            vec![Some(1000), Some(1001)]
+        );
+    }
+
+    #[test]
+    fn scan_batches_streams_supported_overlays_and_rejects_in_memory() {
         use arrow::array::Int64Array;
         let request = crate::storage::ScanRequest {
             projection: None,
@@ -7574,10 +7799,9 @@ mod tests {
             .collect();
         assert_eq!(values, vec![3, 2]);
 
-        // Persisted row-group deletions keep the single-shot fallback: the
-        // merged `read_columns` lane still reads the physical row space while
-        // its ids come from the active space (11.5), so streaming them would
-        // disagree with `scan()`.
+        // Persisted row-group deletions stream too: the base row groups apply
+        // them, the tail carries the appended rows, and the merged single-shot
+        // read agrees with the stream (11.5).
         let path2 = dir.path().join("batch_gate_persisted_delete.apex");
         let builder = TableStorageBackend::create(&path2).unwrap();
         builder.add_column("v", DataType::Int64).unwrap();
@@ -7590,22 +7814,55 @@ mod tests {
         builder.save().unwrap();
         assert!(builder.delete(1));
         builder.save().unwrap();
-        drop(builder);
-        let deleted = TableStorageBackend::open(&path2).unwrap();
-        assert!(deleted.storage.persisted_deletion_count().unwrap() > 0);
-        deleted
+        builder
             .insert_rows_to_delta(&[HashMap::from([("v".to_string(), Value::Int64(3))])])
             .unwrap();
-        assert!(
-            deleted.scan_batches(&request).unwrap().is_none(),
-            "persisted deletions plus an overlay must stay on the fallback"
-        );
+        drop(builder);
+        let deleted = TableStorageBackend::open(&path2).unwrap();
+        assert!(deleted.storage.persisted_deletion_state().unwrap().is_some());
+        let single = deleted
+            .scan(&request)
+            .unwrap()
+            .expect("single-shot scan must produce a morsel")
+            .into_record_batch()
+            .unwrap();
+        let single_values: Vec<i64> = {
+            let column = single
+                .column_by_name("v")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap();
+            column.iter().flatten().collect()
+        };
+        assert_eq!(single_values, vec![2, 3]);
+        let mut stream = deleted
+            .scan_batches(&request)
+            .unwrap()
+            .expect("persisted deletions plus an overlay must stream");
+        let values: Vec<i64> = collect_stream_batches(&mut stream)
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("v")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap();
+                column.iter().flatten().collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(values, vec![2, 3]);
     }
 
-    /// Build a 70k-row, multi-row-group table with an overlay that has no
-    /// persisted row-group deletion: a DeltaStore delete, a DeltaStore cell
-    /// update and appended delta rows.
-    fn overlay_scan_fixture(dir: &Path, name: &str) -> std::path::PathBuf {
+    /// Build a 70k-row, multi-row-group table with a mixed overlay: an
+    /// optional persisted row-group deletion, a DeltaStore delete, a DeltaStore
+    /// cell update and appended delta rows.
+    fn overlay_scan_fixture(
+        dir: &Path,
+        name: &str,
+        persisted_delete: bool,
+    ) -> std::path::PathBuf {
         let path = dir.join(name);
         let builder = TableStorageBackend::create(&path).unwrap();
         builder.add_column("age", DataType::Int64).unwrap();
@@ -7634,6 +7891,12 @@ mod tests {
             )
             .unwrap();
         builder.save().unwrap();
+        if persisted_delete {
+            // Persisted row-group deletion inside the first row group plus the
+            // appended tail: the two row spaces used to disagree here (11.5).
+            assert!(builder.delete(7));
+            builder.save().unwrap();
+        }
         // `_id`s are 1-based; delete and update rows inside the first and
         // second row groups.
         builder.delta_delete_rows(&[200]);
@@ -7664,9 +7927,9 @@ mod tests {
         use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
 
         let dir = tempdir().unwrap();
-        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_equivalence.apex");
+        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_equivalence.apex", true);
         let backend = TableStorageBackend::open(&path).unwrap();
-        assert_eq!(backend.storage.persisted_deletion_count().unwrap(), 0);
+        assert!(backend.storage.persisted_deletion_state().unwrap().is_some());
         assert!(backend.has_delta());
         assert!(backend.has_pending_deltas());
 
@@ -7710,6 +7973,10 @@ mod tests {
             "DeltaStore delete must be applied"
         );
         assert!(
+            !rows.iter().any(|(id, _, _, _)| *id == 7),
+            "persisted row-group deletion must be applied"
+        );
+        assert!(
             rows.iter().any(|(_, age, _, _)| *age == 4242),
             "DeltaStore cell update must be applied"
         );
@@ -7725,7 +7992,7 @@ mod tests {
         use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
 
         let dir = tempdir().unwrap();
-        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_string_update.apex");
+        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_string_update.apex", true);
         let backend = TableStorageBackend::open(&path).unwrap();
         backend.delta_batch_update_rows(&[(150u64, "city", Value::String("cZ".to_string()))]);
 
@@ -7770,7 +8037,7 @@ mod tests {
         use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
 
         let dir = tempdir().unwrap();
-        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_ranges.apex");
+        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_ranges.apex", true);
         let backend = TableStorageBackend::open(&path).unwrap();
 
         let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
@@ -7814,7 +8081,7 @@ mod tests {
         use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
 
         let dir = tempdir().unwrap();
-        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_no_id.apex");
+        let path = overlay_scan_fixture(dir.path(), "batch_scan_overlay_no_id.apex", false);
         let backend = TableStorageBackend::open(&path).unwrap();
 
         let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {

@@ -1398,11 +1398,18 @@ impl OnDemandStorage {
         start_row: usize,
         row_count: Option<usize>,
     ) -> io::Result<HashMap<String, ColumnData>> {
+        // The row-group scan and `read_ids` both emit the physical base rows
+        // (all persisted rows, deletion vectors not applied), so the base/delta
+        // boundary must use that same physical count. `header.row_count` counts
+        // active rows and would otherwise drop tail rows and shift the delta.
+        let base_rows = match self.persisted_physical_base_row_count()? {
+            Some(physical) => physical,
+            None => self.header.read().row_count as usize,
+        };
         let header = self.header.read();
         let schema = self.schema.read();
         let column_index = self.column_index.read();
-        
-        let base_rows = header.row_count as usize;
+
         let delta_rows = self.delta_row_count();
         let total_rows = base_rows + delta_rows;
         
