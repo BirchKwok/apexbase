@@ -531,7 +531,7 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+        if backend.has_pending_writes() {
             return Ok(None);
         }
 
@@ -594,7 +594,7 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+        if backend.has_pending_writes() {
             return Ok(None);
         }
 
@@ -990,7 +990,7 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+        if backend.has_pending_writes() {
             return Ok(None);
         }
 

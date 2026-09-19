@@ -871,6 +871,49 @@ pub struct TableStorageBackend {
     first_string_row_id_cache: RwLock<HashMap<String, Arc<FirstStringRowIdCache>>>,
 }
 
+/// Visible overlay flags for the row-store read lanes.
+///
+/// The scan, stream, dictionary-cache, point-lookup and FTS lanes each used to
+/// rebuild "is there an overlay?" from two or three separate probes with
+/// slightly different subsets, so a lane could quietly serve a view another
+/// lane had already invalidated. Probe the flags once here and let each lane
+/// ask for exactly the ones it needs; the capability matrix in
+/// `docs/READ_PATH_CAPABILITIES.md` records which lane accepts which state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OverlayState {
+    /// The `.delta` file holds complete appended row batches.
+    pub(crate) appended_rows: bool,
+    /// The DeltaStore holds pending cell updates or deletes.
+    pub(crate) pending_cells: bool,
+    /// V4 rows are buffered in memory and not yet persisted.
+    pub(crate) unflushed_rows: bool,
+    /// The persisted base is also loaded into the in-memory buffers.
+    pub(crate) base_in_memory: bool,
+}
+
+impl OverlayState {
+    /// Pending, not-yet-persisted writes: DeltaStore cells or buffered rows.
+    #[inline]
+    pub(crate) fn has_pending_writes(&self) -> bool {
+        self.pending_cells || self.unflushed_rows
+    }
+
+    /// The persisted row groups are no longer the complete visible read view.
+    #[inline]
+    pub(crate) fn needs_merged_read(&self) -> bool {
+        self.appended_rows || self.has_pending_writes()
+    }
+
+    /// No overlay sits on top of the persisted base, and the persisted base is
+    /// not duplicated in the in-memory buffers either, so the mmap fast paths
+    /// can serve the file directly. In-memory tables are classified by the
+    /// caller (`storage.is_in_memory()`), which the lanes check first.
+    #[inline]
+    pub(crate) fn is_clean_view(&self) -> bool {
+        !self.needs_merged_read() && !self.base_in_memory
+    }
+}
+
 /// Keep mask for a merged batch whose first `base_portion` rows are physical
 /// base rows starting at `base_start`. `None` when no row is deleted, so the
 /// caller can hand the batch on untouched.
@@ -1297,9 +1340,38 @@ impl TableStorageBackend {
         self.storage.has_delta()
     }
 
+    /// Probe the visible overlay state once (see `OverlayState`).
+    pub(crate) fn overlay_state(&self) -> OverlayState {
+        OverlayState {
+            appended_rows: self.has_delta(),
+            pending_cells: self.has_pending_deltas(),
+            unflushed_rows: self.pending_v4_in_memory_rows() > 0,
+            base_in_memory: self.storage.has_v4_in_memory_data(),
+        }
+    }
+
+    /// Pending (not-yet-persisted) writes are visible: DeltaStore cells or
+    /// in-memory rows. Deliberately does not probe the delta file, so hot
+    /// point-lookup guards keep their existing cost.
+    pub fn has_pending_writes(&self) -> bool {
+        self.has_pending_deltas() || self.pending_v4_in_memory_rows() > 0
+    }
+
+    /// The persisted file is no longer the complete visible read view: a delta
+    /// file, DeltaStore cells or unflushed rows are visible on top of it.
+    pub fn requires_merged_read(&self) -> bool {
+        self.has_delta() || self.has_pending_writes()
+    }
+
+    /// The visible row set is not exactly the persisted base rows for the given
+    /// physical base count.
+    pub(crate) fn visible_rows_exceed_base(&self, base_rows: u64) -> bool {
+        self.has_delta() || self.row_count() > base_rows || self.active_row_count() > base_rows
+    }
+
     /// True only when storage metadata proves a string equality predicate keeps all rows.
     pub fn string_eq_matches_all(&self, column: &str, value: &str) -> io::Result<bool> {
-        if self.has_delta() || self.has_pending_deltas() || self.pending_v4_in_memory_rows() > 0 {
+        if self.requires_merged_read() {
             return Ok(false);
         }
         Ok(self
@@ -1643,13 +1715,12 @@ impl TableStorageBackend {
             return Ok(None);
         }
 
-        let has_overlay = self.has_delta()
-            || self.has_pending_deltas()
-            || self.pending_v4_in_memory_rows() > 0
-            || self.storage.has_v4_in_memory_data();
+        // Capability matrix: docs/READ_PATH_CAPABILITIES.md (candidate-index and
+        // mmap fast paths require a clean persisted view).
+        let clean_view = self.overlay_state().is_clean_view();
 
         let mut batch = None;
-        if !has_overlay {
+        if clean_view {
             if let Some(indices) = match request.predicate {
                 Some(predicate) => self.scan_candidate_indices(predicate)?,
                 None => None,
@@ -1731,7 +1802,10 @@ impl TableStorageBackend {
             return Ok(None);
         }
 
-        if self.storage.is_in_memory() || self.pending_v4_in_memory_rows() > 0 {
+        // Capability matrix: docs/READ_PATH_CAPABILITIES.md (the row-group
+        // stream needs a V4 file whose base is not held in the memory buffers).
+        let overlay = self.overlay_state();
+        if self.storage.is_in_memory() || overlay.unflushed_rows {
             return Ok(None);
         }
 
@@ -1762,8 +1836,7 @@ impl TableStorageBackend {
             None => None,
         };
 
-        let has_overlay = self.has_delta() || self.has_pending_deltas();
-        if has_overlay {
+        if overlay.needs_merged_read() {
             // The base lane below is the V4 mmap row-group stream. Legacy V3
             // files carry no footer and must keep the single-shot fallback.
             if !self.storage.is_v4_format() {
@@ -2889,7 +2962,7 @@ impl TableStorageBackend {
         &self,
         column_names: Option<&[&str]>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
-        if self.has_delta() || self.has_pending_deltas() || self.pending_v4_in_memory_rows() > 0 {
+        if self.requires_merged_read() {
             // Pending/delta rows must be merged through the general read path;
             // the cached dictionary describes the persisted file only.
             return self.read_columns_to_arrow(column_names, 0, None);
@@ -3143,9 +3216,7 @@ impl TableStorageBackend {
         column_names: &[String],
     ) -> io::Result<Option<(Vec<u32>, Vec<(String, ColumnData)>)>> {
         let base_rows = self.base_row_count();
-        let has_delta =
-            self.has_delta() || self.row_count() > base_rows || self.active_row_count() > base_rows;
-        if has_delta || self.storage.has_v4_in_memory_data() {
+        if self.visible_rows_exceed_base(base_rows) || self.storage.has_v4_in_memory_data() {
             return Ok(None);
         }
         self.storage.read_fts_string_columns_mmap(column_names)
@@ -3251,8 +3322,7 @@ impl TableStorageBackend {
             Some((physical, _)) => physical,
             None => self.base_row_count() as usize,
         };
-        let has_delta =
-            self.has_delta() || self.row_count() > base_rows as u64 || self.active_row_count() > base_rows as u64;
+        let has_delta = self.visible_rows_exceed_base(base_rows as u64);
         // In-memory tables always read from the authoritative `columns` buffers
         // (deleted bitmap + nulls applied), never from mmap, so the delta-state
         // gate must not force them onto the file-backed fallback.
@@ -3695,8 +3765,7 @@ impl TableStorageBackend {
         row_count: Option<usize>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
         let base_rows = self.base_row_count();
-        let has_delta =
-            self.has_delta() || self.row_count() > base_rows || self.active_row_count() > base_rows;
+        let has_delta = self.visible_rows_exceed_base(base_rows);
         if !has_delta {
             let include_id = column_names
                 .map(|cols| cols.contains(&"_id"))
@@ -7623,6 +7692,105 @@ mod tests {
             }
         }
         batches
+    }
+
+    #[test]
+    fn overlay_state_is_the_single_source_for_the_read_lanes() {
+        fn fixture(dir: &Path, name: &str) -> std::path::PathBuf {
+            let path = dir.join(name);
+            let builder = TableStorageBackend::create(&path).unwrap();
+            builder.add_column("v", DataType::Int64).unwrap();
+            builder
+                .insert_rows(&[
+                    HashMap::from([("v".to_string(), Value::Int64(1))]),
+                    HashMap::from([("v".to_string(), Value::Int64(2))]),
+                ])
+                .unwrap();
+            builder.save().unwrap();
+            drop(builder);
+            path
+        }
+
+        let dir = tempdir().unwrap();
+
+        // Clean persisted view: no lane has to merge anything.
+        let clean = TableStorageBackend::open(&fixture(dir.path(), "overlay_clean.apex")).unwrap();
+        let state = clean.overlay_state();
+        assert_eq!(state, OverlayState::default());
+        assert!(state.is_clean_view());
+        assert!(!state.has_pending_writes());
+        assert!(!state.needs_merged_read());
+        assert!(!clean.has_pending_writes());
+        assert!(!clean.requires_merged_read());
+        assert!(!clean.visible_rows_exceed_base(clean.base_row_count()));
+
+        // Appended delta rows are an overlay, but they are not *pending*
+        // writes: the distinction the point-lookup guards rely on.
+        let appended =
+            TableStorageBackend::open(&fixture(dir.path(), "overlay_appended.apex")).unwrap();
+        appended
+            .insert_rows_to_delta(&[HashMap::from([("v".to_string(), Value::Int64(3))])])
+            .unwrap();
+        let state = appended.overlay_state();
+        assert!(state.appended_rows);
+        assert!(!state.pending_cells);
+        assert!(!state.unflushed_rows);
+        assert!(!state.has_pending_writes());
+        assert!(state.needs_merged_read());
+        assert!(!state.is_clean_view());
+        assert!(!appended.has_pending_writes());
+        assert!(appended.requires_merged_read());
+        assert!(appended.visible_rows_exceed_base(appended.base_row_count()));
+
+        // DeltaStore cells are pending writes and an overlay.
+        let cells = TableStorageBackend::open(&fixture(dir.path(), "overlay_cells.apex")).unwrap();
+        cells.delta_batch_update_rows(&[(1u64, "v", Value::Int64(11))]);
+        let state = cells.overlay_state();
+        assert!(!state.appended_rows);
+        assert!(state.pending_cells);
+        assert!(state.has_pending_writes());
+        assert!(state.needs_merged_read());
+        assert!(cells.has_pending_writes());
+
+        // Unflushed in-memory rows are pending writes too.
+        let unflushed =
+            TableStorageBackend::open(&fixture(dir.path(), "overlay_unflushed.apex")).unwrap();
+        unflushed
+            .insert_rows(&[HashMap::from([("v".to_string(), Value::Int64(4))])])
+            .unwrap();
+        assert!(unflushed.pending_v4_in_memory_rows() > 0);
+        let state = unflushed.overlay_state();
+        assert!(state.unflushed_rows);
+        assert!(state.has_pending_writes());
+        assert!(!state.is_clean_view());
+    }
+
+    #[test]
+    fn overlay_state_separates_base_in_memory_from_pending_writes() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("overlay_state_base_in_memory.apex");
+        let mut builder = TableStorageBackend::create(&path).unwrap();
+        builder.add_column("v", DataType::Int64).unwrap();
+        builder
+            .insert_rows(&[
+                HashMap::from([("v".to_string(), Value::Int64(1))]),
+                HashMap::from([("v".to_string(), Value::Int64(2))]),
+            ])
+            .unwrap();
+        builder.save().unwrap();
+        drop(builder);
+
+        // An insert backend keeps the whole base in the memory buffers: the
+        // mmap lanes must not use it, but nothing is pending and nothing has to
+        // be merged the way an appended/dirty overlay does.
+        let loaded = TableStorageBackend::open_for_insert(&path).unwrap();
+        loaded.storage.open_v4_data().unwrap();
+        let state = loaded.overlay_state();
+        assert!(state.base_in_memory);
+        assert!(!state.unflushed_rows);
+        assert!(!state.has_pending_writes());
+        assert!(!state.needs_merged_read());
+        assert!(!state.is_clean_view());
     }
 
     #[test]

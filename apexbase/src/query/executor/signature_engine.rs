@@ -141,7 +141,7 @@ impl ApexExecutor {
                 }
             }
             ReadPredicate::StringEq { column, value } => {
-                if backend.pending_v4_in_memory_rows() > 0 || backend.has_pending_deltas() {
+                if backend.has_pending_writes() {
                     None
                 } else {
                     match read.limit {

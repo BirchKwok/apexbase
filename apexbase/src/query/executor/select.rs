@@ -2336,7 +2336,7 @@ return Ok(result);
         stmt: &SelectStatement,
         limit: Option<usize>,
     ) -> io::Result<Option<RecordBatch>> {
-        if backend.pending_v4_in_memory_rows() > 0 || backend.has_pending_deltas() {
+        if backend.has_pending_writes() {
             return Ok(None);
         }
 

@@ -1066,7 +1066,7 @@ pub fn get_cached_backend_pub(path: &Path) -> io::Result<Arc<TableStorageBackend
 fn get_pending_cached_backend(path: &Path) -> Option<Arc<TableStorageBackend>> {
     let entry = STORAGE_CACHE.get(path)?;
     let backend = &entry.value().0;
-    (backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0)
+    (backend.has_pending_writes())
         .then(|| Arc::clone(backend))
 }
 
@@ -1094,12 +1094,12 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
     if let Some(entry) = STORAGE_CACHE.get(&cache_key) {
         let value = entry.value();
         if value.2 != current_epoch {
-            if value.0.has_pending_deltas() || value.0.pending_v4_in_memory_rows() > 0 {
+            if value.0.has_pending_writes() {
                 drop(entry);
                 if let Some(mut entry) = STORAGE_CACHE.get_mut(&cache_key) {
                     let value = entry.value_mut();
                     if value.2 != current_epoch
-                        && (value.0.has_pending_deltas() || value.0.pending_v4_in_memory_rows() > 0)
+                        && (value.0.has_pending_writes())
                     {
                         value.1 = storage_effective_modified(path);
                         value.2 = current_epoch;

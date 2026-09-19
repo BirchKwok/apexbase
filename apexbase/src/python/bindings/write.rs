@@ -2003,7 +2003,7 @@ impl ApexStorageImpl {
             .all_backends()
             .into_iter()
             .filter_map(|backend| {
-                if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+                if backend.has_pending_writes() {
                     Some(backend)
                 } else {
                     None
@@ -2014,7 +2014,7 @@ impl ApexStorageImpl {
         py.allow_threads(|| {
             crate::Database::unregister_fts_manager(&base_dir);
             for backend in pending_backends {
-                if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+                if backend.has_pending_writes() {
                     let _ = backend.save();
                 }
             }
@@ -2395,7 +2395,7 @@ impl ApexStorageImpl {
     ) -> Option<(Arc<TableStorageBackend>, crate::storage::on_demand::ColumnType)> {
         let (backend, col_type) =
             self.numeric_update_backend_and_type(table_path, table_name, column)?;
-        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+        if backend.has_pending_writes() {
             return None;
         }
         Some((backend, col_type))

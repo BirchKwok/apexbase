@@ -672,7 +672,7 @@ impl ApexStorageImpl {
                     accelerator_col, derivation.codec_version
                 )));
             }
-            if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+            if backend.has_pending_writes() {
                 return Err(PyRuntimeError::new_err(
                     "quantized rescore requires pending writes to be flushed",
                 ));

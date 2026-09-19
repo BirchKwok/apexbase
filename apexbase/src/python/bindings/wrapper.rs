@@ -508,7 +508,7 @@ impl EpochBackendCache {
         let mut entry = self.entries.get_mut(key)?;
         let current = crate::storage::epoch::current(entry.0.path());
         if entry.1 != current {
-            if entry.0.has_pending_deltas() || entry.0.pending_v4_in_memory_rows() > 0 {
+            if entry.0.has_pending_writes() {
                 entry.1 = current;
             } else {
                 drop(entry);

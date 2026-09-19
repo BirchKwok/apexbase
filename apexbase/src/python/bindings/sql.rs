@@ -1626,7 +1626,7 @@ impl ApexStorageImpl {
         // the backend is opened, so two cheap guards are sufficient: no
         // pending delta overlay and no unflushed in-memory rows. File-stat
         // based guards are deliberately avoided on this hot path.
-        if backend.has_pending_deltas() || backend.pending_v4_in_memory_rows() > 0 {
+        if backend.has_pending_writes() {
             return Ok(None);
         }
 
