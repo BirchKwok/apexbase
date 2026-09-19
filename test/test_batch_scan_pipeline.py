@@ -3,7 +3,9 @@
 Covers, against the installed release wheel:
 1. Multi-batch vs single-batch result parity with the in-process
    APEX_BATCH_SCAN toggle (the Rust executor reads the variable per query).
-2. Fallback to the single-batch path when delta state is present.
+2. Delta state (appended rows, DeltaStore deletes and cell updates) is
+   served by the batched path through the overlay batch stream and keeps
+   parity with the single-batch path.
 3. Bounded scan memory: with a fixed number of groups, the batched path's
    peak RSS must stay well below the single-batch materialization on a
    multi-row-group table (measured in separate child processes).
@@ -122,7 +124,7 @@ def test_batch_scan_pipeline_matches_single_batch_pipeline():
             client.close()
 
 
-def test_batch_scan_falls_back_with_delta_state():
+def test_batch_scan_streams_delta_state_with_parity():
     with tempfile.TemporaryDirectory() as tmp:
         client = _make_client(tmp)
         _seed(client)
@@ -133,9 +135,23 @@ def test_batch_scan_falls_back_with_delta_state():
                 "VALUES ('city3', 3, 10, 25.5, true)"
             )
             client.execute("COMMIT")
+            # DeltaStore cell updates must be patched per row group by _id.
+            client.execute("UPDATE perf_scan SET amount = 777 WHERE code = 2")
             sql = QUERIES[1]
             off, on = _ab(client, sql)
-            assert on == off, "delta state must fall back and keep parity"
+            assert on == off, "delta state must stream and keep parity"
+            os.environ["APEX_BATCH_SCAN"] = "1"
+            try:
+                plan = _run(client, "EXPLAIN ANALYZE " + sql)[0]["plan"]
+            finally:
+                os.environ.pop("APEX_BATCH_SCAN", None)
+            assert "batched_scan_pipeline" in plan, plan
+
+            # A persisted row-group deletion still keeps parity, whichever
+            # lane serves it.
+            client.execute("DELETE FROM perf_scan WHERE _id = 200")
+            off, on = _ab(client, sql)
+            assert on == off, "deleted overlay row must keep parity"
         finally:
             client.close()
 
@@ -375,7 +391,7 @@ def test_parallel_batch_scan_auto_stays_serial_below_threshold():
             client.close()
 
 
-def test_parallel_batch_scan_falls_back_with_delta_state():
+def test_parallel_batch_scan_streams_delta_state_with_parity():
     with tempfile.TemporaryDirectory() as tmp:
         client = _make_client(tmp)
         _seed(client)
@@ -386,6 +402,7 @@ def test_parallel_batch_scan_falls_back_with_delta_state():
                 "VALUES ('city3', 3, 10, 25.5, true)"
             )
             client.execute("COMMIT")
+            client.execute("UPDATE perf_scan SET amount = 777 WHERE code = 2")
             sql = QUERIES[1]
             os.environ["APEX_BATCH_SCAN"] = "1"
             try:
@@ -393,7 +410,7 @@ def test_parallel_batch_scan_falls_back_with_delta_state():
             finally:
                 os.environ.pop("APEX_BATCH_SCAN", None)
             parallel = _run_parallel(client, sql, 4)
-            assert parallel == serial, "delta state must fall back and keep parity"
+            assert parallel == serial, "delta state must stream and keep parity"
         finally:
             client.close()
 

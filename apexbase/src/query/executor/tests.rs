@@ -3655,7 +3655,9 @@ fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
         );
     });
 
-    // Outside the gate: delta state forces the single-shot fallback.
+    // Delta state is now served by the same batched pipeline through the
+    // overlay batch stream; the streamed result must match the materialized
+    // path exactly (Q1).
     let delta_backend = TableStorageBackend::open(&path).unwrap();
     delta_backend
         .insert_rows_to_delta(&[HashMap::from([
@@ -3667,7 +3669,7 @@ fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
             ("pad".to_string(), Value::String("z".repeat(110))),
         ])])
         .unwrap();
-    let wide_sql = "SELECT city, code, COUNT(*) AS n                     FROM default WHERE score >= 20                     GROUP BY city, code";
+    let wide_sql = "SELECT city, code, COUNT(*) AS n                     FROM default WHERE score >= 20                     GROUP BY city, code                     ORDER BY n DESC, city, code";
     let stmt = parse(wide_sql);
     let predicate =
         ApexExecutor::build_scan_predicate(stmt.where_clause.as_ref().unwrap()).unwrap();
@@ -3675,9 +3677,12 @@ fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
         ApexExecutor::try_batch_group_pipeline(&delta_backend, &stmt, &predicate, &path.to_string_lossy()).unwrap()
     });
     assert!(
-        result.is_none(),
-        "delta state must disable the batch pipeline"
+        result.is_some(),
+        "delta state must stay on the batch pipeline"
     );
+    let streamed = run_with_batch_scan(true, &path, wide_sql);
+    let materialized = run_with_batch_scan(false, &path, wide_sql);
+    assert_batches_logically_equal(&streamed, &materialized, wide_sql);
 }
 
 #[test]
@@ -3761,7 +3766,9 @@ fn batch_scan_pipeline_matches_single_batch_pipeline() {
         assert_batches_logically_equal(&off, &on, sql);
     }
 
-    // Delta state: the batch pipeline must fall back and still match.
+    // Delta state: the batch pipeline streams the overlay batch view (base row
+    // groups plus a per-batch patch and a tail) and must match the
+    // materialized path.
     let backend = TableStorageBackend::open(&path).unwrap();
     backend
         .insert_rows_to_delta(&[
@@ -5667,4 +5674,42 @@ fn batched_pipeline_result_schema_matches_single_batch() {
             assert_eq!(left.data_type(), right.data_type(), "{sql}: field type");
         }
     }
+}
+
+#[test]
+fn update_overlay_runs_on_the_batched_pipeline() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("batch_overlay_path.apex");
+    create_batch_scan_fixture(&path);
+    let sql = "EXPLAIN ANALYZE SELECT city, code, COUNT(*) AS n FROM default \
+               WHERE amount IS NOT NULL AND code >= 1 GROUP BY city, code";
+
+    // Clean persisted view: the mmap row-group stream serves the batched path.
+    with_batch_scan(true, || {
+        let plan = explain_analyze_plan(&path, sql);
+        assert!(
+            actual_path(&plan).starts_with("batched_scan_pipeline"),
+            "clean view: {}",
+            actual_path(&plan)
+        );
+    });
+
+    // DeltaStore cell updates used to force the materialized fallback; they now
+    // stream as a base row-group scan with a per-batch overlay patch (Q1).
+    ApexExecutor::execute("UPDATE default SET amount = 777 WHERE code = 2", &path).unwrap();
+    with_batch_scan(true, || {
+        let plan = explain_analyze_plan(&path, sql);
+        assert!(
+            actual_path(&plan).starts_with("batched_scan_pipeline"),
+            "update overlay must stay on the batched pipeline, got {}",
+            actual_path(&plan)
+        );
+    });
+
+    // The patched batch stream must still match the materialized result.
+    let batched = run_with_batch_scan(true, &path, sql.replace("EXPLAIN ANALYZE ", "").as_str());
+    let materialized =
+        run_with_batch_scan(false, &path, sql.replace("EXPLAIN ANALYZE ", "").as_str());
+    assert_eq!(batched.num_rows(), materialized.num_rows());
+    assert_eq!(batched.schema(), materialized.schema());
 }
