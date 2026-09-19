@@ -36,7 +36,10 @@ canary 两轮与 full 主比较在 host load 5.7-12.0 下标记同一类聚合/�
 直接消费 + 验证矩阵，canary/full 全过）；base+delta 行组流式读视图见
 `local-perf-results/q1-overlay-acceptance-20260919/`（full exit 0；canary 两轮
 原始 exit 1，两轮标记的干净表指标互不相同且被同构建复测证实为噪音，
-登记为环境受限例外；delta 重指标两轮稳定快约 41%）。
+登记为环境受限例外；delta 重指标两轮稳定快约 41%）；合并读行空间修复见
+`local-perf-results/q1-read-space-acceptance-20260919/`（full exit 0；canary 最终
+修订两轮原始 exit 1 且指标互不相同、同构建极差 109%，登记为环境受限例外；
+公开 benchmark 103/103 `slower=0`）。
 V1 复核见 `local-perf-results/v1-reverify-20260917/`：S3 的 canary/full 复跑在
 持续 host load 6-12 下分别标记第三组不同指标与一个重叠的排序指标，qps/quant/
 idx/par 全过；噪音结论得到强化，但空闲机器上的绿色门禁仍待补。
@@ -55,7 +58,7 @@ COLUMN` 0.0506ms vs SQLite 0.0597ms），向量/量化各 6/6。
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | S1.1–S1.3 已实现并完成最终统一验收（2026-09-17，canary/full 对 base `2c2e471` 均 exit 0）；S2/S3 可开始 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | G1 已逐项关闭（含清单更正、CTE 泄漏修复、planner 缓存上限），G2/G3 仍按独立评审保留；已通过最终统一验收（2026-09-17，canary/full 对 base `0059029` 均 exit 0）；S3 可开始 |
 | 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 已实现并功能验证（流式执行、有界通道、schema 缓存、Rust/Python 测试）；本轮性能门禁在机器高负载下登记为环境受限原始例外，待干净机器复核（V1）；Q1 可开始但需携带该债务 |
-| 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | selection 直接消费与验证矩阵已实现并验收通过（2026-09-17，canary/full 对 base `eb44b85` 均 exit 0，parallel batch scan 快 7.0–9.5%）；base+delta 行组流式读视图已实现（基础 mmap 行组流 + DeltaStore 快照按批打补丁 + 尾部追加，2026-09-19，见 11.3）；持久化删除向量与覆盖层并存时的合并读行空间缺口已定位并登记（11.5），该组合保持单批回落 |
+| 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | selection 直接消费与验证矩阵已实现并验收通过（2026-09-17，canary/full 对 base `eb44b85` 均 exit 0）；base+delta 行组流式读视图已实现（基础 mmap 行组流 + DeltaStore 快照按批打补丁 + 尾部追加，2026-09-19，见 11.3）；持久化删除向量与覆盖层并存时的合并读行空间缺口已修复（见 11.5/11.7），该组合现在也流式且与单批读一致；full 门禁 exit 0，canary 原始 exit 1 为已证实的环境受限例外 |
 | 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 契约已文档化（仅显式校准、成本/时间单位分层）；schema 变化清理反馈已实现并验收；数据老化按滑动均值+容量上限处理；环境指纹与时间衰减登记为后续。canary exit 0，full 原始 exit 1 为环境受限例外（第 13 节）。benchmark 15 个 workload 全部 slower=0 |
 | 9 | P2 / M1 | 剩余职责与文档收敛 | 以重复决策/依赖减少为标准拆 backend 和路由；能力表、限制和 fallback 单源；不按行数制造抽象 | 待实施，与对应边界一起推进 |
 | 10 | P2 / E1 | 需求驱动扩展 | 有容量/工作负载证据后独立设计外部执行、复杂 Join、向量组合等 | 按需 |
@@ -734,25 +737,42 @@ Q1 依据 A2 与 R3 余项，落地“selection 直接消费、减少 gather”�
   scan` 2/4/8 线程与 auto 分别 -8.72%/-7.01%/-9.52%/-7.75%。
 - 报告目录 `local-perf-results/q1-acceptance-20260917/`。
 
-### 11.5 已确认缺口：持久化删除向量与合并读的行空间不一致（未修复）
+### 11.5 合并读的行空间不一致（已修复，2026-09-19）
 
-本地 release 探针（`TableStorageBackend` 单元测试）显示，当同一张表既有持久化行组
-删除向量、又有覆盖层（`.delta` 行或 DeltaStore 单元）时：
+**现象（release 单元探针）**：同一张表既有持久化行组删除向量、又有 `.delta` 覆盖层
+时，`read_columns_to_arrow(Some(&["_id","v"]), 0, None)` 对 1..1000 行（删除 `_id=7`、
+追加一行 `v=555`）返回 **1001 行**：`_id=7` 泄漏，且末尾错位为 `(1000, 555)` 与
+`(1001, 0)`（值被补齐成默认值）。即“多一行、少一行、值错位”三种错误同时存在。
 
-- `read_columns` 以 `header.row_count`（**活跃**基础行数）作为基础/增量边界，但它
-  实际返回的是**物理**行（包含被持久化删除的行）；
-- `read_ids` 返回**物理** id 序列（`ensure_ids_loaded_v4` 推入全部行并单独维护删除
-  位图）。
+**根因**：`read_columns` 以 `header.row_count`（**活跃**行数）作为基础/增量边界，但
+它返回的是**物理**行（行组扫描含被删除行）；`read_ids` 返回**物理** id 序列。两个
+行空间不一致，`read_columns_to_arrow` 于是把物理列按活跃长度截断/补齐，并与物理 id
+错位配对。`header.row_count` 本身没有问题——问题是用它去界定物理读。
 
-两者行空间不一致，结果是：`read_columns_to_arrow(0, None)`（即 `scan()` 在覆盖层
-状态下的慢路径）会把已被持久化删除的行重新读出；窗口起点在边界处还会错位（探针中
-`start = header.row_count` 返回 0 行，而该位置实际是增量行）。SQL 主路径目前不依赖
-该合并读（实测删除行 + 增量行后 `SELECT SUM`/`GROUP BY` 结果正确），因此是潜伏
-缺口，不是已发生的用户可见错误。
+**修复（保持物理内容，只在 Arrow 边界转成活跃视图）**：
 
-本批因此让“持久化删除向量 + 覆盖层”继续走单批回落，不声称修复；修复需要把
-`read_columns` 与 `read_ids` 统一到同一个（活跃）行空间并让合并读应用删除位图，
-涉及被大量调用方共享的合并读语义，按“先文档化设计再落地”留作下一批前置。
+1. `OnDemandStorage::persisted_physical_base_row_count()`：仅当持久化删除向量存在且
+   非空时返回物理基础行数，否则 `None`（物理与活跃空间重合）。footer 已缓存时零克隆。
+2. `read_columns` 在该值存在时改用物理边界，与行组扫描和 `read_ids` 同一空间；无删除
+   向量时行为逐字不变。
+3. `read_columns_to_arrow_inner` 拆成「活跃空间包装 + 物理空间读取」：无删除向量时把
+   窗口直接下推（原路径不变）；有删除向量时先构造**完整活跃视图**（物理基础行按删除
+   位图过滤 + 增量行），再对调用方的活跃窗口做零拷贝 `slice`。`_id` 单独快路径同样过滤。
+4. 覆盖层流的尾部改用 `read_delta_tail_to_arrow`：在物理空间只读增量行，删除向量存在
+   时也不必物化基础表。
+5. 据此移除 `scan_batches` 中“持久化删除向量 + 覆盖层必须回落”的门控；该组合现在也
+   流式，且与单批读一致。
+
+**测试**：Rust `read_columns_to_arrow_keeps_active_rows_with_persisted_deletes_and_delta`
+覆盖全量读、`_id` 单独读与活跃窗口；`overlay_scan_fixture` 加入持久化删除，使覆盖层
+parity/ranges/字符串更新测试都在“物理删除 + DeltaStore 删除/更新 + 追加行”下比对；
+门控测试改为正向断言。Python `test_batch_scan_streams_delta_state_with_parity` 在叠加
+持久化删除后仍断言 `batched_scan_pipeline` 与开/关结果一致。
+
+**残留（登记，未声称修复）**：`pending_v4_in_memory_rows() > 0`（仅内存追加行、
+`ids` 只含新追加行）时基础/增量边界仍有历史歧义，该状态继续回落单批；本批只保证
+“持久化基础 + 覆盖层”的物理空间一致。`read_columns` 的物理内容语义不变，blob 读取、
+首值缓存等按物理行索引的调用方因此保持正确。
 
 ### 11.6 测试与验收（2026-09-19，base+delta 流式读视图）
 
@@ -813,8 +833,44 @@ Aggregation 14/14、Joins 等各组全部 `slower=0`；向量 6/6、量化 6/6�
 登记为**已证实的环境受限例外**，不表述为 canary 通过，原始报告全部保留。
 
 Q1 状态：selection 直接消费、验证矩阵与 base+delta 行组流式读视图均已实现 +
-功能已验证 + 性能已验收（full exit 0）；持久化删除向量 + 覆盖层组合的合并读行空间
-缺口已定位并登记（11.5），该组合保持单批回落。
+功能已验证 + 性能已验收（full exit 0）；合并读的行空间缺口已修复（11.5，见 11.7），
+“持久化删除向量 + 覆盖层”也会流式并与单批读一致。
+
+### 11.7 测试与验收（2026-09-19，合并读行空间修复）
+
+功能：`maturin develop --release` 成功；完整串行 `pytest` 1803 passed（35.14 s）；
+完整 `cargo test --release` 592 单元 + 6 doc-test；`--features flight` 596 单元。
+新增测试：Rust `read_columns_to_arrow_keeps_active_rows_with_persisted_deletes_and_delta`
+（全量、`_id` 单独、活跃窗口三种读都排除持久化删除行且值与 id 对齐）；
+`overlay_scan_fixture` 加入持久化删除，`scan_batches_streams_supported_overlays_and_rejects_in_memory`
+改为“持久化删除 + 覆盖层可流且等于单批”；Python 覆盖层测试叠加持久化删除后仍断言
+`batched_scan_pipeline` 与 parity。
+
+公开 benchmark（同一公开套件，最终修订）：
+`local-perf-results/q1-read-space-acceptance-20260919/public-bench-final3.json`
+103/103 表格 fair detail（Load&Index 2/2、Point&Limited 17/17、Filtering 11/11、
+Aggregation 14/14、Joins 5/5、Set Ops 4/4、Expression 5/5、File Scan 9/9、DML 13/13、
+Table Ops 5/5 与其余各组全部 `slower=0`），向量 6/6、量化 6/6。同一修订在 host load
+16.7 时的另一次运行只标记 1 项 near-tie（`NOT filter (age NOT BETWEEN, name NOT LIKE)`
+5.99ms vs DuckDB 4.84ms），再下一次标记 2 项 near-tie；三次运行标记集合互不相同且
+低负载运行全部 103/103，原始报告全部保留。
+
+性能门禁（base `a832a83`）：
+
+- 修复主体完成、footer 访问器重构之前的中间修订 canary **exit 0**（64 项全过，
+  无回退标记）；该重构只影响“footer 尚未写入”的错误路径，不改变已缓存 footer 的读路径。
+- 最终修订的 canary 两轮**原始 exit 1**，但分别只标记
+  `Derived ratio GROUP BY` +27.21%（同构建 6 轮复测极差 **109.43%**，
+  0.5969–1.2501ms）与 `Two-key GROUP BY (5 funcs)` +24.18%（base 侧自身
+  3.1476–6.9036ms，极差 119%），互不相同；两轮的 delta 重指标与并行指标全过。
+- full 最终修订**exit 0**：main 109/109（初判 `JSON Read + COUNT(*)` +34.01% 经
+  五样本终判为 -1.59%），qps 10/10、quant 8/8、idx 4/4、par 4/4；此前一轮 full
+  初判标记的 `ORDER BY expression (LENGTH)` +141.29% 与
+  `GROUP BY category + HAVING` +25.67% 在复跑中分别为 -1.46% 与 -20.28%，证实为噪音。
+
+结论：合并读行空间修复的功能与公开 benchmark 全部达标，full 完整门禁在最终修订上
+exit 0；canary 在最终修订上的两轮原始 exit 1 属已证实的环境受限例外（同构建极差
+109%、指标集合逐轮不同、复跑反向），保留全部原始报告，不表述为 canary 通过。
 
 Q2 实施与验收（2026-09-17）见第 13 节：契约澄清、schema 变化清理反馈、公开
 benchmark 15/15 `slower=0`；canary exit 0，full 原始 exit 1 为环境受限例外。
@@ -844,8 +900,10 @@ benchmark 15/15 `slower=0`；canary exit 0，full 原始 exit 1 为环境受限�
 **2026-09-19 补充**：Q1 base+delta 流式读视图批次在 host load 4.9–8.3 下取得
 full 完整模式 exit 0（main 109/109，初判 `IN subquery COUNT` +26.95% 经五样本
 终判恢复；qps/quant/idx/par 全过），canary 两轮原始 exit 1 但标记两组互不相同的
-干净表指标、同构建复测极差 40–113%（见 11.6）。V1 因此收紧为：完整模式已在非
-空闲条件下转绿；canary 仍需空闲窗口复核。
+干净表指标、同构建复测极差 40–113%（见 11.6）。合并读行空间修复批次同样取得
+full exit 0（main 109/109，初判 `JSON Read + COUNT(*)` +34.01% 经五样本终判为
+-1.59%），canary 三组互不相同的干净表指标、同构建极差最高 109%（见 11.7）。
+V1 因此收紧为：完整模式已在非空闲条件下连续转绿；canary 仍需空闲窗口复核。
 
 ## 13. 第八批 Q2：成本反馈与自动并行契约
 
