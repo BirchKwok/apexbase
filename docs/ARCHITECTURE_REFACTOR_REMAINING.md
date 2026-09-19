@@ -33,7 +33,10 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 canary 两轮与 full 主比较在 host load 5.7-12.0 下标记同一类聚合/集合形状，
 登记为环境受限原始例外，干净机器复核列为验收债务 V1）。
 最新 Q1 见第 11 节：`local-perf-results/q1-acceptance-20260917/`（selection
-直接消费 + 验证矩阵，canary/full 全过；base+delta 行组流式读视图留待下一批）。
+直接消费 + 验证矩阵，canary/full 全过）；base+delta 行组流式读视图见
+`local-perf-results/q1-overlay-acceptance-20260919/`（full exit 0；canary 两轮
+原始 exit 1，两轮标记的干净表指标互不相同且被同构建复测证实为噪音，
+登记为环境受限例外；delta 重指标两轮稳定快约 41%）。
 V1 复核见 `local-perf-results/v1-reverify-20260917/`：S3 的 canary/full 复跑在
 持续 host load 6-12 下分别标记第三组不同指标与一个重叠的排序指标，qps/quant/
 idx/par 全过；噪音结论得到强化，但空闲机器上的绿色门禁仍待补。
@@ -52,7 +55,7 @@ COLUMN` 0.0506ms vs SQLite 0.0597ms），向量/量化各 6/6。
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | S1.1–S1.3 已实现并完成最终统一验收（2026-09-17，canary/full 对 base `2c2e471` 均 exit 0）；S2/S3 可开始 |
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | G1 已逐项关闭（含清单更正、CTE 泄漏修复、planner 缓存上限），G2/G3 仍按独立评审保留；已通过最终统一验收（2026-09-17，canary/full 对 base `0059029` 均 exit 0）；S3 可开始 |
 | 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 已实现并功能验证（流式执行、有界通道、schema 缓存、Rust/Python 测试）；本轮性能门禁在机器高负载下登记为环境受限原始例外，待干净机器复核（V1）；Q1 可开始但需携带该债务 |
-| 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | selection 直接消费与验证矩阵已实现并验收通过（2026-09-17，canary/full 对 base `eb44b85` 均 exit 0，parallel batch scan 快 7.0–9.5%）；base+delta 行组流式读视图未实现，设计与前提见第 11.3 节，成为下一批前置 |
+| 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | selection 直接消费与验证矩阵已实现并验收通过（2026-09-17，canary/full 对 base `eb44b85` 均 exit 0，parallel batch scan 快 7.0–9.5%）；base+delta 行组流式读视图已实现（基础 mmap 行组流 + DeltaStore 快照按批打补丁 + 尾部追加，2026-09-19，见 11.3）；持久化删除向量与覆盖层并存时的合并读行空间缺口已定位并登记（11.5），该组合保持单批回落 |
 | 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 契约已文档化（仅显式校准、成本/时间单位分层）；schema 变化清理反馈已实现并验收；数据老化按滑动均值+容量上限处理；环境指纹与时间衰减登记为后续。canary exit 0，full 原始 exit 1 为环境受限例外（第 13 节）。benchmark 15 个 workload 全部 slower=0 |
 | 9 | P2 / M1 | 剩余职责与文档收敛 | 以重复决策/依赖减少为标准拆 backend 和路由；能力表、限制和 fallback 单源；不按行数制造抽象 | 待实施，与对应边界一起推进 |
 | 10 | P2 / E1 | 需求驱动扩展 | 有容量/工作负载证据后独立设计外部执行、复杂 Join、向量组合等 | 按需 |
@@ -676,25 +679,37 @@ Q1 依据 A2 与 R3 余项，落地“selection 直接消费、减少 gather”�
 - 未支持类型（UInt64 组键等）仍由 `BatchKeyView`/扫描谓词类型门控保守回落，
   既有 `Unsupported` 回落测试与“覆盖层回落”一致。
 
-### 11.3 base+delta 行组流式读视图（未实现，保留）
+### 11.3 base+delta 行组流式读视图（已实现，2026-09-19）
 
-当前 `scan_batches` 门控要求纯持久化 V4；存在 `.delta` 行或 DeltaStore 单元
-更新时保守回落单批物化（结果正确，内存不有界）。扩为稳定流式读视图需要：
+原 `scan_batches` 门控要求纯持久化 V4；存在 `.delta` 行或 DeltaStore 单元更新时
+保守回落单批物化（结果正确，内存不有界）。本批按“基础行组 mmap 流 + 按批打补丁”
+落地稳定流式读视图：
 
-1. 流创建时快照 overlay（DeltaStore 读守卫或紧凑快照 + 删除位图），保证批间
-   视图一致，避免重复/漏读与新旧 schema 混读。
-2. 每个基础行组批次按下 `_id` 应用 overlay 删除与单元更新（值需按列类型转换），
-   并把 `.delta` 追加行作为尾部批次；选择直接消费下 `_id` 必须可用。
-3. 长查询持有读守卫会阻塞写者，需要在“快照成本 vs 写停顿”之间定案；行级
-   overlay 规模已常驻内存，按批应用不放大峰值。
+1. 基础行组仍由 `RgBatchStream` 逐行组读取（持久化删除向量已应用，只读投影列，
+   未命中覆盖层的批次整批零拷贝直通）。
+2. 流创建时对 `DeltaStore` 取一次快照（`DeltaStore::snapshot()`：只复制删除位图与
+   合并后的单元更新，不带顺序日志），整条流因此看到同一覆盖层，且不需要长查询
+   持有读守卫。追加 `.delta` 行数也在创建时固定，写者中途追加不会被读到。
+3. 每个批次先按 `_id` 与快照比对：全部未命中直接返回原批次（不重建任何列）；
+   命中才走 `DeltaMerger::merge` 应用删除与单元更新。delta 重的形状不再为每个
+   窗口重复合并读。
+4. 追加的 `.delta` 行在最后一个 range 的尾部读取一次
+   （`read_columns_to_arrow_inner(..., apply_delta_store = false)` 变体），随后同样
+   按快照打补丁，保证与基础批次同源同视图。
+5. 打补丁需要 `_id`：调用方未投影 `_id` 时内部仍带该列，补丁后立即剥离
+   （`strip_id_column`，无 `_id` 时原样返回），输出 schema 与纯 V4 批次流一致。
+   仅追加行、没有 DeltaStore 单元更新时完全不带 `_id`、不重建批次。
+6. 并行 range（`scan_batches_ranges`）同样适用：每条 range 独立打补丁，尾部批次
+   只挂在最后一条 range 上，range 之间仍是不相交的连续行组。
+7. 仍回落单批的情形：内存表、未落盘的 V4 内存追加行、非 V4（无 footer）文件、
+   以及持久化删除向量非空（见 11.5）。
 
-该实现涉及存储流式路径的持久化语义，按“先文档化设计再落地”的规则留作下一批；
-Q1 本轮不声称完成该项，并把它登记为 `M1`/后续批的前置。
+覆盖形状：仅 `.delta` 追加行、仅 `DeltaStore` 删除/更新、以及两者并存。
 
-**2026-09-17 尝试与回退**：曾用“按物理窗口重复走 `read_columns_to_arrow` 合并读”
-实现（提交 `fb3ada4`）。功能与正确性通过（70k 行、多窗口、删除/更新/追加覆盖层与
-单批扫描逐值一致；带 UPDATE 覆盖层的 GROUP BY 形状落在 `batched_scan_pipeline`），
-但同机 canary 对 base `14ae19a` 暴露稳定回退：
+**2026-09-17 尝试与回退（保留）**：曾用“按物理窗口重复走
+`read_columns_to_arrow` 合并读”实现（提交 `fb3ada4`）。功能与正确性通过（70k 行、
+多窗口、删除/更新/追加覆盖层与单批扫描逐值一致；带 UPDATE 覆盖层的 GROUP BY 形状
+落在 `batched_scan_pipeline`），但同机 canary 对 base `14ae19a` 暴露稳定回退：
 
 - `Uncached delta Boolean+GROUP+HAVING+TopK`：base 五样本 [20.557, 20.672, 20.595,
   20.899, 20.864] 中位数 20.672ms；current [38.148, 38.231, 38.144, 38.380,
@@ -703,14 +718,10 @@ Q1 本轮不声称完成该项，并把它登记为 `M1`/后续批的前置。
 
 原因是每个窗口都重新执行一次覆盖层合并读；delta 重的形状因此付出约 2 倍代价。
 已回退该提交（workspace 回到 `14ae19a`），直接复测该指标回到 20.27ms。证据保存在
-`local-perf-results/q1-delta-acceptance-20260917/REVERTED.md`。
+`local-perf-results/q1-delta-acceptance-20260917/REVERTED.md`。本批实现改为上述
+“零拷贝直通 + 尾部一次追加”，同一 delta 重指标在最终门禁中反而稳定快约 41%。
 
-下一次实现必须改为“**基础行组 mmap 流 + 按批打补丁**”：overlay 快照一次；
-只对 `_id` 命中的批次应用删除/单元更新，未命中的批次零拷贝直通；增量行在尾部
-追加一次；验收必须把该 delta 重指标与覆盖层 parity 放在同一次门禁里，避免再次
-以吞吐换内存。
-
-### 11.4 测试与验收（2026-09-17）
+### 11.4 测试与验收（2026-09-17，selection 直接消费）
 
 - `maturin develop --release` 成功；完整串行 `pytest` 1802 passed（33.30 s）；
   完整 `cargo test --release` 583 单元 + 6 doc-test；`--features flight`
@@ -723,15 +734,90 @@ Q1 本轮不声称完成该项，并把它登记为 `M1`/后续批的前置。
   scan` 2/4/8 线程与 auto 分别 -8.72%/-7.01%/-9.52%/-7.75%。
 - 报告目录 `local-perf-results/q1-acceptance-20260917/`。
 
-Q1 状态：selection 直接消费与验证矩阵已实现 + 功能已验证 + 性能已验收；
-base+delta 行组流式读视图未实现（11.3），不以此声称 Q1 整体完成。
-- Q2 实施与验收（2026-09-17）：文档化校准契约（仅 EXPLAIN ANALYZE 写反馈、
-  不引入低开销采样、模型成本与时间分层），`invalidate_table_schema_stats` 在
-  DDL 改 schema 后同时清除该表内存反馈与 sidecar；修正 benchmark 计时边界
-  （ApexBase 独有的 `use_table` 客户端切换移出计时区）。公开 benchmark 首次
-  15/15 workload `slower=0`。canary exit 0；full 原始 exit 1 在 host load 4-7 下
-  标记 `Derived table GROUP BY` 与 `UNION ALL (ordered)`，两侧均有尖峰且低峰重叠，
-  登记为环境受限例外。完整记录见第 13 节。
+### 11.5 已确认缺口：持久化删除向量与合并读的行空间不一致（未修复）
+
+本地 release 探针（`TableStorageBackend` 单元测试）显示，当同一张表既有持久化行组
+删除向量、又有覆盖层（`.delta` 行或 DeltaStore 单元）时：
+
+- `read_columns` 以 `header.row_count`（**活跃**基础行数）作为基础/增量边界，但它
+  实际返回的是**物理**行（包含被持久化删除的行）；
+- `read_ids` 返回**物理** id 序列（`ensure_ids_loaded_v4` 推入全部行并单独维护删除
+  位图）。
+
+两者行空间不一致，结果是：`read_columns_to_arrow(0, None)`（即 `scan()` 在覆盖层
+状态下的慢路径）会把已被持久化删除的行重新读出；窗口起点在边界处还会错位（探针中
+`start = header.row_count` 返回 0 行，而该位置实际是增量行）。SQL 主路径目前不依赖
+该合并读（实测删除行 + 增量行后 `SELECT SUM`/`GROUP BY` 结果正确），因此是潜伏
+缺口，不是已发生的用户可见错误。
+
+本批因此让“持久化删除向量 + 覆盖层”继续走单批回落，不声称修复；修复需要把
+`read_columns` 与 `read_ids` 统一到同一个（活跃）行空间并让合并读应用删除位图，
+涉及被大量调用方共享的合并读语义，按“先文档化设计再落地”留作下一批前置。
+
+### 11.6 测试与验收（2026-09-19，base+delta 流式读视图）
+
+功能：`maturin develop --release` 成功；完整串行 `pytest` 1803 passed（34.85 s）；
+完整 `cargo test --release` 591 单元 + 6 doc-test；`--features flight` 595 单元。
+新增/更新测试：
+
+- Rust `scan_batches_streams_overlay_and_rejects_in_memory_and_persisted_deletes`：
+  纯 V4 可流、仅追加行可流（尾部批次）、DeltaStore 更新可流、持久化删除 + 覆盖层
+  回落。
+- Rust `scan_batches_overlay_stream_matches_single_shot_scan`：70k 行 3 个行组，
+  DeltaStore 删除 + 单元更新 + 两条追加行，逐值等于单批扫描，且删除生效、更新与
+  追加可见。
+- Rust `scan_batches_overlay_stream_matches_single_shot_for_updated_string_column`：
+  字符串列单元更新后每个批次 schema 与单批一致（补丁不改变列类型）。
+- Rust `scan_batches_overlay_ranges_partition_rows`：并行 range 拼接等于单批扫描。
+- Rust `scan_batches_overlay_strips_unprojected_id`：未投影 `_id` 时输出 schema
+  与单批一致。
+- Rust `scan_batches_overlay_streams_delta_rows_without_persisted_row_groups`：
+  没有持久化行组、只有增量行时流式可用。
+- Rust `scan_batches_overlay_tail_is_fixed_at_stream_creation`：流创建后追加的行
+  不被读到（稳定读视图）。
+- Rust `update_overlay_runs_on_the_batched_pipeline` 与更新后的
+  `batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate`：
+  带覆盖层的形状落在 `batched_scan_pipeline` 且与物化路径一致。
+- Python `test_batch_scan_streams_delta_state_with_parity` /
+  `test_parallel_batch_scan_streams_delta_state_with_parity`：200K 行上
+  INSERT + UPDATE 后 `EXPLAIN ANALYZE` 显示 `batched_scan_pipeline`，开/关
+  `APEX_BATCH_SCAN` 结果一致，再叠加持久化删除仍一致。
+
+公开 benchmark（`local-perf-results/q1-overlay-acceptance-20260919/public-bench.json`）：
+103/103 表格 fair detail、Load&Index 2/2、Point&Limited 17/17、Filtering 11/11、
+Aggregation 14/14、Joins 等各组全部 `slower=0`；向量 6/6、量化 6/6。
+
+性能门禁（base `d1e6899`）：
+
+- canary 第一轮（200K/2/7）**原始 exit 1**，五样本终判标记
+  `Derived ratio GROUP BY` +33.53%（base 中位数 0.578ms / current 0.772ms）与
+  `Numeric GROUP BY (5 funcs)` +16.50%。两者都是无覆盖层的干净表路径，本批对
+  该路径的调用序列逐条不变（仅把原先合并的 `is_in_memory || has_delta ||
+  has_pending_deltas || pending_v4_in_memory_rows` 门控拆成同一组短路判断）；
+  同构建独立复测 6 轮：`Derived ratio GROUP BY` 极差 **113.29%**
+  （0.5969–1.2730ms），`Numeric GROUP BY (5 funcs)` 极差 **40.10%**
+  （0.9254–1.2965ms），均远超 15% 阈值。
+- canary 第二轮**原始 exit 1**，标记的是**另一组**指标
+  `Filtered numeric TopK` +21.00%（初判另有 `Two-key GROUP BY (5 funcs)`
+  +44.36%，五样本终判恢复）；第一轮的两个指标本轮为 -12.62% 与 -3.48%。
+  两轮的 delta 重指标分别为 -41.03% 与 -40.95%。
+- full（1M/2/5）**exit 0**：main 109/109（初判 3 样本的
+  `IN subquery COUNT` +26.95% 在五样本终判恢复），qps 10/10、quant 8/8、
+  idx 4/4、par 4/4。
+- `Uncached delta Boolean+GROUP+HAVING+TopK`：base 20.390ms → current 12.025ms
+  （canary 第一轮五样本），第二轮 20.536ms → 12.126ms；即被回退的实现所回退的
+  那个指标，本批稳定快约 41%。
+
+结论：canary 两轮原始 exit 1，但两轮标记的是互不相同的干净表指标、同构建复测极差
+达 40–113%、且 full 完整模式（含该批次全部改动）exit 0；按 AGENTS.md §12.14
+登记为**已证实的环境受限例外**，不表述为 canary 通过，原始报告全部保留。
+
+Q1 状态：selection 直接消费、验证矩阵与 base+delta 行组流式读视图均已实现 +
+功能已验证 + 性能已验收（full exit 0）；持久化删除向量 + 覆盖层组合的合并读行空间
+缺口已定位并登记（11.5），该组合保持单批回落。
+
+Q2 实施与验收（2026-09-17）见第 13 节：契约澄清、schema 变化清理反馈、公开
+benchmark 15/15 `slower=0`；canary exit 0，full 原始 exit 1 为环境受限例外。
 
 ## 12. 验收债务 V1 复核（2026-09-17）
 
@@ -754,6 +840,12 @@ base+delta 行组流式读视图未实现（11.3），不以此声称 Q1 整体�
 （CSV 读、向量 TopK、ORDER BY 表达式），两侧均有 2-3 倍尖峰、低峰重叠——
 环境噪音结论得到强化。但门禁仍未在空闲机器上取得绿色结果，V1 记为“已证实为
 环境噪音、仍需空闲窗口复核”，保留全部原始报告，不把失败门禁改称通过。
+
+**2026-09-19 补充**：Q1 base+delta 流式读视图批次在 host load 4.9–8.3 下取得
+full 完整模式 exit 0（main 109/109，初判 `IN subquery COUNT` +26.95% 经五样本
+终判恢复；qps/quant/idx/par 全过），canary 两轮原始 exit 1 但标记两组互不相同的
+干净表指标、同构建复测极差 40–113%（见 11.6）。V1 因此收紧为：完整模式已在非
+空闲条件下转绿；canary 仍需空闲窗口复核。
 
 ## 13. 第八批 Q2：成本反馈与自动并行契约
 
