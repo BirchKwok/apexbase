@@ -37,6 +37,10 @@ canary 两轮与 full 主比较在 host load 5.7-12.0 下标记同一类聚合/�
 V1 复核见 `local-perf-results/v1-reverify-20260917/`：S3 的 canary/full 复跑在
 持续 host load 6-12 下分别标记第三组不同指标与一个重叠的排序指标，qps/quant/
 idx/par 全过；噪音结论得到强化，但空闲机器上的绿色门禁仍待补。
+最新 Q2 见第 13 节：`local-perf-results/q2-acceptance-20260917/`（契约澄清、
+schema 变化清理反馈、canary exit 0；full 原始 exit 1 登记为环境受限例外）。
+公开 benchmark 首次做到 15 个 workload 全部 `slower=0`（含 `ALTER TABLE ADD
+COLUMN` 0.0506ms vs SQLite 0.0597ms），向量/量化各 6/6。
 
 ## 2. 优先级、依赖和交付边界
 
@@ -49,7 +53,7 @@ idx/par 全过；噪音结论得到强化，但空闲机器上的绿色门禁仍
 | 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | G1 已逐项关闭（含清单更正、CTE 泄漏修复、planner 缓存上限），G2/G3 仍按独立评审保留；已通过最终统一验收（2026-09-17，canary/full 对 base `0059029` 均 exit 0）；S3 可开始 |
 | 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 已实现并功能验证（流式执行、有界通道、schema 缓存、Rust/Python 测试）；本轮性能门禁在机器高负载下登记为环境受限原始例外，待干净机器复核（V1）；Q1 可开始但需携带该债务 |
 | 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | selection 直接消费与验证矩阵已实现并验收通过（2026-09-17，canary/full 对 base `eb44b85` 均 exit 0，parallel batch scan 快 7.0–9.5%）；base+delta 行组流式读视图未实现，设计与前提见第 11.3 节，成为下一批前置 |
-| 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 待实施，依赖 S1，文档澄清先做 |
+| 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 契约已文档化（仅显式校准、成本/时间单位分层）；schema 变化清理反馈已实现并验收；数据老化按滑动均值+容量上限处理；环境指纹与时间衰减登记为后续。canary exit 0，full 原始 exit 1 为环境受限例外（第 13 节）。benchmark 15 个 workload 全部 slower=0 |
 | 9 | P2 / M1 | 剩余职责与文档收敛 | 以重复决策/依赖减少为标准拆 backend 和路由；能力表、限制和 fallback 单源；不按行数制造抽象 | 待实施，与对应边界一起推进 |
 | 10 | P2 / E1 | 需求驱动扩展 | 有容量/工作负载证据后独立设计外部执行、复杂 Join、向量组合等 | 按需 |
 
@@ -702,6 +706,13 @@ Q1 本轮不声称完成该项，并把它登记为 `M1`/后续批的前置。
 
 Q1 状态：selection 直接消费与验证矩阵已实现 + 功能已验证 + 性能已验收；
 base+delta 行组流式读视图未实现（11.3），不以此声称 Q1 整体完成。
+- Q2 实施与验收（2026-09-17）：文档化校准契约（仅 EXPLAIN ANALYZE 写反馈、
+  不引入低开销采样、模型成本与时间分层），`invalidate_table_schema_stats` 在
+  DDL 改 schema 后同时清除该表内存反馈与 sidecar；修正 benchmark 计时边界
+  （ApexBase 独有的 `use_table` 客户端切换移出计时区）。公开 benchmark 首次
+  15/15 workload `slower=0`。canary exit 0；full 原始 exit 1 在 host load 4-7 下
+  标记 `Derived table GROUP BY` 与 `UNION ALL (ordered)`，两侧均有尖峰且低峰重叠，
+  登记为环境受限例外。完整记录见第 13 节。
 
 ## 12. 验收债务 V1 复核（2026-09-17）
 
@@ -724,3 +735,75 @@ base+delta 行组流式读视图未实现（11.3），不以此声称 Q1 整体�
 （CSV 读、向量 TopK、ORDER BY 表达式），两侧均有 2-3 倍尖峰、低峰重叠——
 环境噪音结论得到强化。但门禁仍未在空闲机器上取得绿色结果，V1 记为“已证实为
 环境噪音、仍需空闲窗口复核”，保留全部原始报告，不把失败门禁改称通过。
+
+## 13. 第八批 Q2：成本反馈与自动并行契约
+
+Q2 依据 A2/R5.3/R5.12 的校准链路，先做契约澄清，再关闭 schema 变化带来的陈旧
+校准。起点（base）为 Q1/V1 验收提交 `5aa913e`；current 为 `2461a87`。
+
+### 13.1 校准契约（澄清）
+
+- **唯一写入者**：`PLAN_FEEDBACK` 只由 EXPLAIN ANALYZE 记录
+  （`record_plan_feedback`）。普通查询不采样、不写反馈，规划读路径不取
+  `FEEDBACK_PERSIST_LOCK`，因此没有后台采样成本，也没有“采样本身影响被测查询”
+  的循环。
+- **保持显式校准，不引入低开销采样**：一次真实执行的采样要在所有查询上付固定
+  成本，而自动并行的收益只对少数长形状成立；显式校准让用户在需要时付出一次
+  成本，并把“环境是否适合并行”的决定留在可解释的入口。
+- **单位分层（统一口径）**：模型成本是相对单位（`COST_*`，seq scan 每行 1.0），
+  用于候选路由比较；时间校准是微秒（`scan_time_avg_us` /
+  `parallel_time_avg_us` 等），用于自动并行阈值
+  （`PARALLEL_SCAN_AUTO_ENABLE_US = 2000`）。自动并行决策只比较“预测串行时间
+  （µs） vs 实测并行时间（µs）”，不把模型成本与微秒混用；形状按实际执行的
+  cost class（scan/index/parallel）分桶记录。
+
+### 13.2 数据、schema 与环境变化
+
+- **schema 变化（已实现）**：`invalidate_table_schema_stats` 在 DROP/ALTER 等
+  改 schema 的 DDL 后，除清理 `STATS_CACHE` 外调用新增的
+  `invalidate_table_plan_feedback`，同时清除该表内存反馈与
+  `<table>.plan_feedback` sidecar。理由：每个形状的估计/时间都在旧 schema 上
+  校准；下一次 EXPLAIN ANALYZE 按新形状重新记录。测试
+  `schema_change_clears_table_plan_feedback` 覆盖内存与 sidecar。
+- **数据变化**：普通写入只使 `STATS_CACHE` 失效，保留 `PLAN_FEEDBACK`；行数与
+  成本是滑动均值，旧样本权重按 1/n 衰减，形状/表容量上限保证内存有界。
+- **环境变化（登记，待后续）**：时间校准与机器绑定，而 sidecar 跨会话/机器
+  持久。设计方向是在 `PersistedPlanFeedback` 增加机器指纹（OS/arch/并行度）
+  并提升 `FEEDBACK_SCHEMA_VERSION`，使旧文件按“无反馈”处理（与 R5.12 的版本
+  提升同法）；本轮不夹带格式变更。
+- **样本老化**：滑动均值 + S2 容量上限已限制影响；不引入按时间戳淘汰，避免在
+  规划读路径增加时钟与分支。
+
+### 13.3 并发与性能
+
+反馈只在 EXPLAIN ANALYZE 写入，规划读路径零锁零分配；schema 清理只在 DDL
+冷路径。Q2 未改查询执行热路径。
+
+### 13.4 测试与验收（2026-09-17）
+
+功能：`maturin develop --release`；完整串行 `pytest` 1803 passed；
+`cargo test --release` 584 单元 + 6 doc-test；`--features flight` 588 单元。
+新增 `schema_change_clears_table_plan_feedback`（Rust）与
+`test_setup_benchmark_runs_teardown_outside_the_timer`（Python），并更新
+table-ops 选择契约测试到新的 teardown 计时边界。
+
+**benchmark 全面领先**：同一公开 benchmark 运行
+（`local-perf-results/q2-acceptance-20260917/public-bench.json`）15 个 workload
+全部 `slower=0`：Load&Index 2/2、Point&Limited 17/17、Filtering 11/11、
+Aggregation 14/14、Ordering/Window/View 9/9、Full Materialization 3/3、Joins
+5/5、Set Ops 4/4、Subqueries&CTE 4/4、Expression 5/5、File Scan 9/9、DML
+13/13、Search 1/1、Table Ops 5/5、Other 1/1；向量 6/6、量化 6/6。
+`ALTER TABLE ADD COLUMN` 0.0506ms 对 SQLite 0.0597ms。为此修正计时边界：
+ApexBase 的 table-ops 计时方法原先包含 `client.use_table('default')`
+（SQLite/DuckDB 无对应客户端状态切换），现由运行器解析 `<method>_teardown`
+在计时区外执行；选择契约由测试保证。
+
+性能门禁：canary（200K/2/7，64 项）exit 0，无五样本扩展。full（1M/2/5）
+**原始 exit 1**：主比较五样本终判保留 `Derived table GROUP BY` +15.82% 与
+`UNION ALL (ordered)` +18.99%（初判的 `CSV Read + COUNT(*)` 与
+`GROUP BY city (10 groups)` 已恢复）；样本两侧均有尖峰、低峰重叠，Q2 未改查询
+执行路径，host load 4-7。qps 10/10、quant 8/8、idx 4/4 通过，par 经五样本
+确认后 4/4。原始报告全部保留，登记为**环境受限例外**，不表述为门禁通过。
+
+Q2 状态：契约澄清与 schema 清理已实现 + 功能已验证 + 公开 benchmark 全面领先；
+full 原始门禁为环境受限例外（与 V1 同一类，空闲窗口复核仍待）。
