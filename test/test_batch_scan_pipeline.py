@@ -147,11 +147,18 @@ def test_batch_scan_streams_delta_state_with_parity():
                 os.environ.pop("APEX_BATCH_SCAN", None)
             assert "batched_scan_pipeline" in plan, plan
 
-            # A persisted row-group deletion still keeps parity, whichever
-            # lane serves it.
+            # A persisted row-group deletion on top of the overlay must keep
+            # parity and still stream: it used to force the single-shot
+            # fallback (11.5).
             client.execute("DELETE FROM perf_scan WHERE _id = 200")
             off, on = _ab(client, sql)
             assert on == off, "deleted overlay row must keep parity"
+            os.environ["APEX_BATCH_SCAN"] = "1"
+            try:
+                plan = _run(client, "EXPLAIN ANALYZE " + sql)[0]["plan"]
+            finally:
+                os.environ.pop("APEX_BATCH_SCAN", None)
+            assert "batched_scan_pipeline" in plan, plan
         finally:
             client.close()
 
