@@ -691,6 +691,25 @@ Q1 依据 A2 与 R3 余项，落地“selection 直接消费、减少 gather”�
 该实现涉及存储流式路径的持久化语义，按“先文档化设计再落地”的规则留作下一批；
 Q1 本轮不声称完成该项，并把它登记为 `M1`/后续批的前置。
 
+**2026-09-17 尝试与回退**：曾用“按物理窗口重复走 `read_columns_to_arrow` 合并读”
+实现（提交 `fb3ada4`）。功能与正确性通过（70k 行、多窗口、删除/更新/追加覆盖层与
+单批扫描逐值一致；带 UPDATE 覆盖层的 GROUP BY 形状落在 `batched_scan_pipeline`），
+但同机 canary 对 base `14ae19a` 暴露稳定回退：
+
+- `Uncached delta Boolean+GROUP+HAVING+TopK`：base 五样本 [20.557, 20.672, 20.595,
+  20.899, 20.864] 中位数 20.672ms；current [38.148, 38.231, 38.144, 38.380,
+  38.349] 中位数 38.231ms（+84.94%），每个 current 样本都约为 base 的 2 倍，
+  不是调度噪音。
+
+原因是每个窗口都重新执行一次覆盖层合并读；delta 重的形状因此付出约 2 倍代价。
+已回退该提交（workspace 回到 `14ae19a`），直接复测该指标回到 20.27ms。证据保存在
+`local-perf-results/q1-delta-acceptance-20260917/REVERTED.md`。
+
+下一次实现必须改为“**基础行组 mmap 流 + 按批打补丁**”：overlay 快照一次；
+只对 `_id` 命中的批次应用删除/单元更新，未命中的批次零拷贝直通；增量行在尾部
+追加一次；验收必须把该 delta 重指标与覆盖层 parity 放在同一次门禁里，避免再次
+以吞吐换内存。
+
 ### 11.4 测试与验收（2026-09-17）
 
 - `maturin develop --release` 成功；完整串行 `pytest` 1802 passed（33.30 s）；
