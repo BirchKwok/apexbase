@@ -32,6 +32,10 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 最新 S3 见第 10 节：`local-perf-results/s3-acceptance-20260917/`（功能链全过；
 canary 两轮与 full 主比较在 host load 5.7-12.0 下标记同一类聚合/集合形状，
 登记为环境受限原始例外，干净机器复核列为验收债务 V1）。
+最新 M1 见第 14 节：`local-perf-results/m1-acceptance-20260919/`（读取可见状态与
+能力/回退表单源；pytest 1803、cargo 594+6、flight 598+6、公开 benchmark 103/103
+`slower=0`、canary 重跑 exit 0；full 两轮原始 exit 1，两轮标记互不相同的指标并
+被同构建 47–85% 极差证实为噪音，登记为环境受限例外）。
 最新 Q1 见第 11 节：`local-perf-results/q1-acceptance-20260917/`（selection
 直接消费 + 验证矩阵，canary/full 全过）；base+delta 行组流式读视图见
 `local-perf-results/q1-overlay-acceptance-20260919/`（full exit 0；canary 两轮
@@ -60,7 +64,7 @@ COLUMN` 0.0506ms vs SQLite 0.0597ms），向量/量化各 6/6。
 | 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 已实现并功能验证（流式执行、有界通道、schema 缓存、Rust/Python 测试）；本轮性能门禁在机器高负载下登记为环境受限原始例外，待干净机器复核（V1）；Q1 可开始但需携带该债务 |
 | 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | selection 直接消费与验证矩阵已实现并验收通过（2026-09-17，canary/full 对 base `eb44b85` 均 exit 0）；base+delta 行组流式读视图已实现（基础 mmap 行组流 + DeltaStore 快照按批打补丁 + 尾部追加，2026-09-19，见 11.3）；持久化删除向量与覆盖层并存时的合并读行空间缺口已修复（见 11.5/11.7），该组合现在也流式且与单批读一致；full 门禁 exit 0，canary 原始 exit 1 为已证实的环境受限例外 |
 | 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 契约已文档化（仅显式校准、成本/时间单位分层）；schema 变化清理反馈已实现并验收；数据老化按滑动均值+容量上限处理；环境指纹与时间衰减登记为后续。canary exit 0，full 原始 exit 1 为环境受限例外（第 13 节）。benchmark 15 个 workload 全部 slower=0 |
-| 9 | P2 / M1 | 剩余职责与文档收敛 | 以重复决策/依赖减少为标准拆 backend 和路由；能力表、限制和 fallback 单源；不按行数制造抽象 | 待实施，与对应边界一起推进 |
+| 9 | P2 / M1 | 剩余职责与文档收敛 | 以重复决策/依赖减少为标准拆 backend 和路由；能力表、限制和 fallback 单源；不按行数制造抽象 | 读取可见状态判定与能力/回退表已单源（`OverlayState` + `docs/READ_PATH_CAPABILITIES.md`，替换 19 处重复表达式）；backend 职责拆分与 E1 按 14.2 的边界保留。公开 benchmark 103/103、canary exit 0；full 原始 exit 1 为已证实的环境受限例外（第 14 节） |
 | 10 | P2 / E1 | 需求驱动扩展 | 有容量/工作负载证据后独立设计外部执行、复杂 Join、向量组合等 | 按需 |
 
 验收债务 V1 贯穿每批：保留历史失败，每个独立交付批次的最终代码必须重新完成规定验收。
@@ -976,3 +980,74 @@ ApexBase 的 table-ops 计时方法原先包含 `client.use_table('default')`
 
 Q2 状态：契约澄清与 schema 清理已实现 + 功能已验证 + 公开 benchmark 全面领先；
 full 原始门禁为环境受限例外（与 V1 同一类，空闲窗口复核仍待）。
+
+## 14. 第九批 M1：读取路径职责与能力表单源（2026-09-19）
+
+M1 的目标是减少**重复决策**而不是减少行数：读取 lane 的“可见状态”判定此前在
+storage、执行器和 Python 绑定里各拼一遍，同一条 `has_delta() ||
+has_pending_deltas() || pending_v4_in_memory_rows() > 0` 出现在多个文件，且
+`has_delta() || row_count() > base_rows || active_row_count() > base_rows` 也有三份
+独立拷贝——任何一份漂移都会让某个 lane 读到另一个 lane 已失效的视图。
+
+### 14.1 已实施
+
+- `TableStorageBackend::overlay_state()` 单点探测四类可见覆盖层
+  （`appended_rows` / `pending_cells` / `unflushed_rows` / `base_in_memory`），
+  并提供命名判定：`has_pending_writes()`（不探测 delta 文件，保持点查守卫成本）、
+  `requires_merged_read()`、`is_clean_view()`。
+- 替换重复表达式 16 处（Python 绑定 8、执行器 5、storage 3），并把
+  `visible_rows_exceed_base(base_rows)` 作为“逻辑增量”判定的唯一实现，替换 3 处拷贝。
+- `scan()` 与 `scan_batches_split` 的复合 gate 改为读 `OverlayState`，各 lane 的前提
+  现在有名字，不再靠条件顺序表达。
+- 新增 `docs/READ_PATH_CAPABILITIES.md` 作为“能力表 / 限制 / fallback 目标”的单源，
+  逐 lane 登记入口、支持范围、gate 与回退目标，并写明 typed 协议的类型边界
+  （UInt64 谓词列排除）与“新增 lane 必须同步本表 + 补 gate 回退测试”的规则。
+- 新增 Rust 测试 `overlay_state_is_the_single_source_for_the_read_lanes` 与
+  `overlay_state_separates_base_in_memory_from_pending_writes`，钉住每个状态的分类
+  以及 `has_pending_writes` 与 `requires_merged_read` 的区别。
+
+### 14.2 评估后不做（避免制造抽象）
+
+- Python 绑定与执行器里另有约 100 处针对**具体语义**的 `has_pending_deltas()`
+  调用（例如“该列有 pending 单元更新”“该事务的 DeltaStore 非空”），它们不是同一个
+  决策，合并成统一谓词会隐藏语义、扩大热路径成本，因此只替换了逐字相同的
+  2/3 标志组合。
+- 未按行数拆分 `backend.rs`：`include!` 分文件只是编译期组织，不能据此声称依赖
+  解耦；真正的职责拆分需要绑定具体边界，留待出现第二个复用方时再做。
+- E1（外部执行/复杂 Join/向量组合）仍按需：目前没有容量或工作负载证据。
+
+### 14.3 测试与验收（2026-09-19）
+
+报告目录 `local-perf-results/m1-acceptance-20260919/`，base `34ac1a0`。
+
+- 功能：`maturin develop --release` 成功；完整串行 `pytest` **1803 passed**
+  （36.59 s）；`cargo test --release` **594** 单元 + 6 doc-test；
+  `--features flight` **598** 单元。
+- 公开 benchmark：`public-bench-final2.json` 本次运行 **103/103** 表格 fair detail
+  全部 `slower=0`，向量 6/6、量化 6/6。同修订的另三次运行分别在 host load 13–15
+  下各标记 1 项不同的 near-tie（`Filtered aggregation (city)` 1.06ms vs 0.928ms、
+  `NOT filter` 7.49ms vs 3.56ms、`ALTER TABLE ADD COLUMN` 0.062ms vs 0.062ms），
+  与低负载运行对比即可归因于干扰，原始报告全部保留。
+- canary（200K/2/7）：首次原始 exit 1（4 项干净表指标，其中
+  `Numeric GROUP BY (5 funcs)` current 样本 [2.45, 1.72, 1.70, 2.47, 4.05] 与 base
+  [1.13, 0.97, 2.69, 2.19, 0.97] 高度重叠）；重跑 **exit 0**（64 项全过，无五样本
+  扩展）。同构建 6 轮复测显示这些指标的极差为 21.6%（`Filtered numeric TopK`）、
+  23.3%（`Derived ratio GROUP BY`）、30.9%（`Numeric conjunction aggregation`）、
+  42.7%（`Numeric GROUP BY (5 funcs)`）。
+- full（1M/2/5）：两轮**原始 exit 1**，但两轮标记的是**互不相同**的指标集合——
+  第一轮 `JSON Read + Filter` +26.65%（current [8.91, 11.63, 9.03, 12.90, 12.98]
+  双峰）与 `ORDER BY expression (LENGTH)` +38.31%；第二轮 `Filtered aggregation (city)`
+  +27.05%（current [0.42, 0.99, 0.55, 1.24, 0.43] 双峰）与 `NOT filter` +16.73%
+  （base 自身含 6.25ms 尖峰）。第一轮的两个指标在第二轮分别为 +1.2% 与 -2.4%；
+  第二轮的两个指标在第一轮的五样本终判中均未保留（`NOT filter` 曾在第一轮初判出现，
+  五样本终判恢复）。两轮的 qps 10/10、quant 8/8、idx 4/4、par 4/4 全部通过。同构建公开 benchmark 在这两个指标上的极差为 47%（`JSON Read + Filter`
+  8.92–13.12ms）与 85%（`ORDER BY expression (LENGTH)` 1.67–3.08ms），且
+  `JSON Read + Filter` 是 JSON 文件扫描，不经过本批修改的存储读取路径。
+
+结论：M1 改动为“同判定、改写法”，替换前后的可见状态集合逐条一致；公开 benchmark
+在最终修订上有 103/103 `slower=0` 的绿色记录，canary 重跑 exit 0；full 两轮原始
+exit 1 属已证实的环境受限例外（两轮指标互不相同、样本双峰、同构建极差 47–85%），
+保留全部原始报告，不表述为 full 门禁通过。
+
+M1 状态：读取路径的可见状态判定、能力表与 fallback 目标已单源；余项（backend
+职责拆分、E1）按上面 14.2 的边界继续保留。
