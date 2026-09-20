@@ -1542,5 +1542,36 @@ def test_recreate_after_delete_does_not_corrupt_new_table():
             assert grouped[0]["cnt"] == 500
 
 
+def test_repeated_flush_after_in_memory_appends_does_not_duplicate_rows():
+    """Two flushes on one handle must persist appended rows exactly once.
+
+    `pending_v4_in_memory_rows()` used to report the whole loaded base as
+    pending when the cached footer was still the post-save placeholder, which
+    also pushed the second `flush()` onto the delta spill path.
+    """
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        client = ApexClient(tmp_dir)
+        client.create_table("t", {"v": "int"})
+        client.use_table("t")
+        client.store({"v": list(range(1, 1001))})
+        client.flush()
+        client.store({"v": [1001, 1002]})
+        assert client.execute("SELECT COUNT(*) FROM t").scalar() == 1002
+        assert client.execute("SELECT SUM(v) FROM t").scalar() == sum(range(1, 1003))
+        client.flush()
+        client.flush()
+        client.close()
+
+        with ApexClient(tmp_dir) as reopened:
+            reopened.use_table("t")
+            assert reopened.execute("SELECT COUNT(*) FROM t").scalar() == 1002
+            assert reopened.execute("SELECT SUM(v) FROM t").scalar() == sum(
+                range(1, 1003)
+            )
+            ids = [row["_id"] for row in reopened.execute("SELECT _id FROM t").to_dict()]
+            assert ids == sorted(ids)
+            assert len(ids) == len(set(ids))
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
