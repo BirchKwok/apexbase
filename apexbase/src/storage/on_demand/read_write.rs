@@ -4832,6 +4832,11 @@ impl OnDemandStorage {
         // save_v4 physically removes deleted rows; persisted = active
         self.persisted_row_count
             .store(active_count as u64, Ordering::SeqCst);
+        // Keep the cached footer aligned with the file just written. Linux
+        // eagerly recreates the mmap below, so leaving the pre-save placeholder
+        // cached would make footer readers treat every loaded base row as an
+        // unflushed row.
+        *self.v4_footer.write() = Some(footer);
         // Mark base as loaded — all data is now in memory after full rewrite
         self.v4_base_loaded.store(true, Ordering::SeqCst);
         let candidate = max_active_id + 1;
