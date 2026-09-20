@@ -210,13 +210,15 @@ def test_guard_evidence_records_real_dirty_tree(local_guard, tmp_path):
         )
 
     git("init")
-    (tree / "tracked.py").write_text("before\n")
-    (tree / "deleted.py").write_text("removed\n")
+    (tree / "tracked.py").write_bytes(b"before\n")
+    (tree / "deleted.py").write_bytes(b"removed\n")
     (tree / ".gitignore").write_text("Cargo.lock\nignored\n")
     git("add", ".")
     git("-c", "user.name=Evidence Test", "-c", "user.email=test@example.invalid",
         "commit", "-m", "base")
-    (tree / "tracked.py").write_text("after\n")
+    # Bytes, not text: text mode translates "\n" to "\r\n" on Windows and the
+    # inventory must hash the same content on every platform.
+    (tree / "tracked.py").write_bytes(b"after\n")
     (tree / "deleted.py").unlink()
     (tree / "new.bin").write_bytes(b"\x00\xff\x01")
     (tree / "ignored").write_text("not an input\n")
@@ -230,7 +232,9 @@ def test_guard_evidence_records_real_dirty_tree(local_guard, tmp_path):
     evidence.lockfile("current", tree)
     inventory = json.loads((reports / "source-current.json").read_text())
     assert inventory["tracked.py"] == {
-        "sha256": hashlib.sha256(b"after\n").hexdigest(), "executable": True,
+        "sha256": hashlib.sha256(b"after\n").hexdigest(),
+        # NTFS has no execute bit for chmod to set.
+        "executable": sys.platform != "win32",
     }
     assert inventory["new.bin"]["sha256"] == hashlib.sha256(b"\x00\xff\x01").hexdigest()
     assert inventory["link"] == {"symlink": "tracked.py"}
