@@ -188,7 +188,28 @@ static FEEDBACK_PERSIST_LOCK: Lazy<std::sync::Mutex<()>> =
 // R5.12 added the parallel cost class to PlanFeedback: sidecars written
 // before the bump no longer match the layout and count as "no persisted
 // feedback" (their shape re-calibrates on the next EXPLAIN ANALYZE).
-const FEEDBACK_SCHEMA_VERSION: u32 = 2;
+// The environment fingerprint bump (Q2) follows the same rule: v2 files have
+// no fingerprint field and are ignored.
+const FEEDBACK_SCHEMA_VERSION: u32 = 3;
+
+/// Environment identity for persisted plan feedback.
+///
+/// Time calibration is machine-specific: a sidecar carried to another host,
+/// container or CPU count would otherwise feed its microsecond averages into
+/// the auto-parallel decision, and the planner would trust a threshold that
+/// never held there. OS/arch/parallelism cover the environments this project
+/// runs in; a mismatch counts as "no persisted feedback" and the shape
+/// re-calibrates on the next EXPLAIN ANALYZE.
+static FEEDBACK_ENVIRONMENT: Lazy<String> = Lazy::new(|| {
+    let parallelism = std::thread::available_parallelism()
+        .map(|value| value.get())
+        .unwrap_or(0);
+    format!(
+        "{}/{}/{parallelism}",
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    )
+});
 
 /// Bounds for process-global plan feedback (S2). Only EXPLAIN ANALYZE records
 /// feedback, so growth needs explicit user action; the caps keep a long-lived
@@ -254,6 +275,8 @@ fn feedback_mark_loaded(table_key: &str) {
 #[derive(Debug, Serialize, Deserialize)]
 struct PersistedPlanFeedback {
     version: u32,
+    /// Environment the averages were measured in (`FEEDBACK_ENVIRONMENT`).
+    fingerprint: String,
     entries: Vec<(u64, PlanFeedback)>,
 }
 
@@ -266,9 +289,9 @@ fn feedback_sidecar_path(table_key: &str) -> std::path::PathBuf {
 
 /// Lazily load a table's feedback sidecar into the process-global map, at
 /// most once per (process, table): the planning read path must not do
-/// per-query IO. Missing or unreadable files, and version mismatches,
-/// count as "no persisted feedback". Entries already recorded by this
-/// process win over file entries.
+/// per-query IO. Missing or unreadable files, version mismatches and files
+/// written in another environment all count as "no persisted feedback".
+/// Entries already recorded by this process win over file entries.
 fn ensure_feedback_loaded(table_key: &str) {
     if FEEDBACK_LOADED.read().contains(table_key) {
         return;
@@ -279,7 +302,12 @@ fn ensure_feedback_loaded(table_key: &str) {
     };
     let file: PersistedPlanFeedback =
         match bincode::deserialize::<PersistedPlanFeedback>(&data) {
-            Ok(file) if file.version == FEEDBACK_SCHEMA_VERSION => file,
+            Ok(file)
+                if file.version == FEEDBACK_SCHEMA_VERSION
+                    && file.fingerprint == *FEEDBACK_ENVIRONMENT =>
+            {
+                file
+            }
             _ => return feedback_mark_loaded(table_key),
         };
     if !file.entries.is_empty() {
@@ -483,6 +511,7 @@ pub fn record_plan_feedback(
     };
     if let Ok(data) = bincode::serialize(&PersistedPlanFeedback {
         version: FEEDBACK_SCHEMA_VERSION,
+        fingerprint: FEEDBACK_ENVIRONMENT.clone(),
         entries: snapshot,
     }) {
         let _ = std::fs::write(feedback_sidecar_path(table_key), data);
@@ -2031,6 +2060,80 @@ mod tests {
         invalidate_table_schema_stats(&table_key);
         assert!(feedback_lookup_for_tests(&table_key, &select).is_none());
         assert!(!std::path::Path::new(&sidecar).exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plan_feedback_from_another_environment_is_ignored() {
+        let dir = std::env::temp_dir().join(format!(
+            "apex_planner_feedback_environment_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let table_key = dir.join("t.apex").to_string_lossy().to_string();
+        let sidecar = format!("{table_key}.plan_feedback");
+        let select = select_statement("SELECT k, COUNT(*) FROM t WHERE k >= 1 GROUP BY k");
+        let key = feedback_key(&table_key, &select);
+        let entry = |samples: u64| PlanFeedback {
+            strategy: ExecutionStrategy::OlapAggregation,
+            estimated_rows: 0.0,
+            actual_rows: 0.0,
+            samples,
+            scan_cost_avg: 0.0,
+            scan_time_avg_us: 0.0,
+            scan_samples: 0,
+            index_cost_avg: 0.0,
+            index_time_avg_us: 0.0,
+            index_samples: 0,
+            parallel_cost_avg: 0.0,
+            parallel_time_avg_us: 0.0,
+            parallel_samples: 0,
+        };
+
+        // A sidecar measured in another environment must not feed the
+        // auto-parallel thresholds of this one.
+        let foreign = PersistedPlanFeedback {
+            version: FEEDBACK_SCHEMA_VERSION,
+            fingerprint: format!("{}-other/0", FEEDBACK_ENVIRONMENT.as_str()),
+            entries: vec![(key, entry(3))],
+        };
+        std::fs::write(&sidecar, bincode::serialize(&foreign).unwrap()).unwrap();
+        feedback_reset_table_for_tests(&table_key);
+        assert!(
+            feedback_lookup_for_tests(&table_key, &select).is_none(),
+            "feedback from another environment must be ignored"
+        );
+
+        // The matching environment loads normally.
+        record_plan_feedback(
+            &table_key,
+            &select,
+            &ExecutionStrategy::OlapAggregation,
+            100.0,
+            100.0,
+            ExecutedCostClass::Scan,
+            1.0,
+            10.0,
+        );
+        feedback_reset_table_for_tests(&table_key);
+        let loaded = feedback_lookup_for_tests(&table_key, &select).unwrap();
+        assert_eq!(loaded.samples, 1);
+
+        // A pre-fingerprint (older schema version) sidecar is ignored too, so
+        // the version bump retires every file written before Q2.
+        let stale = PersistedPlanFeedback {
+            version: FEEDBACK_SCHEMA_VERSION - 1,
+            fingerprint: FEEDBACK_ENVIRONMENT.clone(),
+            entries: vec![(key, entry(5))],
+        };
+        std::fs::write(&sidecar, bincode::serialize(&stale).unwrap()).unwrap();
+        feedback_reset_table_for_tests(&table_key);
+        assert!(
+            feedback_lookup_for_tests(&table_key, &select).is_none(),
+            "an older feedback schema version must be ignored"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
