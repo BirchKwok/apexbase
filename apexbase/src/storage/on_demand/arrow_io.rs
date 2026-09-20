@@ -3426,20 +3426,32 @@ impl OnDemandStorage {
         if !self.is_v4_format() {
             return 0;
         }
-        let ids = self.ids.read();
-        let ids_len = ids.len();
+        // Take the id facts, then drop the guard: the footer reload below takes
+        // the footer write lock and must not run while a read guard is alive.
+        let (ids_len, first_id) = {
+            let ids = self.ids.read();
+            (ids.len(), ids.first().copied().unwrap_or(0))
+        };
         if ids_len == 0 || !self.has_v4_in_memory_data() {
             return 0;
         }
-        let on_disk_rows = self
-            .v4_footer
-            .read()
-            .as_ref()
-            .map(|footer| footer.row_groups.iter().map(|rg| rg.row_count as usize).sum())
-            .unwrap_or(0);
+        // Reload the footer when the cached one carries no rows: after a
+        // save/rewrite the cache can still hold the pre-write placeholder, and
+        // treating that as "no on-disk rows" would report the whole loaded base
+        // as pending (declining streaming and the point-lookup fast paths for a
+        // table that has nothing pending).
+        let mut on_disk_rows = {
+            let footer = self.v4_footer.read();
+            footer.as_ref().map(footer_physical_rows).unwrap_or(0)
+        };
+        if on_disk_rows == 0 {
+            if let Some(footer) = self.get_or_load_footer().ok().flatten() {
+                on_disk_rows = footer_physical_rows(&footer);
+            }
+        }
         if on_disk_rows == 0 {
             ids_len
-        } else if ids.first().copied().unwrap_or(0) != 1 {
+        } else if first_id != 1 {
             // Insert backends for mmap-only V4 files hold only newly appended
             // IDs, e.g. base has rows 1..N while memory starts at N+1.
             ids_len
@@ -3460,4 +3472,13 @@ impl OnDemandStorage {
         cols.iter().any(|c| c.len() >= on_disk_rows)
     }
 
+}
+
+/// Physical persisted rows across the footer's row groups.
+fn footer_physical_rows(footer: &V4Footer) -> usize {
+    footer
+        .row_groups
+        .iter()
+        .map(|group| group.row_count as usize)
+        .sum()
 }

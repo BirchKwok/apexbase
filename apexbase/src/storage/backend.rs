@@ -7695,6 +7695,94 @@ mod tests {
     }
 
     #[test]
+    fn pending_in_memory_rows_read_correctly_on_the_single_shot_lane() {
+        use arrow::array::Int64Array;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("pending_in_memory_rows.apex");
+        let builder = TableStorageBackend::create(&path).unwrap();
+        builder.add_column("v", DataType::Int64).unwrap();
+        let values: Vec<i64> = (1..=1000).collect();
+        builder
+            .insert_typed_with_nulls(
+                HashMap::from([("v".to_string(), values)]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        builder.save().unwrap();
+        builder
+            .insert_rows(&[
+                HashMap::from([("v".to_string(), Value::Int64(1001))]),
+                HashMap::from([("v".to_string(), Value::Int64(1002))]),
+            ])
+            .unwrap();
+
+        // Unflushed rows are pending writes and an overlay, and the in-memory
+        // buffers hold the complete base plus the appended rows.
+        assert_eq!(builder.pending_v4_in_memory_rows(), 2);
+        assert!(builder.overlay_state().unflushed_rows);
+        assert!(builder.has_pending_writes());
+
+        let batch = builder
+            .read_columns_to_arrow(Some(&["_id", "v"]), 0, None)
+            .unwrap();
+        let ids = batch
+            .column_by_name("_id")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let vals = batch
+            .column_by_name("v")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let pairs: Vec<(i64, i64)> = (0..batch.num_rows())
+            .map(|index| (ids.value(index), vals.value(index)))
+            .collect();
+        assert_eq!(pairs.len(), 1002);
+        assert_eq!(pairs.first().copied(), Some((1, 1)));
+        assert_eq!(pairs.last().copied(), Some((1002, 1002)));
+        assert!(pairs.iter().all(|(id, value)| id == value));
+
+        // The batched stream deliberately declines: the in-memory segment
+        // interleaves the persisted base with the appended rows and has no
+        // stable row-group mapping, so the single-shot merged read is the
+        // contract for this state (docs/READ_PATH_CAPABILITIES.md,
+        // ARCHITECTURE_REFACTOR_REMAINING 11.5). Reads stay correct either way.
+        let request = crate::storage::ScanRequest {
+            projection: Some(&["_id", "v"]),
+            predicate: None,
+        };
+        assert!(
+            builder.scan_batches(&request).unwrap().is_none(),
+            "unflushed rows keep the single-shot fallback"
+        );
+        let single = builder
+            .scan(&request)
+            .unwrap()
+            .expect("single-shot scan must produce a morsel")
+            .into_record_batch()
+            .unwrap();
+        assert_eq!(single.num_rows(), pairs.len());
+        assert_eq!(
+            single
+                .column_by_name("_id")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .unwrap()
+                .value(1001),
+            1002
+        );
+    }
+
+    #[test]
     fn overlay_state_is_the_single_source_for_the_read_lanes() {
         fn fixture(dir: &Path, name: &str) -> std::path::PathBuf {
             let path = dir.join(name);
