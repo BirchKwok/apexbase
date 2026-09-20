@@ -3,6 +3,73 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.34.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.34.0)
+*2026-09-20*
+
+[Compare with v1.33.1](https://github.com/BirchKwok/ApexBase/compare/v1.33.1...v1.34.0)
+
+### Highlights
+
+v1.34.0 completes the planned reliability and resource-control stages of the
+September architecture program. It gives transaction failures an explicit
+outcome contract, extends WAL recovery through UPDATE and index failures,
+streams supported base-plus-delta scans and Flight results in bounded batches,
+and introduces per-query aggregation memory budgets. The release keeps the V4
+format and public Python, Rust, PostgreSQL-wire, and Flight entry points
+compatible.
+
+### Transaction And Recovery Semantics
+
+- Classify commit errors as `not_committed`, `unknown`, or `committed`, retaining the transaction ID, original I/O error kind and source so callers can distinguish a safe new transaction from a result that must be reconciled after reopen
+- Propagate Safe/Max durability through WAL commit, reject durable UPDATE shapes before the commit point when they cannot be recovered, and replay recoverable transactional UPDATE records after restart
+- Apply multi-table transaction work in deterministic table order and document the crash boundary as per-table convergence rather than claiming database-wide crash atomicity
+- Mark persistent secondary indexes stale before committed table changes, refuse stale postings in both planning and execution, and rebuild safely through `REINDEX`
+- Preserve visibility publication and cache invalidation when post-commit watermark maintenance fails, preventing a logically committed transaction from being replayed
+
+### Batched And Parallel Query Execution
+
+- Add a serial row-group pipeline for supported single-table `Filter -> GROUP BY -> HAVING -> TopK` queries, consuming selection vectors directly without gathering a temporary compact batch
+- Stream persisted base rows together with delta inserts, cell updates and deletes through a stable overlay snapshot, while retaining exact single-batch fallback for unsupported types and unflushed in-memory state
+- Add bounded parallel row-group scan/fold execution with caller-thread cancellation, per-query worker limits and explicit 2/4/8-thread performance coverage
+- Carry executable index access details in the query plan and report the physical route through `EXPLAIN ANALYZE`, including plan/execution divergence when correctness requires fallback
+- Persist explicit `EXPLAIN ANALYZE` cost feedback per table, invalidate it after schema changes, and ignore sidecars from incompatible OS, architecture or parallelism environments
+
+### Resource Ownership And Flight Streaming
+
+- Enforce a configurable per-query byte budget for supported aggregation state across serial and parallel workers, returning a clear out-of-memory error and releasing reservations on success, cancellation, failure and fallback
+- Bound planner feedback, statistics and CTE caches, including RAII cleanup for failed CTE evaluation, without adding a global query-path lock
+- Propagate session context and cancellation through the scheduler and bound its work queue
+- Stream supported Flight projections through a capacity-two channel with slow-consumer backpressure and disconnect cancellation; split materialized fallbacks into 65,536-row delivery chunks
+- Cache schema discovery with a fixed capacity and avoid a second full execution for supported streaming queries
+
+### Read-Path Correctness And Maintainability
+
+- Make `OverlayState` the single source for read-lane visibility gates and publish a capability matrix covering supported types, overlay states and exact fallback targets
+- Fix merged reads with persisted delete vectors so physical base positions, active-row windows and delta patches remain in the same row space
+- Fix repeated flush after in-memory V4 appends by refreshing stale footer metadata without re-entering the footer write lock while a read lock is held
+- Split SELECT implementation blocks by responsibility while preserving one executor module and its existing dependency direction
+- Persist same-machine performance-gate provenance, including actual source inventories, binary patches, Cargo locks, wheel digests and raw comparison exit states
+
+### Validation And Performance
+
+- Release build and complete serial Python suite passed: 1,811 tests
+- Complete Rust suites passed: 596 unit + 6 documentation tests for default features, and 600 unit + 6 documentation tests with Flight
+- Public 1-million-row benchmark completed with ApexBase winning 103/103 tabular, 6/6 exact-vector and 6/6 shared quantized-vector comparisons
+- Same-machine canary passed 64/64 after the required five-sample confirmation; the original `4d85ed2` architecture-closeout base also passed 64/64
+- Same-machine full gate passed all 135 checks: 109 main, 10 Q/s, 8 quantized-vector, 4 index and 4 parallel metrics
+- The retained historical public-baseline comparison flagged five cross-date metrics on a different macOS version; each corresponding metric passed the same-machine full comparison, and the original nonzero historical comparison remains recorded
+
+### Upgrade Notes
+
+- No public API or `.apex` file-format migration is required
+- Persisted plan-feedback sidecars from schema versions before v3, or from a different environment fingerprint, are ignored and recalibrated on the next `EXPLAIN ANALYZE`
+- An `unknown` commit outcome must be reconciled by reopening and checking authoritative state; applications must not blindly replay its DML
+- Multi-table durable transactions converge deterministically per table after a crash but do not provide database-wide crash atomicity
+- Update the Rust crate and Python package version metadata to 1.34.0
+
+---
+
+
 ## [v1.33.1](https://github.com/BirchKwok/ApexBase/releases/tag/v1.33.1)
 *2026-09-05*
 
