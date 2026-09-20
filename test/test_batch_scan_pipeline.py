@@ -190,6 +190,17 @@ def test_negative_bound_queries_match_known_values():
 _PEAK_RSS_SNIPPET = r"""
 def peak_rss_mb():
     '''Peak resident set size of this process, in MB (portable).'''
+    if sys.platform.startswith("linux"):
+        # Linux keeps `ru_maxrss` across fork/exec, so a child can inherit
+        # its parent's peak. VmHWM is the high water mark of this address
+        # space and reports only what this process actually used.
+        try:
+            with open("/proc/self/status", encoding="utf-8") as status:
+                for line in status:
+                    if line.startswith("VmHWM:"):
+                        return int(line.split()[1]) / 1024
+        except OSError:
+            pass
     try:
         import resource
     except ImportError:  # Windows has no resource module.
