@@ -8,16 +8,25 @@ twice, because the first attempt already wrote it).
 """
 
 import os
-import sys
 import tempfile
 
 import pytest
 
 from apexbase import ApexClient
 
-pytestmark = pytest.mark.skipif(
-    sys.platform == "win32", reason="POSIX file permissions are required"
-)
+
+def _block_index_sidecar(index_path):
+    """Make persisting the index sidecar fail on every platform.
+
+    A read-only file only fails the save on POSIX; occupying the sidecar
+    path with a directory is rejected by the writer everywhere.
+    """
+    os.remove(index_path)
+    os.mkdir(index_path)
+
+
+def _unblock_index_sidecar(index_path):
+    os.rmdir(index_path)
 
 
 def test_failed_insert_is_not_replayed_and_falls_back_to_scan():
@@ -35,12 +44,12 @@ def test_failed_insert_is_not_replayed_and_falls_back_to_scan():
         assert not os.path.exists(stale_path)
 
         # A real write failure: the index file cannot be persisted.
-        os.chmod(index_path, 0o444)
+        _block_index_sidecar(index_path)
         try:
             with pytest.raises(RuntimeError):
                 c.execute("INSERT INTO t (value) VALUES (999)")
         finally:
-            os.chmod(index_path, 0o644)
+            _unblock_index_sidecar(index_path)
 
         # The row was written exactly once. A replayed INSERT would make it 4.
         assert c.execute("SELECT COUNT(*) FROM t").scalar() == 3
