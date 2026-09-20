@@ -309,6 +309,12 @@ jobs:
         print("pytest completed without skipped tests")
         PY
       env:
+        # `maturin develop --skip-install` only places the extension module in
+        # the source tree, and pytest's conftest fixes sys.path in-process only.
+        # Tests that spawn child interpreters (crash recovery, RSS probes,
+        # benchmark scripts) import apexbase directly, so the in-tree package
+        # must also be available through the child process environment.
+        PYTHONPATH: ${{ github.workspace }}/apexbase/python
         PYTHONFAULTHANDLER: "1"
         RUST_BACKTRACE: "1"
 

@@ -4,13 +4,32 @@ Covers session-context propagation to worker threads, bounded-queue
 admission control, and query cancellation at batch boundaries.
 """
 
-import fcntl
 import os
+import sys
 import time
 
 import pytest
 
 from apexbase import _core, ApexClient
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _lock_exclusive(handle):
+        # Windows byte-range lock; conflicts with the crate's fs2 LockFileEx.
+        msvcrt.locking(handle, msvcrt.LK_LOCK, 1)
+
+    def _unlock(handle):
+        msvcrt.locking(handle, msvcrt.LK_UNLCK, 1)
+else:
+    import fcntl
+
+    def _lock_exclusive(handle):
+        fcntl.flock(handle, fcntl.LOCK_EX)
+
+    def _unlock(handle):
+        fcntl.flock(handle, fcntl.LOCK_UN)
+
 
 ROWS_PER_CHUNK = 100_000
 
@@ -71,7 +90,7 @@ def test_scheduled_queue_rejects_when_full(tmp_path):
     table = _make_table(tmp_path, "t", 1)
     lock_path = tmp_path / "t.apex.lock"
     lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
-    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    _lock_exclusive(lock_fd)
     try:
         _core.init_query_scheduler(1, 1)  # one worker, queue bound 1
 
@@ -89,7 +108,7 @@ def test_scheduled_queue_rejects_when_full(tmp_path):
             _core.submit_scheduled("SELECT COUNT(*) FROM t", str(table))
         assert time.monotonic() - started < 2.0, "rejection must not block"
     finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        _unlock(lock_fd)
         os.close(lock_fd)
 
     ok, err = first.wait()

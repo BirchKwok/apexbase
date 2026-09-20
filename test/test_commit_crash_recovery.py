@@ -14,7 +14,6 @@ These tests exercise the real commit protocol on real files:
 """
 
 import os
-import signal
 import subprocess
 import sys
 import tempfile
@@ -81,7 +80,8 @@ def _kill_commit_trial(rows, kill_delay, do_kill, durability="safe"):
         if do_kill:
             time.sleep(kill_delay)
             try:
-                os.kill(proc.pid, signal.SIGKILL)
+                # SIGKILL on POSIX, TerminateProcess on Windows.
+                proc.kill()
             except ProcessLookupError:
                 pass
         proc.wait()

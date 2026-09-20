@@ -186,6 +186,8 @@ def timed_window(client, concurrency: int, total_queries: int) -> tuple[float, l
 
 
 def load_sample() -> list[float]:
+    if not hasattr(os, "getloadavg"):
+        return []
     try:
         return [round(x, 3) for x in os.getloadavg()]
     except OSError:

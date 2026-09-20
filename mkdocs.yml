@@ -106,7 +106,6 @@ nav:
       - Vector Quantization: VECTOR_QUANTIZATION_GUIDE.md
   - Internals:
       - Storage Architecture: STORAGE_ARCHITECTURE.md
-      - Architecture Review (2026-09): ARCHITECTURE_REVIEW_2026_09.md
       - Scan & Physical Execution: SCAN_EXECUTION_ARCHITECTURE.md
       - Engineering Guidelines: ENGINEERING_GUIDELINES.md
       - Query Optimizer Roadmap: QUERY_OPTIMIZER_ROADMAP.md
