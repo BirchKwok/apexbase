@@ -1,6 +1,7 @@
 # Scan And Physical Execution Architecture
 
-This page describes the storage/query boundary introduced in ApexBase 1.33.
+This page describes the storage/query boundary introduced in ApexBase 1.33 and
+extended in 1.34 with batched overlay streams and bounded parallel scan/fold.
 It is an internal contract for contributors; SQL users keep using the same
 `ApexClient.execute(...)` API.
 
@@ -93,11 +94,21 @@ represented exactly fall back to the general evaluator.
 
 ## Batched Physical Pipeline (R3)
 
-`TableStorageBackend::scan_batches()` exposes the stable row-group stream for
-requests whose read view is the persisted V4 file alone: no delta file, no
-pending DeltaStore cells, no pending V4 rows, and no in-memory table. Any
-other state returns `None` and the caller falls back to the single-shot
-`scan()` for the whole request.
+`TableStorageBackend::scan_batches()` exposes the stable row-group stream in
+two correctness-equivalent lanes:
+
+- **clean** — the read view is the persisted V4 file alone (no delta file, no
+  pending DeltaStore cells, no pending V4 rows, and no in-memory table); rows
+  stream directly from the mmap row groups;
+- **overlay** (v1.34.0) — `AppendedRows` and/or `PendingCells` are visible;
+  base row groups still pass through zero-copy, each batch is patched by `_id`
+  from one DeltaStore snapshot taken when the stream is created, and appended
+  rows arrive as a tail batch.
+
+The batch lane returns `None` — and the caller falls back to the single-shot
+`scan()` for the whole request — for an in-memory table, unflushed V4 rows, a
+legacy non-V4 file, or a projection/predicate type the typed protocol cannot
+evaluate.
 
 Each batch is one row group of active rows (deletion vectors applied) with the
 projected columns, and the complete typed predicate is re-evaluated on every
@@ -167,6 +178,14 @@ When adding another operator or predicate:
   back when exact round-tripping is impossible.
 - Selection materialization currently uses Arrow `take`; late materialization
   can move further downstream in a later phase.
-- The batch stream is serial; parallel morsel scheduling is future work (design/assessment: ARCHITECTURE_REVIEW_2026_09.md §14.8 — opt-in phase A not yet implemented, default stays serial).
+- The batch stream is serial by default. v1.34.0 adds a bounded parallel
+  row-group scan/fold over disjoint row-group ranges (`scan_batches_ranges`),
+  gated by a process-wide worker-token budget of
+  `min(available_parallelism - 1, 8)`: fewer than two free tokens falls back to
+  the serial stream, and readers auto-enable parallel workers when the
+  calibrated serial prediction exceeds the cost threshold and parallel history
+  is still faster. `APEX_PARALLEL_SCAN=0`/`1` forces serial and `N >= 2` forces
+  `N` workers. See [Resource Ownership](RESOURCE_OWNERSHIP.md) for the token
+  pool and the visibility states that keep a request on the serial path.
 
 These are explicit fallback boundaries, not silent semantic differences.

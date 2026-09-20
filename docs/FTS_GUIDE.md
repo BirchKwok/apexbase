@@ -85,14 +85,14 @@ client.store([
 # 3. Query using MATCH() in WHERE
 results = client.execute("SELECT * FROM articles WHERE MATCH('rust')")
 print(results.to_pandas())
-#    _id                  title                    content
-# 0    0  Rust programming language  Rust is fast and safe
+#                    title                    content
+# 0  Rust programming language  Rust is fast and safe
 
 # 4. Fuzzy search — tolerates typos
 results = client.execute("SELECT * FROM articles WHERE FUZZY_MATCH('pytohn')")
 print(results.to_pandas())
-#    _id            title                    content
-# 1    1  Python tutorial  Python is easy to learn
+#             title                    content
+# 0  Python tutorial  Python is easy to learn
 
 client.close()
 ```
@@ -106,7 +106,6 @@ client.close()
 ```sql
 CREATE FTS INDEX ON table_name
     [(col1 [, col2, ...])]
-    [WITH (option = value [, ...])]
 ```
 
 **Effect:**
@@ -128,16 +127,25 @@ CREATE FTS INDEX ON articles (title, content)
 CREATE FTS INDEX ON articles
 ```
 
-**Options (WITH clause)**
+**Options (Python API)**
+
+The native SQL grammar does not currently accept a `WITH (...)` clause on
+`CREATE FTS INDEX`; configure these options through `client.init_fts()`:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `lazy_load` | bool | `false` | mmap the v3 term directory and decode postings on first access |
 | `cache_size` | int | `10000` | Maximum decoded posting bitmaps retained in lazy mode |
 
-```sql
-CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)
-CREATE FTS INDEX ON articles (title) WITH (cache_size=100000)
+```python
+# Equivalent to CREATE FTS INDEX ON articles (title, content)
+client.init_fts(index_fields=["title", "content"])
+
+# Retain up to 200,000 decoded posting bitmaps
+client.init_fts(cache_size=200000)
+
+# Keep the term directory and postings mmap-backed across reopen
+client.init_fts(index_fields=["subject", "body"], lazy_load=True)
 ```
 
 **Examples:**
@@ -146,11 +154,11 @@ CREATE FTS INDEX ON articles (title) WITH (cache_size=100000)
 # Index title + content
 client.execute("CREATE FTS INDEX ON articles (title, content)")
 
-# Retain up to 200,000 decoded posting bitmaps
-client.execute("CREATE FTS INDEX ON wiki WITH (cache_size=200000)")
+# Index every string column
+client.execute("CREATE FTS INDEX ON wiki")
 
-# Keep the term directory and postings mmap-backed across reopen
-client.execute("CREATE FTS INDEX ON emails (subject, body) WITH (lazy_load=true)")
+# The same index with explicit options uses the Python API
+client.init_fts(lazy_load=True)
 ```
 
 ---
@@ -227,8 +235,8 @@ Returns a result set describing all FTS-configured tables across **all databases
 | `table` | string | Table name |
 | `enabled` | bool | Whether FTS is currently active |
 | `fields` | string | Indexed columns (comma-separated, or `(all string cols)`) |
-| `lazy_load` | bool | Stored compatibility setting |
-| `cache_size` | int | Stored compatibility setting |
+| `lazy_load` | bool | Whether the term directory is mmapped and postings are decoded on first access |
+| `cache_size` | int | Bound on decoded posting bitmaps retained in lazy mode |
 
 ```python
 df = client.execute("SHOW FTS INDEXES").to_pandas()
@@ -408,7 +416,25 @@ top5    = client.search_and_retrieve_top("query", n=5)                  # → Re
 client.disable_fts()    # suspend (keep files)
 client.drop_fts()       # drop (delete files)
 stats = client.get_fts_stats()   # {'fts_enabled': True, 'doc_count': N, ...}
+client.compact_fts_index()       # compact the on-disk snapshot + WAL
 ```
+
+### Fuzzy Configuration And Warmup
+
+```python
+client.set_fts_fuzzy_config(
+    threshold=0.7,          # minimum similarity in [0, 1]
+    max_distance=2,         # maximum edit distance
+    max_candidates=20,      # candidate terms examined per query term
+    table_name=None,
+)
+
+# Pre-decode postings for terms you expect to search
+loaded = client.warmup_fts_terms(["rust", "database"], table_name=None)
+```
+
+The same fuzzy knobs are also accepted per call by `FUZZY_MATCH(...)` and
+`fuzzy_search_text(...)`.
 
 ---
 

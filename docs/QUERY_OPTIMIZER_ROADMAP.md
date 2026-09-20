@@ -25,19 +25,20 @@ ApexBase 值得继续建设轻量查询优化器，但不以实现通用数据�
 - `ANALYZE` 收集 row count、NDV、NULL、数值范围和数值直方图，并持久化 sidecar。
 - 索引执行后重新应用完整 `WHERE`，保留残余谓词。
 - 小规模安全 INNER 等值 Join 可进行受限顺序调整。
-- `EXPLAIN` 展示候选成本；`EXPLAIN ANALYZE` 可记录整条查询的基数反馈。
+- `EXPLAIN` 展示候选成本与可执行索引访问规格；`EXPLAIN ANALYZE` 额外报告实际胜出的物理路由（`PATH_TRACE`）、规划/执行分歧（`PLAN_DIVERGENCE`），并写入按查询形状的成本/时间反馈。
+- 计划反馈按 (表, 查询形状哈希) 持久化到 `<table>.plan_feedback`，记录行维度估计/实际滑动均值与 scan/index/parallel 三类的模型成本与实测时间均值；sidecar 带 schema 版本 3 与 OS/arch/并行度指纹，schema 变更时清除。
 - 存储层已有 SQL 无关的 `ScanRequest` / `Morsel` / `SelectionVector` 协议；base 与 delta/overlay 路径向物理算子提供同一输入契约。
 - 首个纵向物理管线已覆盖合取过滤、`GROUP BY`、`HAVING` 和 ordered TopK，并对不精确宽整数及不支持表达式保留通用执行器 fallback。
+- 扫描谓词已是 AND/OR 树（`ScanPredicateExpr`）；`scan_batches_ranges` 支持多个 morsel 的并行调度（受 worker token 预算与成本门控）；晚期物化已用于过滤/排序/分组路径。
 
 ### 3.2 必须先解决的缺口
 
 - 规划器候选提取与索引执行器能力必须使用同一语义，尤其是 OR、表达式及复合索引列顺序。
-- 复合 key 的 NUL 拼接编码没有类型边界和格式版本，属于正确性及磁盘兼容问题。
-- sidecar 需要覆盖 base、delta 和 deltastore 的数据版本，不能只依赖单个文件 mtime。
+- （P0 已落地）复合 key 已改为带版本、类型标签和长度边界的 typed tuple；后续变更必须保持该格式可检测、可重建。
+- （P0 已落地）sidecar 新鲜度已覆盖 base、delta 和 deltastore 的大小与 mtime；新增数据来源时必须同步纳入。
 - 固定成本常量尚未按命中率、投影宽度、缓存状态和存储后端校准。
 - Join 规划目前主要改变顺序，并没有形成可执行的完整物理算子树。
-- 反馈使用 AST Debug 文本，且只有整条查询的输出基数，不能安全驱动复杂物理决策。
-- 当前扫描谓词仍只有合取列表；OR 表达式树、多个 morsel 的并行调度和更晚的选择向量物化尚未进入共享协议。
+- 反馈仍是按 (表, 查询形状) 的聚合值，尚未做到逐算子耗时与索引/统计 generation 键控。
 
 ## 4. 阶段计划
 
@@ -61,7 +62,7 @@ ApexBase 值得继续建设轻量查询优化器，但不以实现通用数据�
 
 - 新增边界必须有 Python 端到端测试和对应 Rust 单元测试；
 - 普通 fast path 不新增统计读取、锁或候选构造；
-- pytest 不超过 9 秒，完整 cargo test 无明显变慢；
+- 完整 pytest 全部通过（不设硬性时间上限，仅记录耗时）；完整 cargo test（含文档测试）通过；
 - 规定 benchmark 的核心 workload 和总分均无可重复回退；
 - EXPLAIN 不展示执行器无法执行的候选。
 
@@ -132,7 +133,9 @@ ApexBase 值得继续建设轻量查询优化器，但不以实现通用数据�
 
 结果必须记录日期、commit/worktree 状态、平台、数据规模、关键分组总耗时、单项最大回退和测试总耗时。benchmark 波动时至少复测可疑分组或完整 workload，不能用一次较快结果掩盖回退。
 
-## 7. 当前批次记录
+## 7. 批次记录
+
+### 历史基线（2026-07 / ApexBase 1.21.0）
 
 - 基线日期：2026-07-11。
 - 环境：macOS arm64，10 cores，32 GB，Python 3.12.2，ApexBase 1.21.0。
@@ -158,3 +161,15 @@ ApexBase 值得继续建设轻量查询优化器，但不以实现通用数据�
 - 修改后 benchmark 稳定复测：OLAP 45/45、OLTP 27/27、Tabular 72/72、Vector 1/1。
 - 关键 ApexBase workload：Filtering 575.97ms；Point & Limited Reads 8.12ms；Vector batch TopK 46.09ms。相对路线图正式基线分别为 +0.5%、-7.0%、-1.1%，无可重复核心回退。
 - 优化器 micro-benchmark（5,000 行，5 次）：规划中位数 0.04–0.18ms；目标执行场景中位数 0.03–0.23ms。
+
+### 2026-09-20 v1.34.0 批次
+
+- 工作区：`main` @ `41f3400`；macOS 27.0 arm64，10 cores，32 GB，Python 3.12.2，ApexBase 1.34.0。
+- 数据：Tabular 1,000,000 行；Vector 1,000,000 × 128。
+- 实现范围：EXPLAIN ANALYZE 物理路由与规划/执行分歧、按形状持久化的计划反馈（schema 版本 3 + 环境指纹）、索引 stale 标记与 `REINDEX`、批量/并行扫描管线与内存预算。
+- release 构建：`maturin develop --release` 成功。
+- Python 验证：完整 pytest 通过（1,811 项）。
+- Rust 验证：默认特性 596 单元 + 6 文档测试；`--features flight` 600 单元 + 6 文档测试。
+- 公开 benchmark：103/103 tabular、6/6 exact-vector、6/6 共享 quantized codec 胜出（`local-perf-results/release-1.34.0-20260920/`）。
+- 同机门禁：canary 64/64；full 模式 135 项全部通过（109 main + 10 Q/s + 8 quantized + 4 index + 4 parallel）。
+- 说明：完整测试集已从 1.21.0 时期的 1,408 项增长到 1,811 项，`pytest` 耗时按 AGENTS.md 仅作记录，不设硬性上限。

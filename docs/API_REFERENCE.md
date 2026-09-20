@@ -40,10 +40,10 @@ ApexClient(
 - `dirpath=":memory:"`: Create an isolated process-local database without filesystem persistence
 - `batch_size`: Batch size for bulk operations
 - `drop_if_exists`: If True, delete existing data on open
-- `enable_cache`: Enable query result caching
-- `cache_size`: Maximum cache entries
+- `enable_cache`: Enable client-side result caching (see `cache_size`)
+- `cache_size`: Soft hint for the result cache. The effective cache holds at most `min(cache_size, 64)` analytical results, and only results of at most 4096 rows and 8 MiB are cached at all
 - `prefer_arrow_format`: Prefer Arrow format for internal transfers
-- `durability`: Persistence level - 'fast' (async), 'safe' (sync), 'max' (fsync every write)
+- `durability`: Persistence level - `'fast'` leaves writes in the OS page cache, `'safe'` fsyncs on explicit `flush()` / `close()`, `'max'` fsyncs every write
 
 **Example:**
 ```python
@@ -228,7 +228,9 @@ Create a new table, optionally with a pre-defined schema.
 - `table_name`: Name of the table to create.
 - `schema`: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.
 
-**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`
+**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp`, `date`
+
+An unrecognized type string raises `ValueError` listing the supported names.
 
 **Examples:**
 ```python
@@ -486,6 +488,12 @@ simple `UPDATE ... SET <numeric column> = <literal> WHERE _id = N` statements
 against the same table and column are coalesced into one native batch write;
 all other statements run sequentially.
 
+A coalesced numeric `UPDATE` returns a `ResultView` with a single
+`rows_affected` column describing that statement's outcome. When the native
+batch declines a statement (for example a shape it does not support), it is
+executed normally instead, so the returned list always has one entry per input
+statement.
+
 **Example:**
 ```python
 results = client.execute_batch([
@@ -610,11 +618,12 @@ count = client.count_rows("users")  # Specific table
 ```python
 replace(id_: int, data: dict) -> bool
 ```
-Replace a record by _id.
+Replace a record by `_id`. Row ids start at `1` (`FIRST_ROW_ID`), so `0` is
+never a valid id.
 
 **Example:**
 ```python
-success = client.replace(0, {"name": "Alice", "age": 31})
+success = client.replace(1, {"name": "Alice", "age": 31})
 ```
 
 #### batch_replace
@@ -626,8 +635,8 @@ Batch replace multiple records.
 **Example:**
 ```python
 updated = client.batch_replace({
-    0: {"name": "Alice", "age": 31},
-    1: {"name": "Bob", "age": 26}
+    1: {"name": "Alice", "age": 31},
+    2: {"name": "Bob", "age": 26}
 })
 ```
 
@@ -662,7 +671,11 @@ add_column(column_name: str, column_type: str) -> None
 ```
 Add a new column to the current table.
 
-**Types:** `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `Float32`, `Float64`, `String`, `Bool`
+**Types:** `int` / `int64` / `i64` / `integer`, `float` / `float64` / `f64` / `double`, `bool` / `boolean`, `str` / `string` / `text`, `bytes` / `binary`, `blob` / `large_binary` / `largebinary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp` / `datetime`, `date`.
+
+The value is matched case-insensitively. Unlike `create_table`, an unrecognized
+name does **not** raise: it silently creates a `String` column, so check
+`get_column_dtype()` after a dynamic call.
 
 **Example:**
 ```python
@@ -707,13 +720,18 @@ dtype = client.get_column_dtype("age")  # 'Int64'
 ```python
 list_fields() -> List[str]
 ```
-List all column names in the current table.
+List all column names in the current table. The internal `_id` column is never
+included.
 
 **Example:**
 ```python
 fields = client.list_fields()
-print(fields)  # ['_id', 'name', 'age', 'city']
+print(fields)  # e.g. ['name', 'age', 'city']
 ```
+
+> Column order follows the table's stored schema. For a schemaless table built
+> from record inserts, treat the order as unspecified and address columns by
+> name.
 
 ---
 
@@ -727,7 +745,6 @@ FTS is implemented natively in Rust and available through all interfaces (Python
 |-----------|-------------|
 | `CREATE FTS INDEX ON table (col1, col2)` | Create FTS index on specified columns |
 | `CREATE FTS INDEX ON table` | Create FTS index on all string columns |
-| `CREATE FTS INDEX ON table WITH (opt=val)` | Create with options |
 | `DROP FTS INDEX ON table` | Drop index and delete files |
 | `ALTER FTS INDEX ON table DISABLE` | Suspend indexing, keep files |
 | `ALTER FTS INDEX ON table ENABLE` | Resume indexing and back-fill any missed rows |
@@ -739,16 +756,19 @@ FTS is implemented natively in Rust and available through all interfaces (Python
 
 **`CREATE FTS INDEX`**
 ```sql
-CREATE FTS INDEX ON table_name [(col1, col2, ...)] [WITH (lazy_load=bool, cache_size=N)]
+CREATE FTS INDEX ON table_name [(col1, col2, ...)]
 ```
 
 - `(col1, col2)` — optional column list; omit to index all string columns
-- `lazy_load` — mmap the v3 term directory and decode postings on demand (default `false`)
-- `cache_size` — maximum decoded postings retained in lazy mode (default `10000`)
+- The native grammar does not accept a `WITH (...)` clause. Use
+  `client.init_fts(index_fields=..., lazy_load=..., cache_size=...)` when you
+  need those options: `lazy_load` mmaps the v3 term directory and decodes
+  postings on demand (default `false`), and `cache_size` bounds decoded
+  postings retained in lazy mode (default `10000`).
 
 ```python
 client.execute("CREATE FTS INDEX ON articles (title, content)")
-client.execute("CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)")
+client.init_fts(index_fields=["title", "content"], lazy_load=True, cache_size=50000)
 ```
 
 **`DROP FTS INDEX`**
@@ -877,13 +897,18 @@ ids = client.search_text('"distributed database"')
 search_text_with_scores(
     query: str,
     table_name: str = None,
-    limit: int = 1000
+    limit: int = 1000,
+    fuzzy: bool = False,
+    min_results: int = 1
 ) -> List[Tuple[int, float]]
 ```
-Return BM25-ranked document IDs together with their scores.
+Return BM25-ranked document IDs together with their scores. Set `fuzzy=True` to
+relax term matching (using `min_results` as the soft minimum) when exact search
+returns too few hits.
 
 ```python
 hits = client.search_text_with_scores("database", limit=20)
+hits = client.search_text_with_scores("databse", fuzzy=True, min_results=5)
 ```
 
 #### fuzzy_search_text
@@ -942,7 +967,11 @@ Get FTS statistics.
 **Example:**
 ```python
 stats = client.get_fts_stats()
-print(stats)  # {'fts_enabled': True, 'doc_count': 1000, 'term_count': 5000}
+print(stats)
+# {'fts_enabled': True, 'engine_initialized': True, 'doc_count': 1000, 'term_count': 5000}
+
+# A table without an FTS index reports a disabled form instead:
+# {'fts_enabled': False, 'table': 'users'}
 ```
 
 #### set_fts_fuzzy_config
@@ -1248,11 +1277,51 @@ ids = results.get_ids(return_list=True)  # Python list
 ```python
 shape: tuple  # (rows, columns)
 ```
+Number of rows and columns of the materialized Arrow result. Row-returning
+`SELECT *` results carry the internal `_id` column, so `shape[1]` can be one
+larger than `len(results.columns)`, which hides `_id` by default. Explicit
+projections such as `SELECT name FROM users` do not add `_id`. Pass
+`show_internal_id=True` to `execute()` to expose `_id` in both properties.
 
 #### columns
 ```python
 columns: List[str]
 ```
+User column names. The internal `_id` column is excluded unless the result was
+requested with `show_internal_id=True` (or `_id` was projected explicitly).
+
+### Streaming And Export Helpers
+
+#### to_record_batches
+```python
+to_record_batches(max_chunksize: int = None) -> List[pa.RecordBatch]
+```
+Split the materialized Arrow result into record batches. This is a delivery
+convenience, not lazy execution: the full result is already materialized.
+
+#### iter_batches
+```python
+iter_batches(max_chunksize: int = None) -> Iterator[pa.RecordBatch]
+```
+Iterate over the same batches.
+
+```python
+for batch in results.iter_batches(max_chunksize=4096):
+    process(batch)
+```
+
+#### tolist
+```python
+tolist() -> List[Any]
+```
+Return the result as a Python list (one entry per row, or raw scalars for
+single-column results).
+
+#### to_lance
+```python
+to_lance(uri, mode: str = "create", **write_options)
+```
+Write the result to a Lance dataset through the Arrow table path.
 
 ### Sequence Interface
 
@@ -1278,9 +1347,13 @@ second = results[1]
 ```python
 from apexbase import (
     __version__,      # Package version
+    ApexClient,       # Client class
+    ResultView,       # Result wrapper returned by execute()/search
+    execute,          # Module-level process-local execute()
     FTS_AVAILABLE,    # True (FTS always available)
     ARROW_AVAILABLE,  # True if pyarrow installed
     POLARS_AVAILABLE, # True if polars installed
+    PANDAS_AVAILABLE, # True if pandas installed
     DurabilityLevel,  # Type hint: Literal['fast', 'safe', 'max']
 )
 ```
@@ -1348,9 +1421,10 @@ client.execute(
 )
 ```
 
-Arity and type mismatches raise `ValueError` instead of silently producing a
-wrong query. Placeholders inside string/identifier literals and comments are
-not substituted.
+Wrong placeholder arity (or a named placeholder that is missing from the
+mapping) raises `ValueError`; an unsupported Python value type raises
+`TypeError`. Neither silently produces a wrong query. Placeholders inside
+string/identifier literals and comments are not substituted.
 
 ### SELECT
 ```sql
@@ -1543,7 +1617,9 @@ result = client.execute("""
 - All three functions use `mmap` for zero-copy file access.
 - CSV and JSON files are parsed in parallel (one chunk per CPU core via Rayon).
 - Parquet files use parallel column decoding with shared metadata (zero re-parse overhead).
-- Benchmarked against Polars on 1M rows: CSV 0.95×, NDJSON 0.93×, Parquet 1.33× (Arrow output).
+- For end-to-end engine comparisons, see the retained snapshots on the
+  [Performance](performance.md) page; this repository does not currently
+  maintain a per-format file-reader ratio table.
 
 ---
 
@@ -1551,10 +1627,12 @@ result = client.execute("""
 
 Register external data files (CSV, JSON, Parquet) as temporary native tables. The file is parsed once and materialized into ApexBase's mmap-backed `.apex` format, stored in a `.apex_tmp/` subdirectory. Subsequent queries bypass file parsing entirely — leveraging zone maps, bloom filters, and zero-copy mmap reads for **order-of-magnitude speedups** over repeated `read_csv()` / `read_json()` / `read_parquet()` calls. Temp tables are automatically cleaned up on client close.
 
-### `register_temp_table(name, file_path, on_bad_lines="error")`
+### `register_temp_table(name, file_path, on_bad_lines="error", encoding="utf-8")`
 
 ```python
-client.register_temp_table(name: str, file_path: str, on_bad_lines: str = "error")
+client.register_temp_table(
+    name: str, file_path: str, on_bad_lines: str = "error", encoding: str = "utf-8"
+)
 ```
 
 | Parameter | Type | Description |
@@ -1562,6 +1640,7 @@ client.register_temp_table(name: str, file_path: str, on_bad_lines: str = "error
 | `name` | `str` | Name for the temporary table |
 | `file_path` | `str` | Path to the data file |
 | `on_bad_lines` | `str` | CSV-only malformed-row policy: `error`, `skip`, or `warn` |
+| `encoding` | `str` | Source encoding for CSV/TSV/NDJSON input; non-UTF-8 files are transcoded once during registration |
 
 **Supported formats** (auto-detected by file extension):
 
@@ -1867,6 +1946,15 @@ For retrieval systems, keep the source vector and create a separate stored
 accelerator so the compressed scan can be followed by source-vector reranking:
 
 ```python
+create_quantized_column(source: str, target: str = None, codec: str = "turboquant4") -> str
+drop_quantized_column(target: str) -> None
+```
+
+`target` defaults to a name derived from the source column and codec. Supported
+codecs are `float16`, `bfloat16`, `int8`, `uint8`, `bit1`, `turboquant2`,
+`turboquant3`, and `turboquant4`.
+
+```python
 client.create_quantized_column(
     source="vec",
     target="vec_tq4",
@@ -2087,15 +2175,18 @@ results = client.execute("""
 
 ### Vector Search Performance
 
-Benchmark: 1M rows × dim=128, k=10, release build, warm mmap scan buffer.
+Retained v1.34.0 public snapshot: 1,000,000 rows x dim=128, `k=10`, release
+build, exact Float32 TopK (see [Performance](performance.md) for the full
+report and provenance).
 
 | Metric | ApexBase | DuckDB | Speedup |
 |---|---|---|---|
-| L2 | ~12ms | ~47ms | **3.8× faster** |
-| Cosine | ~13ms | ~42ms | **3.1× faster** |
-| Dot | ~13ms | ~36ms | **2.8× faster** |
+| TopK L2 | 7.479 ms | 31.412 ms | **4.2× faster** |
+| TopK Cosine | 7.020 ms | 35.477 ms | **5.1× faster** |
+| TopK Dot | 7.415 ms | 39.810 ms | **5.4× faster** |
+| Batch TopK L2 (10 queries) | 55.884 ms | 388.870 ms | **7.0× faster** |
 
-All three metrics use a single scan of the mmap float buffer; distance computation is SIMD-accelerated.
+All metrics use a single scan of the mmap float buffer; distance computation is SIMD-accelerated.
 
 ---
 
@@ -2139,10 +2230,28 @@ DROP TABLE IF EXISTS table_name
 | Type | Aliases | Description |
 |------|---------|-------------|
 | `STRING` | `VARCHAR`, `TEXT` | String/text data |
-| `INT` | `INTEGER`, `INT32`, `INT64` | Integer numbers |
-| `FLOAT` | `DOUBLE`, `FLOAT64` | Floating point numbers |
+| `TINYINT` | `INT1` | 8-bit signed integer |
+| `SMALLINT` | `INT2` | 16-bit signed integer |
+| `INT` | `INTEGER`, `INT4` | 32-bit signed integer |
+| `BIGINT` | `INT64` | 64-bit signed integer |
+| `UTINYINT` / `USMALLINT` / `UINTEGER` / `UBIGINT` | — | Unsigned integers |
+| `FLOAT` | `FLOAT32` | 32-bit float |
+| `DOUBLE` | `FLOAT64`, `REAL` | 64-bit float |
 | `BOOL` | `BOOLEAN` | Boolean values |
+| `BINARY` | `BYTES`, `VARBINARY`, `BYTEA` | Byte array |
+| `BLOB` | `LARGE_BINARY`, `LARGEBINARY`, `LONGBLOB` | Large byte object |
+| `JSON` | — | JSON document |
+| `DECIMAL` / `NUMERIC` | — | Accepted with optional `(precision, scale)`; stored as string to preserve precision |
+| `TIMESTAMP` | `DATETIME` | Timestamp |
+| `DATE` | — | Calendar date |
+| `ARRAY` | — | Nested values |
+| `FLOAT32_VECTOR` | `F32_VECTOR` | Float32 embedding |
 | `FLOAT16_VECTOR` | `FLOAT16VECTOR`, `F16_VECTOR` | Half-precision float vector (SIMD-accelerated TopK) |
+| `BFLOAT16_VECTOR` | `BF16_VECTOR` | BFloat16 embedding |
+| `INT8_VECTOR` | `I8_VECTOR` | 8-bit quantized embedding |
+| `UINT8_VECTOR` | `U8_VECTOR` | 8-bit unsigned quantized embedding |
+| `BIT1_VECTOR` | `BINARY1_VECTOR` | 1-bit binary embedding |
+| `TURBOQUANT2_VECTOR` / `TURBOQUANT3_VECTOR` / `TURBOQUANT4_VECTOR` | `TQ2_VECTOR` / `TQ3_VECTOR` / `TQ4_VECTOR` | TurboQuant-compressed embeddings |
 
 ### Examples
 

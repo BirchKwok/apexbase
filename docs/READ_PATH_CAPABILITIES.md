@@ -48,7 +48,7 @@
 
 | lane | 入口 | 限制 | fallback |
 | --- | --- | --- | --- |
-| 分批聚合管线 | `try_batch_group_pipeline` | 单表；`BatchGroupAggregator::new` 形状门 + `can_use_incremental_aggregation` + 列可解析；`scan_batches`/`scan_batches_ranges` 可用 | 单批 `scan()` 聚合 |
+| 分批聚合管线 | `try_batch_group_pipeline` | 单表；`BatchGroupAggregator::new` 形状门 + `can_use_incremental_aggregation` + 列可解析；`scan_batches`/`scan_batches_ranges` 可用；并行折叠需 worker token 预算 ≥2，且 `APEX_PARALLEL_SCAN` 未显式关闭时由成本自动启用（预测串行 ≥2 ms 且并行历史更快） | 单批 `scan()` 聚合 |
 | 单批 scan 聚合 | `try_scan_group_pipeline` → `backend.scan()` | 单表、WHERE 可转 typed 谓词、无 JOIN/DISTINCT/window | 通用执行器 |
 | S3 流式投影 | `execute_streaming_select` | 单表投影 SELECT：无 DISTINCT/JOIN/GROUP/HAVING/ORDER/LIMIT/window；投影为 SELECT 顺序的普通列；谓词与投影列均受 typed 协议支持 | 物化执行（`execute`） |
 | Flight 交付 | `flight::service` | 有界通道 `STREAM_CHANNEL_CAPACITY`；每块 `DELIVERY_CHUNK_ROWS` | 上一 lane 的 fallback 链 |

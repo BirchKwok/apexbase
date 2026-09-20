@@ -1,9 +1,11 @@
 # 资源与状态归属清单（架构评审 R4）
 
-本文档是 `ARCHITECTURE_REVIEW_2026_09.md` 第 3 节 A4（缓存与
-会话生命周期分散）与 A5（按需存储与查询内存上限未打通）的落地
-交付物：为每个进程内状态/缓存明确 **owner、key、数据来源、容量、
-失效时机、关闭时机、跨进程行为**。
+本文档是 2026-09 架构评审 A4（缓存与会话生命周期分散）与 A5（按需存储
+与查询内存上限未打通）的落地交付物：为每个进程内状态/缓存明确
+**owner、key、数据来源、容量、失效时机、关闭时机、跨进程行为**。
+评审原文 `ARCHITECTURE_REVIEW_2026_09.md` 已在 v1.34.0 收尾时移除；
+本文件与 [Read-Path Capabilities](READ_PATH_CAPABILITIES.md) 是该轮
+架构约束的现存权威来源。
 
 规则（来自评审建议）：
 
@@ -36,7 +38,7 @@
 | --- | --- | --- | --- | --- | --- | --- | --- |
 | `CLASSIFY_CACHE`（query_signature.rs） | 查询签名分类器 | SQL 文本 | `QuerySignature` | 512 条；满后整体清空（S2 审计确认） | 不失效 | 进程退出 | 无 |
 | `STATS_CACHE`（planner.rs） | 查询规划器 | 表 key | 表统计 + 观察 epoch + 插入序号 | 1024 条 FIFO（S2 起；被逐出表在下次访问时从 sidecar 重读） | 写入后 `invalidate_table_stats` | 进程退出 | 无 |
-| `PLAN_FEEDBACK`（planner.rs） | 查询规划器 | (表 key, 查询形状) | 计划反馈：行维度估计/实际行数滑动均值 + 按实际执行成本类（scan/index/parallel，R5.12 并行批量扫描独立成本类）的模型成本与实测时间滑动均值（R5.3 时间校准）；持久化于每表 sidecar `<table>.plan_feedback`（bincode + 版本，R5.12 起版本 2），每进程惰性加载一次，随表文件回收（R5.8） | 每表 256 个形状、进程内 256 张表（S2 起）；逐出观测样本最少者，sidecar 随内存快照一起收缩 | 仅 EXPLAIN ANALYZE 记录（记录时同步写 sidecar） | 进程退出（内存态）；sidecar 跨会话持久 | 有（sidecar 文件；他进程更新仅在本进程下次启动时可见） |
+| `PLAN_FEEDBACK`（planner.rs） | 查询规划器 | (表 key, 查询形状) | 计划反馈：行维度估计/实际行数滑动均值 + 按实际执行成本类（scan/index/parallel，R5.12 并行批量扫描独立成本类）的模型成本与实测时间滑动均值（R5.3 时间校准）；持久化于每表 sidecar `<table>.plan_feedback`（bincode + 版本；Q2 起版本 3，v2 及更早 sidecar 因缺少 OS/arch/并行度指纹而被忽略），每进程惰性加载一次，随表文件回收（R5.8） | 每表 256 个形状、进程内 256 张表（S2 起）；逐出观测样本最少者，sidecar 随内存快照一起收缩 | 仅 EXPLAIN ANALYZE 记录（记录时同步写 sidecar） | 进程退出（内存态）；sidecar 跨会话持久 | 有（sidecar 文件；他进程更新仅在本进程下次启动时可见） |
 | `JIT_FILTER_CACHE`（jit.rs） | JIT 过滤器 | 谓词模式 | 编译后的过滤闭包 | 有界（内部 LRU） | 内部驱逐 | 进程退出 | 无 |
 | `PARALLEL_SCAN_TOKENS`（executor/batch_group.rs） | 查询执行器（并行批量管道 worker 预算，R5.7/R5.11） | —（进程级计数） | 在飞并行扫描+折叠 worker token 池（`APEX_PARALLEL_SCAN` 显式诊断路径 + R5.12 成本自动启用路径，后两者共用同一预算） | `min(hardware_concurrency - 1, 8)`（R5.11 实测曲线/矩阵定案），惰性初始化（首次并行请求前零状态） | 每查询取 `min(请求, 可用)`，<2 退串行；RAII guard 查询结束归还 | 进程退出 | 无（仅计数，不保留查询数据） |
 
@@ -68,7 +70,7 @@
 
 | 状态 | owner | key | 数据来源 | 容量 | 失效时机 | 关闭时机 | 跨进程 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| `_query_result_cache` | `ApexClient` 实例 | (路由, SQL, token) | 查询结果（缓存值含数据代际 token） | FIFO 上限（超限弹最旧） | 本地写入后按 token/路由失效（见 `test_cache_invalidation_contract.py`） | 实例 drop | 无 |
+| `_query_result_cache` | `ApexClient` 实例 | `(database, table, sql, show_flag)`（代际 token 存在 value 中） | 查询结果（缓存值含数据代际 token） | `min(_cache_size, 64)`；>4096 行或 >8 MiB 的结果不缓存；事务内禁用 | 本地写入后按 token/路由失效（见 `test_cache_invalidation_contract.py`） | 实例 drop | 无 |
 | `_query_result_cacheability` | 同上 | SQL | 可缓存性判定 | 256（超限整体清空） | 同上 | 实例 drop | 无 |
 | `_simple_sql_cache` | 同上 | SQL | 简单 SQL 路由 | 256 条；满后整体清空（S2 审计确认） | 本地写入后清空相关项 | 实例 drop | 无 |
 | 模块级 `_auto_scheduler_*` | 模块 | — | 自动调度器开关 | — | `_disable_auto_scheduler` | 进程退出 | 无 |

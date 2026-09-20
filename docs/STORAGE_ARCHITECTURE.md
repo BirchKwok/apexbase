@@ -78,6 +78,8 @@ development.
 │  - DeltaStore (.apex.delta) + compaction                            │
 │  - Blob sidecars (<table>.blobs/)                                   │
 │  - Stats sidecar (<table>.stats)                                    │
+│  - Plan-feedback sidecar (<table>.plan_feedback)                    │
+│  - Fused predicate-lane group kernel (fused.rs)                     │
 │  - Aggregation WAL (agg_wal.rs)                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -88,12 +90,13 @@ Supporting subsystems (not shown above, all under `apexbase/src/storage/`):
 |--------|------|
 | `epoch.rs` | Generation counters; caches are only trusted when `epoch + mtime` match |
 | `mvcc/` | Snapshot / version store / GC used by transactions |
-| `index/` | B-Tree and hash secondary indexes (`IndexManager`) |
+| `index/` | B-Tree and hash secondary indexes (`IndexManager`); persistent postings are marked stale before committed table changes and refused in planning/execution until `REINDEX` rebuilds them (marker: `<table>.index.stale`) |
 | `delta/` | DeltaStore: update log + delete bitmap, merge logic |
-| `incremental.rs` | Append-only WAL (`.apex.wal`) for incremental writes |
+| `incremental.rs` | Legacy append-only WAL backend; the transactional `.apex.wal` is written by `on_demand/agg_wal.rs` |
 | `table_catalog.rs` | `.apex_tables` / `.apex_schemas` memory-mapped registries |
 | `bloom.rs`, `concurrent.rs` | Filter helpers and concurrent primitives |
 | `scan.rs` | SQL-independent scan request, Arrow column views, selection vectors, and morsels |
+| `backend.rs` (`OverlayState`) | Single read-visibility gate derived from `appended_rows` / `pending_cells` / `unflushed_rows` / `base_in_memory`, exposed through `overlay_state()`, `has_pending_writes()`, `needs_merged_read()`, and `is_clean_view()` |
 
 ## Scan And Operator Boundary
 
@@ -104,9 +107,17 @@ write, or in-memory overlay instead uses the authoritative merged read. Both
 lanes return the same `Morsel` contract and reapply the full predicate
 conjunction before physical operators consume the selection.
 
-The first vertical pipeline is `WHERE -> GROUP BY -> HAVING -> ordered TopK`.
-Unsupported expressions and numeric literals that cannot be represented
-exactly use the general evaluator. See
+The first two composable pipelines share the boundary. `scan()` emits a single
+morsel; the row-group batch stream (`scan_batches`, also split into disjoint
+ranges by `scan_batches_ranges`) feeds the serial and parallel
+`WHERE -> GROUP BY -> HAVING -> ordered TopK` slice. Unsupported expressions and
+numeric literals that cannot be represented exactly use the general evaluator.
+
+Every read lane decides which lane it may take by probing `overlay_state()`
+once instead of rebuilding `has_delta()` / `pending_v4_in_memory_rows()`
+combinations at the call site; see
+[Read-Path Capabilities](READ_PATH_CAPABILITIES.md) for the lane-by-lane matrix
+of supported visibility states, gates, and fallback targets. See
 [Scan & Physical Execution](SCAN_EXECUTION_ARCHITECTURE.md) for the complete
 protocol, fallback boundaries, and extension rules.
 
@@ -297,8 +308,12 @@ engine.write(&table_path, &rows, durability)
 | `Safe` | fsync on save/flush | Production default |
 | `Max` | fsync on every write | Critical data |
 
-The append-only WAL (`.apex.wal`, `storage/incremental.rs`) is a separate
-incremental-write mechanism and is not tied to the `Max` durability level.
+`.apex.wal` is written by the on-demand transactional path
+(`storage/on_demand/agg_wal.rs`): `Safe` and `Max` durability write
+transactional DML to the WAL before the commit point, `Max` fsyncs each WAL
+append, and `Safe` fsyncs at save/flush. The legacy `storage/incremental.rs`
+append-only backend is a separate mechanism that shares the file extension; the
+two WALs must not be conflated.
 
 ## File Format
 

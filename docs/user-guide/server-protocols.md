@@ -84,9 +84,16 @@ df = table.to_pandas()
 
 Arrow Flight is the best option when result sets are large and the consumer can work with Arrow tables.
 
+Supported single-table projections stream from the executor through a bounded
+channel (capacity two), so a slow consumer applies backpressure to the server
+instead of making it buffer the whole result. Results that must be materialized
+first are delivered in 65,536-row chunks. A client that disconnects cancels the
+in-flight query.
+
 ## Operational Notes
 
 - Use the same `--dir` that your embedded Python or Rust app uses.
 - Run one writer-heavy workload at a time unless your application has tested its concurrency pattern.
 - Prefer binding to `127.0.0.1` for local tools.
 - Put the server behind your own network controls if exposing it beyond the machine.
+- Both `apexbase-server` and `apexbase-flight` accept `--host` (default `127.0.0.1`) in addition to `--dir` and `--port`.

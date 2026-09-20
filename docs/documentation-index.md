@@ -33,7 +33,11 @@ python -m mkdocs serve
 | [Vector Quantization Guide](VECTOR_QUANTIZATION_GUIDE.md) | Users building compressed candidate retrieval with exact reranking |
 | [Storage Architecture](STORAGE_ARCHITECTURE.md) | Contributors and maintainers |
 | [Scan & Physical Execution](SCAN_EXECUTION_ARCHITECTURE.md) | Contributors extending filters, grouping, ordering, or scan scheduling |
+| [Read-Path Capabilities](READ_PATH_CAPABILITIES.md) | Contributors touching read visibility, merged reads, or scan fallbacks |
+| [Resource Ownership](RESOURCE_OWNERSHIP.md) | Contributors changing caches, session state, or memory limits |
+| [Fused Filter + GROUP BY Design](FUSED_GROUP_AGG_DESIGN.md) | Contributors working on the filtered-grouped execution kernel |
 | [Engineering Guidelines](ENGINEERING_GUIDELINES.md) | Contributors changing query or storage paths |
+| [Query Optimizer Roadmap](QUERY_OPTIMIZER_ROADMAP.md) | Contributors and maintainers tracking planner work |
 | [HTAP Roadmap](HTAP_ROADMAP.md) | High-level project direction |
 
 ## Server Quick Reference
@@ -46,9 +50,17 @@ python -m mkdocs serve
 
 ## Documentation Deployment
 
+Build and validate the site locally before opening a pull request:
+
+```bash
+python -m pip install -r docs/requirements.txt
+python -m mkdocs build --strict
+python -m mkdocs serve
+```
+
 GitHub Pages deployment is handled by `.github/workflows/docs.yml`.
 
-- Pull requests run `python -m mkdocs build --strict`.
+- Pull requests run `python -m mkdocs build --strict`; the strict flag fails the build on missing link targets and broken navigation entries.
 - Manual `workflow_dispatch` runs deploy the current package version with the `latest` alias.
 - `v*` tags deploy the tag version and keep historical documentation available.
 - The site URL is configured as `https://birchkwok.github.io/apexbase/`.

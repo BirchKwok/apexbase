@@ -69,9 +69,9 @@ with ApexClient("./data") as client:
 | User guide | Building an application with ApexBase | [Python Client](user-guide/python-client.md), [SQL Guide](user-guide/sql.md), [Data Import](user-guide/data-import.md) |
 | Reference | Exact API and type details | [Python API](API_REFERENCE.md), [Rust Embedded API](RUST_EMBEDDED_API.md) |
 | Performance | Reproducible benchmark snapshots | [Performance](performance.md) |
-| Query execution internals | Shared scan, selection, delta visibility, and physical operators | [Scan & Physical Execution](SCAN_EXECUTION_ARCHITECTURE.md) |
+| Query execution internals | Shared scan, selection, delta visibility, and physical operators | [Scan & Physical Execution](SCAN_EXECUTION_ARCHITECTURE.md), [Read-Path Capabilities](READ_PATH_CAPABILITIES.md) |
 | Feature guides | Deep dives into specialized capabilities | [Full-Text Search](FTS_GUIDE.md), [Float16 Vectors](FLOAT16_VECTOR_GUIDE.md), [Vector Quantization](VECTOR_QUANTIZATION_GUIDE.md) |
-| Internals | Contributors and maintainers | [Storage Architecture](STORAGE_ARCHITECTURE.md), [Scan & Physical Execution](SCAN_EXECUTION_ARCHITECTURE.md), [Engineering Guidelines](ENGINEERING_GUIDELINES.md), [HTAP Roadmap](HTAP_ROADMAP.md) |
+| Internals | Contributors and maintainers | [Storage Architecture](STORAGE_ARCHITECTURE.md), [Read-Path Capabilities](READ_PATH_CAPABILITIES.md), [Resource Ownership](RESOURCE_OWNERSHIP.md), [Fused Filter + GROUP BY Design](FUSED_GROUP_AGG_DESIGN.md), [Engineering Guidelines](ENGINEERING_GUIDELINES.md), [Query Optimizer Roadmap](QUERY_OPTIMIZER_ROADMAP.md), [HTAP Roadmap](HTAP_ROADMAP.md) |
 
 ## What ApexBase Is Good At
 

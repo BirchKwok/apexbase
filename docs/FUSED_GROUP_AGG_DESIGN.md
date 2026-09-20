@@ -1,6 +1,7 @@
 # Fused Filter + GROUP BY Design (Boolean 6.4x 专项)
 
-Status: complete (2026-09, Phases 1-3 merged into the v1.33.x working tree)
+Status: complete — Phases 1-3 merged and released in v1.33.1; unchanged through
+v1.34.0 (2026-09-20).
 
 ## Problem
 
@@ -201,6 +202,11 @@ into a truth table over `(comparison bits, group id)`:
 Public benchmark (no cache, 1M rows): the metric moved from 37.2 ms
 (6.4x slower than DuckDB) to 5.55 ms vs DuckDB 5.76 ms — now the winner.
 Tabular fair scoreboard: 103/103 (was 101/103).
+
+Current no-cache results for the same metric: 3.98 ms vs DuckDB 5.68 ms in the
+v1.33.1 snapshot, and 4.01 ms vs DuckDB 5.75 ms in the v1.34.0 snapshot, with
+103/103 tabular wins in both. The table above records the phase-3 measurement
+taken during v1.33.0 development and is kept as the design record.
 
 ## Testing and acceptance (per phase, per AGENTS.md)
 

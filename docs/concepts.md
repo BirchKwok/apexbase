@@ -21,10 +21,16 @@ client = ApexClient(":memory:")
 ```
 
 This is a true process-local storage backend, not a temporary directory.
-Tables still use the normal SQL, DDL, DML, index, FTS, schema, and result
-paths, but no database, catalog, WAL, delta, blob-sidecar, or index files are
-created. Its contents disappear when the client is closed and are not shared
-with another independently created in-memory client.
+Tables still use the normal SQL, DDL, DML, index, schema, and result paths, but
+no database, catalog, WAL, delta, blob-sidecar, or index files are created. Its
+contents disappear when the client is closed and are not shared with another
+independently created in-memory client.
+
+!!! warning "In-memory FTS has no back-fill"
+    On `:memory:`, create the FTS index *before* writing rows
+    (`init_fts(...)` or `CREATE FTS INDEX` on an empty table). An index created
+    after rows are stored does not back-fill those rows, so searches return
+    nothing for them. Filesystem tables index existing rows either way.
 
 ## Databases
 
@@ -148,13 +154,23 @@ Durability is configured when opening the client:
 
 | Mode | Best for | Behavior |
 | --- | --- | --- |
-| `fast` | Local analytics, scratch data, benchmarks | Prioritizes throughput |
-| `safe` | Application data with balanced speed and safety | Synchronous writes |
-| `max` | Highest crash safety | Fsync on each write |
+| `fast` | Local analytics, scratch data, benchmarks | Leaves writes in the OS page cache; no fsync |
+| `safe` | Application data with balanced speed and safety | Fsyncs on explicit `flush()` / `close()` |
+| `max` | Highest crash safety | Fsyncs every write |
 
 ```python
 client = ApexClient("./data", durability="safe")
 ```
+
+## Bounded Process Caches
+
+ApexBase keeps several per-process caches bounded so long-running applications
+have a predictable memory ceiling: parsed SQL statements, planner feedback
+(256 query shapes per table across at most 256 tables), table statistics, CTE
+batches, dictionary/null caches, and the client-side analytical result cache
+(at most 64 results, each at most 4096 rows / 8 MiB). Caches are invalidated by
+epoch and file mtime, so external writers never serve stale rows. See
+[Resource Ownership](RESOURCE_OWNERSHIP.md) for the authoritative inventory.
 
 ## Interfaces
 

@@ -93,7 +93,7 @@ client.store({"user_id": 0, "amount": 100.0, "product": "Widget"})
 client.use_table("users")
 
 # List tables
-print(client.list_tables())  # ['users', 'orders']
+print(client.list_tables())  # ['orders', 'users']
 
 # Reopen an existing database
 client2 = ApexClient("./data")
@@ -208,19 +208,19 @@ client.create_table("metrics")
 
 # Insert test data
 for i in range(100):
-    client.store({"id": i, "value": i * 10})
+    client.store({"id": i, "value": i * 10, "category": "even" if i % 2 == 0 else "odd"})
 
 # Basic query (use your table name in FROM clause)
 results = client.execute("SELECT * FROM metrics WHERE value > 500")
 
 # Aggregation
-scalar = client.execute("SELECT COUNT(*) FROM users").scalar()
+scalar = client.execute("SELECT COUNT(*) FROM metrics").scalar()
 avg = client.execute("SELECT AVG(value) FROM metrics").scalar()
 
 # GROUP BY
 results = client.execute("""
-    SELECT category, COUNT(*), AVG(price)
-    FROM products
+    SELECT category, COUNT(*), AVG(value)
+    FROM metrics
     GROUP BY category
 """)
 
@@ -346,8 +346,8 @@ arrow = results.to_arrow()
 dicts = results.to_dict()
 
 # Properties
-print(results.shape)      # (rows, columns)
-print(results.columns)    # ['_id', 'name', 'age']
+print(results.shape)      # (rows, columns) of the materialized Arrow result
+print(results.columns)    # user columns; the internal _id column is hidden by default
 print(len(results))       # row count
 
 # Access
@@ -361,6 +361,21 @@ for row in results:
 # Indexing
 row = results[0]
 ```
+
+!!! note "`shape` counts the internal row id on `SELECT *`"
+    Row-returning results carry the internal `_id` column. `results.columns`
+    and `to_pandas()` hide it by default, while `results.shape` reports the
+    column count of the materialized Arrow table and therefore includes it for
+    `SELECT *`. Pass `show_internal_id=True` to `execute()` to expose `_id` in
+    both `shape` and `columns`:
+
+    ```python
+    results = client.execute("SELECT * FROM users", show_internal_id=True)
+    print(results.columns)  # ['_id', 'name', 'age']
+    ```
+
+    Explicit projections such as `SELECT name FROM users` do not add `_id`, so
+    `shape[1]` and `len(results.columns)` match there.
 
 ## Next Steps
 

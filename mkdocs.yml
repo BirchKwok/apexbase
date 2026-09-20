@@ -10,7 +10,6 @@ strict: true
 exclude_docs: |
   README.md
   requirements.txt
-  hooks/*.py
 
 hooks:
   - hooks/mkdocs_version.py
@@ -107,6 +106,9 @@ nav:
   - Internals:
       - Storage Architecture: STORAGE_ARCHITECTURE.md
       - Scan & Physical Execution: SCAN_EXECUTION_ARCHITECTURE.md
+      - Read-Path Capabilities: READ_PATH_CAPABILITIES.md
+      - Resource Ownership: RESOURCE_OWNERSHIP.md
+      - Fused Filter + GROUP BY Design: FUSED_GROUP_AGG_DESIGN.md
       - Engineering Guidelines: ENGINEERING_GUIDELINES.md
       - Query Optimizer Roadmap: QUERY_OPTIMIZER_ROADMAP.md
       - HTAP Roadmap: HTAP_ROADMAP.md

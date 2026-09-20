@@ -113,7 +113,8 @@ with ApexClient(":memory:") as client:
 ```
 
 For the smallest SQL-only scripts, `apexbase.execute(...)` uses one lazily
-created process-local in-memory connection shared by later module-level calls.
+created process-local in-memory connection shared by later module-level calls;
+create a table before running table-scoped queries.
 
 ## Performance At A Glance
 
@@ -122,18 +123,21 @@ and **1,000,000 vectors x 128 dimensions** on Apple arm64 with Python 3.12.
 
 | Area | Snapshot |
 | --- | --- |
-| **Public coverage** | 102 tabular metrics, 6 exact-vector metrics, and 8 ApexBase quantized-vector precision rows |
-| **Comparable results** | ApexBase wins 111 / 114 rows with a direct competitor in the retained complete snapshot |
+| **Public coverage** | 103 tabular metrics, 6 exact-vector metrics, and 8 ApexBase quantized-vector precision rows |
+| **Comparable results** | ApexBase wins 115 / 115 rows with a direct competitor in the retained complete snapshot |
 | **Exact vector search** | All 6 single/batch Float32 TopK rows beat the compared engines and match brute-force exact top-k row sets |
 | **Reproducibility** | Fixed data sizes, 2 warmups, 5 timed iterations, dependency metadata, and a retained JSON report |
 
 Benchmarks are workload-sensitive. The default benchmark command tracks this public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/apexbase/latest/performance/).
 
 Starting with 1.33, filtered grouped queries can use a shared physical scan
-protocol across persisted base data and delta/overlay state. The protocol
-keeps predicate selection, grouping, `HAVING`, and ordered TopK as composable
+protocol across persisted base data and delta/overlay state. The protocol keeps
+predicate selection, grouping, `HAVING`, and ordered TopK as composable
 operators with a generic fallback for unsupported or inexact predicate forms.
-See [Scan & Physical Execution](https://birchkwok.github.io/apexbase/latest/SCAN_EXECUTION_ARCHITECTURE/).
+v1.34.0 adds a serial row-group pipeline, bounded parallel scan/fold execution,
+streaming overlay reads, and a per-query aggregation memory budget on top of it.
+See [Scan & Physical Execution](https://birchkwok.github.io/apexbase/latest/SCAN_EXECUTION_ARCHITECTURE/)
+and [Resource Ownership](https://birchkwok.github.io/apexbase/latest/RESOURCE_OWNERSHIP/).
 
 ## Documentation
 

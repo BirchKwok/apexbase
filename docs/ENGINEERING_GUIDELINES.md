@@ -11,7 +11,7 @@ All SQL classification MUST go through the centralized `QuerySignature` system.
 ### Rust: `query_signature::classify(sql)`
 
 - **Location**: `apexbase/src/query/query_signature.rs`
-- **Enum**: `QuerySignature` — classifies SQL into `CountStar`, `PointLookup`, `SimpleScanLimit`, `StringEqualityFilter`, `LikeFilter`, `DmlWrite`, `Ddl`, `Transaction`, `MultiStatement`, `SessionCommand`, `Explain`, `Cte`, `TableFunction`, `Complex`
+- **Enum**: `QuerySignature` (27 variants) — `CountStar`, `PointLookup`, `ProjectedPointLookup`, `IdBatchLookup`, `ProjectedIdBatchLookup`, `FullScan`, `ProjectedFullScan`, `SimpleScanLimit`, `ProjectedScanLimit`, `StringEqualityFilter`, `StringEqualityFilterLimit`, `ProjectedStringEqualityFilter`, `ProjectedStringEqualityFilterLimit`, `NumericRangeFilterLimit`, `ProjectedNumericRangeFilterLimit`, `LikeFilter`, `TableFunction`, `DirectFileRead`, `Ddl`, `DmlWrite`, `Transaction`, `MultiStatement`, `SessionCommand`, `Explain`, `Cte`, `FilteredStringAgg`, `Complex`. See `query_signature.rs` for the authoritative list.
 - **Usage**: Call `classify()` ONCE per query entry point, then `match` on the result.
 
 ```rust
@@ -32,7 +32,7 @@ match &sig {
 
 ### What is FORBIDDEN
 
-- **No inline SQL pattern matching** in `python/bindings/`, `executor/mod.rs`, or `client.py` outside of the classifier
+- **No inline SQL pattern matching** in `python/bindings/`, `executor/mod.rs`, or `client.py` outside of the classifier. The `DmlWrite` pre-parse inside `execute_with_base_dir()` (the `DELETE FROM ` / `UPDATE ` cases) is the one sanctioned inline shape.
 - **No duplicate `sql.to_uppercase()`** — each entry point does ONE classify/uppercase pass
 - **No new fast paths** added directly in bindings or client — add a new `QuerySignature` variant first, then wire it through the 3 layers
 
@@ -92,7 +92,7 @@ match &sig {
 
 ### What NOT to do
 
-- **NEVER add query result caching** (e.g., caching PyObject results by SQL string). All optimizations must be genuine algorithmic improvements.
+- **Query result caching is allowed only through the existing bounded cache** `ApexClient._query_result_cache` (key = `(database, table, sql, show_flag)`, value carries a data-generation token; capacity `min(_cache_size, 64)`; results above 4096 rows or 8 MiB are not cached; disabled inside a transaction). Do not add a second, unbounded cache, and do not cache raw `PyObject` results by SQL string.
 - **NEVER add `sql.to_uppercase()` calls** outside the classifier. Each layer does ONE uppercase pass.
 - **NEVER add new `if sql_upper.starts_with(...)` checks** in python/bindings/ or client.py. Add a QuerySignature variant instead.
 
@@ -106,14 +106,14 @@ match &sig {
 4. **Wire executor** dispatch in `execute_with_base_dir()` (if pre-parse) or `select.rs` (if post-parse)
 5. **Wire bindings** dispatch in the appropriate method (`execute()`, `_execute_arrow_ffi()`, etc.)
 6. **Wire Python** dispatch in `_execute_impl()` — add new `_sig` value + handler
-7. **Run full test suite**: `cargo test --lib query_signature` + `maturin develop --release` + `pytest test/ -x -q`
+7. **Run the full test suite**: `maturin develop --release`, then the complete `pytest` and complete `cargo test` (no `-x`, no partial runs). Use `cargo test --lib query_signature` only as a fast inner-loop check.
 
 ---
 
 ## 6. Testing Requirements
 
-- **Rust unit tests**: `cargo test --lib query_signature` — all classifier tests must pass
-- **Python integration tests**: `maturin develop --release && python -m pytest -x -q`
+- **Rust tests**: `cargo test --lib query_signature` for a fast inner loop, then the complete `cargo test` (including doc tests) before finishing
+- **Python integration tests**: `maturin develop --release`, then the complete serial `pytest` suite
 - **No test deletion**: Never delete or weaken existing tests without explicit direction
 - **Regression tests**: When fixing a bug, add a test that reproduces the original failure
 

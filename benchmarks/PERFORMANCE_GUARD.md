@@ -93,8 +93,9 @@ The current side is built from the current workspace, including local source
 changes. `--base-ref` may be any local Git commit, branch, or tag. Fetch the
 remote first if `origin/main` must reflect its latest state.
 
-For the complete suite — the public tabular/vector scoreboard **plus** a
-separate base/current Q/s comparison (ApexBase-only, canary scale):
+For the complete suite — the public tabular/vector scoreboard **plus** separate
+base/current comparisons for the OLAP Q/s profile, quantized distance scans,
+index-accelerated reads, and the opt-in parallel fold:
 
 ```bash
 python benchmarks/run_local_perf_guard.py \
@@ -102,11 +103,22 @@ python benchmarks/run_local_perf_guard.py \
   --mode full
 ```
 
-The full mode is intentionally expensive: it performs six complete benchmark
-runs of the public scoreboard and six Q/s runs in addition to two release
-builds. The canary is the normal edit-time check; use full mode for final
-performance acceptance. A Q/s regression fails the full gate even when every
-public tabular/vector metric passes.
+Full mode is intentionally expensive: after two release builds it runs five
+interleaved sample phases, each collected in `base/current/current/base/base/current`
+order. The phases cover 135 metrics in total.
+
+| Phase | Suite | Metrics | Scale |
+| --- | --- | ---: | --- |
+| `perf` | Public tabular + exact-vector scoreboard (quantized module skipped) | 109 | 1,000,000 rows, 2 warmups, 5 iterations |
+| `qps` | OLAP Q/s read profile, single-thread and 4-thread | 10 | canary scale |
+| `quant` | Quantized distance scans (ApexBase-only) | 8 | 1,000,000 rows |
+| `idx` | Index-accelerated read metrics | 4 | 1,000,000 rows |
+| `par` | Opt-in parallel fold, 2/4/8 threads | 4 | 1,000,000 rows |
+
+Every phase must pass: a Q/s, quantized-vector, index, or parallel regression
+fails the full gate even when all public tabular/vector metrics pass. The
+canary is the normal edit-time check; use full mode for final performance
+acceptance.
 
 By default, reports are written under
 `local-perf-results/<timestamp>/`. A custom directory must not already exist:
@@ -128,10 +140,33 @@ Useful options are:
 A metric fails only when it exceeds both the relative and absolute tolerance.
 Exit status 0 means the gate passed; status 1 means at least one metric
 regressed; status 2 means the reports were incompatible or incomplete. The
-output directory normally keeps six JSON reports and `comparison.txt`. A
-confirmation run keeps ten JSON reports, the first decision in
-`comparison-initial.txt`, and the final five-sample decision in
-`comparison.txt`.
+output directory keeps one `<phase>-<side>-<n>.json` report per sample,
+`<phase>-comparison.txt` per comparison, the first decision of a confirmation
+run in `<phase>-comparison-initial.txt`, and the provenance files described
+below. A confirmation run keeps ten JSON reports for that phase and makes the
+final decision from the five-sample medians.
+
+## Provenance manifest
+
+Every run writes `run-manifest.json` in the output directory. It records what
+was actually compared, so an acceptance claim can be re-checked later without
+trusting the console output:
+
+- base and current commit IDs, the current branch, and whether the workspace
+  was dirty;
+- the exact parsed arguments, Python version, and load average at start;
+- `source-<side>.json` (sha256 and executable bit for every tracked and
+  untracked source file included in that side's build) and
+  `source-<side>.patch` (binary diff against `HEAD`), plus the digest of each
+  side's `Cargo.lock`;
+- the wheel name and sha256 installed for each side;
+- the exit code of every comparison phase and the overall `status`
+  (`passed`/`regressed`/`interrupted`/`error`), `exit_code`, start and finish
+  timestamps, and the failing command's exit code when the gate could not
+  complete.
+
+The manifest is written incrementally to `run-manifest.json.tmp` and atomically
+renamed, so an interrupted run leaves the last consistent state behind.
 
 This local guard is the required same-machine performance evidence. The
 repository intentionally does not run performance comparisons in GitHub

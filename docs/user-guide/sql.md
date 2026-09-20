@@ -61,8 +61,8 @@ client.execute("SELECT * FROM users WHERE city IN (?)", params=[["Beijing", "Sha
 ```
 
 Binding works for SELECT, DML, DDL, and transaction statements, and keeps the
-TopK vector query on its native FFI fast path. Arity and type mismatches raise
-`ValueError`.
+TopK vector query on its native FFI fast path. Wrong placeholder arity raises
+`ValueError`, and an unsupported value type raises `TypeError`.
 
 ## Analytical Queries
 
@@ -132,6 +132,25 @@ SELECT user_id FROM refunded_users;
 
 `UNION`, `UNION ALL`, `INTERSECT`, and `EXCEPT` are supported.
 
+## Indexes
+
+```sql
+CREATE INDEX idx_order_user ON orders (user_id);
+DROP INDEX idx_order_user ON orders;
+DROP INDEX IF EXISTS idx_order_user ON orders;
+
+ANALYZE orders;   -- refresh the planner statistics for this table
+REINDEX orders;   -- rebuild persistent secondary-index postings
+```
+
+`DROP INDEX` requires the `ON table` clause. Secondary-index DDL, `ANALYZE`, and
+`REINDEX` operate on the selected table, so call `use_table(name)` first (or use
+the `ON table` form where the statement accepts it).
+
+ApexBase marks persisted index postings stale before a committed table change
+and refuses to use them in planning or execution until `REINDEX` rebuilds them,
+so a stale index degrades to a correct scan instead of returning wrong rows.
+
 ## Transactions
 
 ```sql
@@ -144,6 +163,25 @@ COMMIT;
 ```
 
 Use `ROLLBACK` to cancel a transaction, or `ROLLBACK TO savepoint_name` to undo part of one.
+
+### Commit Failures
+
+If `COMMIT` fails, the error carries a machine-readable outcome and the
+transaction id, for example:
+
+```text
+commit_outcome=unknown txn_id=42: <original I/O error>
+```
+
+| Outcome | Meaning | Safe next step |
+| --- | --- | --- |
+| `not_committed` | No commit marker or data application was attempted. | Retry the work as a new transaction. |
+| `unknown` | A marker or data write may have taken effect, or the transaction is gone and its outcome is unavailable. | Reopen the database, inspect the authoritative state, and reconcile; never blind-replay the DML. |
+| `committed` | Data, indexes, and transaction publication completed; only post-commit maintenance failed. | Treat the work as durable. |
+
+Multi-table transactions apply their work in deterministic table order. After a
+crash, recovery converges each table independently: the contract is per-table
+convergence, not database-wide atomicity.
 
 ## File Table Functions
 
@@ -177,12 +215,26 @@ For fuzzy matching, lifecycle commands, and configuration, see the [Full-Text Se
 
 ## Vector Search
 
+`topk_distance(column, [query...], k, 'metric')` is a whole-column TopK
+expression; wrap it in `explode_rename` to turn the `(id, distance)` pairs into
+rows:
+
 ```sql
-SELECT *
-FROM explode_rename(
-    topk_distance('items', 'embedding', '[0.1, 0.2, 0.3]', 10, 'cosine'),
-    '_id,dist'
-);
+SELECT explode_rename(
+    topk_distance(embedding, [0.1, 0.2, 0.3], 10, 'cosine'),
+    '_id', 'dist'
+)
+FROM items;
+```
+
+The supported metrics are `'l2'`, `'cosine'`, and `'dot'`. The same expression
+accepts a bound parameter for the query vector from Python:
+
+```python
+client.execute(
+    "SELECT explode_rename(topk_distance(embedding, ?, 10, 'cosine'), '_id', 'dist') FROM items",
+    params=[query_vector],
+)
 ```
 
 Vector columns can be declared as `FLOAT32_VECTOR`, `FLOAT16_VECTOR`,
@@ -201,4 +253,33 @@ EXPLAIN SELECT * FROM users WHERE age > 30;
 EXPLAIN ANALYZE SELECT city, COUNT(*) FROM users GROUP BY city;
 ```
 
+`EXPLAIN` prints the candidate and chosen plan, including the index access spec
+when one is executable. `EXPLAIN ANALYZE` also reports what actually ran:
+
+- `Actual Path` — the physical route that executed;
+- `Actual Rows` and `Actual Time` — measured result size and duration;
+- `Plan Divergence` — a note when execution had to leave the planned route (for
+  example, a planned index route that was unavailable at execution time);
+- `Feedback Recorded` — whether this run's cost/time feedback was written to
+  the table sidecar.
+
+`EXPLAIN ANALYZE` persists per-shape cost and time feedback in the table
+sidecar `<table>.plan_feedback`. Feedback is ignored when its sidecar schema
+version or the recorded OS/architecture/parallelism fingerprint differs, and it
+is dropped on schema changes.
+
 Use `EXPLAIN` when you are checking whether a query is taking a fast path, using an index, or falling back to the full planner.
+
+## Execution Limits
+
+Aggregation state for supported `GROUP BY` kernels is charged against a
+per-query byte budget. Set `APEX_QUERY_MEMORY_MB` to the budget in MiB (`0`
+disables the budget, default `1024`). Exceeding it fails the query with an
+out-of-memory error instead of letting the process exhaust memory; reservations
+are released on success, cancellation, failure, and fallback.
+
+Supported batched scans may use parallel row-group workers. At most
+`min(CPU - 1, 8)` workers run across all queries in a process, and parallel
+execution is selected only when the calibrated serial cost is at least 2 ms and
+parallel history is still faster. `APEX_PARALLEL_SCAN` is a diagnostic
+override: `0`/`1` forces serial, and `N >= 2` forces `N` workers.

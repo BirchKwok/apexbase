@@ -126,14 +126,26 @@ fn main() -> apexbase::Result<()> {
 
 | Variant | Rust type | SQL type |
 |---------|-----------|----------|
-| `Value::Int64(i64)` | `i64` | `INT64` / `INTEGER` |
-| `Value::Float64(f64)` | `f64` | `FLOAT64` / `DOUBLE` |
-| `Value::String(String)` | `String` | `STRING` / `TEXT` / `VARCHAR` |
+| `Value::Null` | — | `NULL` |
 | `Value::Bool(bool)` | `bool` | `BOOL` / `BOOLEAN` |
+| `Value::Int8(i8)` | `i8` | `TINYINT` / `INT1` |
+| `Value::Int16(i16)` | `i16` | `SMALLINT` / `INT2` |
+| `Value::Int32(i32)` | `i32` | `INT` / `INTEGER` / `INT4` |
+| `Value::Int64(i64)` | `i64` | `BIGINT` / `INT64` |
+| `Value::UInt8(u8)` | `u8` | `UTINYINT` |
+| `Value::UInt16(u16)` | `u16` | `USMALLINT` |
+| `Value::UInt32(u32)` | `u32` | `UINTEGER` |
+| `Value::UInt64(u64)` | `u64` | `UBIGINT` |
+| `Value::Float32(f32)` | `f32` | `FLOAT` / `FLOAT32` |
+| `Value::Float64(f64)` | `f64` | `DOUBLE` / `FLOAT64` / `REAL` |
+| `Value::String(String)` | `String` | `STRING` / `TEXT` / `VARCHAR` |
 | `Value::Binary(Vec<u8>)` | `Vec<u8>` | `BINARY` / `VARBINARY` |
 | `Value::Blob(Vec<u8>)` | `Vec<u8>` | `BLOB` / `LARGE_BINARY` |
-| `Value::FixedList(Vec<u8>)` | raw LE f32 bytes | `FIXEDLIST` (vector embedding) |
-| `Value::Null` | — | `NULL` |
+| `Value::FixedList(Vec<u8>)` | raw LE f32 bytes | `FLOAT32_VECTOR` (embedding) |
+| `Value::Json(serde_json::Value)` | JSON value | `JSON` |
+| `Value::Timestamp(i64)` | microseconds since the Unix epoch | `TIMESTAMP` / `DATETIME` |
+| `Value::Date(i32)` | days since the Unix epoch | `DATE` |
+| `Value::Array(Vec<Value>)` | nested values | `ARRAY` |
 
 ```rust
 use apexbase::data::Value;
@@ -153,13 +165,22 @@ let v_null  = Value::Null;
 
 | Variant | Description |
 |---------|-------------|
-| `ColumnType::Int64` | 64-bit signed integer |
-| `ColumnType::Float64` | 64-bit IEEE 754 float |
-| `ColumnType::String` | UTF-8 string (plain or dict-encoded on disk) |
+| `ColumnType::Null` | Null-typed column |
 | `ColumnType::Bool` | Boolean (bit-packed) |
+| `ColumnType::Int8` / `Int16` / `Int32` / `Int64` | Signed integers |
+| `ColumnType::UInt8` / `UInt16` / `UInt32` / `UInt64` | Unsigned integers |
+| `ColumnType::Float32` / `Float64` | IEEE 754 floats |
+| `ColumnType::String` | UTF-8 string |
+| `ColumnType::StringDict` | Dictionary-encoded string for low-cardinality columns |
 | `ColumnType::Binary` | Arbitrary byte array |
 | `ColumnType::Blob` | Large byte object stored through inline/sidecar descriptors |
+| `ColumnType::Timestamp` | Microseconds since the Unix epoch |
+| `ColumnType::Date` | Days since the Unix epoch |
 | `ColumnType::FixedList` | Fixed-size float32 vector (embedding storage) |
+| `ColumnType::Float16List` / `BFloat16List` | Fixed-size half-precision vectors, decoded to f32 on read |
+| `ColumnType::Int8Vector` / `UInt8Vector` | 8-bit quantized vectors |
+| `ColumnType::Bit1Vector` | 1-bit binary vectors |
+| `ColumnType::TurboQuant2Vector` / `TurboQuant3Vector` / `TurboQuant4Vector` | TurboQuant-compressed vectors |
 
 ### DataType
 
@@ -167,12 +188,21 @@ let v_null  = Value::Null;
 
 | Variant | Description |
 |---------|-------------|
-| `DataType::Int64` | 64-bit integer |
-| `DataType::Float64` | 64-bit float |
-| `DataType::String` | UTF-8 string |
+| `DataType::Null` | Null type |
 | `DataType::Bool` | Boolean |
+| `DataType::Int8` / `Int16` / `Int32` / `Int64` | Signed integers |
+| `DataType::UInt8` / `UInt16` / `UInt32` / `UInt64` | Unsigned integers |
+| `DataType::Float32` / `Float64` | Floating point |
+| `DataType::String` | UTF-8 string |
 | `DataType::Binary` | Byte array |
+| `DataType::Json` | JSON document |
+| `DataType::Timestamp` / `Date` | Temporal types |
+| `DataType::Array` | Nested value array |
+| `DataType::Decimal` | Decimal type |
 | `DataType::Blob` | Large byte object |
+| `DataType::Float16Vector` / `Float32Vector` / `BFloat16Vector` | Float vectors |
+| `DataType::Int8Vector` / `UInt8Vector` / `Bit1Vector` | Quantized vectors |
+| `DataType::TurboQuant2Vector` / `TurboQuant3Vector` / `TurboQuant4Vector` | TurboQuant vectors |
 
 ---
 
@@ -590,7 +620,11 @@ table.execute("DROP FTS INDEX ON articles")?;           // remove index + files
 
 ## Vector Search
 
-ApexBase provides SIMD-accelerated (NEON / AVX2) nearest-neighbour search. Vectors are stored as `FixedList` columns.
+ApexBase provides SIMD-accelerated (NEON / AVX2) nearest-neighbour search.
+Float32 embeddings use `ColumnType::FixedList`; half-precision and quantized
+embeddings have their own `ColumnType` variants
+(`Float16List`, `BFloat16List`, `Int8Vector`, `UInt8Vector`, `Bit1Vector`,
+`TurboQuant2Vector`/`3`/`4`).
 
 ```rust
 use apexbase::data::Value;
@@ -863,11 +897,11 @@ The example at `examples/embedded.rs` demonstrates all 16 steps:
 
 ## Performance Notes
 
-- **Point lookups** (`retrieve`) — O(log n) via V4 RCIX index, ~24 µs warm.
+- **Point lookups** (`retrieve`) — O(log n) via the V4 RCIX index; the retained 1M-row public snapshot measures 2.05 µs for a direct full-row read and 2.71 µs for the SQL point lookup.
 - **Batch reads** (`retrieve_many`) — single footer lock + one mmap slice per row-group via V4 mmap fast-path.
 - **Bulk insert** (`insert_batch`) — routes through `Database::write` (StorageEngine smart routing): V4 tables append a new Row Group via the insert backend; legacy non-V4 tables use delta appends when the schema matches exactly.
 - **Arrow insert** (`insert_arrow`) — bypasses `HashMap` construction; preferred for Arrow-native pipelines.
 - **SQL queries** — same Arrow-native JIT engine as the Python API: Cranelift JIT, vectorized SIMD filters, zone-map pruning, mmap on-demand scans.
 - **Count** (`count()`) — O(1) for V4 tables — reads only the footer metadata.
 - **Concurrency** — reads are parallel on V4 mmap-only tables (no lock contention); writes are serialized per table.
-- **Vector search** — SIMD-accelerated (NEON fp16 on ARM, AVX2+F16C on x86_64); 3–4× faster than DuckDB at 1M rows × dim=128.
+- **Vector search** — SIMD-accelerated (NEON fp16 on ARM, AVX2+F16C on x86_64); 4–7× faster than DuckDB at 1M rows × dim=128 in the retained v1.34.0 public snapshot (see [Performance](performance.md)).

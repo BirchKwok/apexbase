@@ -1,6 +1,6 @@
 # ApexBase Usage Examples
 
-Comprehensive examples covering 100% of the ApexBase Python API.
+Comprehensive examples covering the core ApexBase Python API end to end.
 
 ## Table of Contents
 
@@ -490,8 +490,8 @@ arrow_table = results.to_arrow()
 dicts = results.to_dict()
 
 # Properties
-print(results.shape)      # (rows, columns)
-print(results.columns)    # ['_id', 'name', 'age', ...]
+print(results.shape)      # (rows, columns) of the materialized Arrow result
+print(results.columns)    # ['name', 'age', ...] — _id is hidden by default
 print(len(results))       # row count
 
 # Get IDs
@@ -532,7 +532,7 @@ print(f"age column type: {dtype}")  # Int64
 
 # List all fields
 fields = client.list_fields()
-print(fields)  # ['_id', 'name', 'age', 'email_address', 'score']
+print(fields)  # ['name', 'age', 'email_address', 'score'] — _id is never listed
 
 # Drop column
 client.drop_column("score")
@@ -568,8 +568,8 @@ client.store([
 # 3. MATCH — all query terms must appear
 results = client.execute("SELECT * FROM articles WHERE MATCH('python')")
 print(results.to_pandas())
-#    _id            title                    content
-# 0    0  Python Tutorial  Learn Python programming
+#             title                    content
+# 0  Python Tutorial  Learn Python programming
 
 # 4. FUZZY_MATCH — tolerates typos
 results = client.execute("SELECT * FROM articles WHERE FUZZY_MATCH('progaming')")
@@ -679,13 +679,13 @@ client.create_table("people")
 # Insert test data
 client.store({"name": "Alice", "age": 30})
 
-# Replace by ID
-success = client.replace(0, {"name": "Alice Smith", "age": 31})
+# Replace by ID (row ids start at 1)
+success = client.replace(1, {"name": "Alice Smith", "age": 31})
 
 # Batch replace
 updated_ids = client.batch_replace({
-    0: {"name": "Alice Updated", "age": 32},
-    1: {"name": "Bob Updated", "age": 26}
+    1: {"name": "Alice Updated", "age": 32},
+    2: {"name": "Bob Updated", "age": 26}
 })
 
 client.close()
@@ -841,15 +841,16 @@ with ApexClient("./analytics", durability="safe") as client:
     # Add computed column
     client.add_column("region", "String")
     
-    # Query analytics
+    # Query analytics (group by the stored date value; format months in Python
+    # with the DataFrame if you need a "%Y-%m" bucket)
     monthly = client.execute("""
         SELECT 
-            strftime('%Y-%m', date) as month,
+            date as day,
             SUM(revenue) as total_revenue,
             AVG(quantity) as avg_quantity
         FROM sales
-        GROUP BY month
-        ORDER BY month
+        GROUP BY day
+        ORDER BY day
     """)
     
     print(monthly.to_pandas())
@@ -1426,25 +1427,31 @@ result = client.execute("""
 
 **Initialization:** `__init__`, `create_clean`, `close`
 
-**Table Management:** `use_table`, `create_table`, `drop_table`, `list_tables`, `current_table`
+**Databases And Sessions:** `use_database`, `use`, `list_databases`, `current_database`, `use_table`, `create_table`, `drop_table`, `list_tables`, `current_table`
 
-**Data Storage:** `store`, `from_pandas(df, table_name=)`, `from_polars(df, table_name=)`, `from_pyarrow(table, table_name=)`
+**Data Storage:** `store`, `store_durable_one`, `from_pandas(df, table_name=)`, `from_polars(df, table_name=)`, `from_pyarrow(table, table_name=)`, `from_lance`, `to_lance`
+
+**Batched And Buffered Writes:** `execute_batch`, `execute_batch_parallel`, `begin_buffered_writes`, `end_buffered_writes`, `flush_buffered_writes`, `buffered_write_count`
 
 **Query:** `execute`, `query`, `retrieve`, `retrieve_many`, `retrieve_all`, `count_rows`
 
-**Vector Search:** `topk_distance(col, query, k=10, metric='l2', id_col='_id', dist_col='dist')`, `batch_topk_distance(col, queries, k=10, metric='l2')`
+**Vector Search:** `topk_distance(col, query, k=10, metric='l2', id_col='_id', dist_col='dist')`, `batch_topk_distance(col, queries, k=10, metric='l2')`, `create_quantized_column(source, target=None, codec='turboquant4')`, `drop_quantized_column(target)`
 
 **Modification:** `replace`, `batch_replace`, `delete`
 
-**Columns:** `add_column`, `drop_column`, `rename_column`, `get_column_dtype`, `list_fields`
+**Columns:** `add_column`, `drop_column`, `rename_column`, `get_column_dtype`, `list_fields`, `set_compression`, `get_compression`
 
-**FTS:** `init_fts`, `search_text`, `fuzzy_search_text`, `search_and_retrieve`, `search_and_retrieve_top`, `get_fts_stats`, `disable_fts`, `drop_fts`
+**Files:** `register_temp_table`, `drop_temp_table`
+
+**FTS:** `init_fts`, `search_text`, `search_text_with_scores`, `fuzzy_search_text`, `search_and_retrieve`, `search_and_retrieve_top`, `get_fts_stats`, `set_fts_fuzzy_config`, `compact_fts_index`, `warmup_fts_terms`, `disable_fts`, `drop_fts`
 
 **Utility:** `flush`, `flush_cache`, `set_auto_flush`, `get_auto_flush`, `estimate_memory_bytes`, `optimize`
 
 ### ResultView Methods
 
-**Conversion:** `to_pandas`, `to_polars`, `to_arrow`, `to_dict`
+**Conversion:** `to_pandas`, `to_polars`, `to_arrow`, `to_dict`, `tolist`, `to_lance`
+
+**Streaming:** `to_record_batches`, `iter_batches`
 
 **Access:** `scalar`, `first`, `get_ids`, `__len__`, `__iter__`, `__getitem__`
 
@@ -1452,4 +1459,4 @@ result = client.execute("""
 
 ---
 
-*This documentation covers 100% of the public ApexBase Python API.*
+*This page covers the core public ApexBase Python API; `docs/API_REFERENCE.md` is the authoritative signature-level reference.*

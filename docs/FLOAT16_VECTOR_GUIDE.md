@@ -23,7 +23,7 @@ ApexBase supports `FLOAT16_VECTOR` columns for storing embedding vectors in half
 |---|---|
 | Large embedding tables (>1M rows, high dim) | Embeddings with high dynamic range (e.g., raw logits) |
 | Memory-constrained environments | Downstream code that expects exact float32 fidelity |
-| Apple Silicon / AWS Graviton (NEON fp16 hardware) | Dimensions that are odd multiples < 8 (micro-batches) |
+| Apple Silicon / AWS Graviton (NEON fp16 hardware) | Dimensions not divisible by 8 (the 8-wide kernels fall back to a scalar tail) |
 | Models that already quantize (CLIP, text embeddings) | Prototype / exploration phase where precision matters |
 
 For most modern embedding models (CLIP, BERT, Sentence-Transformers, OpenAI `text-embedding-*`), float16 quantization error is well below retrieval noise.
@@ -160,7 +160,10 @@ Applies to: Apple M1/M2/M3/M4, AWS Graviton 3/4, Ampere Altra.
 
 - Uses `FCVTL` / `FCVTL2` to widen f16→f32 in-register (no memory round-trip)
 - 8 elements loaded per NEON vector, widened to two 128-bit f32 registers
-- ~2–3× faster than scalar; often ≥2× faster than equivalent float32 kernels
+- Avoids the scalar per-element widen step of the fallback path; the end-to-end
+  gain depends on dimension, data layout, and whether the scan is
+  memory-bound, so measure it for your workload rather than assuming a fixed
+  speedup
 
 ### x86_64 — AVX2 + F16C
 
@@ -212,7 +215,7 @@ exact    = float(np.sqrt(np.sum((vec - query) ** 2)))
 f16_dist = float(np.sqrt(np.sum((f16_quantize(vec) - query) ** 2)))
 rel_err  = abs(exact - f16_dist) / exact
 print(f"exact: {exact:.4f}  f16: {f16_dist:.4f}  rel_err: {rel_err:.2e}")
-# exact: 5.8123  f16: 5.8119  rel_err: 7.23e-05
+# exact: 10.0652  f16: 10.0653  rel_err: 1.49e-05
 ```
 
 For top-k retrieval, quantization error is well within retrieval noise for dimensions ≥ 32 and any standard embedding model.
@@ -272,7 +275,7 @@ client.close()
 | **Bytes per element** | 2 | 4 |
 | **Storage for 1M × dim=128** | ~256 MB | ~512 MB |
 | **Distance precision** | ~3.3 decimal digits | ~7.2 decimal digits |
-| **SIMD on Apple Silicon** | NEON fp16 (≥2× faster) | NEON f32 |
+| **SIMD on Apple Silicon** | NEON fp16 | NEON f32 |
 | **SIMD on x86_64** | AVX2+F16C | AVX2 f32 |
 | **Query API** | identical | identical |
 | **Recommended for** | production, large tables | prototyping, high-precision needs |

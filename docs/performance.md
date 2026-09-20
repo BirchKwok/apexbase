@@ -4,6 +4,87 @@ This page records the latest complete public cross-engine benchmark. It is a
 reproducible snapshot, not a universal claim: rerun the suite on your own
 hardware and workload.
 
+## v1.34.0 Public No-Cache Snapshot
+
+- **Date / source**: 2026-09-20, v1.34.0 release tree (commit `41f3400`)
+- **System**: macOS 27.0, Apple arm64 (10 cores), 32 GB RAM
+- **Tabular stack**: Python 3.12.2, ApexBase 1.34.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
+- **Vector stack**: Python 3.12.2, ApexBase 1.34.0, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1
+- **Build**: maturin 1.9.1, rustc 1.92.0, release profile
+- **Tabular dataset**: 1,000,000 rows x 5 columns
+- **Vector dataset**: 1,000,000 Float32 vectors x 128 dimensions, `k=10`, 10 exact batch queries; quantized module 20 queries with `candidate_k=100` and seed `20260821`
+- **Method**: result cache disabled for every ApexBase client (`enable_cache=False`), 2 warmup iterations + 5 timed iterations, materialized results
+- **Retained report**: `local-perf-results/release-1.34.0-20260920/public-benchmark.json`
+
+The no-cache public suite completed all **117/117 named rows**: 103 tabular,
+6 exact-vector, and 8 ApexBase quantized precision rows. ApexBase won every row
+that has a direct competitor — **115/115**: 103/103 tabular, 6/6 exact vector,
+and 6/6 quantized codecs shared with sqlite-vector. Float16 and BFloat16 remain
+ApexBase-only quantized formats and are excluded from the comparable total.
+
+| Scope | Metrics | Apex wins | Ties | Slower |
+| --- | ---: | ---: | ---: | ---: |
+| OLAP fair | 71 | 71 | 0 | 0 |
+| OLTP fair | 32 | 32 | 0 | 0 |
+| Exact vector similarity | 6 | 6 | 0 | 0 |
+| Quantized vector, shared codecs | 6 | 6 | 0 | 0 |
+| **Comparable total** | **115** | **115** | **0** | **0** |
+
+Representative medians from the retained run:
+
+| Metric | ApexBase | SQLite | DuckDB | ApexBase vs best competitor |
+| --- | ---: | ---: | ---: | ---: |
+| COUNT(*) | 0.084 ms | 8.399 ms | 0.500 ms | 5.93x faster |
+| Projection full scan (3 cols) | 212.418 ms | 885.736 ms | 670.344 ms | 3.16x faster |
+| Filter (name = 'user_5000') | 0.187 ms | 46.945 ms | 1.749 ms | 9.36x faster |
+| GROUP BY city (10 groups) | 0.999 ms | 371.201 ms | 3.506 ms | 3.51x faster |
+| GROUP BY + HAVING | 0.722 ms | 366.956 ms | 3.580 ms | 4.96x faster |
+| Boolean Filter+GROUP+HAVING+TopK | 4.014 ms | 192.575 ms | 5.746 ms | 1.43x faster |
+| Multi-cond (age>30 AND score>50) | 196.646 ms | 592.362 ms | 363.623 ms | 1.85x faster |
+| JSON Read + GROUP BY category | 59.921 ms | N/A | 88.128 ms | 1.47x faster |
+| ORDER BY score LIMIT 100 | 1.948 ms | 55.595 ms | 5.512 ms | 2.83x faster |
+| Bulk Insert (N rows; default fair) | 233.685 ms | 1.05 s | 189.52 s | 4.49x faster |
+| FTS Index Build (name,city,category) | 1.651 ms | 1.54 s | 1.14 s | 692.52x faster |
+| Batch TopK L2 (10 queries) | 55.884 ms | 1.43 s | 388.870 ms | 6.96x faster |
+
+Exact vector medians for the same run:
+
+| Metric | ApexBase | SQLite + sqlite-vector | DuckDB |
+| --- | ---: | ---: | ---: |
+| TopK L2 | 7.479 ms | 142.252 ms | 31.412 ms |
+| TopK Cosine | 7.020 ms | 172.040 ms | 35.477 ms |
+| TopK Dot | 7.415 ms | 139.883 ms | 39.810 ms |
+| Batch TopK L2 (10 queries) | 55.884 ms | 1,431.887 ms | 388.870 ms |
+| Batch TopK Cosine (10 queries) | 48.162 ms | 1,547.773 ms | 396.102 ms |
+| Batch TopK Dot (10 queries) | 51.467 ms | 1,406.353 ms | 417.101 ms |
+
+Quantized batch-amortized retrieval for the same run (20 queries, `k=10`,
+`candidate_k=100`):
+
+| Codec | Apex quantized | Apex recall | Apex exact-rescore | Rescore recall | sqlite-vector quantized | SQLite recall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| INT8 | 1.373 ms | 0.975 | 17.582 ms | 1.000 | 8.773 ms | 0.945 |
+| UINT8 | 3.436 ms | 0.985 | 20.898 ms | 1.000 | 8.702 ms | 0.960 |
+| 1-bit | 0.627 ms | 0.140 | 15.184 ms | 0.415 | 2.050 ms | 0.100 |
+| TurboQuant 2-bit | 4.961 ms | 0.450 | 20.351 ms | 0.870 | 27.467 ms | 0.535 |
+| TurboQuant 3-bit | 18.669 ms | 0.595 | 34.908 ms | 0.990 | 67.610 ms | 0.725 |
+| TurboQuant 4-bit | 9.650 ms | 0.760 | 25.782 ms | 1.000 | 52.467 ms | 0.840 |
+
+ApexBase-only derived columns in the same run: Float16 at 2.476 ms quantized
+with 1.000 recall, and BFloat16 at 10.114 ms with 1.000 recall.
+
+### Cross-date comparison caveat
+
+`benchmarks/latest_public_baseline.json` was recorded on macOS 26.6.2, so
+comparing it with this run crosses an OS upgrade. The default comparison
+reported 13 metrics above the 15% relative threshold; the same-machine
+base/current canary and full gates re-measured those paths against the
+identical commit and passed. The nonzero cross-date comparison remains on
+record at
+`local-perf-results/release-1.34.0-20260920/public-baseline-comparison.log` and
+must not be read as a regression verdict; only the same-machine comparison
+decides that.
+
 ## v1.33.1 Public No-Cache Snapshot
 
 - **Date / source**: 2026-09-05, v1.33.1 release tree; runtime code was measured immediately before the metadata-only version bump
@@ -103,7 +184,12 @@ the [sqlite-vector](https://github.com/sqliteai/sqlite-vector) extension's
 distance operator. Quantized scans remain a separate diagnostic because their
 recall and storage contracts differ from exact Float32 search.
 
-## Tabular and Exact Vector Metrics
+## v1.30.0 Tabular And Exact Vector Metrics
+
+These tables are the retained v1.30.0 run
+(`benchmarks/results/v1.30.0-vector-quantization-public-final.json`), kept as a
+historical reference. The current comparable numbers are in the version
+sections above; do not mix rows across snapshots.
 
 ### OLAP Fair Metrics (70)
 
@@ -230,7 +316,11 @@ recall and storage contracts differ from exact Float32 search.
 
 All vector rows matched the brute-force exact top-k row sets.
 
-## Quantized L2 Distance Snapshot
+## v1.30.0 Quantized L2 Distance Snapshot
+
+This is the retained v1.30.0 run
+(`benchmarks/results/v1.30.0-public-unified-vector-1m.json`). The current
+quantized medians are in the v1.34.0 section above.
 
 The public benchmark entrypoint includes this snapshot alongside the tabular
 and exact-vector modules. It uses 1,000,000 identical normally

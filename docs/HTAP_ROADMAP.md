@@ -21,11 +21,12 @@ ApexBase is focused on being a fast embedded HTAP engine with:
 | Python API | `ApexClient`, `ResultView`, DataFrame import/export |
 | SQL | DDL, DML, joins, CTEs, subqueries, windows, set operations |
 | Multi-database | Named databases and `database.table` SQL references |
-| Transactions | BEGIN / COMMIT / ROLLBACK, savepoints, optimistic concurrency |
-| Indexing | B-Tree and Hash indexes |
+| Transactions | BEGIN / COMMIT / ROLLBACK, savepoints, optimistic concurrency, and a commit-outcome contract (`not_committed` / `unknown` / `committed`) with WAL recovery for INSERT, UPDATE, and DELETE |
+| Indexing | B-Tree and Hash indexes, stale-posting detection, and `REINDEX` recovery |
 | Full-text search | SQL-native FTS index management and `MATCH()` predicates |
-| Vector search | TopK distance APIs and SQL integration |
-| Protocols | PostgreSQL Wire and Arrow Flight servers |
+| Vector search | TopK distance APIs, SQL integration, and stored quantized accelerators with exact rescore |
+| Protocols | PostgreSQL Wire and Arrow Flight servers, including streaming Flight results with backpressure |
+| Query execution | Shared scan protocol, serial and parallel row-group pipeline, per-query aggregation memory budget |
 | Rust embedding | Native Rust API for embedded use |
 
 ## Near-Term Documentation Goals
