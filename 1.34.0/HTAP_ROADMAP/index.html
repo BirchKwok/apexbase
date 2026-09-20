@@ -1239,6 +1239,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -1586,11 +1670,11 @@
 </tr>
 <tr>
 <td>Transactions</td>
-<td>BEGIN / COMMIT / ROLLBACK, savepoints, optimistic concurrency</td>
+<td>BEGIN / COMMIT / ROLLBACK, savepoints, optimistic concurrency, and a commit-outcome contract (<code>not_committed</code> / <code>unknown</code> / <code>committed</code>) with WAL recovery for INSERT, UPDATE, and DELETE</td>
 </tr>
 <tr>
 <td>Indexing</td>
-<td>B-Tree and Hash indexes</td>
+<td>B-Tree and Hash indexes, stale-posting detection, and <code>REINDEX</code> recovery</td>
 </tr>
 <tr>
 <td>Full-text search</td>
@@ -1598,11 +1682,15 @@
 </tr>
 <tr>
 <td>Vector search</td>
-<td>TopK distance APIs and SQL integration</td>
+<td>TopK distance APIs, SQL integration, and stored quantized accelerators with exact rescore</td>
 </tr>
 <tr>
 <td>Protocols</td>
-<td>PostgreSQL Wire and Arrow Flight servers</td>
+<td>PostgreSQL Wire and Arrow Flight servers, including streaming Flight results with backpressure</td>
+</tr>
+<tr>
+<td>Query execution</td>
+<td>Shared scan protocol, serial and parallel row-group pipeline, per-query aggregation memory budget</td>
 </tr>
 <tr>
 <td>Rust embedding</td>

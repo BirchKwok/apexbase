@@ -1341,6 +1341,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -1638,12 +1722,18 @@
 </span><span id="__span-7-5"><a id="__codelineno-7-5" name="__codelineno-7-5" href="#__codelineno-7-5"></a><span class="n">df</span> <span class="o">=</span> <span class="n">table</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">()</span>
 </span></code></pre></div>
 <p>Arrow Flight is the best option when result sets are large and the consumer can work with Arrow tables.</p>
+<p>Supported single-table projections stream from the executor through a bounded
+channel (capacity two), so a slow consumer applies backpressure to the server
+instead of making it buffer the whole result. Results that must be materialized
+first are delivered in 65,536-row chunks. A client that disconnects cancels the
+in-flight query.</p>
 <h2 id="operational-notes">Operational Notes<a class="headerlink" href="#operational-notes" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Use the same <code>--dir</code> that your embedded Python or Rust app uses.</li>
 <li>Run one writer-heavy workload at a time unless your application has tested its concurrency pattern.</li>
 <li>Prefer binding to <code>127.0.0.1</code> for local tools.</li>
 <li>Put the server behind your own network controls if exposing it beyond the machine.</li>
+<li>Both <code>apexbase-server</code> and <code>apexbase-flight</code> accept <code>--host</code> (default <code>127.0.0.1</code>) in addition to <code>--dir</code> and <code>--port</code>.</li>
 </ul>
 
 

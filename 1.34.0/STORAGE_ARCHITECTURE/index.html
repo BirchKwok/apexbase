@@ -1629,6 +1629,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -1908,8 +1992,10 @@ development.</p>
 </span><span id="__span-0-58"><a id="__codelineno-0-58" name="__codelineno-0-58" href="#__codelineno-0-58"></a>│  - DeltaStore (.apex.delta) + compaction                            │
 </span><span id="__span-0-59"><a id="__codelineno-0-59" name="__codelineno-0-59" href="#__codelineno-0-59"></a>│  - Blob sidecars (&lt;table&gt;.blobs/)                                   │
 </span><span id="__span-0-60"><a id="__codelineno-0-60" name="__codelineno-0-60" href="#__codelineno-0-60"></a>│  - Stats sidecar (&lt;table&gt;.stats)                                    │
-</span><span id="__span-0-61"><a id="__codelineno-0-61" name="__codelineno-0-61" href="#__codelineno-0-61"></a>│  - Aggregation WAL (agg_wal.rs)                                     │
-</span><span id="__span-0-62"><a id="__codelineno-0-62" name="__codelineno-0-62" href="#__codelineno-0-62"></a>└─────────────────────────────────────────────────────────────────────┘
+</span><span id="__span-0-61"><a id="__codelineno-0-61" name="__codelineno-0-61" href="#__codelineno-0-61"></a>│  - Plan-feedback sidecar (&lt;table&gt;.plan_feedback)                    │
+</span><span id="__span-0-62"><a id="__codelineno-0-62" name="__codelineno-0-62" href="#__codelineno-0-62"></a>│  - Fused predicate-lane group kernel (fused.rs)                     │
+</span><span id="__span-0-63"><a id="__codelineno-0-63" name="__codelineno-0-63" href="#__codelineno-0-63"></a>│  - Aggregation WAL (agg_wal.rs)                                     │
+</span><span id="__span-0-64"><a id="__codelineno-0-64" name="__codelineno-0-64" href="#__codelineno-0-64"></a>└─────────────────────────────────────────────────────────────────────┘
 </span></code></pre></div>
 <p>Supporting subsystems (not shown above, all under <code>apexbase/src/storage/</code>):</p>
 <table>
@@ -1930,7 +2016,7 @@ development.</p>
 </tr>
 <tr>
 <td><code>index/</code></td>
-<td>B-Tree and hash secondary indexes (<code>IndexManager</code>)</td>
+<td>B-Tree and hash secondary indexes (<code>IndexManager</code>); persistent postings are marked stale before committed table changes and refused in planning/execution until <code>REINDEX</code> rebuilds them (marker: <code>&lt;table&gt;.index.stale</code>)</td>
 </tr>
 <tr>
 <td><code>delta/</code></td>
@@ -1938,7 +2024,7 @@ development.</p>
 </tr>
 <tr>
 <td><code>incremental.rs</code></td>
-<td>Append-only WAL (<code>.apex.wal</code>) for incremental writes</td>
+<td>Legacy append-only WAL backend; the transactional <code>.apex.wal</code> is written by <code>on_demand/agg_wal.rs</code></td>
 </tr>
 <tr>
 <td><code>table_catalog.rs</code></td>
@@ -1952,6 +2038,10 @@ development.</p>
 <td><code>scan.rs</code></td>
 <td>SQL-independent scan request, Arrow column views, selection vectors, and morsels</td>
 </tr>
+<tr>
+<td><code>backend.rs</code> (<code>OverlayState</code>)</td>
+<td>Single read-visibility gate derived from <code>appended_rows</code> / <code>pending_cells</code> / <code>unflushed_rows</code> / <code>base_in_memory</code>, exposed through <code>overlay_state()</code>, <code>has_pending_writes()</code>, <code>needs_merged_read()</code>, and <code>is_clean_view()</code></td>
+</tr>
 </tbody>
 </table>
 <h2 id="scan-and-operator-boundary">Scan And Operator Boundary<a class="headerlink" href="#scan-and-operator-boundary" title="Permanent link">&para;</a></h2>
@@ -1961,9 +2051,16 @@ numeric mmap candidate before projected materialization. Any delta, pending
 write, or in-memory overlay instead uses the authoritative merged read. Both
 lanes return the same <code>Morsel</code> contract and reapply the full predicate
 conjunction before physical operators consume the selection.</p>
-<p>The first vertical pipeline is <code>WHERE -&gt; GROUP BY -&gt; HAVING -&gt; ordered TopK</code>.
-Unsupported expressions and numeric literals that cannot be represented
-exactly use the general evaluator. See
+<p>The first two composable pipelines share the boundary. <code>scan()</code> emits a single
+morsel; the row-group batch stream (<code>scan_batches</code>, also split into disjoint
+ranges by <code>scan_batches_ranges</code>) feeds the serial and parallel
+<code>WHERE -&gt; GROUP BY -&gt; HAVING -&gt; ordered TopK</code> slice. Unsupported expressions and
+numeric literals that cannot be represented exactly use the general evaluator.</p>
+<p>Every read lane decides which lane it may take by probing <code>overlay_state()</code>
+once instead of rebuilding <code>has_delta()</code> / <code>pending_v4_in_memory_rows()</code>
+combinations at the call site; see
+<a href="../READ_PATH_CAPABILITIES/">Read-Path Capabilities</a> for the lane-by-lane matrix
+of supported visibility states, gates, and fallback targets. See
 <a href="../SCAN_EXECUTION_ARCHITECTURE/">Scan &amp; Physical Execution</a> for the complete
 protocol, fallback boundaries, and extension rules.</p>
 <h2 id="persistent-and-in-memory-backends">Persistent And In-Memory Backends<a class="headerlink" href="#persistent-and-in-memory-backends" title="Permanent link">&para;</a></h2>
@@ -2299,8 +2396,12 @@ bindings layer:</p>
 </tr>
 </tbody>
 </table>
-<p>The append-only WAL (<code>.apex.wal</code>, <code>storage/incremental.rs</code>) is a separate
-incremental-write mechanism and is not tied to the <code>Max</code> durability level.</p>
+<p><code>.apex.wal</code> is written by the on-demand transactional path
+(<code>storage/on_demand/agg_wal.rs</code>): <code>Safe</code> and <code>Max</code> durability write
+transactional DML to the WAL before the commit point, <code>Max</code> fsyncs each WAL
+append, and <code>Safe</code> fsyncs at save/flush. The legacy <code>storage/incremental.rs</code>
+append-only backend is a separate mechanism that shares the file extension; the
+two WALs must not be conflated.</p>
 <h2 id="file-format">File Format<a class="headerlink" href="#file-format" title="Permanent link">&para;</a></h2>
 <h3 id="v4-row-group-format-apex-default">V4 Row Group Format (.apex) — Default<a class="headerlink" href="#v4-row-group-format-apex-default" title="Permanent link">&para;</a></h3>
 <p>V4 is the current default save format; legacy V3 compatibility was dropped in

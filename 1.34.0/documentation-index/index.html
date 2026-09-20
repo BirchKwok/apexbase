@@ -1232,6 +1232,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -1592,8 +1676,24 @@
 <td>Contributors extending filters, grouping, ordering, or scan scheduling</td>
 </tr>
 <tr>
+<td><a href="../READ_PATH_CAPABILITIES/">Read-Path Capabilities</a></td>
+<td>Contributors touching read visibility, merged reads, or scan fallbacks</td>
+</tr>
+<tr>
+<td><a href="../RESOURCE_OWNERSHIP/">Resource Ownership</a></td>
+<td>Contributors changing caches, session state, or memory limits</td>
+</tr>
+<tr>
+<td><a href="../FUSED_GROUP_AGG_DESIGN/">Fused Filter + GROUP BY Design</a></td>
+<td>Contributors working on the filtered-grouped execution kernel</td>
+</tr>
+<tr>
 <td><a href="../ENGINEERING_GUIDELINES/">Engineering Guidelines</a></td>
 <td>Contributors changing query or storage paths</td>
+</tr>
+<tr>
+<td><a href="../QUERY_OPTIMIZER_ROADMAP/">Query Optimizer Roadmap</a></td>
+<td>Contributors and maintainers tracking planner work</td>
 </tr>
 <tr>
 <td><a href="../HTAP_ROADMAP/">HTAP Roadmap</a></td>
@@ -1629,9 +1729,14 @@
 </tbody>
 </table>
 <h2 id="documentation-deployment">Documentation Deployment<a class="headerlink" href="#documentation-deployment" title="Permanent link">&para;</a></h2>
+<p>Build and validate the site locally before opening a pull request:</p>
+<div class="language-bash highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a>python<span class="w"> </span>-m<span class="w"> </span>pip<span class="w"> </span>install<span class="w"> </span>-r<span class="w"> </span>docs/requirements.txt
+</span><span id="__span-1-2"><a id="__codelineno-1-2" name="__codelineno-1-2" href="#__codelineno-1-2"></a>python<span class="w"> </span>-m<span class="w"> </span>mkdocs<span class="w"> </span>build<span class="w"> </span>--strict
+</span><span id="__span-1-3"><a id="__codelineno-1-3" name="__codelineno-1-3" href="#__codelineno-1-3"></a>python<span class="w"> </span>-m<span class="w"> </span>mkdocs<span class="w"> </span>serve
+</span></code></pre></div>
 <p>GitHub Pages deployment is handled by <code>.github/workflows/docs.yml</code>.</p>
 <ul>
-<li>Pull requests run <code>python -m mkdocs build --strict</code>.</li>
+<li>Pull requests run <code>python -m mkdocs build --strict</code>; the strict flag fails the build on missing link targets and broken navigation entries.</li>
 <li>Manual <code>workflow_dispatch</code> runs deploy the current package version with the <code>latest</code> alias.</li>
 <li><code>v*</code> tags deploy the tag version and keep historical documentation available.</li>
 <li>The site URL is configured as <code>https://birchkwok.github.io/apexbase/</code>.</li>

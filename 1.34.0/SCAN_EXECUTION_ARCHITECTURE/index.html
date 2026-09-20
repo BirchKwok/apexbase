@@ -18,7 +18,7 @@
         <link rel="prev" href="../STORAGE_ARCHITECTURE/">
       
       
-        <link rel="next" href="../ENGINEERING_GUIDELINES/">
+        <link rel="next" href="../READ_PATH_CAPABILITIES/">
       
       
         
@@ -1402,6 +1402,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -1609,7 +1693,8 @@
 
 
 <h1 id="scan-and-physical-execution-architecture">Scan And Physical Execution Architecture<a class="headerlink" href="#scan-and-physical-execution-architecture" title="Permanent link">&para;</a></h1>
-<p>This page describes the storage/query boundary introduced in ApexBase 1.33.
+<p>This page describes the storage/query boundary introduced in ApexBase 1.33 and
+extended in 1.34 with batched overlay streams and bounded parallel scan/fold.
 It is an internal contract for contributors; SQL users keep using the same
 <code>ApexClient.execute(...)</code> API.</p>
 <h2 id="why-the-boundary-exists">Why The Boundary Exists<a class="headerlink" href="#why-the-boundary-exists" title="Permanent link">&para;</a></h2>
@@ -1714,11 +1799,21 @@ negative literals (parsed as a unary minus over a literal). Arbitrary
 expressions, unsupported Arrow types, and numeric bounds that cannot be
 represented exactly fall back to the general evaluator.</p>
 <h2 id="batched-physical-pipeline-r3">Batched Physical Pipeline (R3)<a class="headerlink" href="#batched-physical-pipeline-r3" title="Permanent link">&para;</a></h2>
-<p><code>TableStorageBackend::scan_batches()</code> exposes the stable row-group stream for
-requests whose read view is the persisted V4 file alone: no delta file, no
-pending DeltaStore cells, no pending V4 rows, and no in-memory table. Any
-other state returns <code>None</code> and the caller falls back to the single-shot
-<code>scan()</code> for the whole request.</p>
+<p><code>TableStorageBackend::scan_batches()</code> exposes the stable row-group stream in
+two correctness-equivalent lanes:</p>
+<ul>
+<li><strong>clean</strong> — the read view is the persisted V4 file alone (no delta file, no
+  pending DeltaStore cells, no pending V4 rows, and no in-memory table); rows
+  stream directly from the mmap row groups;</li>
+<li><strong>overlay</strong> (v1.34.0) — <code>AppendedRows</code> and/or <code>PendingCells</code> are visible;
+  base row groups still pass through zero-copy, each batch is patched by <code>_id</code>
+  from one DeltaStore snapshot taken when the stream is created, and appended
+  rows arrive as a tail batch.</li>
+</ul>
+<p>The batch lane returns <code>None</code> — and the caller falls back to the single-shot
+<code>scan()</code> for the whole request — for an in-memory table, unflushed V4 rows, a
+legacy non-V4 file, or a projection/predicate type the typed protocol cannot
+evaluate.</p>
 <p>Each batch is one row group of active rows (deletion vectors applied) with the
 projected columns, and the complete typed predicate is re-evaluated on every
 batch, so per-batch selections keep the exact <code>Morsel::select</code> semantics and
@@ -1780,7 +1875,15 @@ Cross-client table changes remain guarded by the shared table epoch.</p>
   back when exact round-tripping is impossible.</li>
 <li>Selection materialization currently uses Arrow <code>take</code>; late materialization
   can move further downstream in a later phase.</li>
-<li>The batch stream is serial; parallel morsel scheduling is future work (design/assessment: ARCHITECTURE_REVIEW_2026_09.md §14.8 — opt-in phase A not yet implemented, default stays serial).</li>
+<li>The batch stream is serial by default. v1.34.0 adds a bounded parallel
+  row-group scan/fold over disjoint row-group ranges (<code>scan_batches_ranges</code>),
+  gated by a process-wide worker-token budget of
+  <code>min(available_parallelism - 1, 8)</code>: fewer than two free tokens falls back to
+  the serial stream, and readers auto-enable parallel workers when the
+  calibrated serial prediction exceeds the cost threshold and parallel history
+  is still faster. <code>APEX_PARALLEL_SCAN=0</code>/<code>1</code> forces serial and <code>N &gt;= 2</code> forces
+  <code>N</code> workers. See <a href="../RESOURCE_OWNERSHIP/">Resource Ownership</a> for the token
+  pool and the visibility states that keep a request on the serial path.</li>
 </ul>
 <p>These are explicit fallback boundaries, not silent semantic differences.</p>
 

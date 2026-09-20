@@ -15,6 +15,10 @@
         <link rel="canonical" href="https://birchkwok.github.io/apexbase/1.34.0/READ_PATH_CAPABILITIES/">
       
       
+        <link rel="prev" href="../SCAN_EXECUTION_ARCHITECTURE/">
+      
+      
+        <link rel="next" href="../RESOURCE_OWNERSHIP/">
       
       
         
@@ -25,7 +29,7 @@
     
     
       
-        <title>读取路径能力、限制与 fallback（单源） - ApexBase</title>
+        <title>Read-Path Capabilities - ApexBase</title>
       
     
     
@@ -115,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              读取路径能力、限制与 fallback（单源）
+              Read-Path Capabilities
             
           </span>
         </div>
@@ -353,10 +357,12 @@
   
   
   
+    
+  
   
     
     
-      <li class="md-tabs__item">
+      <li class="md-tabs__item md-tabs__item--active">
         <a href="../STORAGE_ARCHITECTURE/" class="md-tabs__link">
           
   
@@ -1117,26 +1123,31 @@
       
   
   
+    
   
   
+  
     
     
     
     
+      
+        
+        
       
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" checked>
         
           
-          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="">
             
   
   
@@ -1154,7 +1165,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_7">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1208,6 +1219,181 @@
     
   
     Scan & Physical Execution
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-read-visibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. 可见状态分类（read visibility）
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-lane-fallback" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. lane × 支持 × 限制 × fallback
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-typed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. typed 批次协议的类型边界（单源）
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. 修改规则
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
   
 
     
@@ -1383,6 +1569,46 @@
 
   
 
+
+  <nav class="md-path" aria-label="Navigation" >
+    <ol class="md-path__list">
+      
+        
+  
+  
+    <li class="md-path__item">
+      <a href=".." class="md-path__link">
+        
+  <span class="md-ellipsis">
+    Home
+  </span>
+
+      </a>
+    </li>
+  
+
+      
+      
+        
+  
+  
+    
+    
+      <li class="md-path__item">
+        <a href="../STORAGE_ARCHITECTURE/" class="md-path__link">
+          
+  <span class="md-ellipsis">
+    Internals
+  </span>
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ol>
+  </nav>
 
               
               <article class="md-content__inner md-typeset">
@@ -1563,7 +1789,7 @@
 <tr>
 <td>分批聚合管线</td>
 <td><code>try_batch_group_pipeline</code></td>
-<td>单表；<code>BatchGroupAggregator::new</code> 形状门 + <code>can_use_incremental_aggregation</code> + 列可解析；<code>scan_batches</code>/<code>scan_batches_ranges</code> 可用</td>
+<td>单表；<code>BatchGroupAggregator::new</code> 形状门 + <code>can_use_incremental_aggregation</code> + 列可解析；<code>scan_batches</code>/<code>scan_batches_ranges</code> 可用；并行折叠需 worker token 预算 ≥2，且 <code>APEX_PARALLEL_SCAN</code> 未显式关闭时由成本自动启用（预测串行 ≥2 ms 且并行历史更快）</td>
 <td>单批 <code>scan()</code> 聚合</td>
 </tr>
 <tr>

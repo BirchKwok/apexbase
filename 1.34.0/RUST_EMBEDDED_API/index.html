@@ -1801,6 +1801,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -2153,24 +2237,69 @@
 </thead>
 <tbody>
 <tr>
-<td><code>Value::Int64(i64)</code></td>
-<td><code>i64</code></td>
-<td><code>INT64</code> / <code>INTEGER</code></td>
-</tr>
-<tr>
-<td><code>Value::Float64(f64)</code></td>
-<td><code>f64</code></td>
-<td><code>FLOAT64</code> / <code>DOUBLE</code></td>
-</tr>
-<tr>
-<td><code>Value::String(String)</code></td>
-<td><code>String</code></td>
-<td><code>STRING</code> / <code>TEXT</code> / <code>VARCHAR</code></td>
+<td><code>Value::Null</code></td>
+<td>—</td>
+<td><code>NULL</code></td>
 </tr>
 <tr>
 <td><code>Value::Bool(bool)</code></td>
 <td><code>bool</code></td>
 <td><code>BOOL</code> / <code>BOOLEAN</code></td>
+</tr>
+<tr>
+<td><code>Value::Int8(i8)</code></td>
+<td><code>i8</code></td>
+<td><code>TINYINT</code> / <code>INT1</code></td>
+</tr>
+<tr>
+<td><code>Value::Int16(i16)</code></td>
+<td><code>i16</code></td>
+<td><code>SMALLINT</code> / <code>INT2</code></td>
+</tr>
+<tr>
+<td><code>Value::Int32(i32)</code></td>
+<td><code>i32</code></td>
+<td><code>INT</code> / <code>INTEGER</code> / <code>INT4</code></td>
+</tr>
+<tr>
+<td><code>Value::Int64(i64)</code></td>
+<td><code>i64</code></td>
+<td><code>BIGINT</code> / <code>INT64</code></td>
+</tr>
+<tr>
+<td><code>Value::UInt8(u8)</code></td>
+<td><code>u8</code></td>
+<td><code>UTINYINT</code></td>
+</tr>
+<tr>
+<td><code>Value::UInt16(u16)</code></td>
+<td><code>u16</code></td>
+<td><code>USMALLINT</code></td>
+</tr>
+<tr>
+<td><code>Value::UInt32(u32)</code></td>
+<td><code>u32</code></td>
+<td><code>UINTEGER</code></td>
+</tr>
+<tr>
+<td><code>Value::UInt64(u64)</code></td>
+<td><code>u64</code></td>
+<td><code>UBIGINT</code></td>
+</tr>
+<tr>
+<td><code>Value::Float32(f32)</code></td>
+<td><code>f32</code></td>
+<td><code>FLOAT</code> / <code>FLOAT32</code></td>
+</tr>
+<tr>
+<td><code>Value::Float64(f64)</code></td>
+<td><code>f64</code></td>
+<td><code>DOUBLE</code> / <code>FLOAT64</code> / <code>REAL</code></td>
+</tr>
+<tr>
+<td><code>Value::String(String)</code></td>
+<td><code>String</code></td>
+<td><code>STRING</code> / <code>TEXT</code> / <code>VARCHAR</code></td>
 </tr>
 <tr>
 <td><code>Value::Binary(Vec&lt;u8&gt;)</code></td>
@@ -2185,12 +2314,27 @@
 <tr>
 <td><code>Value::FixedList(Vec&lt;u8&gt;)</code></td>
 <td>raw LE f32 bytes</td>
-<td><code>FIXEDLIST</code> (vector embedding)</td>
+<td><code>FLOAT32_VECTOR</code> (embedding)</td>
 </tr>
 <tr>
-<td><code>Value::Null</code></td>
-<td>—</td>
-<td><code>NULL</code></td>
+<td><code>Value::Json(serde_json::Value)</code></td>
+<td>JSON value</td>
+<td><code>JSON</code></td>
+</tr>
+<tr>
+<td><code>Value::Timestamp(i64)</code></td>
+<td>microseconds since the Unix epoch</td>
+<td><code>TIMESTAMP</code> / <code>DATETIME</code></td>
+</tr>
+<tr>
+<td><code>Value::Date(i32)</code></td>
+<td>days since the Unix epoch</td>
+<td><code>DATE</code></td>
+</tr>
+<tr>
+<td><code>Value::Array(Vec&lt;Value&gt;)</code></td>
+<td>nested values</td>
+<td><code>ARRAY</code></td>
 </tr>
 </tbody>
 </table>
@@ -2215,20 +2359,32 @@
 </thead>
 <tbody>
 <tr>
-<td><code>ColumnType::Int64</code></td>
-<td>64-bit signed integer</td>
-</tr>
-<tr>
-<td><code>ColumnType::Float64</code></td>
-<td>64-bit IEEE 754 float</td>
-</tr>
-<tr>
-<td><code>ColumnType::String</code></td>
-<td>UTF-8 string (plain or dict-encoded on disk)</td>
+<td><code>ColumnType::Null</code></td>
+<td>Null-typed column</td>
 </tr>
 <tr>
 <td><code>ColumnType::Bool</code></td>
 <td>Boolean (bit-packed)</td>
+</tr>
+<tr>
+<td><code>ColumnType::Int8</code> / <code>Int16</code> / <code>Int32</code> / <code>Int64</code></td>
+<td>Signed integers</td>
+</tr>
+<tr>
+<td><code>ColumnType::UInt8</code> / <code>UInt16</code> / <code>UInt32</code> / <code>UInt64</code></td>
+<td>Unsigned integers</td>
+</tr>
+<tr>
+<td><code>ColumnType::Float32</code> / <code>Float64</code></td>
+<td>IEEE 754 floats</td>
+</tr>
+<tr>
+<td><code>ColumnType::String</code></td>
+<td>UTF-8 string</td>
+</tr>
+<tr>
+<td><code>ColumnType::StringDict</code></td>
+<td>Dictionary-encoded string for low-cardinality columns</td>
 </tr>
 <tr>
 <td><code>ColumnType::Binary</code></td>
@@ -2239,8 +2395,32 @@
 <td>Large byte object stored through inline/sidecar descriptors</td>
 </tr>
 <tr>
+<td><code>ColumnType::Timestamp</code></td>
+<td>Microseconds since the Unix epoch</td>
+</tr>
+<tr>
+<td><code>ColumnType::Date</code></td>
+<td>Days since the Unix epoch</td>
+</tr>
+<tr>
 <td><code>ColumnType::FixedList</code></td>
 <td>Fixed-size float32 vector (embedding storage)</td>
+</tr>
+<tr>
+<td><code>ColumnType::Float16List</code> / <code>BFloat16List</code></td>
+<td>Fixed-size half-precision vectors, decoded to f32 on read</td>
+</tr>
+<tr>
+<td><code>ColumnType::Int8Vector</code> / <code>UInt8Vector</code></td>
+<td>8-bit quantized vectors</td>
+</tr>
+<tr>
+<td><code>ColumnType::Bit1Vector</code></td>
+<td>1-bit binary vectors</td>
+</tr>
+<tr>
+<td><code>ColumnType::TurboQuant2Vector</code> / <code>TurboQuant3Vector</code> / <code>TurboQuant4Vector</code></td>
+<td>TurboQuant-compressed vectors</td>
 </tr>
 </tbody>
 </table>
@@ -2255,28 +2435,64 @@
 </thead>
 <tbody>
 <tr>
-<td><code>DataType::Int64</code></td>
-<td>64-bit integer</td>
-</tr>
-<tr>
-<td><code>DataType::Float64</code></td>
-<td>64-bit float</td>
-</tr>
-<tr>
-<td><code>DataType::String</code></td>
-<td>UTF-8 string</td>
+<td><code>DataType::Null</code></td>
+<td>Null type</td>
 </tr>
 <tr>
 <td><code>DataType::Bool</code></td>
 <td>Boolean</td>
 </tr>
 <tr>
+<td><code>DataType::Int8</code> / <code>Int16</code> / <code>Int32</code> / <code>Int64</code></td>
+<td>Signed integers</td>
+</tr>
+<tr>
+<td><code>DataType::UInt8</code> / <code>UInt16</code> / <code>UInt32</code> / <code>UInt64</code></td>
+<td>Unsigned integers</td>
+</tr>
+<tr>
+<td><code>DataType::Float32</code> / <code>Float64</code></td>
+<td>Floating point</td>
+</tr>
+<tr>
+<td><code>DataType::String</code></td>
+<td>UTF-8 string</td>
+</tr>
+<tr>
 <td><code>DataType::Binary</code></td>
 <td>Byte array</td>
 </tr>
 <tr>
+<td><code>DataType::Json</code></td>
+<td>JSON document</td>
+</tr>
+<tr>
+<td><code>DataType::Timestamp</code> / <code>Date</code></td>
+<td>Temporal types</td>
+</tr>
+<tr>
+<td><code>DataType::Array</code></td>
+<td>Nested value array</td>
+</tr>
+<tr>
+<td><code>DataType::Decimal</code></td>
+<td>Decimal type</td>
+</tr>
+<tr>
 <td><code>DataType::Blob</code></td>
 <td>Large byte object</td>
+</tr>
+<tr>
+<td><code>DataType::Float16Vector</code> / <code>Float32Vector</code> / <code>BFloat16Vector</code></td>
+<td>Float vectors</td>
+</tr>
+<tr>
+<td><code>DataType::Int8Vector</code> / <code>UInt8Vector</code> / <code>Bit1Vector</code></td>
+<td>Quantized vectors</td>
+</tr>
+<tr>
+<td><code>DataType::TurboQuant2Vector</code> / <code>TurboQuant3Vector</code> / <code>TurboQuant4Vector</code></td>
+<td>TurboQuant vectors</td>
 </tr>
 </tbody>
 </table>
@@ -2685,7 +2901,11 @@ The table is the default context — use its name unqualified in SQL.</p>
 </span></code></pre></div>
 <hr />
 <h2 id="vector-search">Vector Search<a class="headerlink" href="#vector-search" title="Permanent link">&para;</a></h2>
-<p>ApexBase provides SIMD-accelerated (NEON / AVX2) nearest-neighbour search. Vectors are stored as <code>FixedList</code> columns.</p>
+<p>ApexBase provides SIMD-accelerated (NEON / AVX2) nearest-neighbour search.
+Float32 embeddings use <code>ColumnType::FixedList</code>; half-precision and quantized
+embeddings have their own <code>ColumnType</code> variants
+(<code>Float16List</code>, <code>BFloat16List</code>, <code>Int8Vector</code>, <code>UInt8Vector</code>, <code>Bit1Vector</code>,
+<code>TurboQuant2Vector</code>/<code>3</code>/<code>4</code>).</p>
 <div class="language-rust highlight"><pre><span></span><code><span id="__span-21-1"><a id="__codelineno-21-1" name="__codelineno-21-1" href="#__codelineno-21-1"></a><span class="k">use</span><span class="w"> </span><span class="n">apexbase</span><span class="p">::</span><span class="n">data</span><span class="p">::</span><span class="n">Value</span><span class="p">;</span>
 </span><span id="__span-21-2"><a id="__codelineno-21-2" name="__codelineno-21-2" href="#__codelineno-21-2"></a><span class="k">use</span><span class="w"> </span><span class="n">std</span><span class="p">::</span><span class="n">collections</span><span class="p">::</span><span class="n">HashMap</span><span class="p">;</span>
 </span><span id="__span-21-3"><a id="__codelineno-21-3" name="__codelineno-21-3" href="#__codelineno-21-3"></a>
@@ -3108,14 +3328,14 @@ Handles: <code>Int8/16/32/64</code>, <code>UInt8/16/32/64</code>, <code>Float32/
 <hr />
 <h2 id="performance-notes">Performance Notes<a class="headerlink" href="#performance-notes" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>Point lookups</strong> (<code>retrieve</code>) — O(log n) via V4 RCIX index, ~24 µs warm.</li>
+<li><strong>Point lookups</strong> (<code>retrieve</code>) — O(log n) via the V4 RCIX index; the retained 1M-row public snapshot measures 2.05 µs for a direct full-row read and 2.71 µs for the SQL point lookup.</li>
 <li><strong>Batch reads</strong> (<code>retrieve_many</code>) — single footer lock + one mmap slice per row-group via V4 mmap fast-path.</li>
 <li><strong>Bulk insert</strong> (<code>insert_batch</code>) — routes through <code>Database::write</code> (StorageEngine smart routing): V4 tables append a new Row Group via the insert backend; legacy non-V4 tables use delta appends when the schema matches exactly.</li>
 <li><strong>Arrow insert</strong> (<code>insert_arrow</code>) — bypasses <code>HashMap</code> construction; preferred for Arrow-native pipelines.</li>
 <li><strong>SQL queries</strong> — same Arrow-native JIT engine as the Python API: Cranelift JIT, vectorized SIMD filters, zone-map pruning, mmap on-demand scans.</li>
 <li><strong>Count</strong> (<code>count()</code>) — O(1) for V4 tables — reads only the footer metadata.</li>
 <li><strong>Concurrency</strong> — reads are parallel on V4 mmap-only tables (no lock contention); writes are serialized per table.</li>
-<li><strong>Vector search</strong> — SIMD-accelerated (NEON fp16 on ARM, AVX2+F16C on x86_64); 3–4× faster than DuckDB at 1M rows × dim=128.</li>
+<li><strong>Vector search</strong> — SIMD-accelerated (NEON fp16 on ARM, AVX2+F16C on x86_64); 4–7× faster than DuckDB at 1M rows × dim=128 in the retained v1.34.0 public snapshot (see <a href="../performance/">Performance</a>).</li>
 </ul>
 
 

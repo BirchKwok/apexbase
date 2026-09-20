@@ -771,6 +771,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#bounded-process-caches" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Bounded Process Caches
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#interfaces" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1396,6 +1407,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -1615,10 +1710,17 @@
 <div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">client</span> <span class="o">=</span> <span class="n">ApexClient</span><span class="p">(</span><span class="s2">":memory:"</span><span class="p">)</span>
 </span></code></pre></div>
 <p>This is a true process-local storage backend, not a temporary directory.
-Tables still use the normal SQL, DDL, DML, index, FTS, schema, and result
-paths, but no database, catalog, WAL, delta, blob-sidecar, or index files are
-created. Its contents disappear when the client is closed and are not shared
-with another independently created in-memory client.</p>
+Tables still use the normal SQL, DDL, DML, index, schema, and result paths, but
+no database, catalog, WAL, delta, blob-sidecar, or index files are created. Its
+contents disappear when the client is closed and are not shared with another
+independently created in-memory client.</p>
+<div class="admonition warning">
+<p class="admonition-title">In-memory FTS has no back-fill</p>
+<p>On <code>:memory:</code>, create the FTS index <em>before</em> writing rows
+(<code>init_fts(...)</code> or <code>CREATE FTS INDEX</code> on an empty table). An index created
+after rows are stored does not back-fill those rows, so searches return
+nothing for them. Filesystem tables index existing rows either way.</p>
+</div>
 <h2 id="databases">Databases<a class="headerlink" href="#databases" title="Permanent link">&para;</a></h2>
 <p>ApexBase supports multiple isolated databases under one root directory. The default database maps to the root directory. Named databases live in subdirectories.</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">client</span><span class="o">.</span><span class="n">use_database</span><span class="p">(</span><span class="s2">"analytics"</span><span class="p">)</span>
@@ -1713,22 +1815,30 @@ database connection.</p>
 <tr>
 <td><code>fast</code></td>
 <td>Local analytics, scratch data, benchmarks</td>
-<td>Prioritizes throughput</td>
+<td>Leaves writes in the OS page cache; no fsync</td>
 </tr>
 <tr>
 <td><code>safe</code></td>
 <td>Application data with balanced speed and safety</td>
-<td>Synchronous writes</td>
+<td>Fsyncs on explicit <code>flush()</code> / <code>close()</code></td>
 </tr>
 <tr>
 <td><code>max</code></td>
 <td>Highest crash safety</td>
-<td>Fsync on each write</td>
+<td>Fsyncs every write</td>
 </tr>
 </tbody>
 </table>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-10-1"><a id="__codelineno-10-1" name="__codelineno-10-1" href="#__codelineno-10-1"></a><span class="n">client</span> <span class="o">=</span> <span class="n">ApexClient</span><span class="p">(</span><span class="s2">"./data"</span><span class="p">,</span> <span class="n">durability</span><span class="o">=</span><span class="s2">"safe"</span><span class="p">)</span>
 </span></code></pre></div>
+<h2 id="bounded-process-caches">Bounded Process Caches<a class="headerlink" href="#bounded-process-caches" title="Permanent link">&para;</a></h2>
+<p>ApexBase keeps several per-process caches bounded so long-running applications
+have a predictable memory ceiling: parsed SQL statements, planner feedback
+(256 query shapes per table across at most 256 tables), table statistics, CTE
+batches, dictionary/null caches, and the client-side analytical result cache
+(at most 64 results, each at most 4096 rows / 8 MiB). Caches are invalidated by
+epoch and file mtime, so external writers never serve stale rows. See
+<a href="../RESOURCE_OWNERSHIP/">Resource Ownership</a> for the authoritative inventory.</p>
 <h2 id="interfaces">Interfaces<a class="headerlink" href="#interfaces" title="Permanent link">&para;</a></h2>
 <p>The same storage engine can be reached through several interfaces:</p>
 <ul>

@@ -15,7 +15,7 @@
         <link rel="canonical" href="https://birchkwok.github.io/apexbase/1.34.0/ENGINEERING_GUIDELINES/">
       
       
-        <link rel="prev" href="../SCAN_EXECUTION_ARCHITECTURE/">
+        <link rel="prev" href="../FUSED_GROUP_AGG_DESIGN/">
       
       
         <link rel="next" href="../QUERY_OPTIMIZER_ROADMAP/">
@@ -1236,6 +1236,90 @@
                 
   
   
+  
+  
+    <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
     
   
   
@@ -1674,7 +1758,7 @@
 <h3 id="rust-query_signatureclassifysql">Rust: <code>query_signature::classify(sql)</code><a class="headerlink" href="#rust-query_signatureclassifysql" title="Permanent link">&para;</a></h3>
 <ul>
 <li><strong>Location</strong>: <code>apexbase/src/query/query_signature.rs</code></li>
-<li><strong>Enum</strong>: <code>QuerySignature</code> — classifies SQL into <code>CountStar</code>, <code>PointLookup</code>, <code>SimpleScanLimit</code>, <code>StringEqualityFilter</code>, <code>LikeFilter</code>, <code>DmlWrite</code>, <code>Ddl</code>, <code>Transaction</code>, <code>MultiStatement</code>, <code>SessionCommand</code>, <code>Explain</code>, <code>Cte</code>, <code>TableFunction</code>, <code>Complex</code></li>
+<li><strong>Enum</strong>: <code>QuerySignature</code> (27 variants) — <code>CountStar</code>, <code>PointLookup</code>, <code>ProjectedPointLookup</code>, <code>IdBatchLookup</code>, <code>ProjectedIdBatchLookup</code>, <code>FullScan</code>, <code>ProjectedFullScan</code>, <code>SimpleScanLimit</code>, <code>ProjectedScanLimit</code>, <code>StringEqualityFilter</code>, <code>StringEqualityFilterLimit</code>, <code>ProjectedStringEqualityFilter</code>, <code>ProjectedStringEqualityFilterLimit</code>, <code>NumericRangeFilterLimit</code>, <code>ProjectedNumericRangeFilterLimit</code>, <code>LikeFilter</code>, <code>TableFunction</code>, <code>DirectFileRead</code>, <code>Ddl</code>, <code>DmlWrite</code>, <code>Transaction</code>, <code>MultiStatement</code>, <code>SessionCommand</code>, <code>Explain</code>, <code>Cte</code>, <code>FilteredStringAgg</code>, <code>Complex</code>. See <code>query_signature.rs</code> for the authoritative list.</li>
 <li><strong>Usage</strong>: Call <code>classify()</code> ONCE per query entry point, then <code>match</code> on the result.</li>
 </ul>
 <div class="language-rust highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">use</span><span class="w"> </span><span class="k">crate</span><span class="p">::</span><span class="n">query</span><span class="p">::</span><span class="n">query_signature</span><span class="p">::{</span><span class="bp">self</span><span class="p">,</span><span class="w"> </span><span class="n">QuerySignature</span><span class="p">};</span>
@@ -1693,7 +1777,7 @@
 </ul>
 <h3 id="what-is-forbidden">What is FORBIDDEN<a class="headerlink" href="#what-is-forbidden" title="Permanent link">&para;</a></h3>
 <ul>
-<li><strong>No inline SQL pattern matching</strong> in <code>python/bindings/</code>, <code>executor/mod.rs</code>, or <code>client.py</code> outside of the classifier</li>
+<li><strong>No inline SQL pattern matching</strong> in <code>python/bindings/</code>, <code>executor/mod.rs</code>, or <code>client.py</code> outside of the classifier. The <code>DmlWrite</code> pre-parse inside <code>execute_with_base_dir()</code> (the <code>DELETE FROM</code> / <code>UPDATE</code> cases) is the one sanctioned inline shape.</li>
 <li><strong>No duplicate <code>sql.to_uppercase()</code></strong> — each entry point does ONE classify/uppercase pass</li>
 <li><strong>No new fast paths</strong> added directly in bindings or client — add a new <code>QuerySignature</code> variant first, then wire it through the 3 layers</li>
 </ul>
@@ -1794,7 +1878,7 @@
 </ul>
 <h3 id="what-not-to-do">What NOT to do<a class="headerlink" href="#what-not-to-do" title="Permanent link">&para;</a></h3>
 <ul>
-<li><strong>NEVER add query result caching</strong> (e.g., caching PyObject results by SQL string). All optimizations must be genuine algorithmic improvements.</li>
+<li><strong>Query result caching is allowed only through the existing bounded cache</strong> <code>ApexClient._query_result_cache</code> (key = <code>(database, table, sql, show_flag)</code>, value carries a data-generation token; capacity <code>min(_cache_size, 64)</code>; results above 4096 rows or 8 MiB are not cached; disabled inside a transaction). Do not add a second, unbounded cache, and do not cache raw <code>PyObject</code> results by SQL string.</li>
 <li><strong>NEVER add <code>sql.to_uppercase()</code> calls</strong> outside the classifier. Each layer does ONE uppercase pass.</li>
 <li><strong>NEVER add new <code>if sql_upper.starts_with(...)</code> checks</strong> in python/bindings/ or client.py. Add a QuerySignature variant instead.</li>
 </ul>
@@ -1807,13 +1891,13 @@
 <li><strong>Wire executor</strong> dispatch in <code>execute_with_base_dir()</code> (if pre-parse) or <code>select.rs</code> (if post-parse)</li>
 <li><strong>Wire bindings</strong> dispatch in the appropriate method (<code>execute()</code>, <code>_execute_arrow_ffi()</code>, etc.)</li>
 <li><strong>Wire Python</strong> dispatch in <code>_execute_impl()</code> — add new <code>_sig</code> value + handler</li>
-<li><strong>Run full test suite</strong>: <code>cargo test --lib query_signature</code> + <code>maturin develop --release</code> + <code>pytest test/ -x -q</code></li>
+<li><strong>Run the full test suite</strong>: <code>maturin develop --release</code>, then the complete <code>pytest</code> and complete <code>cargo test</code> (no <code>-x</code>, no partial runs). Use <code>cargo test --lib query_signature</code> only as a fast inner-loop check.</li>
 </ol>
 <hr />
 <h2 id="6-testing-requirements">6. Testing Requirements<a class="headerlink" href="#6-testing-requirements" title="Permanent link">&para;</a></h2>
 <ul>
-<li><strong>Rust unit tests</strong>: <code>cargo test --lib query_signature</code> — all classifier tests must pass</li>
-<li><strong>Python integration tests</strong>: <code>maturin develop --release &amp;&amp; python -m pytest -x -q</code></li>
+<li><strong>Rust tests</strong>: <code>cargo test --lib query_signature</code> for a fast inner loop, then the complete <code>cargo test</code> (including doc tests) before finishing</li>
+<li><strong>Python integration tests</strong>: <code>maturin develop --release</code>, then the complete serial <code>pytest</code> suite</li>
 <li><strong>No test deletion</strong>: Never delete or weaken existing tests without explicit direction</li>
 <li><strong>Regression tests</strong>: When fixing a bug, add a test that reproduces the original failure</li>
 </ul>

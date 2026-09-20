@@ -886,6 +886,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#indexes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Indexes
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#transactions" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -893,6 +904,23 @@
       
     </span>
   </a>
+  
+    <nav class="md-nav" aria-label="Transactions">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#commit-failures" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Commit Failures
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
   
 </li>
       
@@ -934,6 +962,17 @@
     <span class="md-ellipsis">
       
         Explain
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#execution-limits" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Execution Limits
       
     </span>
   </a>
@@ -1440,6 +1479,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -1691,8 +1814,8 @@ comma-separated list for <code>IN (?)</code>.</p>
 </span><span id="__span-4-11"><a id="__codelineno-4-11" name="__codelineno-4-11" href="#__codelineno-4-11"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">"SELECT * FROM users WHERE city IN (?)"</span><span class="p">,</span> <span class="n">params</span><span class="o">=</span><span class="p">[[</span><span class="s2">"Beijing"</span><span class="p">,</span> <span class="s2">"Shanghai"</span><span class="p">]])</span>
 </span></code></pre></div>
 <p>Binding works for SELECT, DML, DDL, and transaction statements, and keeps the
-TopK vector query on its native FFI fast path. Arity and type mismatches raise
-<code>ValueError</code>.</p>
+TopK vector query on its native FFI fast path. Wrong placeholder arity raises
+<code>ValueError</code>, and an unsupported value type raises <code>TypeError</code>.</p>
 <h2 id="analytical-queries">Analytical Queries<a class="headerlink" href="#analytical-queries" title="Permanent link">&para;</a></h2>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-5-1"><a id="__codelineno-5-1" name="__codelineno-5-1" href="#__codelineno-5-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">city</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">users</span><span class="p">,</span><span class="w"> </span><span class="k">AVG</span><span class="p">(</span><span class="n">age</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">avg_age</span>
 </span><span id="__span-5-2"><a id="__codelineno-5-2" name="__codelineno-5-2" href="#__codelineno-5-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">users</span>
@@ -1742,20 +1865,68 @@ TopK vector query on its native FFI fast path. Arity and type mismatches raise
 </span><span id="__span-10-7"><a id="__codelineno-10-7" name="__codelineno-10-7" href="#__codelineno-10-7"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">user_id</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">refunded_users</span><span class="p">;</span>
 </span></code></pre></div>
 <p><code>UNION</code>, <code>UNION ALL</code>, <code>INTERSECT</code>, and <code>EXCEPT</code> are supported.</p>
+<h2 id="indexes">Indexes<a class="headerlink" href="#indexes" title="Permanent link">&para;</a></h2>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_order_user</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">orders</span><span class="w"> </span><span class="p">(</span><span class="n">user_id</span><span class="p">);</span>
+</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="k">DROP</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="n">idx_order_user</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">orders</span><span class="p">;</span>
+</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="k">DROP</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">IF</span><span class="w"> </span><span class="k">EXISTS</span><span class="w"> </span><span class="n">idx_order_user</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">orders</span><span class="p">;</span>
+</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a>
+</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="k">ANALYZE</span><span class="w"> </span><span class="n">orders</span><span class="p">;</span><span class="w">   </span><span class="c1">-- refresh the planner statistics for this table</span>
+</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="k">REINDEX</span><span class="w"> </span><span class="n">orders</span><span class="p">;</span><span class="w">   </span><span class="c1">-- rebuild persistent secondary-index postings</span>
+</span></code></pre></div>
+<p><code>DROP INDEX</code> requires the <code>ON table</code> clause. Secondary-index DDL, <code>ANALYZE</code>, and
+<code>REINDEX</code> operate on the selected table, so call <code>use_table(name)</code> first (or use
+the <code>ON table</code> form where the statement accepts it).</p>
+<p>ApexBase marks persisted index postings stale before a committed table change
+and refuses to use them in planning or execution until <code>REINDEX</code> rebuilds them,
+so a stale index degrades to a correct scan instead of returning wrong rows.</p>
 <h2 id="transactions">Transactions<a class="headerlink" href="#transactions" title="Permanent link">&para;</a></h2>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-11-1"><a id="__codelineno-11-1" name="__codelineno-11-1" href="#__codelineno-11-1"></a><span class="k">BEGIN</span><span class="p">;</span>
-</span><span id="__span-11-2"><a id="__codelineno-11-2" name="__codelineno-11-2" href="#__codelineno-11-2"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">orders</span><span class="w"> </span><span class="p">(</span><span class="n">order_id</span><span class="p">,</span><span class="w"> </span><span class="n">total</span><span class="p">)</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1001</span><span class="p">,</span><span class="w"> </span><span class="mi">39</span><span class="p">.</span><span class="mi">9</span><span class="p">);</span>
-</span><span id="__span-11-3"><a id="__codelineno-11-3" name="__codelineno-11-3" href="#__codelineno-11-3"></a><span class="n">SAVEPOINT</span><span class="w"> </span><span class="n">before_adjustment</span><span class="p">;</span>
-</span><span id="__span-11-4"><a id="__codelineno-11-4" name="__codelineno-11-4" href="#__codelineno-11-4"></a><span class="k">UPDATE</span><span class="w"> </span><span class="n">orders</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">total</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">35</span><span class="p">.</span><span class="mi">9</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">order_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1001</span><span class="p">;</span>
-</span><span id="__span-11-5"><a id="__codelineno-11-5" name="__codelineno-11-5" href="#__codelineno-11-5"></a><span class="n">RELEASE</span><span class="w"> </span><span class="n">before_adjustment</span><span class="p">;</span>
-</span><span id="__span-11-6"><a id="__codelineno-11-6" name="__codelineno-11-6" href="#__codelineno-11-6"></a><span class="k">COMMIT</span><span class="p">;</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">BEGIN</span><span class="p">;</span>
+</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="k">INSERT</span><span class="w"> </span><span class="k">INTO</span><span class="w"> </span><span class="n">orders</span><span class="w"> </span><span class="p">(</span><span class="n">order_id</span><span class="p">,</span><span class="w"> </span><span class="n">total</span><span class="p">)</span><span class="w"> </span><span class="k">VALUES</span><span class="w"> </span><span class="p">(</span><span class="mi">1001</span><span class="p">,</span><span class="w"> </span><span class="mi">39</span><span class="p">.</span><span class="mi">9</span><span class="p">);</span>
+</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="n">SAVEPOINT</span><span class="w"> </span><span class="n">before_adjustment</span><span class="p">;</span>
+</span><span id="__span-12-4"><a id="__codelineno-12-4" name="__codelineno-12-4" href="#__codelineno-12-4"></a><span class="k">UPDATE</span><span class="w"> </span><span class="n">orders</span><span class="w"> </span><span class="k">SET</span><span class="w"> </span><span class="n">total</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">35</span><span class="p">.</span><span class="mi">9</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">order_id</span><span class="w"> </span><span class="o">=</span><span class="w"> </span><span class="mi">1001</span><span class="p">;</span>
+</span><span id="__span-12-5"><a id="__codelineno-12-5" name="__codelineno-12-5" href="#__codelineno-12-5"></a><span class="n">RELEASE</span><span class="w"> </span><span class="n">before_adjustment</span><span class="p">;</span>
+</span><span id="__span-12-6"><a id="__codelineno-12-6" name="__codelineno-12-6" href="#__codelineno-12-6"></a><span class="k">COMMIT</span><span class="p">;</span>
 </span></code></pre></div>
 <p>Use <code>ROLLBACK</code> to cancel a transaction, or <code>ROLLBACK TO savepoint_name</code> to undo part of one.</p>
+<h3 id="commit-failures">Commit Failures<a class="headerlink" href="#commit-failures" title="Permanent link">&para;</a></h3>
+<p>If <code>COMMIT</code> fails, the error carries a machine-readable outcome and the
+transaction id, for example:</p>
+<div class="language-text highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a>commit_outcome=unknown txn_id=42: &lt;original I/O error&gt;
+</span></code></pre></div>
+<table>
+<thead>
+<tr>
+<th>Outcome</th>
+<th>Meaning</th>
+<th>Safe next step</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>not_committed</code></td>
+<td>No commit marker or data application was attempted.</td>
+<td>Retry the work as a new transaction.</td>
+</tr>
+<tr>
+<td><code>unknown</code></td>
+<td>A marker or data write may have taken effect, or the transaction is gone and its outcome is unavailable.</td>
+<td>Reopen the database, inspect the authoritative state, and reconcile; never blind-replay the DML.</td>
+</tr>
+<tr>
+<td><code>committed</code></td>
+<td>Data, indexes, and transaction publication completed; only post-commit maintenance failed.</td>
+<td>Treat the work as durable.</td>
+</tr>
+</tbody>
+</table>
+<p>Multi-table transactions apply their work in deterministic table order. After a
+crash, recovery converges each table independently: the contract is per-table
+convergence, not database-wide atomicity.</p>
 <h2 id="file-table-functions">File Table Functions<a class="headerlink" href="#file-table-functions" title="Permanent link">&para;</a></h2>
 <p>Query files directly:</p>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-12-1"><a id="__codelineno-12-1" name="__codelineno-12-1" href="#__codelineno-12-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">city</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">rows</span>
-</span><span id="__span-12-2"><a id="__codelineno-12-2" name="__codelineno-12-2" href="#__codelineno-12-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">read_csv</span><span class="p">(</span><span class="s1">'events.csv'</span><span class="p">)</span>
-</span><span id="__span-12-3"><a id="__codelineno-12-3" name="__codelineno-12-3" href="#__codelineno-12-3"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">city</span><span class="p">;</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">city</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="k">rows</span>
+</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">read_csv</span><span class="p">(</span><span class="s1">'events.csv'</span><span class="p">)</span>
+</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">city</span><span class="p">;</span>
 </span></code></pre></div>
 <p>Supported functions:</p>
 <ul>
@@ -1765,19 +1936,29 @@ TopK vector query on its native FFI fast path. Arity and type mismatches raise
 </ul>
 <p>For repeated queries over a file, register it as a temporary table from Python. See <a href="../data-import/">Data Import</a>.</p>
 <h2 id="full-text-search">Full-Text Search<a class="headerlink" href="#full-text-search" title="Permanent link">&para;</a></h2>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-13-1"><a id="__codelineno-13-1" name="__codelineno-13-1" href="#__codelineno-13-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">FTS</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">articles</span><span class="p">(</span><span class="n">title</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="p">);</span>
-</span><span id="__span-13-2"><a id="__codelineno-13-2" name="__codelineno-13-2" href="#__codelineno-13-2"></a>
-</span><span id="__span-13-3"><a id="__codelineno-13-3" name="__codelineno-13-3" href="#__codelineno-13-3"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">title</span>
-</span><span id="__span-13-4"><a id="__codelineno-13-4" name="__codelineno-13-4" href="#__codelineno-13-4"></a><span class="k">FROM</span><span class="w"> </span><span class="n">articles</span>
-</span><span id="__span-13-5"><a id="__codelineno-13-5" name="__codelineno-13-5" href="#__codelineno-13-5"></a><span class="k">WHERE</span><span class="w"> </span><span class="k">MATCH</span><span class="p">(</span><span class="s1">'rust database'</span><span class="p">);</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">FTS</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="n">articles</span><span class="p">(</span><span class="n">title</span><span class="p">,</span><span class="w"> </span><span class="n">content</span><span class="p">);</span>
+</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a>
+</span><span id="__span-15-3"><a id="__codelineno-15-3" name="__codelineno-15-3" href="#__codelineno-15-3"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">title</span>
+</span><span id="__span-15-4"><a id="__codelineno-15-4" name="__codelineno-15-4" href="#__codelineno-15-4"></a><span class="k">FROM</span><span class="w"> </span><span class="n">articles</span>
+</span><span id="__span-15-5"><a id="__codelineno-15-5" name="__codelineno-15-5" href="#__codelineno-15-5"></a><span class="k">WHERE</span><span class="w"> </span><span class="k">MATCH</span><span class="p">(</span><span class="s1">'rust database'</span><span class="p">);</span>
 </span></code></pre></div>
 <p>For fuzzy matching, lifecycle commands, and configuration, see the <a href="../../FTS_GUIDE/">Full-Text Search Guide</a>.</p>
 <h2 id="vector-search">Vector Search<a class="headerlink" href="#vector-search" title="Permanent link">&para;</a></h2>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-14-1"><a id="__codelineno-14-1" name="__codelineno-14-1" href="#__codelineno-14-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span>
-</span><span id="__span-14-2"><a id="__codelineno-14-2" name="__codelineno-14-2" href="#__codelineno-14-2"></a><span class="k">FROM</span><span class="w"> </span><span class="n">explode_rename</span><span class="p">(</span>
-</span><span id="__span-14-3"><a id="__codelineno-14-3" name="__codelineno-14-3" href="#__codelineno-14-3"></a><span class="w">    </span><span class="n">topk_distance</span><span class="p">(</span><span class="s1">'items'</span><span class="p">,</span><span class="w"> </span><span class="s1">'embedding'</span><span class="p">,</span><span class="w"> </span><span class="s1">'[0.1, 0.2, 0.3]'</span><span class="p">,</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="s1">'cosine'</span><span class="p">),</span>
-</span><span id="__span-14-4"><a id="__codelineno-14-4" name="__codelineno-14-4" href="#__codelineno-14-4"></a><span class="w">    </span><span class="s1">'_id,dist'</span>
-</span><span id="__span-14-5"><a id="__codelineno-14-5" name="__codelineno-14-5" href="#__codelineno-14-5"></a><span class="p">);</span>
+<p><code>topk_distance(column, [query...], k, 'metric')</code> is a whole-column TopK
+expression; wrap it in <code>explode_rename</code> to turn the <code>(id, distance)</code> pairs into
+rows:</p>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">explode_rename</span><span class="p">(</span>
+</span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="w">    </span><span class="n">topk_distance</span><span class="p">(</span><span class="n">embedding</span><span class="p">,</span><span class="w"> </span><span class="p">[</span><span class="mi">0</span><span class="p">.</span><span class="mi">1</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">2</span><span class="p">,</span><span class="w"> </span><span class="mi">0</span><span class="p">.</span><span class="mi">3</span><span class="p">],</span><span class="w"> </span><span class="mi">10</span><span class="p">,</span><span class="w"> </span><span class="s1">'cosine'</span><span class="p">),</span>
+</span><span id="__span-16-3"><a id="__codelineno-16-3" name="__codelineno-16-3" href="#__codelineno-16-3"></a><span class="w">    </span><span class="s1">'_id'</span><span class="p">,</span><span class="w"> </span><span class="s1">'dist'</span>
+</span><span id="__span-16-4"><a id="__codelineno-16-4" name="__codelineno-16-4" href="#__codelineno-16-4"></a><span class="p">)</span>
+</span><span id="__span-16-5"><a id="__codelineno-16-5" name="__codelineno-16-5" href="#__codelineno-16-5"></a><span class="k">FROM</span><span class="w"> </span><span class="n">items</span><span class="p">;</span>
+</span></code></pre></div>
+<p>The supported metrics are <code>'l2'</code>, <code>'cosine'</code>, and <code>'dot'</code>. The same expression
+accepts a bound parameter for the query vector from Python:</p>
+<div class="language-python highlight"><pre><span></span><code><span id="__span-17-1"><a id="__codelineno-17-1" name="__codelineno-17-1" href="#__codelineno-17-1"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span>
+</span><span id="__span-17-2"><a id="__codelineno-17-2" name="__codelineno-17-2" href="#__codelineno-17-2"></a>    <span class="s2">"SELECT explode_rename(topk_distance(embedding, ?, 10, 'cosine'), '_id', 'dist') FROM items"</span><span class="p">,</span>
+</span><span id="__span-17-3"><a id="__codelineno-17-3" name="__codelineno-17-3" href="#__codelineno-17-3"></a>    <span class="n">params</span><span class="o">=</span><span class="p">[</span><span class="n">query_vector</span><span class="p">],</span>
+</span><span id="__span-17-4"><a id="__codelineno-17-4" name="__codelineno-17-4" href="#__codelineno-17-4"></a><span class="p">)</span>
 </span></code></pre></div>
 <p>Vector columns can be declared as <code>FLOAT32_VECTOR</code>, <code>FLOAT16_VECTOR</code>,
 <code>BFLOAT16_VECTOR</code>, <code>INT8_VECTOR</code>, <code>UINT8_VECTOR</code>, <code>BIT1_VECTOR</code>, or
@@ -1788,10 +1969,35 @@ rules, and Python rescore API, see the
 <a href="../../VECTOR_QUANTIZATION_GUIDE/">Vector Quantization Guide</a>. Float16 SIMD
 details remain in the <a href="../../FLOAT16_VECTOR_GUIDE/">Float16 Vector Guide</a>.</p>
 <h2 id="explain">Explain<a class="headerlink" href="#explain" title="Permanent link">&para;</a></h2>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-15-1"><a id="__codelineno-15-1" name="__codelineno-15-1" href="#__codelineno-15-1"></a><span class="k">EXPLAIN</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">users</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">age</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">30</span><span class="p">;</span>
-</span><span id="__span-15-2"><a id="__codelineno-15-2" name="__codelineno-15-2" href="#__codelineno-15-2"></a><span class="k">EXPLAIN</span><span class="w"> </span><span class="k">ANALYZE</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="n">city</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">users</span><span class="w"> </span><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">city</span><span class="p">;</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-18-1"><a id="__codelineno-18-1" name="__codelineno-18-1" href="#__codelineno-18-1"></a><span class="k">EXPLAIN</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="o">*</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">users</span><span class="w"> </span><span class="k">WHERE</span><span class="w"> </span><span class="n">age</span><span class="w"> </span><span class="o">&gt;</span><span class="w"> </span><span class="mi">30</span><span class="p">;</span>
+</span><span id="__span-18-2"><a id="__codelineno-18-2" name="__codelineno-18-2" href="#__codelineno-18-2"></a><span class="k">EXPLAIN</span><span class="w"> </span><span class="k">ANALYZE</span><span class="w"> </span><span class="k">SELECT</span><span class="w"> </span><span class="n">city</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">FROM</span><span class="w"> </span><span class="n">users</span><span class="w"> </span><span class="k">GROUP</span><span class="w"> </span><span class="k">BY</span><span class="w"> </span><span class="n">city</span><span class="p">;</span>
 </span></code></pre></div>
+<p><code>EXPLAIN</code> prints the candidate and chosen plan, including the index access spec
+when one is executable. <code>EXPLAIN ANALYZE</code> also reports what actually ran:</p>
+<ul>
+<li><code>Actual Path</code> — the physical route that executed;</li>
+<li><code>Actual Rows</code> and <code>Actual Time</code> — measured result size and duration;</li>
+<li><code>Plan Divergence</code> — a note when execution had to leave the planned route (for
+  example, a planned index route that was unavailable at execution time);</li>
+<li><code>Feedback Recorded</code> — whether this run's cost/time feedback was written to
+  the table sidecar.</li>
+</ul>
+<p><code>EXPLAIN ANALYZE</code> persists per-shape cost and time feedback in the table
+sidecar <code>&lt;table&gt;.plan_feedback</code>. Feedback is ignored when its sidecar schema
+version or the recorded OS/architecture/parallelism fingerprint differs, and it
+is dropped on schema changes.</p>
 <p>Use <code>EXPLAIN</code> when you are checking whether a query is taking a fast path, using an index, or falling back to the full planner.</p>
+<h2 id="execution-limits">Execution Limits<a class="headerlink" href="#execution-limits" title="Permanent link">&para;</a></h2>
+<p>Aggregation state for supported <code>GROUP BY</code> kernels is charged against a
+per-query byte budget. Set <code>APEX_QUERY_MEMORY_MB</code> to the budget in MiB (<code>0</code>
+disables the budget, default <code>1024</code>). Exceeding it fails the query with an
+out-of-memory error instead of letting the process exhaust memory; reservations
+are released on success, cancellation, failure, and fallback.</p>
+<p>Supported batched scans may use parallel row-group workers. At most
+<code>min(CPU - 1, 8)</code> workers run across all queries in a process, and parallel
+execution is selected only when the calibrated serial cost is at least 2 ms and
+parallel history is still faster. <code>APEX_PARALLEL_SCAN</code> is a diagnostic
+override: <code>0</code>/<code>1</code> forces serial, and <code>N &gt;= 2</code> forces <code>N</code> workers.</p>
 
 
 

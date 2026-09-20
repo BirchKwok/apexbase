@@ -1502,6 +1502,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -1742,7 +1826,7 @@
 </tr>
 <tr>
 <td>Apple Silicon / AWS Graviton (NEON fp16 hardware)</td>
-<td>Dimensions that are odd multiples &lt; 8 (micro-batches)</td>
+<td>Dimensions not divisible by 8 (the 8-wide kernels fall back to a scalar tail)</td>
 </tr>
 <tr>
 <td>Models that already quantize (CLIP, text embeddings)</td>
@@ -1873,7 +1957,10 @@
 <ul>
 <li>Uses <code>FCVTL</code> / <code>FCVTL2</code> to widen f16→f32 in-register (no memory round-trip)</li>
 <li>8 elements loaded per NEON vector, widened to two 128-bit f32 registers</li>
-<li>~2–3× faster than scalar; often ≥2× faster than equivalent float32 kernels</li>
+<li>Avoids the scalar per-element widen step of the fallback path; the end-to-end
+  gain depends on dimension, data layout, and whether the scan is
+  memory-bound, so measure it for your workload rather than assuming a fixed
+  speedup</li>
 </ul>
 <h3 id="x86_64-avx2-f16c">x86_64 — AVX2 + F16C<a class="headerlink" href="#x86_64-avx2-f16c" title="Permanent link">&para;</a></h3>
 <p>Applies to: Intel Haswell+ (2013+), AMD Ryzen (2017+).</p>
@@ -1915,7 +2002,7 @@
 </span><span id="__span-8-12"><a id="__codelineno-8-12" name="__codelineno-8-12" href="#__codelineno-8-12"></a><span class="n">f16_dist</span> <span class="o">=</span> <span class="nb">float</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">sum</span><span class="p">((</span><span class="n">f16_quantize</span><span class="p">(</span><span class="n">vec</span><span class="p">)</span> <span class="o">-</span> <span class="n">query</span><span class="p">)</span> <span class="o">**</span> <span class="mi">2</span><span class="p">)))</span>
 </span><span id="__span-8-13"><a id="__codelineno-8-13" name="__codelineno-8-13" href="#__codelineno-8-13"></a><span class="n">rel_err</span>  <span class="o">=</span> <span class="nb">abs</span><span class="p">(</span><span class="n">exact</span> <span class="o">-</span> <span class="n">f16_dist</span><span class="p">)</span> <span class="o">/</span> <span class="n">exact</span>
 </span><span id="__span-8-14"><a id="__codelineno-8-14" name="__codelineno-8-14" href="#__codelineno-8-14"></a><span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"exact: </span><span class="si">{</span><span class="n">exact</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">  f16: </span><span class="si">{</span><span class="n">f16_dist</span><span class="si">:</span><span class="s2">.4f</span><span class="si">}</span><span class="s2">  rel_err: </span><span class="si">{</span><span class="n">rel_err</span><span class="si">:</span><span class="s2">.2e</span><span class="si">}</span><span class="s2">"</span><span class="p">)</span>
-</span><span id="__span-8-15"><a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a><span class="c1"># exact: 5.8123  f16: 5.8119  rel_err: 7.23e-05</span>
+</span><span id="__span-8-15"><a id="__codelineno-8-15" name="__codelineno-8-15" href="#__codelineno-8-15"></a><span class="c1"># exact: 10.0652  f16: 10.0653  rel_err: 1.49e-05</span>
 </span></code></pre></div>
 <p>For top-k retrieval, quantization error is well within retrieval noise for dimensions ≥ 32 and any standard embedding model.</p>
 <hr />
@@ -1988,7 +2075,7 @@
 </tr>
 <tr>
 <td><strong>SIMD on Apple Silicon</strong></td>
-<td>NEON fp16 (≥2× faster)</td>
+<td>NEON fp16</td>
 <td>NEON f32</td>
 </tr>
 <tr>

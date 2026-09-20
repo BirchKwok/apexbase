@@ -1016,6 +1016,34 @@
     <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
       
         <li class="md-nav__item">
+  <a href="#v1340-public-no-cache-snapshot" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        v1.34.0 Public No-Cache Snapshot
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="v1.34.0 Public No-Cache Snapshot">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#cross-date-comparison-caveat" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Cross-date comparison caveat
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#v1331-public-no-cache-snapshot" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -1049,15 +1077,15 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#tabular-and-exact-vector-metrics" class="md-nav__link">
+  <a href="#v1300-tabular-and-exact-vector-metrics" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Tabular and Exact Vector Metrics
+        v1.30.0 Tabular And Exact Vector Metrics
       
     </span>
   </a>
   
-    <nav class="md-nav" aria-label="Tabular and Exact Vector Metrics">
+    <nav class="md-nav" aria-label="v1.30.0 Tabular And Exact Vector Metrics">
       <ul class="md-nav__list">
         
           <li class="md-nav__item">
@@ -1099,10 +1127,10 @@
 </li>
       
         <li class="md-nav__item">
-  <a href="#quantized-l2-distance-snapshot" class="md-nav__link">
+  <a href="#v1300-quantized-l2-distance-snapshot" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Quantized L2 Distance Snapshot
+        v1.30.0 Quantized L2 Distance Snapshot
       
     </span>
   </a>
@@ -1386,6 +1414,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -1556,6 +1668,301 @@
 <p>This page records the latest complete public cross-engine benchmark. It is a
 reproducible snapshot, not a universal claim: rerun the suite on your own
 hardware and workload.</p>
+<h2 id="v1340-public-no-cache-snapshot">v1.34.0 Public No-Cache Snapshot<a class="headerlink" href="#v1340-public-no-cache-snapshot" title="Permanent link">&para;</a></h2>
+<ul>
+<li><strong>Date / source</strong>: 2026-09-20, v1.34.0 release tree (commit <code>41f3400</code>)</li>
+<li><strong>System</strong>: macOS 27.0, Apple arm64 (10 cores), 32 GB RAM</li>
+<li><strong>Tabular stack</strong>: Python 3.12.2, ApexBase 1.34.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Vector stack</strong>: Python 3.12.2, ApexBase 1.34.0, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1</li>
+<li><strong>Build</strong>: maturin 1.9.1, rustc 1.92.0, release profile</li>
+<li><strong>Tabular dataset</strong>: 1,000,000 rows x 5 columns</li>
+<li><strong>Vector dataset</strong>: 1,000,000 Float32 vectors x 128 dimensions, <code>k=10</code>, 10 exact batch queries; quantized module 20 queries with <code>candidate_k=100</code> and seed <code>20260821</code></li>
+<li><strong>Method</strong>: result cache disabled for every ApexBase client (<code>enable_cache=False</code>), 2 warmup iterations + 5 timed iterations, materialized results</li>
+<li><strong>Retained report</strong>: <code>local-perf-results/release-1.34.0-20260920/public-benchmark.json</code></li>
+</ul>
+<p>The no-cache public suite completed all <strong>117/117 named rows</strong>: 103 tabular,
+6 exact-vector, and 8 ApexBase quantized precision rows. ApexBase won every row
+that has a direct competitor — <strong>115/115</strong>: 103/103 tabular, 6/6 exact vector,
+and 6/6 quantized codecs shared with sqlite-vector. Float16 and BFloat16 remain
+ApexBase-only quantized formats and are excluded from the comparable total.</p>
+<table>
+<thead>
+<tr>
+<th>Scope</th>
+<th style="text-align: right;">Metrics</th>
+<th style="text-align: right;">Apex wins</th>
+<th style="text-align: right;">Ties</th>
+<th style="text-align: right;">Slower</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>OLAP fair</td>
+<td style="text-align: right;">71</td>
+<td style="text-align: right;">71</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>OLTP fair</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">32</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>Exact vector similarity</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td>Quantized vector, shared codecs</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">6</td>
+<td style="text-align: right;">0</td>
+<td style="text-align: right;">0</td>
+</tr>
+<tr>
+<td><strong>Comparable total</strong></td>
+<td style="text-align: right;"><strong>115</strong></td>
+<td style="text-align: right;"><strong>115</strong></td>
+<td style="text-align: right;"><strong>0</strong></td>
+<td style="text-align: right;"><strong>0</strong></td>
+</tr>
+</tbody>
+</table>
+<p>Representative medians from the retained run:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite</th>
+<th style="text-align: right;">DuckDB</th>
+<th style="text-align: right;">ApexBase vs best competitor</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>COUNT(*)</td>
+<td style="text-align: right;">0.084 ms</td>
+<td style="text-align: right;">8.399 ms</td>
+<td style="text-align: right;">0.500 ms</td>
+<td style="text-align: right;">5.93x faster</td>
+</tr>
+<tr>
+<td>Projection full scan (3 cols)</td>
+<td style="text-align: right;">212.418 ms</td>
+<td style="text-align: right;">885.736 ms</td>
+<td style="text-align: right;">670.344 ms</td>
+<td style="text-align: right;">3.16x faster</td>
+</tr>
+<tr>
+<td>Filter (name = 'user_5000')</td>
+<td style="text-align: right;">0.187 ms</td>
+<td style="text-align: right;">46.945 ms</td>
+<td style="text-align: right;">1.749 ms</td>
+<td style="text-align: right;">9.36x faster</td>
+</tr>
+<tr>
+<td>GROUP BY city (10 groups)</td>
+<td style="text-align: right;">0.999 ms</td>
+<td style="text-align: right;">371.201 ms</td>
+<td style="text-align: right;">3.506 ms</td>
+<td style="text-align: right;">3.51x faster</td>
+</tr>
+<tr>
+<td>GROUP BY + HAVING</td>
+<td style="text-align: right;">0.722 ms</td>
+<td style="text-align: right;">366.956 ms</td>
+<td style="text-align: right;">3.580 ms</td>
+<td style="text-align: right;">4.96x faster</td>
+</tr>
+<tr>
+<td>Boolean Filter+GROUP+HAVING+TopK</td>
+<td style="text-align: right;">4.014 ms</td>
+<td style="text-align: right;">192.575 ms</td>
+<td style="text-align: right;">5.746 ms</td>
+<td style="text-align: right;">1.43x faster</td>
+</tr>
+<tr>
+<td>Multi-cond (age&gt;30 AND score&gt;50)</td>
+<td style="text-align: right;">196.646 ms</td>
+<td style="text-align: right;">592.362 ms</td>
+<td style="text-align: right;">363.623 ms</td>
+<td style="text-align: right;">1.85x faster</td>
+</tr>
+<tr>
+<td>JSON Read + GROUP BY category</td>
+<td style="text-align: right;">59.921 ms</td>
+<td style="text-align: right;">N/A</td>
+<td style="text-align: right;">88.128 ms</td>
+<td style="text-align: right;">1.47x faster</td>
+</tr>
+<tr>
+<td>ORDER BY score LIMIT 100</td>
+<td style="text-align: right;">1.948 ms</td>
+<td style="text-align: right;">55.595 ms</td>
+<td style="text-align: right;">5.512 ms</td>
+<td style="text-align: right;">2.83x faster</td>
+</tr>
+<tr>
+<td>Bulk Insert (N rows; default fair)</td>
+<td style="text-align: right;">233.685 ms</td>
+<td style="text-align: right;">1.05 s</td>
+<td style="text-align: right;">189.52 s</td>
+<td style="text-align: right;">4.49x faster</td>
+</tr>
+<tr>
+<td>FTS Index Build (name,city,category)</td>
+<td style="text-align: right;">1.651 ms</td>
+<td style="text-align: right;">1.54 s</td>
+<td style="text-align: right;">1.14 s</td>
+<td style="text-align: right;">692.52x faster</td>
+</tr>
+<tr>
+<td>Batch TopK L2 (10 queries)</td>
+<td style="text-align: right;">55.884 ms</td>
+<td style="text-align: right;">1.43 s</td>
+<td style="text-align: right;">388.870 ms</td>
+<td style="text-align: right;">6.96x faster</td>
+</tr>
+</tbody>
+</table>
+<p>Exact vector medians for the same run:</p>
+<table>
+<thead>
+<tr>
+<th>Metric</th>
+<th style="text-align: right;">ApexBase</th>
+<th style="text-align: right;">SQLite + sqlite-vector</th>
+<th style="text-align: right;">DuckDB</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>TopK L2</td>
+<td style="text-align: right;">7.479 ms</td>
+<td style="text-align: right;">142.252 ms</td>
+<td style="text-align: right;">31.412 ms</td>
+</tr>
+<tr>
+<td>TopK Cosine</td>
+<td style="text-align: right;">7.020 ms</td>
+<td style="text-align: right;">172.040 ms</td>
+<td style="text-align: right;">35.477 ms</td>
+</tr>
+<tr>
+<td>TopK Dot</td>
+<td style="text-align: right;">7.415 ms</td>
+<td style="text-align: right;">139.883 ms</td>
+<td style="text-align: right;">39.810 ms</td>
+</tr>
+<tr>
+<td>Batch TopK L2 (10 queries)</td>
+<td style="text-align: right;">55.884 ms</td>
+<td style="text-align: right;">1,431.887 ms</td>
+<td style="text-align: right;">388.870 ms</td>
+</tr>
+<tr>
+<td>Batch TopK Cosine (10 queries)</td>
+<td style="text-align: right;">48.162 ms</td>
+<td style="text-align: right;">1,547.773 ms</td>
+<td style="text-align: right;">396.102 ms</td>
+</tr>
+<tr>
+<td>Batch TopK Dot (10 queries)</td>
+<td style="text-align: right;">51.467 ms</td>
+<td style="text-align: right;">1,406.353 ms</td>
+<td style="text-align: right;">417.101 ms</td>
+</tr>
+</tbody>
+</table>
+<p>Quantized batch-amortized retrieval for the same run (20 queries, <code>k=10</code>,
+<code>candidate_k=100</code>):</p>
+<table>
+<thead>
+<tr>
+<th>Codec</th>
+<th style="text-align: right;">Apex quantized</th>
+<th style="text-align: right;">Apex recall</th>
+<th style="text-align: right;">Apex exact-rescore</th>
+<th style="text-align: right;">Rescore recall</th>
+<th style="text-align: right;">sqlite-vector quantized</th>
+<th style="text-align: right;">SQLite recall</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>INT8</td>
+<td style="text-align: right;">1.373 ms</td>
+<td style="text-align: right;">0.975</td>
+<td style="text-align: right;">17.582 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">8.773 ms</td>
+<td style="text-align: right;">0.945</td>
+</tr>
+<tr>
+<td>UINT8</td>
+<td style="text-align: right;">3.436 ms</td>
+<td style="text-align: right;">0.985</td>
+<td style="text-align: right;">20.898 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">8.702 ms</td>
+<td style="text-align: right;">0.960</td>
+</tr>
+<tr>
+<td>1-bit</td>
+<td style="text-align: right;">0.627 ms</td>
+<td style="text-align: right;">0.140</td>
+<td style="text-align: right;">15.184 ms</td>
+<td style="text-align: right;">0.415</td>
+<td style="text-align: right;">2.050 ms</td>
+<td style="text-align: right;">0.100</td>
+</tr>
+<tr>
+<td>TurboQuant 2-bit</td>
+<td style="text-align: right;">4.961 ms</td>
+<td style="text-align: right;">0.450</td>
+<td style="text-align: right;">20.351 ms</td>
+<td style="text-align: right;">0.870</td>
+<td style="text-align: right;">27.467 ms</td>
+<td style="text-align: right;">0.535</td>
+</tr>
+<tr>
+<td>TurboQuant 3-bit</td>
+<td style="text-align: right;">18.669 ms</td>
+<td style="text-align: right;">0.595</td>
+<td style="text-align: right;">34.908 ms</td>
+<td style="text-align: right;">0.990</td>
+<td style="text-align: right;">67.610 ms</td>
+<td style="text-align: right;">0.725</td>
+</tr>
+<tr>
+<td>TurboQuant 4-bit</td>
+<td style="text-align: right;">9.650 ms</td>
+<td style="text-align: right;">0.760</td>
+<td style="text-align: right;">25.782 ms</td>
+<td style="text-align: right;">1.000</td>
+<td style="text-align: right;">52.467 ms</td>
+<td style="text-align: right;">0.840</td>
+</tr>
+</tbody>
+</table>
+<p>ApexBase-only derived columns in the same run: Float16 at 2.476 ms quantized
+with 1.000 recall, and BFloat16 at 10.114 ms with 1.000 recall.</p>
+<h3 id="cross-date-comparison-caveat">Cross-date comparison caveat<a class="headerlink" href="#cross-date-comparison-caveat" title="Permanent link">&para;</a></h3>
+<p><code>benchmarks/latest_public_baseline.json</code> was recorded on macOS 26.6.2, so
+comparing it with this run crosses an OS upgrade. The default comparison
+reported 13 metrics above the 15% relative threshold; the same-machine
+base/current canary and full gates re-measured those paths against the
+identical commit and passed. The nonzero cross-date comparison remains on
+record at
+<code>local-perf-results/release-1.34.0-20260920/public-baseline-comparison.log</code> and
+must not be read as a regression verdict; only the same-machine comparison
+decides that.</p>
 <h2 id="v1331-public-no-cache-snapshot">v1.33.1 Public No-Cache Snapshot<a class="headerlink" href="#v1331-public-no-cache-snapshot" title="Permanent link">&para;</a></h2>
 <ul>
 <li><strong>Date / source</strong>: 2026-09-05, v1.33.1 release tree; runtime code was measured immediately before the metadata-only version bump</li>
@@ -1790,7 +2197,11 @@ the <a href="https://github.com/sqliteai/sqlite-vector">sqlite-vector</a> extens
 <code>vector_full_scan()</code> rather than by SQLite core, which has no native vector
 distance operator. Quantized scans remain a separate diagnostic because their
 recall and storage contracts differ from exact Float32 search.</p>
-<h2 id="tabular-and-exact-vector-metrics">Tabular and Exact Vector Metrics<a class="headerlink" href="#tabular-and-exact-vector-metrics" title="Permanent link">&para;</a></h2>
+<h2 id="v1300-tabular-and-exact-vector-metrics">v1.30.0 Tabular And Exact Vector Metrics<a class="headerlink" href="#v1300-tabular-and-exact-vector-metrics" title="Permanent link">&para;</a></h2>
+<p>These tables are the retained v1.30.0 run
+(<code>benchmarks/results/v1.30.0-vector-quantization-public-final.json</code>), kept as a
+historical reference. The current comparable numbers are in the version
+sections above; do not mix rows across snapshots.</p>
 <h3 id="olap-fair-metrics-70">OLAP Fair Metrics (70)<a class="headerlink" href="#olap-fair-metrics-70" title="Permanent link">&para;</a></h3>
 <table>
 <thead>
@@ -2479,7 +2890,10 @@ recall and storage contracts differ from exact Float32 search.</p>
 </tbody>
 </table>
 <p>All vector rows matched the brute-force exact top-k row sets.</p>
-<h2 id="quantized-l2-distance-snapshot">Quantized L2 Distance Snapshot<a class="headerlink" href="#quantized-l2-distance-snapshot" title="Permanent link">&para;</a></h2>
+<h2 id="v1300-quantized-l2-distance-snapshot">v1.30.0 Quantized L2 Distance Snapshot<a class="headerlink" href="#v1300-quantized-l2-distance-snapshot" title="Permanent link">&para;</a></h2>
+<p>This is the retained v1.30.0 run
+(<code>benchmarks/results/v1.30.0-public-unified-vector-1m.json</code>). The current
+quantized medians are in the v1.34.0 section above.</p>
 <p>The public benchmark entrypoint includes this snapshot alongside the tabular
 and exact-vector modules. It uses 1,000,000 identical normally
 distributed Float32 vectors with 128 dimensions, 20 query vectors, <code>k=10</code>, two

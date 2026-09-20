@@ -2117,6 +2117,90 @@
   
   
     <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
       <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
         
   
@@ -2324,7 +2408,7 @@
 
 
 <h1 id="apexbase-usage-examples">ApexBase Usage Examples<a class="headerlink" href="#apexbase-usage-examples" title="Permanent link">&para;</a></h1>
-<p>Comprehensive examples covering 100% of the ApexBase Python API.</p>
+<p>Comprehensive examples covering the core ApexBase Python API end to end.</p>
 <h2 id="table-of-contents">Table of Contents<a class="headerlink" href="#table-of-contents" title="Permanent link">&para;</a></h2>
 <ol>
 <li><a href="#basic-operations">Basic Operations</a></li>
@@ -2806,8 +2890,8 @@
 </span><span id="__span-17-7"><a id="__codelineno-17-7" name="__codelineno-17-7" href="#__codelineno-17-7"></a><span class="n">dicts</span> <span class="o">=</span> <span class="n">results</span><span class="o">.</span><span class="n">to_dict</span><span class="p">()</span>
 </span><span id="__span-17-8"><a id="__codelineno-17-8" name="__codelineno-17-8" href="#__codelineno-17-8"></a>
 </span><span id="__span-17-9"><a id="__codelineno-17-9" name="__codelineno-17-9" href="#__codelineno-17-9"></a><span class="c1"># Properties</span>
-</span><span id="__span-17-10"><a id="__codelineno-17-10" name="__codelineno-17-10" href="#__codelineno-17-10"></a><span class="nb">print</span><span class="p">(</span><span class="n">results</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>      <span class="c1"># (rows, columns)</span>
-</span><span id="__span-17-11"><a id="__codelineno-17-11" name="__codelineno-17-11" href="#__codelineno-17-11"></a><span class="nb">print</span><span class="p">(</span><span class="n">results</span><span class="o">.</span><span class="n">columns</span><span class="p">)</span>    <span class="c1"># ['_id', 'name', 'age', ...]</span>
+</span><span id="__span-17-10"><a id="__codelineno-17-10" name="__codelineno-17-10" href="#__codelineno-17-10"></a><span class="nb">print</span><span class="p">(</span><span class="n">results</span><span class="o">.</span><span class="n">shape</span><span class="p">)</span>      <span class="c1"># (rows, columns) of the materialized Arrow result</span>
+</span><span id="__span-17-11"><a id="__codelineno-17-11" name="__codelineno-17-11" href="#__codelineno-17-11"></a><span class="nb">print</span><span class="p">(</span><span class="n">results</span><span class="o">.</span><span class="n">columns</span><span class="p">)</span>    <span class="c1"># ['name', 'age', ...] — _id is hidden by default</span>
 </span><span id="__span-17-12"><a id="__codelineno-17-12" name="__codelineno-17-12" href="#__codelineno-17-12"></a><span class="nb">print</span><span class="p">(</span><span class="nb">len</span><span class="p">(</span><span class="n">results</span><span class="p">))</span>       <span class="c1"># row count</span>
 </span><span id="__span-17-13"><a id="__codelineno-17-13" name="__codelineno-17-13" href="#__codelineno-17-13"></a>
 </span><span id="__span-17-14"><a id="__codelineno-17-14" name="__codelineno-17-14" href="#__codelineno-17-14"></a><span class="c1"># Get IDs</span>
@@ -2844,7 +2928,7 @@
 </span><span id="__span-18-15"><a id="__codelineno-18-15" name="__codelineno-18-15" href="#__codelineno-18-15"></a>
 </span><span id="__span-18-16"><a id="__codelineno-18-16" name="__codelineno-18-16" href="#__codelineno-18-16"></a><span class="c1"># List all fields</span>
 </span><span id="__span-18-17"><a id="__codelineno-18-17" name="__codelineno-18-17" href="#__codelineno-18-17"></a><span class="n">fields</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">list_fields</span><span class="p">()</span>
-</span><span id="__span-18-18"><a id="__codelineno-18-18" name="__codelineno-18-18" href="#__codelineno-18-18"></a><span class="nb">print</span><span class="p">(</span><span class="n">fields</span><span class="p">)</span>  <span class="c1"># ['_id', 'name', 'age', 'email_address', 'score']</span>
+</span><span id="__span-18-18"><a id="__codelineno-18-18" name="__codelineno-18-18" href="#__codelineno-18-18"></a><span class="nb">print</span><span class="p">(</span><span class="n">fields</span><span class="p">)</span>  <span class="c1"># ['name', 'age', 'email_address', 'score'] — _id is never listed</span>
 </span><span id="__span-18-19"><a id="__codelineno-18-19" name="__codelineno-18-19" href="#__codelineno-18-19"></a>
 </span><span id="__span-18-20"><a id="__codelineno-18-20" name="__codelineno-18-20" href="#__codelineno-18-20"></a><span class="c1"># Drop column</span>
 </span><span id="__span-18-21"><a id="__codelineno-18-21" name="__codelineno-18-21" href="#__codelineno-18-21"></a><span class="n">client</span><span class="o">.</span><span class="n">drop_column</span><span class="p">(</span><span class="s2">"score"</span><span class="p">)</span>
@@ -2875,8 +2959,8 @@
 </span><span id="__span-19-15"><a id="__codelineno-19-15" name="__codelineno-19-15" href="#__codelineno-19-15"></a><span class="c1"># 3. MATCH — all query terms must appear</span>
 </span><span id="__span-19-16"><a id="__codelineno-19-16" name="__codelineno-19-16" href="#__codelineno-19-16"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">"SELECT * FROM articles WHERE MATCH('python')"</span><span class="p">)</span>
 </span><span id="__span-19-17"><a id="__codelineno-19-17" name="__codelineno-19-17" href="#__codelineno-19-17"></a><span class="nb">print</span><span class="p">(</span><span class="n">results</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
-</span><span id="__span-19-18"><a id="__codelineno-19-18" name="__codelineno-19-18" href="#__codelineno-19-18"></a><span class="c1">#    _id            title                    content</span>
-</span><span id="__span-19-19"><a id="__codelineno-19-19" name="__codelineno-19-19" href="#__codelineno-19-19"></a><span class="c1"># 0    0  Python Tutorial  Learn Python programming</span>
+</span><span id="__span-19-18"><a id="__codelineno-19-18" name="__codelineno-19-18" href="#__codelineno-19-18"></a><span class="c1">#             title                    content</span>
+</span><span id="__span-19-19"><a id="__codelineno-19-19" name="__codelineno-19-19" href="#__codelineno-19-19"></a><span class="c1"># 0  Python Tutorial  Learn Python programming</span>
 </span><span id="__span-19-20"><a id="__codelineno-19-20" name="__codelineno-19-20" href="#__codelineno-19-20"></a>
 </span><span id="__span-19-21"><a id="__codelineno-19-21" name="__codelineno-19-21" href="#__codelineno-19-21"></a><span class="c1"># 4. FUZZY_MATCH — tolerates typos</span>
 </span><span id="__span-19-22"><a id="__codelineno-19-22" name="__codelineno-19-22" href="#__codelineno-19-22"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">"SELECT * FROM articles WHERE FUZZY_MATCH('progaming')"</span><span class="p">)</span>
@@ -2972,13 +3056,13 @@
 </span><span id="__span-23-4"><a id="__codelineno-23-4" name="__codelineno-23-4" href="#__codelineno-23-4"></a><span class="c1"># Insert test data</span>
 </span><span id="__span-23-5"><a id="__codelineno-23-5" name="__codelineno-23-5" href="#__codelineno-23-5"></a><span class="n">client</span><span class="o">.</span><span class="n">store</span><span class="p">({</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">30</span><span class="p">})</span>
 </span><span id="__span-23-6"><a id="__codelineno-23-6" name="__codelineno-23-6" href="#__codelineno-23-6"></a>
-</span><span id="__span-23-7"><a id="__codelineno-23-7" name="__codelineno-23-7" href="#__codelineno-23-7"></a><span class="c1"># Replace by ID</span>
-</span><span id="__span-23-8"><a id="__codelineno-23-8" name="__codelineno-23-8" href="#__codelineno-23-8"></a><span class="n">success</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice Smith"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">31</span><span class="p">})</span>
+</span><span id="__span-23-7"><a id="__codelineno-23-7" name="__codelineno-23-7" href="#__codelineno-23-7"></a><span class="c1"># Replace by ID (row ids start at 1)</span>
+</span><span id="__span-23-8"><a id="__codelineno-23-8" name="__codelineno-23-8" href="#__codelineno-23-8"></a><span class="n">success</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">replace</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice Smith"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">31</span><span class="p">})</span>
 </span><span id="__span-23-9"><a id="__codelineno-23-9" name="__codelineno-23-9" href="#__codelineno-23-9"></a>
 </span><span id="__span-23-10"><a id="__codelineno-23-10" name="__codelineno-23-10" href="#__codelineno-23-10"></a><span class="c1"># Batch replace</span>
 </span><span id="__span-23-11"><a id="__codelineno-23-11" name="__codelineno-23-11" href="#__codelineno-23-11"></a><span class="n">updated_ids</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">batch_replace</span><span class="p">({</span>
-</span><span id="__span-23-12"><a id="__codelineno-23-12" name="__codelineno-23-12" href="#__codelineno-23-12"></a>    <span class="mi">0</span><span class="p">:</span> <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice Updated"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">32</span><span class="p">},</span>
-</span><span id="__span-23-13"><a id="__codelineno-23-13" name="__codelineno-23-13" href="#__codelineno-23-13"></a>    <span class="mi">1</span><span class="p">:</span> <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Bob Updated"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">26</span><span class="p">}</span>
+</span><span id="__span-23-12"><a id="__codelineno-23-12" name="__codelineno-23-12" href="#__codelineno-23-12"></a>    <span class="mi">1</span><span class="p">:</span> <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Alice Updated"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">32</span><span class="p">},</span>
+</span><span id="__span-23-13"><a id="__codelineno-23-13" name="__codelineno-23-13" href="#__codelineno-23-13"></a>    <span class="mi">2</span><span class="p">:</span> <span class="p">{</span><span class="s2">"name"</span><span class="p">:</span> <span class="s2">"Bob Updated"</span><span class="p">,</span> <span class="s2">"age"</span><span class="p">:</span> <span class="mi">26</span><span class="p">}</span>
 </span><span id="__span-23-14"><a id="__codelineno-23-14" name="__codelineno-23-14" href="#__codelineno-23-14"></a><span class="p">})</span>
 </span><span id="__span-23-15"><a id="__codelineno-23-15" name="__codelineno-23-15" href="#__codelineno-23-15"></a>
 </span><span id="__span-23-16"><a id="__codelineno-23-16" name="__codelineno-23-16" href="#__codelineno-23-16"></a><span class="n">client</span><span class="o">.</span><span class="n">close</span><span class="p">()</span>
@@ -3113,30 +3197,31 @@
 </span><span id="__span-29-18"><a id="__codelineno-29-18" name="__codelineno-29-18" href="#__codelineno-29-18"></a>    <span class="c1"># Add computed column</span>
 </span><span id="__span-29-19"><a id="__codelineno-29-19" name="__codelineno-29-19" href="#__codelineno-29-19"></a>    <span class="n">client</span><span class="o">.</span><span class="n">add_column</span><span class="p">(</span><span class="s2">"region"</span><span class="p">,</span> <span class="s2">"String"</span><span class="p">)</span>
 </span><span id="__span-29-20"><a id="__codelineno-29-20" name="__codelineno-29-20" href="#__codelineno-29-20"></a>
-</span><span id="__span-29-21"><a id="__codelineno-29-21" name="__codelineno-29-21" href="#__codelineno-29-21"></a>    <span class="c1"># Query analytics</span>
-</span><span id="__span-29-22"><a id="__codelineno-29-22" name="__codelineno-29-22" href="#__codelineno-29-22"></a>    <span class="n">monthly</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">"""</span>
-</span><span id="__span-29-23"><a id="__codelineno-29-23" name="__codelineno-29-23" href="#__codelineno-29-23"></a><span class="s2">        SELECT </span>
-</span><span id="__span-29-24"><a id="__codelineno-29-24" name="__codelineno-29-24" href="#__codelineno-29-24"></a><span class="s2">            strftime('%Y-%m', date) as month,</span>
-</span><span id="__span-29-25"><a id="__codelineno-29-25" name="__codelineno-29-25" href="#__codelineno-29-25"></a><span class="s2">            SUM(revenue) as total_revenue,</span>
-</span><span id="__span-29-26"><a id="__codelineno-29-26" name="__codelineno-29-26" href="#__codelineno-29-26"></a><span class="s2">            AVG(quantity) as avg_quantity</span>
-</span><span id="__span-29-27"><a id="__codelineno-29-27" name="__codelineno-29-27" href="#__codelineno-29-27"></a><span class="s2">        FROM sales</span>
-</span><span id="__span-29-28"><a id="__codelineno-29-28" name="__codelineno-29-28" href="#__codelineno-29-28"></a><span class="s2">        GROUP BY month</span>
-</span><span id="__span-29-29"><a id="__codelineno-29-29" name="__codelineno-29-29" href="#__codelineno-29-29"></a><span class="s2">        ORDER BY month</span>
-</span><span id="__span-29-30"><a id="__codelineno-29-30" name="__codelineno-29-30" href="#__codelineno-29-30"></a><span class="s2">    """</span><span class="p">)</span>
-</span><span id="__span-29-31"><a id="__codelineno-29-31" name="__codelineno-29-31" href="#__codelineno-29-31"></a>
-</span><span id="__span-29-32"><a id="__codelineno-29-32" name="__codelineno-29-32" href="#__codelineno-29-32"></a>    <span class="nb">print</span><span class="p">(</span><span class="n">monthly</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
-</span><span id="__span-29-33"><a id="__codelineno-29-33" name="__codelineno-29-33" href="#__codelineno-29-33"></a>
-</span><span id="__span-29-34"><a id="__codelineno-29-34" name="__codelineno-29-34" href="#__codelineno-29-34"></a>    <span class="c1"># Initialize FTS for product search</span>
-</span><span id="__span-29-35"><a id="__codelineno-29-35" name="__codelineno-29-35" href="#__codelineno-29-35"></a>    <span class="n">client</span><span class="o">.</span><span class="n">init_fts</span><span class="p">(</span><span class="n">index_fields</span><span class="o">=</span><span class="p">[</span><span class="s2">"product"</span><span class="p">])</span>
-</span><span id="__span-29-36"><a id="__codelineno-29-36" name="__codelineno-29-36" href="#__codelineno-29-36"></a>
-</span><span id="__span-29-37"><a id="__codelineno-29-37" name="__codelineno-29-37" href="#__codelineno-29-37"></a>    <span class="c1"># Search products</span>
-</span><span id="__span-29-38"><a id="__codelineno-29-38" name="__codelineno-29-38" href="#__codelineno-29-38"></a>    <span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">search_and_retrieve</span><span class="p">(</span><span class="s2">"A"</span><span class="p">)</span>
-</span><span id="__span-29-39"><a id="__codelineno-29-39" name="__codelineno-29-39" href="#__codelineno-29-39"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Found </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">results</span><span class="p">)</span><span class="si">}</span><span class="s2"> records"</span><span class="p">)</span>
-</span><span id="__span-29-40"><a id="__codelineno-29-40" name="__codelineno-29-40" href="#__codelineno-29-40"></a>
-</span><span id="__span-29-41"><a id="__codelineno-29-41" name="__codelineno-29-41" href="#__codelineno-29-41"></a>    <span class="c1"># Cleanup</span>
-</span><span id="__span-29-42"><a id="__codelineno-29-42" name="__codelineno-29-42" href="#__codelineno-29-42"></a>    <span class="n">client</span><span class="o">.</span><span class="n">drop_fts</span><span class="p">()</span>
-</span><span id="__span-29-43"><a id="__codelineno-29-43" name="__codelineno-29-43" href="#__codelineno-29-43"></a>
-</span><span id="__span-29-44"><a id="__codelineno-29-44" name="__codelineno-29-44" href="#__codelineno-29-44"></a><span class="c1"># Client automatically closed</span>
+</span><span id="__span-29-21"><a id="__codelineno-29-21" name="__codelineno-29-21" href="#__codelineno-29-21"></a>    <span class="c1"># Query analytics (group by the stored date value; format months in Python</span>
+</span><span id="__span-29-22"><a id="__codelineno-29-22" name="__codelineno-29-22" href="#__codelineno-29-22"></a>    <span class="c1"># with the DataFrame if you need a "%Y-%m" bucket)</span>
+</span><span id="__span-29-23"><a id="__codelineno-29-23" name="__codelineno-29-23" href="#__codelineno-29-23"></a>    <span class="n">monthly</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">"""</span>
+</span><span id="__span-29-24"><a id="__codelineno-29-24" name="__codelineno-29-24" href="#__codelineno-29-24"></a><span class="s2">        SELECT </span>
+</span><span id="__span-29-25"><a id="__codelineno-29-25" name="__codelineno-29-25" href="#__codelineno-29-25"></a><span class="s2">            date as day,</span>
+</span><span id="__span-29-26"><a id="__codelineno-29-26" name="__codelineno-29-26" href="#__codelineno-29-26"></a><span class="s2">            SUM(revenue) as total_revenue,</span>
+</span><span id="__span-29-27"><a id="__codelineno-29-27" name="__codelineno-29-27" href="#__codelineno-29-27"></a><span class="s2">            AVG(quantity) as avg_quantity</span>
+</span><span id="__span-29-28"><a id="__codelineno-29-28" name="__codelineno-29-28" href="#__codelineno-29-28"></a><span class="s2">        FROM sales</span>
+</span><span id="__span-29-29"><a id="__codelineno-29-29" name="__codelineno-29-29" href="#__codelineno-29-29"></a><span class="s2">        GROUP BY day</span>
+</span><span id="__span-29-30"><a id="__codelineno-29-30" name="__codelineno-29-30" href="#__codelineno-29-30"></a><span class="s2">        ORDER BY day</span>
+</span><span id="__span-29-31"><a id="__codelineno-29-31" name="__codelineno-29-31" href="#__codelineno-29-31"></a><span class="s2">    """</span><span class="p">)</span>
+</span><span id="__span-29-32"><a id="__codelineno-29-32" name="__codelineno-29-32" href="#__codelineno-29-32"></a>
+</span><span id="__span-29-33"><a id="__codelineno-29-33" name="__codelineno-29-33" href="#__codelineno-29-33"></a>    <span class="nb">print</span><span class="p">(</span><span class="n">monthly</span><span class="o">.</span><span class="n">to_pandas</span><span class="p">())</span>
+</span><span id="__span-29-34"><a id="__codelineno-29-34" name="__codelineno-29-34" href="#__codelineno-29-34"></a>
+</span><span id="__span-29-35"><a id="__codelineno-29-35" name="__codelineno-29-35" href="#__codelineno-29-35"></a>    <span class="c1"># Initialize FTS for product search</span>
+</span><span id="__span-29-36"><a id="__codelineno-29-36" name="__codelineno-29-36" href="#__codelineno-29-36"></a>    <span class="n">client</span><span class="o">.</span><span class="n">init_fts</span><span class="p">(</span><span class="n">index_fields</span><span class="o">=</span><span class="p">[</span><span class="s2">"product"</span><span class="p">])</span>
+</span><span id="__span-29-37"><a id="__codelineno-29-37" name="__codelineno-29-37" href="#__codelineno-29-37"></a>
+</span><span id="__span-29-38"><a id="__codelineno-29-38" name="__codelineno-29-38" href="#__codelineno-29-38"></a>    <span class="c1"># Search products</span>
+</span><span id="__span-29-39"><a id="__codelineno-29-39" name="__codelineno-29-39" href="#__codelineno-29-39"></a>    <span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">search_and_retrieve</span><span class="p">(</span><span class="s2">"A"</span><span class="p">)</span>
+</span><span id="__span-29-40"><a id="__codelineno-29-40" name="__codelineno-29-40" href="#__codelineno-29-40"></a>    <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">"Found </span><span class="si">{</span><span class="nb">len</span><span class="p">(</span><span class="n">results</span><span class="p">)</span><span class="si">}</span><span class="s2"> records"</span><span class="p">)</span>
+</span><span id="__span-29-41"><a id="__codelineno-29-41" name="__codelineno-29-41" href="#__codelineno-29-41"></a>
+</span><span id="__span-29-42"><a id="__codelineno-29-42" name="__codelineno-29-42" href="#__codelineno-29-42"></a>    <span class="c1"># Cleanup</span>
+</span><span id="__span-29-43"><a id="__codelineno-29-43" name="__codelineno-29-43" href="#__codelineno-29-43"></a>    <span class="n">client</span><span class="o">.</span><span class="n">drop_fts</span><span class="p">()</span>
+</span><span id="__span-29-44"><a id="__codelineno-29-44" name="__codelineno-29-44" href="#__codelineno-29-44"></a>
+</span><span id="__span-29-45"><a id="__codelineno-29-45" name="__codelineno-29-45" href="#__codelineno-29-45"></a><span class="c1"># Client automatically closed</span>
 </span></code></pre></div>
 <hr />
 <h2 id="file-reading-table-functions">File Reading Table Functions<a class="headerlink" href="#file-reading-table-functions" title="Permanent link">&para;</a></h2>
@@ -3675,20 +3760,23 @@ recall tradeoffs, automatic maintenance, and deletion constraints.</p>
 <h2 id="api-summary">API Summary<a class="headerlink" href="#api-summary" title="Permanent link">&para;</a></h2>
 <h3 id="apexclient-methods">ApexClient Methods<a class="headerlink" href="#apexclient-methods" title="Permanent link">&para;</a></h3>
 <p><strong>Initialization:</strong> <code>__init__</code>, <code>create_clean</code>, <code>close</code></p>
-<p><strong>Table Management:</strong> <code>use_table</code>, <code>create_table</code>, <code>drop_table</code>, <code>list_tables</code>, <code>current_table</code></p>
-<p><strong>Data Storage:</strong> <code>store</code>, <code>from_pandas(df, table_name=)</code>, <code>from_polars(df, table_name=)</code>, <code>from_pyarrow(table, table_name=)</code></p>
+<p><strong>Databases And Sessions:</strong> <code>use_database</code>, <code>use</code>, <code>list_databases</code>, <code>current_database</code>, <code>use_table</code>, <code>create_table</code>, <code>drop_table</code>, <code>list_tables</code>, <code>current_table</code></p>
+<p><strong>Data Storage:</strong> <code>store</code>, <code>store_durable_one</code>, <code>from_pandas(df, table_name=)</code>, <code>from_polars(df, table_name=)</code>, <code>from_pyarrow(table, table_name=)</code>, <code>from_lance</code>, <code>to_lance</code></p>
+<p><strong>Batched And Buffered Writes:</strong> <code>execute_batch</code>, <code>execute_batch_parallel</code>, <code>begin_buffered_writes</code>, <code>end_buffered_writes</code>, <code>flush_buffered_writes</code>, <code>buffered_write_count</code></p>
 <p><strong>Query:</strong> <code>execute</code>, <code>query</code>, <code>retrieve</code>, <code>retrieve_many</code>, <code>retrieve_all</code>, <code>count_rows</code></p>
-<p><strong>Vector Search:</strong> <code>topk_distance(col, query, k=10, metric='l2', id_col='_id', dist_col='dist')</code>, <code>batch_topk_distance(col, queries, k=10, metric='l2')</code></p>
+<p><strong>Vector Search:</strong> <code>topk_distance(col, query, k=10, metric='l2', id_col='_id', dist_col='dist')</code>, <code>batch_topk_distance(col, queries, k=10, metric='l2')</code>, <code>create_quantized_column(source, target=None, codec='turboquant4')</code>, <code>drop_quantized_column(target)</code></p>
 <p><strong>Modification:</strong> <code>replace</code>, <code>batch_replace</code>, <code>delete</code></p>
-<p><strong>Columns:</strong> <code>add_column</code>, <code>drop_column</code>, <code>rename_column</code>, <code>get_column_dtype</code>, <code>list_fields</code></p>
-<p><strong>FTS:</strong> <code>init_fts</code>, <code>search_text</code>, <code>fuzzy_search_text</code>, <code>search_and_retrieve</code>, <code>search_and_retrieve_top</code>, <code>get_fts_stats</code>, <code>disable_fts</code>, <code>drop_fts</code></p>
+<p><strong>Columns:</strong> <code>add_column</code>, <code>drop_column</code>, <code>rename_column</code>, <code>get_column_dtype</code>, <code>list_fields</code>, <code>set_compression</code>, <code>get_compression</code></p>
+<p><strong>Files:</strong> <code>register_temp_table</code>, <code>drop_temp_table</code></p>
+<p><strong>FTS:</strong> <code>init_fts</code>, <code>search_text</code>, <code>search_text_with_scores</code>, <code>fuzzy_search_text</code>, <code>search_and_retrieve</code>, <code>search_and_retrieve_top</code>, <code>get_fts_stats</code>, <code>set_fts_fuzzy_config</code>, <code>compact_fts_index</code>, <code>warmup_fts_terms</code>, <code>disable_fts</code>, <code>drop_fts</code></p>
 <p><strong>Utility:</strong> <code>flush</code>, <code>flush_cache</code>, <code>set_auto_flush</code>, <code>get_auto_flush</code>, <code>estimate_memory_bytes</code>, <code>optimize</code></p>
 <h3 id="resultview-methods">ResultView Methods<a class="headerlink" href="#resultview-methods" title="Permanent link">&para;</a></h3>
-<p><strong>Conversion:</strong> <code>to_pandas</code>, <code>to_polars</code>, <code>to_arrow</code>, <code>to_dict</code></p>
+<p><strong>Conversion:</strong> <code>to_pandas</code>, <code>to_polars</code>, <code>to_arrow</code>, <code>to_dict</code>, <code>tolist</code>, <code>to_lance</code></p>
+<p><strong>Streaming:</strong> <code>to_record_batches</code>, <code>iter_batches</code></p>
 <p><strong>Access:</strong> <code>scalar</code>, <code>first</code>, <code>get_ids</code>, <code>__len__</code>, <code>__iter__</code>, <code>__getitem__</code></p>
 <p><strong>Properties:</strong> <code>shape</code>, <code>columns</code></p>
 <hr />
-<p><em>This documentation covers 100% of the public ApexBase Python API.</em></p>
+<p><em>This page covers the core public ApexBase Python API; <code>docs/API_REFERENCE.md</code> is the authoritative signature-level reference.</em></p>
 
 
 

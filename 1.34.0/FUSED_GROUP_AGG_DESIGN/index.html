@@ -15,6 +15,10 @@
         <link rel="canonical" href="https://birchkwok.github.io/apexbase/1.34.0/FUSED_GROUP_AGG_DESIGN/">
       
       
+        <link rel="prev" href="../RESOURCE_OWNERSHIP/">
+      
+      
+        <link rel="next" href="../ENGINEERING_GUIDELINES/">
       
       
         
@@ -25,7 +29,7 @@
     
     
       
-        <title>Fused Filter + GROUP BY Design (Boolean 6.4x 专项) - ApexBase</title>
+        <title>Fused Filter + GROUP BY Design - ApexBase</title>
       
     
     
@@ -115,7 +119,7 @@
         <div class="md-header__topic" data-md-component="header-topic">
           <span class="md-ellipsis">
             
-              Fused Filter + GROUP BY Design (Boolean 6.4x 专项)
+              Fused Filter + GROUP BY Design
             
           </span>
         </div>
@@ -353,10 +357,12 @@
   
   
   
+    
+  
   
     
     
-      <li class="md-tabs__item">
+      <li class="md-tabs__item md-tabs__item--active">
         <a href="../STORAGE_ARCHITECTURE/" class="md-tabs__link">
           
   
@@ -1117,26 +1123,31 @@
       
   
   
+    
   
   
+  
     
     
     
     
+      
+        
+        
       
       
         
       
     
     
-    <li class="md-nav__item md-nav__item--nested">
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
       
         
         
-        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" >
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" checked>
         
           
-          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="0">
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="">
             
   
   
@@ -1154,7 +1165,7 @@
             <span class="md-nav__icon md-icon"></span>
           </label>
         
-        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="false">
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="true">
           <label class="md-nav__title" for="__nav_7">
             <span class="md-nav__icon md-icon"></span>
             
@@ -1216,6 +1227,342 @@
   
 
       </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../READ_PATH_CAPABILITIES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#problem" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Problem
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#verified-cost-breakdown-1m-rows-no-cache" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Verified cost breakdown (1M rows, no cache)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#design-principles" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Design principles
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#phase-1-generic-pipeline-quick-wins" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 1 — generic pipeline quick wins
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Phase 1 — generic pipeline quick wins">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#p11-mixed-projection-dictionary-gather" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        P1.1 Mixed-projection dictionary gather
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#p12-dictionary-level-ineq-in-morsel-re-evaluation" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        P1.2 Dictionary-level IN/Eq in morsel re-evaluation
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#p13-primitive-gather-layout" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        P1.3 Primitive gather layout
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#phase-2-fused-predicate-lane-aggregation-kernel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 2 — fused predicate-lane aggregation kernel
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Phase 2 — fused predicate-lane aggregation kernel">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#kernel" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Kernel
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#gate-in-try_fast_numeric_filter_group_by-generalized" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Gate (in try_fast_numeric_filter_group_by, generalized)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#expected-result" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Expected result
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#phase-3-lut-truth-table-fast-lane-decode" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Phase 3 — LUT truth table + fast lane decode
+      
+    </span>
+  </a>
+  
+    <nav class="md-nav" aria-label="Phase 3 — LUT truth table + fast lane decode">
+      <ul class="md-nav__list">
+        
+          <li class="md-nav__item">
+  <a href="#p31-lut-truth-table-fast-path" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        P3.1 LUT truth-table fast path
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#p32-in-place-lane-views-no-per-rg-materialization" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        P3.2 In-place lane views (no per-RG materialization)
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
+  <a href="#measured-1m-rows-no-cache-probe-query" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Measured (1M rows, no cache, probe query)
+      
+    </span>
+  </a>
+  
+</li>
+        
+      </ul>
+    </nav>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#testing-and-acceptance-per-phase-per-agentsmd" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Testing and acceptance (per phase, per AGENTS.md)
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#risk-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Risk notes
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
     </li>
   
 
@@ -1384,6 +1731,46 @@
   
 
 
+  <nav class="md-path" aria-label="Navigation" >
+    <ol class="md-path__list">
+      
+        
+  
+  
+    <li class="md-path__item">
+      <a href=".." class="md-path__link">
+        
+  <span class="md-ellipsis">
+    Home
+  </span>
+
+      </a>
+    </li>
+  
+
+      
+      
+        
+  
+  
+    
+    
+      <li class="md-path__item">
+        <a href="../STORAGE_ARCHITECTURE/" class="md-path__link">
+          
+  <span class="md-ellipsis">
+    Internals
+  </span>
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ol>
+  </nav>
+
               
               <article class="md-content__inner md-typeset">
                 
@@ -1395,7 +1782,8 @@
 
 
 <h1 id="fused-filter-group-by-design-boolean-64x">Fused Filter + GROUP BY Design (Boolean 6.4x 专项)<a class="headerlink" href="#fused-filter-group-by-design-boolean-64x" title="Permanent link">&para;</a></h1>
-<p>Status: complete (2026-09, Phases 1-3 merged into the v1.33.x working tree)</p>
+<p>Status: complete — Phases 1-3 merged and released in v1.33.1; unchanged through
+v1.34.0 (2026-09-20).</p>
 <h2 id="problem">Problem<a class="headerlink" href="#problem" title="Permanent link">&para;</a></h2>
 <p>No-cache benchmark metric <code>Boolean Filter+GROUP+HAVING+TopK</code>:</p>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-0-1"><a id="__codelineno-0-1" name="__codelineno-0-1" href="#__codelineno-0-1"></a><span class="k">SELECT</span><span class="w"> </span><span class="n">city</span><span class="p">,</span><span class="w"> </span><span class="k">COUNT</span><span class="p">(</span><span class="o">*</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">n</span><span class="p">,</span><span class="w"> </span><span class="k">AVG</span><span class="p">(</span><span class="n">score</span><span class="p">)</span><span class="w"> </span><span class="k">AS</span><span class="w"> </span><span class="n">av</span>
@@ -1612,6 +2000,10 @@ into a truth table over <code>(comparison bits, group id)</code>:</p>
 <p>Public benchmark (no cache, 1M rows): the metric moved from 37.2 ms
 (6.4x slower than DuckDB) to 5.55 ms vs DuckDB 5.76 ms — now the winner.
 Tabular fair scoreboard: 103/103 (was 101/103).</p>
+<p>Current no-cache results for the same metric: 3.98 ms vs DuckDB 5.68 ms in the
+v1.33.1 snapshot, and 4.01 ms vs DuckDB 5.75 ms in the v1.34.0 snapshot, with
+103/103 tabular wins in both. The table above records the phase-3 measurement
+taken during v1.33.0 development and is kept as the design record.</p>
 <h2 id="testing-and-acceptance-per-phase-per-agentsmd">Testing and acceptance (per phase, per AGENTS.md)<a class="headerlink" href="#testing-and-acceptance-per-phase-per-agentsmd" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Rust unit tests: kernel vs generic pipeline on random predicate trees
