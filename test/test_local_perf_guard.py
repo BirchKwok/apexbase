@@ -1,4 +1,8 @@
 import importlib.util
+import hashlib
+import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -195,3 +199,102 @@ def test_commit_canary_runs_real_wal_commit_and_reopen():
     assert len(results) == 1
     assert results[0]["query"] == "Rust Safe TXN INSERT 10 + COMMIT"
     assert results[0]["ApexBase"] > 0
+
+
+def test_guard_evidence_records_real_dirty_tree(local_guard, tmp_path):
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    def git(*args):
+        return subprocess.run(
+            ("git", *args), cwd=tree, check=True, capture_output=True,
+        )
+
+    git("init")
+    (tree / "tracked.py").write_text("before\n")
+    (tree / "deleted.py").write_text("removed\n")
+    (tree / ".gitignore").write_text("Cargo.lock\nignored\n")
+    git("add", ".")
+    git("-c", "user.name=Evidence Test", "-c", "user.email=test@example.invalid",
+        "commit", "-m", "base")
+    (tree / "tracked.py").write_text("after\n")
+    (tree / "deleted.py").unlink()
+    (tree / "new.bin").write_bytes(b"\x00\xff\x01")
+    (tree / "ignored").write_text("not an input\n")
+    (tree / "Cargo.lock").write_text("lock input\n")
+    (tree / "link").symlink_to("tracked.py")
+    (tree / "tracked.py").chmod(0o755)
+    reports = tmp_path / "reports"
+    reports.mkdir()
+    evidence = local_guard.GateEvidence(reports, {"base_commit": "test"})
+    evidence.source("current", tree)
+    evidence.lockfile("current", tree)
+    inventory = json.loads((reports / "source-current.json").read_text())
+    assert inventory["tracked.py"] == {
+        "sha256": hashlib.sha256(b"after\n").hexdigest(), "executable": True,
+    }
+    assert inventory["new.bin"]["sha256"] == hashlib.sha256(b"\x00\xff\x01").hexdigest()
+    assert inventory["link"] == {"symlink": "tracked.py"}
+    assert "deleted.py" not in inventory
+    assert "ignored" not in inventory
+    assert (reports / "Cargo-current.lock").read_bytes() == (tree / "Cargo.lock").read_bytes()
+    patch = (reports / "source-current.patch").read_text()
+    assert "-before" in patch and "+after" in patch and "deleted.py" in patch
+    first = evidence.data["sources"]["current"]["inventory_sha256"]
+    evidence.source("current", tree)
+    assert evidence.data["sources"]["current"]["inventory_sha256"] == first
+    (tree / "new.bin").write_bytes(b"different")
+    evidence.source("current", tree)
+    assert evidence.data["sources"]["current"]["inventory_sha256"] != first
+
+
+@pytest.mark.parametrize("outcome,status", [
+    (0, "passed"), (1, "regressed"), (2, "error"), (130, "interrupted"),
+])
+def test_guard_main_persists_outcomes(local_guard, tmp_path, monkeypatch, outcome, status):
+    # Exercise CLI state/error handling without running an expensive build;
+    # source provenance above uses real Git and the real filesystem.
+    monkeypatch.setattr(local_guard.shutil, "which", lambda _: sys.executable)
+    def execute(args, directory, evidence):
+        initial = json.loads((directory / "run-manifest.json").read_text())
+        assert initial["status"] == "running" and initial["exit_code"] is None
+        evidence.comparison("comparison-initial", 1)
+        if outcome == 130:
+            raise KeyboardInterrupt
+        if outcome == 2:
+            raise subprocess.CalledProcessError(7, ["failed-build"])
+        evidence.comparison("comparison", outcome)
+        return outcome
+    monkeypatch.setattr(local_guard, "execute_gate", execute)
+    directory = tmp_path / "reports"
+    assert local_guard.main(["--base-ref", "HEAD", "--output-dir", str(directory)]) == outcome
+    report = json.loads((directory / "run-manifest.json").read_text())
+    assert report["status"] == status and report["exit_code"] == outcome
+    assert report["comparisons"]["comparison-initial"] == 1
+    assert report["finished_at"] >= report["started_at"]
+    assert report["base_commit"] == report["current_commit"]
+    assert report["arguments"]["settle_seconds"] == 30
+    if outcome == 2:
+        assert report["failed_command_exit_code"] == 7
+        assert "failed-build" in report["error"]
+    assert not (directory / "run-manifest.json.tmp").exists()
+
+
+def test_guard_evidence_wheel_and_incomplete_state(local_guard, tmp_path):
+    evidence = local_guard.GateEvidence(tmp_path, {})
+    wheel = tmp_path / "example.whl"
+    wheel.write_bytes(b"wheel artifact")
+    evidence.wheel("current", wheel)
+    report = json.loads((tmp_path / "run-manifest.json").read_text())
+    assert report["status"] == "running" and report["exit_code"] is None
+    assert report["wheels"]["current"] == {
+        "name": wheel.name, "sha256": hashlib.sha256(b"wheel artifact").hexdigest(),
+    }
+
+
+def test_guard_evidence_keeps_incompatible_report_status(local_guard, tmp_path):
+    evidence = local_guard.GateEvidence(tmp_path, {})
+    evidence.comparison("comparison", 2)
+    evidence.finish(2)
+    report = json.loads((tmp_path / "run-manifest.json").read_text())
+    assert report["comparisons"] == {"comparison": 2}
+    assert report["status"] == "error" and report["exit_code"] == 2
