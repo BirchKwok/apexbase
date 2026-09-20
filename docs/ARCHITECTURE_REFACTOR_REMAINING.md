@@ -32,6 +32,10 @@ canary `local-perf-results/20260910-152709/` 五样本最终仍有 3 项回退�
 最新 S3 见第 10 节：`local-perf-results/s3-acceptance-20260917/`（功能链全过；
 canary 两轮与 full 主比较在 host load 5.7-12.0 下标记同一类聚合/集合形状，
 登记为环境受限原始例外，干净机器复核列为验收债务 V1）。
+最新收口见第 15 节（2026-09-20）：Q2 环境指纹已实现（schema v3，异环境 sidecar
+忽略）；未落盘内存追加行的读取边界已冻结并修复 `pending_v4_in_memory_rows()` 的
+陈旧 footer 误判（含 footer 读锁重入死锁）；S2 G2/G3、M1 backend 拆分、E1 均给出
+评审结论与触发条件，不再以“待实施”搁置。
 最新 M1 见第 14 节：`local-perf-results/m1-acceptance-20260919/`（读取可见状态与
 能力/回退表单源；pytest 1803、cargo 594+6、flight 598+6、公开 benchmark 103/103
 `slower=0`、canary 重跑 exit 0；full 两轮原始 exit 1，两轮标记互不相同的指标并
@@ -60,12 +64,12 @@ COLUMN` 0.0506ms vs SQLite 0.0597ms），向量/量化各 6/6。
 | 2 | P0 / C2 | UPDATE、Safe/Max 与恢复一致性 | 沿 WAL/数据/索引/水位画时序；补真实 UPDATE 和 fsync 失败测试；保证或明确拒绝无法支持的语义；文件格式变化独立设计 | C2.1–C2.3 已实现，功能验收完成；性能证据已收口并登记 full 原始噪音例外；C3 可开始 |
 | 3 | P0 / C3 | 跨表与索引恢复契约 | 覆盖各表 marker 间故障、索引保存失败及 compact 后重开；明确按表收敛与原子提交区别；若引入数据库提交记录，先完成兼容与恢复设计 | C3.1–C3.2 已实现并完成最终统一验收（full 原始噪音例外见 7.3）；S1 可开始 |
 | 4 | P1 / S1 | 查询内存预算与资源准入 | 先约束高基数聚合及并行局部状态；预算按字节计量，超预算明确报错或走已验证回退；取消和失败释放资源；峰值 RSS/并发/回收验收 | S1.1–S1.3 已实现并完成最终统一验收（2026-09-17，canary/full 对 base `2c2e471` 均 exit 0）；S2/S3 可开始 |
-| 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | G1 已逐项关闭（含清单更正、CTE 泄漏修复、planner 缓存上限），G2/G3 仍按独立评审保留；已通过最终统一验收（2026-09-17，canary/full 对 base `0059029` 均 exit 0）；S3 可开始 |
-| 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 已实现并功能验证（流式执行、有界通道、schema 缓存、Rust/Python 测试）；本轮性能门禁在机器高负载下登记为环境受限原始例外，待干净机器复核（V1）；Q1 可开始但需携带该债务 |
-| 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | selection 直接消费与验证矩阵已实现并验收通过（2026-09-17，canary/full 对 base `eb44b85` 均 exit 0）；base+delta 行组流式读视图已实现（基础 mmap 行组流 + DeltaStore 快照按批打补丁 + 尾部追加，2026-09-19，见 11.3）；持久化删除向量与覆盖层并存时的合并读行空间缺口已修复（见 11.5/11.7），该组合现在也流式且与单批读一致；full 门禁 exit 0，canary 原始 exit 1 为已证实的环境受限例外 |
-| 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 契约已文档化（仅显式校准、成本/时间单位分层）；schema 变化清理反馈已实现并验收；数据老化按滑动均值+容量上限处理；环境指纹与时间衰减登记为后续。canary exit 0，full 原始 exit 1 为环境受限例外（第 13 节）。benchmark 15 个 workload 全部 slower=0 |
-| 9 | P2 / M1 | 剩余职责与文档收敛 | 以重复决策/依赖减少为标准拆 backend 和路由；能力表、限制和 fallback 单源；不按行数制造抽象 | 读取可见状态判定与能力/回退表已单源（`OverlayState` + `docs/READ_PATH_CAPABILITIES.md`，替换 19 处重复表达式）；backend 职责拆分与 E1 按 14.2 的边界保留。公开 benchmark 103/103、canary exit 0；full 原始 exit 1 为已证实的环境受限例外（第 14 节） |
-| 10 | P2 / E1 | 需求驱动扩展 | 有容量/工作负载证据后独立设计外部执行、复杂 Join、向量组合等 | 按需 |
+| 5 | P1 / S2 | 缓存容量与状态 owner | 逐项关闭 RESOURCE_OWNERSHIP 的 G1/G2/G3；保留 epoch 引用缓存；无新全局大锁；close/reopen/跨客户端/跨进程/持有结果生命周期测试 | G1 已逐项关闭（含清单更正、CTE 泄漏修复、planner 缓存上限）；G2/G3 已独立评审并登记为非阻塞项 + 触发条件（15.3），非正确性/容量缺口；已通过最终统一验收（2026-09-17，canary/full 对 base `0059029` 均 exit 0） |
+| 6 | P1 / S3 | Flight 分批桥接与协议资源边界 | 查询执行至输出端有界；慢消费者背压、断连取消；schema 请求避免重复完整执行；不为嵌入式点查增加固定锁成本 | 已实现并功能验证（流式执行、有界通道、schema 缓存、Rust/Python 测试）；后续批次已在 full 完整模式多次 exit 0（11.7、14.3），canary 的 host-load 干扰按 V1 记录（15.5） |
+| 7 | P1 / Q1 | 完善分批物理执行 | base+delta 稳定读视图；selection 直接消费，减少 gather；扩展形状前验证 NULL/UInt64/精确整数/更新删除/schema 一致性 | selection 直接消费与验证矩阵已实现并验收通过（2026-09-17，canary/full 对 base `eb44b85` 均 exit 0）；base+delta 行组流式读视图已实现（基础 mmap 行组流 + DeltaStore 快照按批打补丁 + 尾部追加，2026-09-19，见 11.3）；持久化删除向量与覆盖层并存时的合并读行空间缺口已修复（见 11.5/11.7），该组合现在也流式且与单批读一致；未落盘内存追加行的读取边界已冻结并测试，缺“持久化基础视图未变”证据前不接入流式（15.2） |
+| 8 | P1 / Q2 | 成本反馈与自动并行契约 | 明确只由 EXPLAIN ANALYZE 校准的当前行为；评估低开销采样或保持显式校准；处理数据/schema/环境变化及历史样本老化；统一候选成本单位 | 契约已文档化（仅显式校准、成本/时间单位分层）；schema 变化清理反馈已实现并验收；数据老化按滑动均值+容量上限处理并关闭；**环境指纹已实现**（OS/arch/并行度 + schema v3，异环境/旧版本 sidecar 一律忽略，15.1）。canary exit 0，full 原始 exit 1 为环境受限例外（第 13 节）。benchmark 15 个 workload 全部 slower=0 |
+| 9 | P2 / M1 | 剩余职责与文档收敛 | 以重复决策/依赖减少为标准拆 backend 和路由；能力表、限制和 fallback 单源；不按行数制造抽象 | 读取可见状态判定与能力/回退表已单源（`OverlayState` + `docs/READ_PATH_CAPABILITIES.md`，替换 19 处重复表达式）；backend 职责拆分已评审并登记触发条件（15.4）。公开 benchmark 103/103、canary exit 0；full 原始 exit 1 为已证实的环境受限例外（第 14 节） |
+| 10 | P2 / E1 | 需求驱动扩展 | 有容量/工作负载证据后独立设计外部执行、复杂 Join、向量组合等 | 按需：触发条件为明确需求 + 基准数据（15.5），当前无证据，不实施 |
 
 验收债务 V1 贯穿每批：保留历史失败，每个独立交付批次的最终代码必须重新完成规定验收。
 不得用新 base 抹掉历史未通过结论；本轮 base 用起点 SHA 衡量新增修改，历史 R5.12 canary 仍单独登记为未通过。
@@ -1051,3 +1055,92 @@ exit 1 属已证实的环境受限例外（两轮指标互不相同、样本双�
 
 M1 状态：读取路径的可见状态判定、能力表与 fallback 目标已单源；余项（backend
 职责拆分、E1）按上面 14.2 的边界继续保留。
+
+## 15. 剩余项收口（2026-09-20）
+
+本节逐项关闭第 2 节表中仍未关闭的工作。原则：能落地且有验收的落地；属于架构迁移的
+给出评审结论、owner 与触发条件；没有证据的按需项明确触发条件，不再以“待实施”搁置。
+
+### 15.1 Q2 环境指纹（已完成）
+
+`PersistedPlanFeedback` 增加 `fingerprint`（OS / arch / 可用并行度），
+`FEEDBACK_SCHEMA_VERSION` 2→3；指纹不匹配或版本不匹配一律按“无持久化反馈”处理，
+该形状在下一次 EXPLAIN ANALYZE 重新校准。测试
+`plan_feedback_from_another_environment_is_ignored` 覆盖：异环境指纹被忽略、同环境
+正常加载、旧版本（无指纹）文件被忽略。Q2 的**时间衰减**按 13.2 的结论关闭：滑动
+均值 + 容量上限已限制陈旧样本的影响，不为规划读路径引入时钟与分支。
+
+### 15.2 Q1 未落盘内存追加行（边界冻结 + 缺陷修复）
+
+`pending_v4_in_memory_rows() > 0` 时读取仍走单批合并路径，正确性由新增测试
+`pending_in_memory_rows_read_correctly_on_the_single_shot_lane` 固定（1002 行、
+id 与值对齐、`scan_batches` 明确返回 `None`）。**不接入行组流的原因**是缺少
+“持久化基础未被就地改写”的不变量：内存缓冲区是权威视图，若其中基础行与 mmap
+不一致（未落盘的就地更新），基础流 + 内存尾部会混读。触发条件是出现可用的
+“持久化基础视图代际”证据。
+
+同批修复两个真实缺陷（均由上面的新测试暴露）：
+
+- `pending_v4_in_memory_rows()` 在缓存 footer 为空（save 后的旧占位 footer）时把
+  整个已加载基础当作待落盘行返回。后果：流式与点查快路径被无谓拒绝；
+  `save()` 的第二次调用可能因此走 spill 路径。改为：缓存 footer 无行时重新加载
+  一次（并缓存新 footer），随后按物理基础行数计算待落盘行。
+- 该重载不能持有 `ids` / `v4_footer` 读守卫：footer 重载会取 footer 写锁，读锁未
+  释放即重入写锁会死锁。改为先取出 `(ids_len, first_id)` 再释放守卫。
+- 新增 `footer_physical_rows(&V4Footer)` 作为“footer 物理行数”的单源（与
+  `persisted_physical_base_row_count` 同口径）。
+
+### 15.3 S2 G2/G3（评审结论：保留为非阻塞项）
+
+- **G2**（`StorageEngine.cache` 与执行器 `STORAGE_CACHE` 双读 backend 缓存）：两者
+  语义相同（LRU + epoch/mtime 失效）但入口不同；合并需要迁移全部查询热路径的
+  backend 获取。这是性能/结构优化，不是正确性或容量缺口（G1 已在 S2 关闭）。触发
+  条件：出现因双缓存不一致导致的可复现缺陷，或读路径统一改造批次；在此之前由
+  `test_cache_invalidation_contract.py` 的 close/reopen、跨客户端与外部进程改写
+  覆盖一致性。
+- **G3**（调度器 thread-local）：只有初始化线程能提交任务，是 `RESOURCE_OWNERSHIP`
+  §1.6 已文档化的约束；进程级共享需要独立设计工作线程池归属、`Drop` 关闭语义与
+  Flight `spawn_blocking` 的交互。触发条件：出现跨线程提交需求，或调度器成为
+  可测量瓶颈。
+
+### 15.4 M1 backend 职责拆分（保留，需复用方触发）
+
+`include!` 分文件是编译期组织，不构成依赖解耦；按“不按行数制造抽象”的原则，拆分
+的触发条件是出现第二个复用方，或出现同一决策在两处漂移的证据。本轮已把“读取可见
+状态”这一真实重复决策单源化（第 14 节），未制造新的抽象层。
+
+### 15.5 E1 与 V1
+
+- **E1**（外部聚合/排序/Join、FTS/向量组合、构建 feature）：按需，无容量或工作负载
+  证据，不实施；触发条件是明确需求与基准数据。
+- **V1**（空闲窗口绿色门禁）：2026-09-19/20 的多个批次已在 full 完整模式多次 exit 0
+  （见 11.7、14.3），canary 仍受 host load 干扰；本轮在最终修订上继续复核，原始退出
+  状态与报告见本节末（结论只按原始报告表述）。
+
+### 15.6 测试与验收（2026-09-20）
+
+报告目录 `local-perf-results/remaining-acceptance-20260920/`，base `4d85ed2`。
+
+- 功能：`maturin develop --release` 成功；完整串行 `pytest` **1804 passed**
+  （35.06 s，新增 `test_repeated_flush_after_in_memory_appends_does_not_duplicate_rows`）；
+  `cargo test --release` **596** 单元 + 6 doc-test；`--features flight` **600** 单元。
+- 公开 benchmark：`public-bench-rerun.json` 本次运行 **103/103** 表格 fair detail
+  全部 `slower=0`，向量 6/6、量化 6/6。同修订在高负载下的一次运行只标记 1 项
+  near-tie（`GROUP BY city ORDER BY count` 2.62ms vs DuckDB 2.59ms），原始报告保留。
+- canary（200K/2/7）：两轮**原始 exit 1**，两轮标记互不相同且都落在已被同构建复测
+  证实为噪音的干净表指标上——第一轮 `Derived ratio GROUP BY` +23.64%（current
+  样本 [0.57, 0.93, 0.64, **2.09**, 0.81] vs base [0.56, 0.60, **1.08**, 0.66, 0.67]）
+  与 `Filtered numeric TopK` +15.03%（base 自身含 4.60ms 尖峰）；第二轮
+  `Numeric GROUP BY (5 funcs)` +92.78%（base [0.97, **3.83**, 1.07, 0.92, 2.03]
+  极差 316%）与 `Table CREATE+DROP cycle` +17.27%（0.35ms 级小指标）。
+  两轮的 delta 重指标与并行指标均通过。
+- full（1M/2/5）**exit 0**：main **109/109**（初判 `GROUP BY category (10 groups)`
+  +99.43% 与 `UNION ALL (ordered)` +18.46% 经五样本终判恢复），qps 10/10、
+  quant 8/8、idx 4/4、par 4/4。
+- V1：full 完整模式在 host load 6–7 下再次转绿；canary 的两轮原始例外与第 12、14 节
+  记录同源（标记集合逐轮不同、样本双侧尖峰、同构建极差 21–316%），继续按环境受限
+  例外登记，空闲窗口复核仍待。
+
+结论：第 15 节的收口项中，Q2 环境指纹与 Q1 未落盘行的缺陷修复均已实现并有 Rust +
+Python 测试；公开 benchmark 全面领先；full 完整门禁 exit 0；canary 原始 exit 1 为
+已证实的环境受限例外。S2 G2/G3、M1 backend 拆分与 E1 保留为带触发条件的登记项。
