@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import os
 import shlex
 import shutil
@@ -18,6 +20,89 @@ ROOT = Path(__file__).resolve().parents[1]
 SAMPLE_ORDER = ("base", "current", "current", "base", "base", "current")
 CONFIRMATION_SAMPLE_ORDER = ("current", "base", "base", "current")
 FULL_QUANT_ROWS = 1_000_000
+
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class GateEvidence:
+    """Persist provenance and raw outcomes outside benchmark timing regions."""
+
+    def __init__(self, directory, metadata):
+        self.directory = directory
+        self.data = {
+            "format_version": 1,
+            **metadata,
+            "status": "running",
+            "exit_code": None,
+            "started_at": datetime.now().astimezone().isoformat(),
+            "comparisons": {},
+            "sources": {},
+            "wheels": {},
+        }
+        self.save()
+
+    def save(self):
+        temporary = self.directory / "run-manifest.json.tmp"
+        temporary.write_text(json.dumps(self.data, indent=2) + "\n", encoding="utf-8")
+        temporary.replace(self.directory / "run-manifest.json")
+
+    def source(self, side, tree):
+        # Record the actual temporary tree, including copied untracked sources.
+        paths = run(
+            ("git", "ls-files", "--cached", "--others", "--exclude-standard", "-z"),
+            cwd=tree, capture=True,
+        ).stdout.split("\0")
+        files = {}
+        for relative in sorted(set(filter(None, paths))):
+            path = tree / relative
+            if path.is_symlink():
+                files[relative] = {"symlink": os.readlink(path)}
+            elif path.is_file():
+                files[relative] = {
+                    "sha256": file_digest(path),
+                    "executable": bool(path.stat().st_mode & 0o111),
+                }
+        inventory = self.directory / f"source-{side}.json"
+        inventory.write_text(json.dumps(files, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+        patch = run(("git", "diff", "--binary", "HEAD"), cwd=tree, capture=True).stdout
+        (self.directory / f"source-{side}.patch").write_text(patch, encoding="utf-8")
+        self.data["sources"][side] = {
+            "inventory": inventory.name,
+            "inventory_sha256": file_digest(inventory),
+            "patch_sha256": file_digest(self.directory / f"source-{side}.patch"),
+        }
+        self.save()
+
+    def lockfile(self, side, tree):
+        # Cargo.lock may be ignored by Git but is part of the actual build input.
+        lock = tree / "Cargo.lock"
+        shutil.copy2(lock, self.directory / f"Cargo-{side}.lock")
+        self.data["sources"][side]["cargo_lock_sha256"] = file_digest(lock)
+        self.save()
+
+    def wheel(self, side, path):
+        self.data["wheels"][side] = {"name": path.name, "sha256": file_digest(path)}
+        self.save()
+
+    def comparison(self, name, returncode):
+        self.data["comparisons"][name] = returncode
+        self.save()
+
+    def finish(self, returncode, error=None):
+        self.data.update(
+            exit_code=returncode,
+            status={0: "passed", 1: "regressed", 130: "interrupted"}.get(returncode, "error"),
+            finished_at=datetime.now().astimezone().isoformat(),
+        )
+        if error is not None:
+            self.data["error"] = str(error)
+        self.save()
 
 
 def run(command, *, cwd=ROOT, env=None, capture=False, check=True):
@@ -172,6 +257,36 @@ def main(argv=None):
     print(f"Current: {current_branch} ({current_commit}){' + local changes' if dirty else ''}")
     print(f"Reports: {output_dir}")
 
+    evidence = GateEvidence(output_dir, {
+        "base_commit": base_commit,
+        "current_commit": current_commit,
+        "current_branch": current_branch,
+        "dirty": dirty,
+        "arguments": {key: str(value) if isinstance(value, Path) else value
+                      for key, value in vars(args).items()},
+        "python": sys.version,
+        "load_average_at_start": list(os.getloadavg()) if hasattr(os, "getloadavg") else None,
+    })
+    try:
+        result = execute_gate(args, output_dir, evidence)
+    except KeyboardInterrupt:
+        evidence.finish(130, "interrupted by user")
+        return 130
+    except Exception as exc:
+        if isinstance(exc, subprocess.CalledProcessError):
+            evidence.data["failed_command_exit_code"] = exc.returncode
+        evidence.finish(2, exc)
+        print(f"Performance gate could not complete: {exc}", file=sys.stderr)
+        return 2
+    evidence.finish(result)
+    return result
+
+
+def execute_gate(args, output_dir, evidence):
+    base_commit = evidence.data["base_commit"]
+    current_commit = evidence.data["current_commit"]
+    current_branch = evidence.data["current_branch"]
+    dirty = evidence.data["dirty"]
     with tempfile.TemporaryDirectory(prefix="apexbase-local-perf-") as temp_name:
         temp = Path(temp_name)
         base_tree = temp / "base"
@@ -192,6 +307,8 @@ def main(argv=None):
             run(("git", "worktree", "add", "--detach", current_tree, current_commit))
             worktrees.append(current_tree)
             copy_workspace_changes(current_tree)
+            evidence.source("base", base_tree)
+            evidence.source("current", current_tree)
             run((sys.executable, "-m", "venv", "--system-site-packages", venv))
             python = venv / "bin" / "python"
             build_env = os.environ.copy()
@@ -209,7 +326,10 @@ def main(argv=None):
                     cwd=source,
                     env=env,
                 )
+                evidence.lockfile(side, source)
             wheels = {side: one_wheel(directory) for side, directory in wheel_dirs.items()}
+            for side, wheel in wheels.items():
+                evidence.wheel(side, wheel)
 
             if args.settle_seconds:
                 print(f"\nWaiting {args.settle_seconds:g}s for build load to settle...", flush=True)
@@ -246,6 +366,7 @@ def main(argv=None):
                     check=False,
                 )
                 if completed.returncode == 1:
+                    evidence.comparison(f"{stem}-initial", completed.returncode)
                     initial_output = completed.stdout + completed.stderr
                     (output_dir / f"{stem}-initial.txt").write_text(
                         initial_output, encoding="utf-8"
@@ -265,6 +386,7 @@ def main(argv=None):
                 comparison = output_dir / f"{stem}.txt"
                 comparison_output = completed.stdout + completed.stderr
                 comparison.write_text(comparison_output, encoding="utf-8")
+                evidence.comparison(stem, completed.returncode)
                 print(f"\n{comparison_output}", end="")
                 return completed.returncode
 
