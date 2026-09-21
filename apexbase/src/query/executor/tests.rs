@@ -5713,3 +5713,22 @@ fn update_overlay_runs_on_the_batched_pipeline() {
     assert_eq!(batched.num_rows(), materialized.num_rows());
     assert_eq!(batched.schema(), materialized.schema());
 }
+
+#[test]
+fn memory_index_stale_marker_stays_in_process() {
+    // Process-local tables have no directory for `<table>.index.stale`, and a
+    // path with the `apexbase_memory:` scheme is not a legal Windows filename.
+    // The marker must therefore live in process memory.
+    let path = Path::new("apexbase_memory:stale-marker-test/t.apex");
+    assert!(!indexes_stale(path));
+
+    mark_indexes_stale(path, crate::storage::DurabilityLevel::Fast).unwrap();
+    assert!(indexes_stale(path));
+
+    clear_indexes_stale(path).unwrap();
+    assert!(!indexes_stale(path));
+
+    // Clearing an already-clear marker must stay idempotent.
+    clear_indexes_stale(path).unwrap();
+    assert!(!indexes_stale(path));
+}

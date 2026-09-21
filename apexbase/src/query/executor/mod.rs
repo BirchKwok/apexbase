@@ -806,7 +806,19 @@ fn index_stale_path(storage_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.index.stale", storage_path.display()))
 }
 
+/// Stale-index markers for process-local tables.
+///
+/// A `:memory:` table has no directory to hold `<table>.index.stale`, and a
+/// path carrying the `apexbase_memory:` scheme is not a legal filesystem name
+/// on Windows. Its postings still live in process memory, so the marker is
+/// kept in a process-local set instead of on disk.
+static MEMORY_INDEX_STALE: Lazy<parking_lot::RwLock<ahash::AHashSet<PathBuf>>> =
+    Lazy::new(|| parking_lot::RwLock::new(ahash::AHashSet::new()));
+
 fn indexes_stale(storage_path: &Path) -> bool {
+    if crate::storage::is_memory_path(storage_path) {
+        return MEMORY_INDEX_STALE.read().contains(storage_path);
+    }
     match std::fs::metadata(index_stale_path(storage_path)) {
         Ok(_) => true,
         Err(error) if error.kind() == io::ErrorKind::NotFound => false,
@@ -822,6 +834,13 @@ fn mark_indexes_stale(
 ) -> io::Result<()> {
     use std::io::Write;
 
+    if crate::storage::is_memory_path(storage_path) {
+        MEMORY_INDEX_STALE
+            .write()
+            .insert(storage_path.to_path_buf());
+        return Ok(());
+    }
+
     let marker_path = index_stale_path(storage_path);
     let mut marker = std::fs::File::create(marker_path)?;
     marker.write_all(b"index maintenance incomplete\n")?;
@@ -833,6 +852,10 @@ fn mark_indexes_stale(
 }
 
 fn clear_indexes_stale(storage_path: &Path) -> io::Result<()> {
+    if crate::storage::is_memory_path(storage_path) {
+        MEMORY_INDEX_STALE.write().remove(storage_path);
+        return Ok(());
+    }
     let marker_path = index_stale_path(storage_path);
     match std::fs::remove_file(marker_path) {
         Ok(()) => Ok(()),

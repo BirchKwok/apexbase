@@ -28,6 +28,7 @@ unchanged.
 
 - Accept `CREATE FTS INDEX ... WITH (lazy_load=..., cache_size=...)`; the tokenizer emits `Token::With`, so the previous `Identifier("WITH")` check never matched and the whole statement failed to parse
 - Run `ANALYZE` and `REINDEX` on `:memory:` tables, keeping statistics and rebuilt postings in process memory instead of addressing a path that does not exist
+- Keep the stale-index marker for `:memory:` tables in a process-local set, so `REINDEX`, commit-time index maintenance, and the stale-index read gate work everywhere; an `apexbase_memory:` path is not a legal Windows filename
 
 ### Explicit Failure Modes And Result Shape
 
@@ -47,7 +48,7 @@ unchanged.
 ### Validation And Performance
 
 - Release build and complete serial Python suite passed: 1,820 tests
-- Complete Rust suites passed: 601 unit + 6 documentation tests for default features, and 605 unit + 6 documentation tests with Flight
+- Complete Rust suites passed: 602 unit + 6 documentation tests for default features, and 606 unit + 6 documentation tests with Flight
 - Public 1-million-row benchmark completed with ApexBase winning 103/103 tabular, 6/6 exact-vector and 6/6 shared quantized-vector comparisons on the release runtime
 - Same-machine canary passed 64/64
 - Every fix carries Rust unit tests and Python regression tests, including a new `test/test_memory_table_sql_parity.py` suite
