@@ -3797,9 +3797,9 @@ deletes).</p>
 </span></code></pre></div>
 Add a new column to the current table.</p>
 <p><strong>Types:</strong> <code>int</code> / <code>int64</code> / <code>i64</code> / <code>integer</code>, <code>float</code> / <code>float64</code> / <code>f64</code> / <code>double</code>, <code>bool</code> / <code>boolean</code>, <code>str</code> / <code>string</code> / <code>text</code>, <code>bytes</code> / <code>binary</code>, <code>blob</code> / <code>large_binary</code> / <code>largebinary</code>, <code>float16_vector</code>, <code>float32_vector</code>, <code>bfloat16_vector</code>, <code>int8_vector</code>, <code>uint8_vector</code>, <code>bit1_vector</code>, <code>turboquant2_vector</code>, <code>turboquant3_vector</code>, <code>turboquant4_vector</code>, <code>timestamp</code> / <code>datetime</code>, <code>date</code>.</p>
-<p>The value is matched case-insensitively. Unlike <code>create_table</code>, an unrecognized
-name does <strong>not</strong> raise: it silently creates a <code>String</code> column, so check
-<code>get_column_dtype()</code> after a dynamic call.</p>
+<p>The value is matched case-insensitively. An unrecognized name raises
+<code>ValueError</code> listing the supported names, matching <code>create_table</code>; pass an
+explicit type when the value comes from user input.</p>
 <p><strong>Example:</strong>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-62-1"><a id="__codelineno-62-1" name="__codelineno-62-1" href="#__codelineno-62-1"></a><span class="n">client</span><span class="o">.</span><span class="n">add_column</span><span class="p">(</span><span class="s2">"email"</span><span class="p">,</span> <span class="s2">"String"</span><span class="p">)</span>
 </span><span id="__span-62-2"><a id="__codelineno-62-2" name="__codelineno-62-2" href="#__codelineno-62-2"></a><span class="n">client</span><span class="o">.</span><span class="n">add_column</span><span class="p">(</span><span class="s2">"score"</span><span class="p">,</span> <span class="s2">"Float64"</span><span class="p">)</span>
@@ -3860,6 +3860,10 @@ name.</p>
 <td>Create FTS index on all string columns</td>
 </tr>
 <tr>
+<td><code>CREATE FTS INDEX ON table WITH (opt=val)</code></td>
+<td>Create with <code>lazy_load</code> / <code>cache_size</code> options</td>
+</tr>
+<tr>
 <td><code>DROP FTS INDEX ON table</code></td>
 <td>Drop index and delete files</td>
 </tr>
@@ -3894,18 +3898,20 @@ name.</p>
 </tbody>
 </table>
 <p><strong><code>CREATE FTS INDEX</code></strong>
-<div class="language-sql highlight"><pre><span></span><code><span id="__span-71-1"><a id="__codelineno-71-1" name="__codelineno-71-1" href="#__codelineno-71-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">FTS</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="p">[(</span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">,</span><span class="w"> </span><span class="p">...)]</span>
+<div class="language-sql highlight"><pre><span></span><code><span id="__span-71-1"><a id="__codelineno-71-1" name="__codelineno-71-1" href="#__codelineno-71-1"></a><span class="k">CREATE</span><span class="w"> </span><span class="n">FTS</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">table_name</span><span class="w"> </span><span class="p">[(</span><span class="n">col1</span><span class="p">,</span><span class="w"> </span><span class="n">col2</span><span class="p">,</span><span class="w"> </span><span class="p">...)]</span><span class="w"> </span><span class="p">[</span><span class="k">WITH</span><span class="w"> </span><span class="p">(</span><span class="n">lazy_load</span><span class="o">=</span><span class="n">bool</span><span class="p">,</span><span class="w"> </span><span class="n">cache_size</span><span class="o">=</span><span class="n">N</span><span class="p">)]</span>
 </span></code></pre></div></p>
 <ul>
 <li><code>(col1, col2)</code> — optional column list; omit to index all string columns</li>
-<li>The native grammar does not accept a <code>WITH (...)</code> clause. Use
-  <code>client.init_fts(index_fields=..., lazy_load=..., cache_size=...)</code> when you
-  need those options: <code>lazy_load</code> mmaps the v3 term directory and decodes
-  postings on demand (default <code>false</code>), and <code>cache_size</code> bounds decoded
-  postings retained in lazy mode (default <code>10000</code>).</li>
+<li><code>lazy_load</code> — mmap the v3 term directory and decode postings on demand (default <code>false</code>)</li>
+<li><code>cache_size</code> — maximum decoded postings retained in lazy mode (default <code>10000</code>)</li>
 </ul>
+<p>Both options are also available through
+<code>client.init_fts(index_fields=..., lazy_load=..., cache_size=...)</code>. Existing
+rows are back-filled in every case, on filesystem and <code>:memory:</code> databases
+alike.</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-72-1"><a id="__codelineno-72-1" name="__codelineno-72-1" href="#__codelineno-72-1"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">"CREATE FTS INDEX ON articles (title, content)"</span><span class="p">)</span>
-</span><span id="__span-72-2"><a id="__codelineno-72-2" name="__codelineno-72-2" href="#__codelineno-72-2"></a><span class="n">client</span><span class="o">.</span><span class="n">init_fts</span><span class="p">(</span><span class="n">index_fields</span><span class="o">=</span><span class="p">[</span><span class="s2">"title"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">],</span> <span class="n">lazy_load</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">cache_size</span><span class="o">=</span><span class="mi">50000</span><span class="p">)</span>
+</span><span id="__span-72-2"><a id="__codelineno-72-2" name="__codelineno-72-2" href="#__codelineno-72-2"></a><span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">"CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)"</span><span class="p">)</span>
+</span><span id="__span-72-3"><a id="__codelineno-72-3" name="__codelineno-72-3" href="#__codelineno-72-3"></a><span class="n">client</span><span class="o">.</span><span class="n">init_fts</span><span class="p">(</span><span class="n">index_fields</span><span class="o">=</span><span class="p">[</span><span class="s2">"title"</span><span class="p">,</span> <span class="s2">"content"</span><span class="p">],</span> <span class="n">lazy_load</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">cache_size</span><span class="o">=</span><span class="mi">50000</span><span class="p">)</span>
 </span></code></pre></div>
 <p><strong><code>DROP FTS INDEX</code></strong>
 <div class="language-sql highlight"><pre><span></span><code><span id="__span-73-1"><a id="__codelineno-73-1" name="__codelineno-73-1" href="#__codelineno-73-1"></a><span class="k">DROP</span><span class="w"> </span><span class="n">FTS</span><span class="w"> </span><span class="k">INDEX</span><span class="w"> </span><span class="k">ON</span><span class="w"> </span><span class="k">table_name</span>
@@ -4258,11 +4264,9 @@ Get internal _ids from results.</p>
 <h4 id="shape">shape<a class="headerlink" href="#shape" title="Permanent link">&para;</a></h4>
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-142-1"><a id="__codelineno-142-1" name="__codelineno-142-1" href="#__codelineno-142-1"></a><span class="n">shape</span><span class="p">:</span> <span class="nb">tuple</span>  <span class="c1"># (rows, columns)</span>
 </span></code></pre></div>
-Number of rows and columns of the materialized Arrow result. Row-returning
-<code>SELECT *</code> results carry the internal <code>_id</code> column, so <code>shape[1]</code> can be one
-larger than <code>len(results.columns)</code>, which hides <code>_id</code> by default. Explicit
-projections such as <code>SELECT name FROM users</code> do not add <code>_id</code>. Pass
-<code>show_internal_id=True</code> to <code>execute()</code> to expose <code>_id</code> in both properties.</p>
+Number of rows and columns of the materialized Arrow result. The count matches
+<code>len(results.columns)</code>: the internal <code>_id</code> column is not counted unless the
+result was requested with <code>show_internal_id=True</code>.</p>
 <h4 id="columns">columns<a class="headerlink" href="#columns" title="Permanent link">&para;</a></h4>
 <p><div class="language-python highlight"><pre><span></span><code><span id="__span-143-1"><a id="__codelineno-143-1" name="__codelineno-143-1" href="#__codelineno-143-1"></a><span class="n">columns</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span>
 </span></code></pre></div>

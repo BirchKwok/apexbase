@@ -1875,7 +1875,9 @@ TopK vector query on its native FFI fast path. Wrong placeholder arity raises
 </span></code></pre></div>
 <p><code>DROP INDEX</code> requires the <code>ON table</code> clause. Secondary-index DDL, <code>ANALYZE</code>, and
 <code>REINDEX</code> operate on the selected table, so call <code>use_table(name)</code> first (or use
-the <code>ON table</code> form where the statement accepts it).</p>
+the <code>ON table</code> form where the statement accepts it). All of them work on
+filesystem and <code>:memory:</code> databases; a process-local table keeps its statistics
+and index postings in memory.</p>
 <p>ApexBase marks persisted index postings stale before a committed table change
 and refuses to use them in planning or execution until <code>REINDEX</code> rebuilds them,
 so a stale index degrades to a correct scan instead of returning wrong rows.</p>

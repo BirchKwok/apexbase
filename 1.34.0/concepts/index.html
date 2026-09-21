@@ -1710,17 +1710,15 @@
 <div class="language-python highlight"><pre><span></span><code><span id="__span-1-1"><a id="__codelineno-1-1" name="__codelineno-1-1" href="#__codelineno-1-1"></a><span class="n">client</span> <span class="o">=</span> <span class="n">ApexClient</span><span class="p">(</span><span class="s2">":memory:"</span><span class="p">)</span>
 </span></code></pre></div>
 <p>This is a true process-local storage backend, not a temporary directory.
-Tables still use the normal SQL, DDL, DML, index, schema, and result paths, but
-no database, catalog, WAL, delta, blob-sidecar, or index files are created. Its
-contents disappear when the client is closed and are not shared with another
-independently created in-memory client.</p>
-<div class="admonition warning">
-<p class="admonition-title">In-memory FTS has no back-fill</p>
-<p>On <code>:memory:</code>, create the FTS index <em>before</em> writing rows
-(<code>init_fts(...)</code> or <code>CREATE FTS INDEX</code> on an empty table). An index created
-after rows are stored does not back-fill those rows, so searches return
-nothing for them. Filesystem tables index existing rows either way.</p>
-</div>
+Tables still use the normal SQL, DDL, DML, index, FTS, schema, and result
+paths, but no database, catalog, WAL, delta, blob-sidecar, or index files are
+created. Its contents disappear when the client is closed and are not shared
+with another independently created in-memory client.</p>
+<p>FTS behaves the same as on a filesystem database: <code>CREATE FTS INDEX</code> and
+<code>init_fts()</code> both back-fill rows that already exist, whichever order you create
+the index and write the rows, and the Python search API and SQL <code>MATCH()</code>
+agree on which tables are enabled. <code>ANALYZE</code> and <code>REINDEX</code> also work, keeping
+their statistics and postings in process memory.</p>
 <h2 id="databases">Databases<a class="headerlink" href="#databases" title="Permanent link">&para;</a></h2>
 <p>ApexBase supports multiple isolated databases under one root directory. The default database maps to the root directory. Named databases live in subdirectories.</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-2-1"><a id="__codelineno-2-1" name="__codelineno-2-1" href="#__codelineno-2-1"></a><span class="n">client</span><span class="o">.</span><span class="n">use_database</span><span class="p">(</span><span class="s2">"analytics"</span><span class="p">)</span>

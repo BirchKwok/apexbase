@@ -1756,7 +1756,7 @@
 <td>FTS/字符串列 mmap</td>
 <td><code>read_fts_string_columns_mmap</code></td>
 <td>FTS 字符串列直读</td>
-<td><code>!visible_rows_exceed_base(base_rows) &amp;&amp; !has_v4_in_memory_data()</code></td>
+<td><code>!visible_rows_exceed_base(base_rows) &amp;&amp; !has_v4_in_memory_data()</code>，且 V4 footer 可加载（内存表无持久化 base，必须回退）</td>
 <td><code>None</code>（调用方走通用读）</td>
 </tr>
 <tr>

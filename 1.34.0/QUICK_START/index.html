@@ -2063,17 +2063,15 @@ process:</p>
 </span><span id="__span-15-23"><a id="__codelineno-15-23" name="__codelineno-15-23" href="#__codelineno-15-23"></a><span class="n">row</span> <span class="o">=</span> <span class="n">results</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
 </span></code></pre></div>
 <div class="admonition note">
-<p class="admonition-title"><code>shape</code> counts the internal row id on <code>SELECT *</code></p>
-<p>Row-returning results carry the internal <code>_id</code> column. <code>results.columns</code>
-and <code>to_pandas()</code> hide it by default, while <code>results.shape</code> reports the
-column count of the materialized Arrow table and therefore includes it for
-<code>SELECT *</code>. Pass <code>show_internal_id=True</code> to <code>execute()</code> to expose <code>_id</code> in
-both <code>shape</code> and <code>columns</code>:</p>
+<p class="admonition-title">The internal row id stays hidden</p>
+<p>Result rows carry an internal <code>_id</code> column that <code>results.columns</code>,
+<code>results.shape</code>, and <code>to_pandas()</code> all hide by default, so <code>shape[1]</code>
+always equals <code>len(results.columns)</code>. Pass <code>show_internal_id=True</code> to
+<code>execute()</code> when you need the id:</p>
 <div class="language-python highlight"><pre><span></span><code><span id="__span-16-1"><a id="__codelineno-16-1" name="__codelineno-16-1" href="#__codelineno-16-1"></a><span class="n">results</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">execute</span><span class="p">(</span><span class="s2">"SELECT * FROM users"</span><span class="p">,</span> <span class="n">show_internal_id</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
 </span><span id="__span-16-2"><a id="__codelineno-16-2" name="__codelineno-16-2" href="#__codelineno-16-2"></a><span class="nb">print</span><span class="p">(</span><span class="n">results</span><span class="o">.</span><span class="n">columns</span><span class="p">)</span>  <span class="c1"># ['_id', 'name', 'age']</span>
 </span></code></pre></div>
-<p>Explicit projections such as <code>SELECT name FROM users</code> do not add <code>_id</code>, so
-<code>shape[1]</code> and <code>len(results.columns)</code> match there.</p>
+<p><code>results.get_ids()</code> returns the ids without changing the projection.</p>
 </div>
 <h2 id="next-steps">Next Steps<a class="headerlink" href="#next-steps" title="Permanent link">&para;</a></h2>
 <ul>
