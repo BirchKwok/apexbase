@@ -1549,6 +1549,17 @@
 </li>
       
         <li class="md-nav__item">
+  <a href="#why-the-fused-route-stays-the-default" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Why The Fused Route Stays The Default
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
   <a href="#risk-notes" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2019,6 +2030,33 @@ taken during v1.33.0 development and is kept as the design record.</p>
   <code>benchmarks/latest_public_baseline.json</code>, canary gate, and <code>--mode full</code>
   local perf guard before release.</li>
 </ul>
+<h2 id="why-the-fused-route-stays-the-default">Why The Fused Route Stays The Default<a class="headerlink" href="#why-the-fused-route-stays-the-default" title="Permanent link">&para;</a></h2>
+<p>The fused kernel dispatches before the batched/parallel
+<code>Filter -&gt; GROUP BY -&gt; HAVING -&gt; TopK</code> slice and keeps the shapes it owns. A
+one-off A/B measurement (fused gate temporarily disabled so the batched slice
+took over) on the public <code>Boolean Filter+GROUP+HAVING+TopK</code> query at 1M rows:</p>
+<table>
+<thead>
+<tr>
+<th>Route</th>
+<th>Latency</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>Fused kernel (<code>fast_fused_group_by</code>, default)</td>
+<td>3.95 ms</td>
+</tr>
+<tr>
+<td>Batched/parallel pipeline (16 batches, 8 workers)</td>
+<td>11.26 ms</td>
+</tr>
+</tbody>
+</table>
+<p>The batched slice is therefore the fallback for shapes outside the fused
+grammar, not an alternative route for fused-eligible ones, even though it can
+use multiple workers. Re-measure with the same harness mean (2 warmups + 5
+timed iterations) before changing the routing.</p>
 <h2 id="risk-notes">Risk notes<a class="headerlink" href="#risk-notes" title="Permanent link">&para;</a></h2>
 <ul>
 <li>Epsilon/strict-bound semantics of the numeric range leaf must be reused
