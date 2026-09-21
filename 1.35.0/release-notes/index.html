@@ -2469,6 +2469,7 @@ unchanged.</p>
 <ul>
 <li>Accept <code>CREATE FTS INDEX ... WITH (lazy_load=..., cache_size=...)</code>; the tokenizer emits <code>Token::With</code>, so the previous <code>Identifier("WITH")</code> check never matched and the whole statement failed to parse</li>
 <li>Run <code>ANALYZE</code> and <code>REINDEX</code> on <code>:memory:</code> tables, keeping statistics and rebuilt postings in process memory instead of addressing a path that does not exist</li>
+<li>Keep the stale-index marker for <code>:memory:</code> tables in a process-local set, so <code>REINDEX</code>, commit-time index maintenance, and the stale-index read gate work everywhere; an <code>apexbase_memory:</code> path is not a legal Windows filename</li>
 </ul>
 <h3 id="explicit-failure-modes-and-result-shape">Explicit Failure Modes And Result Shape<a class="headerlink" href="#explicit-failure-modes-and-result-shape" title="Permanent link">&para;</a></h3>
 <ul>
@@ -2488,7 +2489,7 @@ unchanged.</p>
 <h3 id="validation-and-performance">Validation And Performance<a class="headerlink" href="#validation-and-performance" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Release build and complete serial Python suite passed: 1,820 tests</li>
-<li>Complete Rust suites passed: 601 unit + 6 documentation tests for default features, and 605 unit + 6 documentation tests with Flight</li>
+<li>Complete Rust suites passed: 602 unit + 6 documentation tests for default features, and 606 unit + 6 documentation tests with Flight</li>
 <li>Public 1-million-row benchmark completed with ApexBase winning 103/103 tabular, 6/6 exact-vector and 6/6 shared quantized-vector comparisons on the release runtime</li>
 <li>Same-machine canary passed 64/64</li>
 <li>Every fix carries Rust unit tests and Python regression tests, including a new <code>test/test_memory_table_sql_parity.py</code> suite</li>
