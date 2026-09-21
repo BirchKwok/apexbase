@@ -673,9 +673,9 @@ Add a new column to the current table.
 
 **Types:** `int` / `int64` / `i64` / `integer`, `float` / `float64` / `f64` / `double`, `bool` / `boolean`, `str` / `string` / `text`, `bytes` / `binary`, `blob` / `large_binary` / `largebinary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp` / `datetime`, `date`.
 
-The value is matched case-insensitively. Unlike `create_table`, an unrecognized
-name does **not** raise: it silently creates a `String` column, so check
-`get_column_dtype()` after a dynamic call.
+The value is matched case-insensitively. An unrecognized name raises
+`ValueError` listing the supported names, matching `create_table`; pass an
+explicit type when the value comes from user input.
 
 **Example:**
 ```python
@@ -745,6 +745,7 @@ FTS is implemented natively in Rust and available through all interfaces (Python
 |-----------|-------------|
 | `CREATE FTS INDEX ON table (col1, col2)` | Create FTS index on specified columns |
 | `CREATE FTS INDEX ON table` | Create FTS index on all string columns |
+| `CREATE FTS INDEX ON table WITH (opt=val)` | Create with `lazy_load` / `cache_size` options |
 | `DROP FTS INDEX ON table` | Drop index and delete files |
 | `ALTER FTS INDEX ON table DISABLE` | Suspend indexing, keep files |
 | `ALTER FTS INDEX ON table ENABLE` | Resume indexing and back-fill any missed rows |
@@ -756,18 +757,21 @@ FTS is implemented natively in Rust and available through all interfaces (Python
 
 **`CREATE FTS INDEX`**
 ```sql
-CREATE FTS INDEX ON table_name [(col1, col2, ...)]
+CREATE FTS INDEX ON table_name [(col1, col2, ...)] [WITH (lazy_load=bool, cache_size=N)]
 ```
 
 - `(col1, col2)` — optional column list; omit to index all string columns
-- The native grammar does not accept a `WITH (...)` clause. Use
-  `client.init_fts(index_fields=..., lazy_load=..., cache_size=...)` when you
-  need those options: `lazy_load` mmaps the v3 term directory and decodes
-  postings on demand (default `false`), and `cache_size` bounds decoded
-  postings retained in lazy mode (default `10000`).
+- `lazy_load` — mmap the v3 term directory and decode postings on demand (default `false`)
+- `cache_size` — maximum decoded postings retained in lazy mode (default `10000`)
+
+Both options are also available through
+`client.init_fts(index_fields=..., lazy_load=..., cache_size=...)`. Existing
+rows are back-filled in every case, on filesystem and `:memory:` databases
+alike.
 
 ```python
 client.execute("CREATE FTS INDEX ON articles (title, content)")
+client.execute("CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)")
 client.init_fts(index_fields=["title", "content"], lazy_load=True, cache_size=50000)
 ```
 
@@ -1277,11 +1281,9 @@ ids = results.get_ids(return_list=True)  # Python list
 ```python
 shape: tuple  # (rows, columns)
 ```
-Number of rows and columns of the materialized Arrow result. Row-returning
-`SELECT *` results carry the internal `_id` column, so `shape[1]` can be one
-larger than `len(results.columns)`, which hides `_id` by default. Explicit
-projections such as `SELECT name FROM users` do not add `_id`. Pass
-`show_internal_id=True` to `execute()` to expose `_id` in both properties.
+Number of rows and columns of the materialized Arrow result. The count matches
+`len(results.columns)`: the internal `_id` column is not counted unless the
+result was requested with `show_internal_id=True`.
 
 #### columns
 ```python

@@ -2729,7 +2729,7 @@ impl ApexExecutor {
     }
 
     /// Read the fts_config.json as a serde_json::Value (object).  Returns empty object if missing.
-    pub(in crate::query::executor) fn read_fts_config(base_dir: &Path) -> serde_json::Value {
+    pub(crate) fn read_fts_config(base_dir: &Path) -> serde_json::Value {
         if crate::storage::is_memory_path(base_dir) {
             return Self::memory_fts_configs()
                 .read()
@@ -2765,6 +2765,37 @@ impl ApexExecutor {
         }
     }
 
+    /// Record the enabled FTS configuration for one table.
+    ///
+    /// Shared by the SQL DDL handler and the Python `init_fts()` binding so a
+    /// process-local database resolves `MATCH()` exactly like a filesystem
+    /// database: filesystem databases persist `fts_config.json`, in-memory
+    /// databases store the same document in the process-local registry.
+    pub(crate) fn enable_fts_config(
+        base_dir: &Path,
+        table: &str,
+        fields: Option<&[String]>,
+        lazy_load: bool,
+        cache_size: usize,
+    ) {
+        let mut cfg = Self::read_fts_config(base_dir);
+        let Some(obj) = cfg.as_object_mut() else {
+            return;
+        };
+        obj.insert(
+            table.to_string(),
+            serde_json::json!({
+                "enabled": true,
+                "index_fields": fields.map(|f| serde_json::json!(f)).unwrap_or(serde_json::Value::Null),
+                "config": {
+                    "lazy_load": lazy_load,
+                    "cache_size": cache_size
+                }
+            }),
+        );
+        Self::write_fts_config(base_dir, &cfg);
+    }
+
     /// CREATE FTS INDEX ON table [(col1, col2)] [WITH (lazy_load=.., cache_size=..)]
     pub(super) fn execute_create_fts_index(
         base_dir: &Path,
@@ -2775,21 +2806,8 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         use crate::fts::{FtsConfig, FtsManager};
 
-        // Update fts_config.json
-        let mut cfg = Self::read_fts_config(base_dir);
-        let obj = cfg
-            .as_object_mut()
-            .ok_or_else(|| err_input("Corrupt fts_config.json"))?;
-        let table_cfg = serde_json::json!({
-            "enabled": true,
-            "index_fields": fields.map(|f| serde_json::json!(f)).unwrap_or(serde_json::Value::Null),
-            "config": {
-                "lazy_load": lazy_load,
-                "cache_size": cache_size
-            }
-        });
-        obj.insert(table.to_string(), table_cfg);
-        Self::write_fts_config(base_dir, &cfg);
+        // Update fts_config.json (or the process-local config for in-memory databases)
+        Self::enable_fts_config(base_dir, table, fields, lazy_load, cache_size);
 
         // Ensure FtsManager for this base_dir exists and the engine for this table is created
         let fts_cfg = FtsConfig {

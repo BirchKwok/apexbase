@@ -2269,10 +2269,13 @@ impl SqlParser {
                         } else {
                             None
                         };
-                        // Optional WITH (key=value, ...)
+                        // Optional WITH (key=value, ...). The tokenizer emits
+                        // Token::With for the WITH keyword, so both spellings
+                        // must be accepted here.
                         let mut lazy_load = false;
                         let mut cache_size: usize = 10000;
-                        if matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "WITH")
+                        if matches!(self.current(), Token::With)
+                            || matches!(self.current(), Token::Identifier(ref s) if s.to_uppercase() == "WITH")
                         {
                             self.advance();
                             self.expect(Token::LParen)?;
@@ -6873,5 +6876,66 @@ mod tests {
 
         let stmt = SqlParser::parse("SELECT stack(2, 'A', 1, 'B', 2) AS (code, value)").unwrap();
         assert!(matches!(stmt, SqlStatement::Union(_)));
+    }
+
+    #[test]
+    fn test_create_fts_index_with_options_parses() {
+        // The tokenizer emits Token::With for WITH; the option clause must be
+        // accepted there (regression: the branch only matched Identifier, so
+        // the whole statement failed to parse).
+        let stmt =
+            SqlParser::parse("CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)")
+                .unwrap();
+        let SqlStatement::CreateFtsIndex {
+            table,
+            fields,
+            lazy_load,
+            cache_size,
+        } = stmt
+        else {
+            panic!("expected CreateFtsIndex");
+        };
+        assert_eq!(table, "logs");
+        assert!(fields.is_none());
+        assert!(lazy_load);
+        assert_eq!(cache_size, 50_000);
+
+        let stmt = SqlParser::parse(
+            "CREATE FTS INDEX ON articles (title, body) WITH (cache_size = 200000)",
+        )
+        .unwrap();
+        let SqlStatement::CreateFtsIndex {
+            table,
+            fields,
+            lazy_load,
+            cache_size,
+        } = stmt
+        else {
+            panic!("expected CreateFtsIndex");
+        };
+        assert_eq!(table, "articles");
+        assert_eq!(
+            fields.unwrap(),
+            vec!["title".to_string(), "body".to_string()]
+        );
+        assert!(!lazy_load);
+        assert_eq!(cache_size, 200_000);
+    }
+
+    #[test]
+    fn test_create_fts_index_without_options_uses_defaults() {
+        let stmt = SqlParser::parse("CREATE FTS INDEX ON docs (body)").unwrap();
+        let SqlStatement::CreateFtsIndex {
+            fields,
+            lazy_load,
+            cache_size,
+            ..
+        } = stmt
+        else {
+            panic!("expected CreateFtsIndex");
+        };
+        assert_eq!(fields.unwrap(), vec!["body".to_string()]);
+        assert!(!lazy_load);
+        assert_eq!(cache_size, 10_000);
     }
 }

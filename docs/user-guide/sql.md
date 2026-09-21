@@ -145,7 +145,9 @@ REINDEX orders;   -- rebuild persistent secondary-index postings
 
 `DROP INDEX` requires the `ON table` clause. Secondary-index DDL, `ANALYZE`, and
 `REINDEX` operate on the selected table, so call `use_table(name)` first (or use
-the `ON table` form where the statement accepts it).
+the `ON table` form where the statement accepts it). All of them work on
+filesystem and `:memory:` databases; a process-local table keeps its statistics
+and index postings in memory.
 
 ApexBase marks persisted index postings stale before a committed table change
 and refuses to use them in planning or execution until `REINDEX` rebuilds them,

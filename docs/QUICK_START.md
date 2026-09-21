@@ -362,20 +362,18 @@ for row in results:
 row = results[0]
 ```
 
-!!! note "`shape` counts the internal row id on `SELECT *`"
-    Row-returning results carry the internal `_id` column. `results.columns`
-    and `to_pandas()` hide it by default, while `results.shape` reports the
-    column count of the materialized Arrow table and therefore includes it for
-    `SELECT *`. Pass `show_internal_id=True` to `execute()` to expose `_id` in
-    both `shape` and `columns`:
+!!! note "The internal row id stays hidden"
+    Result rows carry an internal `_id` column that `results.columns`,
+    `results.shape`, and `to_pandas()` all hide by default, so `shape[1]`
+    always equals `len(results.columns)`. Pass `show_internal_id=True` to
+    `execute()` when you need the id:
 
     ```python
     results = client.execute("SELECT * FROM users", show_internal_id=True)
     print(results.columns)  # ['_id', 'name', 'age']
     ```
 
-    Explicit projections such as `SELECT name FROM users` do not add `_id`, so
-    `shape[1]` and `len(results.columns)` match there.
+    `results.get_ids()` returns the ids without changing the projection.
 
 ## Next Steps
 

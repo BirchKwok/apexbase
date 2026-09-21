@@ -1894,12 +1894,16 @@ impl ApexExecutor {
     // ========== DML Execution Methods ==========
 
     #[inline]
-    pub(in crate::query::executor) fn execute_analyze(storage_path: &Path, table_name: &str) -> io::Result<ApexResult> {
-        crate::storage::table_catalog::ensure_table_file(
-            storage_path,
-            crate::storage::DurabilityLevel::Fast,
-        )?;
-        let storage = TableStorageBackend::open(storage_path)?;
+    pub(in crate::query::executor) fn execute_analyze(storage_path: &Path, _table_name: &str) -> io::Result<ApexResult> {
+        let storage = if crate::storage::is_memory_path(storage_path) {
+            crate::Database::read_backend(storage_path)?
+        } else {
+            crate::storage::table_catalog::ensure_table_file(
+                storage_path,
+                crate::storage::DurabilityLevel::Fast,
+            )?;
+            std::sync::Arc::new(TableStorageBackend::open(storage_path)?)
+        };
         let batch = storage.read_columns_to_arrow(None, 0, None)?;
         let schema = batch.schema();
         let num_rows = batch.num_rows();
@@ -2098,7 +2102,7 @@ impl ApexExecutor {
         table: &str,
     ) -> io::Result<ApexResult> {
         let table_path = Self::resolve_table_path(table, base_dir, default_table_path);
-        if !table_path.exists() {
+        if !crate::storage::engine::engine().table_exists(&table_path) {
             return Err(err_not_found(format!("Table '{}' does not exist", table)));
         }
 
@@ -2132,7 +2136,11 @@ impl ApexExecutor {
         idx_mgr.rebuild_all();
 
         // Re-read table data and rebuild
-        let storage = TableStorageBackend::open(&table_path)?;
+        let storage = if crate::storage::is_memory_path(&table_path) {
+            crate::Database::read_backend(&table_path)?
+        } else {
+            std::sync::Arc::new(TableStorageBackend::open(&table_path)?)
+        };
         let row_count = storage.row_count();
         if row_count > 0 {
             const INDEX_BUILD_BATCH_ROWS: usize = 65_536;

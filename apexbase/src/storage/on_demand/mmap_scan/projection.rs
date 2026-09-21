@@ -121,9 +121,13 @@ impl OnDemandStorage {
             return Ok(None);
         }
 
+        // No persisted V4 base to mmap (for example a process-local in-memory
+        // table). Report "lane unavailable" instead of an empty result so the
+        // caller falls back to the generic Arrow read; returning an empty
+        // `Some` here silently skipped every existing row.
         let footer = match self.get_or_load_footer()? {
             Some(f) => f,
-            None => return Ok(Some((Vec::new(), Vec::new()))),
+            None => return Ok(None),
         };
         let schema = &footer.schema;
 

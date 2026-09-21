@@ -40,7 +40,7 @@
 | 候选索引读 | `scan()` → `scan_candidate_indices` + `read_columns_by_indices_to_arrow` | 谓词命中率低的点查/范围查 | `overlay_state().is_clean_view()`；命中数 × 4 ≤ 行数 × 3 | 单批合并读 |
 | 缓存字典读 | `read_columns_to_arrow_dict` | 低基数 string 列 GROUP BY，复用全局字典 | `!requires_merged_read()` | `read_columns_to_arrow` |
 | 首值缓存 | `build_first_string_row_id_cache` | `col = 'x' LIMIT 1` 的常量时间点查 | `!has_pending_deltas() && delta_row_count() == 0` | 常规点查 |
-| FTS/字符串列 mmap | `read_fts_string_columns_mmap` | FTS 字符串列直读 | `!visible_rows_exceed_base(base_rows) && !has_v4_in_memory_data()` | `None`（调用方走通用读） |
+| FTS/字符串列 mmap | `read_fts_string_columns_mmap` | FTS 字符串列直读 | `!visible_rows_exceed_base(base_rows) && !has_v4_in_memory_data()`，且 V4 footer 可加载（内存表无持久化 base，必须回退） | `None`（调用方走通用读） |
 | 等值全匹配证明 | `string_eq_matches_all` | 证明 `col = 'x'` 保留全部行以跳过过滤 | `!requires_merged_read()` | `Ok(false)` |
 | 列窗口读 | `read_columns_to_arrow_window` | CREATE INDEX 等流式消费者按活跃窗口读 | `!visible_rows_exceed_base(base_rows)` 时走 `to_arrow_batch_mmap_range` | `read_columns_to_arrow` |
 

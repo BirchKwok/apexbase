@@ -238,4 +238,16 @@ mod tests {
         let engine = FtsEngine::new(&path, FtsConfig::default()).unwrap();
         assert_eq!(engine.search_ids("three").unwrap(), vec![3]);
     }
+
+    #[test]
+    fn memory_only_engine_requires_its_first_backfill() {
+        // A process-local engine loads no snapshot, so it must report a pending
+        // rebuild. Otherwise a Python init_fts() issued after writes would
+        // never back-fill the rows that already exist.
+        let engine = FtsEngine::memory_only(FtsConfig::default()).unwrap();
+        assert!(engine.needs_rebuild());
+        engine.add_documents_arrow_texts(&[1], &["rust"]).unwrap();
+        assert!(!engine.needs_rebuild());
+        assert_eq!(engine.search_ids("rust").unwrap(), vec![1]);
+    }
 }

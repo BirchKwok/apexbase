@@ -106,12 +106,15 @@ client.close()
 ```sql
 CREATE FTS INDEX ON table_name
     [(col1 [, col2, ...])]
+    [WITH (option = value [, ...])]
 ```
 
 **Effect:**
 
-- Registers the table in `fts_config.json` with `enabled = true`.
-- Creates (or opens) the ApexFTS engine for the table under `{dir}/fts_indexes/{table}.afts` and replays `{table}.afts.wal`.
+- Registers the table as FTS-enabled: a filesystem database writes
+  `fts_config.json`, a `:memory:` database keeps the same document in a
+  process-local registry.
+- Creates (or opens) the ApexFTS engine for the table under `{dir}/fts_indexes/{table}.afts` and replays `{table}.afts.wal`. Process-local tables keep the engine in memory instead.
 - **Existing rows are back-filled automatically** — all rows already in the table are indexed immediately. The status message reports the number of rows indexed.
 - New documents stored via `store()` / `INSERT` are indexed automatically on every write.
 
@@ -127,15 +130,19 @@ CREATE FTS INDEX ON articles (title, content)
 CREATE FTS INDEX ON articles
 ```
 
-**Options (Python API)**
-
-The native SQL grammar does not currently accept a `WITH (...)` clause on
-`CREATE FTS INDEX`; configure these options through `client.init_fts()`:
+**Options (WITH clause)**
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `lazy_load` | bool | `false` | mmap the v3 term directory and decode postings on first access |
 | `cache_size` | int | `10000` | Maximum decoded posting bitmaps retained in lazy mode |
+
+```sql
+CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)
+CREATE FTS INDEX ON articles (title) WITH (cache_size=100000)
+```
+
+The same options are available through `client.init_fts()`:
 
 ```python
 # Equivalent to CREATE FTS INDEX ON articles (title, content)
@@ -157,9 +164,16 @@ client.execute("CREATE FTS INDEX ON articles (title, content)")
 # Index every string column
 client.execute("CREATE FTS INDEX ON wiki")
 
-# The same index with explicit options uses the Python API
+# Explicit options through SQL...
+client.execute("CREATE FTS INDEX ON logs WITH (lazy_load=true, cache_size=50000)")
+
+# ...or through the Python API
 client.init_fts(lazy_load=True)
 ```
+
+Both routes work on filesystem and `:memory:` databases, and both back-fill
+rows that already exist. After SQL DDL, the Python search API sees the same
+enabled state, so `search_text()` and `MATCH()` can be mixed freely.
 
 ---
 

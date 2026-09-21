@@ -1641,5 +1641,30 @@ class TestFTSSQLSync:
             client.close()
 
 
+def test_create_fts_index_with_options_parses_and_searches():
+    """The documented WITH clause must parse and configure the engine."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        client = ApexClient(dirpath=temp_dir)
+        client.create_table("wiki")
+        client.store([
+            {"title": "Rust", "body": "systems programming"},
+            {"title": "Python", "body": "scripting language"},
+        ])
+
+        client.execute(
+            "CREATE FTS INDEX ON wiki(title, body) "
+            "WITH (lazy_load=true, cache_size=50000)"
+        )
+        df = client.execute("SELECT title FROM wiki WHERE MATCH('rust')").to_pandas()
+        assert list(df["title"]) == ["Rust"]
+
+        # cache_size alone, without the column list, is also accepted.
+        client.execute("CREATE FTS INDEX ON wiki WITH (cache_size=2000)")
+        df = client.execute("SELECT title FROM wiki WHERE MATCH('scripting')").to_pandas()
+        assert list(df["title"]) == ["Python"]
+
+        client.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

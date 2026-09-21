@@ -51,12 +51,18 @@ impl FtsEngine {
     }
 
     pub fn memory_only(config: FtsConfig) -> FtsResult<Self> {
+        // A process-local engine loads no snapshot, so its first use must
+        // back-fill the rows that already exist in the table. Without this the
+        // default state reports "nothing to rebuild" and a Python
+        // ``init_fts()`` issued after writes would index nothing.
+        let mut state = IndexState::default();
+        state.needs_rebuild = true;
         Ok(Self {
             core: Arc::new(EngineCore {
                 index_path: PathBuf::new(),
                 wal_path: PathBuf::new(),
                 config: RwLock::new(config),
-                state: RwLock::new(IndexState::default()),
+                state: RwLock::new(state),
                 search_count: AtomicU64::new(0),
             }),
             flush_handle: Mutex::new(None),

@@ -1706,7 +1706,19 @@ impl ApexStorageImpl {
             "turboquant4_vector" | "tq4_vector" => crate::data::DataType::TurboQuant4Vector,
             "timestamp" | "datetime" => crate::data::DataType::Timestamp,
             "date" => crate::data::DataType::Date,
-            _ => crate::data::DataType::String,
+            other => {
+                // Silently creating a String column here used to hide typos in
+                // dynamic callers; fail loudly like create_table() does.
+                return Err(PyValueError::new_err(format!(
+                    "Unknown column type '{}' for column '{}'. Supported: int, int64, i64, \
+                     integer, float, float64, f64, double, bool, boolean, str, string, text, \
+                     bytes, binary, blob, large_binary, float16_vector, float32_vector, \
+                     bfloat16_vector, int8_vector, uint8_vector, bit1_vector, \
+                     turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, \
+                     datetime, date",
+                    other, column_name
+                )))
+            }
         };
 
         let table_path = self.get_current_table_path()?;
@@ -2118,6 +2130,19 @@ impl ApexStorageImpl {
                 cache_size,
                 ..FtsConfig::default()
             };
+            let base_dir = self.current_base_dir();
+            // In-memory databases have no fts_config.json, so the SQL MATCH()
+            // gate would otherwise keep reporting "FTS is disabled" for a table
+            // the Python API just enabled.
+            if crate::storage::is_memory_path(&base_dir) {
+                crate::Database::enable_fts_config(
+                    &base_dir,
+                    &table_name,
+                    index_fields.as_deref(),
+                    lazy_load,
+                    cache_size,
+                );
+            }
             let needs_rebuild = py.allow_threads(|| -> PyResult<bool> {
                 m.configure_table(&table_name, config);
                 m.get_engine(&table_name)
@@ -2125,7 +2150,6 @@ impl ApexStorageImpl {
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()))
             })?;
             if needs_rebuild {
-                let base_dir = self.current_base_dir();
                 let backfill_running =
                     py.allow_threads(|| crate::Database::has_fts_backfill(&base_dir, &table_name));
                 if !backfill_running {

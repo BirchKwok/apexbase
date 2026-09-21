@@ -8482,4 +8482,28 @@ mod tests {
         assert_eq!(merged.num_rows(), 2);
         assert_eq!(values(&merged), values(&single));
     }
+
+    #[test]
+    fn fts_mmap_lane_reports_unavailable_for_in_memory_tables() {
+        // In-memory tables have no persisted V4 base. The FTS mmap lane must
+        // report itself unavailable (None) so the back-fill falls back to the
+        // generic Arrow read instead of concluding there are no rows.
+        let memory = TableStorageBackend::create(Path::new("apexbase_memory:fts-lane-test")).unwrap();
+        memory.add_column("body", DataType::String).unwrap();
+        memory
+            .insert_rows(&[HashMap::from([(
+                "body".to_string(),
+                Value::String("rust programming".to_string()),
+            )])])
+            .unwrap();
+
+        assert!(memory.is_in_memory());
+        assert_eq!(memory.row_count(), 1);
+        assert!(
+            memory
+                .read_fts_string_columns_mmap(&["body".to_string()])
+                .unwrap()
+                .is_none()
+        );
+    }
 }

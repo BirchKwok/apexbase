@@ -1145,5 +1145,27 @@ class TestExecuteBatch:
             client.close()
 
 
+def test_select_star_shape_excludes_hidden_internal_id():
+    """``shape`` and ``columns`` must agree about the hidden ``_id`` column."""
+    client = ApexClient(":memory:")
+    try:
+        client.create_table("people")
+        client.store([{"name": "A", "age": 1}, {"name": "B", "age": 2}])
+
+        result = client.execute("SELECT * FROM people")
+        assert "_id" not in result.columns
+        assert result.shape == (2, len(result.columns))
+
+        with_id = client.execute("SELECT * FROM people", show_internal_id=True)
+        assert with_id.columns[0] == "_id"
+        assert with_id.shape == (2, len(with_id.columns))
+
+        projected = client.execute("SELECT name FROM people")
+        assert projected.columns == ["name"]
+        assert projected.shape == (2, 1)
+    finally:
+        client.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

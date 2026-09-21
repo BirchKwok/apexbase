@@ -739,5 +739,30 @@ class TestColumnOperationsEdgeCases:
             client.close()
 
 
+class TestColumnTypeValidation:
+    """Unknown type names must fail loudly instead of creating a String column."""
+
+    def test_add_column_rejects_unknown_type(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("types")
+            client.store({"name": "Alice"})
+
+            with pytest.raises(ValueError, match="Unknown column type"):
+                client.add_column("bad", "Int8")
+            with pytest.raises(ValueError, match="Unknown column type"):
+                client.add_column("bad", "not_a_type")
+
+            assert "bad" not in client.list_fields()
+
+            # The documented spellings still map to their real types.
+            client.add_column("count", "Int64")
+            client.add_column("ratio", "Float64")
+            assert client.get_column_dtype("count") == "Int64"
+            assert client.get_column_dtype("ratio") == "Float64"
+
+            client.close()
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

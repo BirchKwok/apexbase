@@ -21,16 +21,16 @@ client = ApexClient(":memory:")
 ```
 
 This is a true process-local storage backend, not a temporary directory.
-Tables still use the normal SQL, DDL, DML, index, schema, and result paths, but
-no database, catalog, WAL, delta, blob-sidecar, or index files are created. Its
-contents disappear when the client is closed and are not shared with another
-independently created in-memory client.
+Tables still use the normal SQL, DDL, DML, index, FTS, schema, and result
+paths, but no database, catalog, WAL, delta, blob-sidecar, or index files are
+created. Its contents disappear when the client is closed and are not shared
+with another independently created in-memory client.
 
-!!! warning "In-memory FTS has no back-fill"
-    On `:memory:`, create the FTS index *before* writing rows
-    (`init_fts(...)` or `CREATE FTS INDEX` on an empty table). An index created
-    after rows are stored does not back-fill those rows, so searches return
-    nothing for them. Filesystem tables index existing rows either way.
+FTS behaves the same as on a filesystem database: `CREATE FTS INDEX` and
+`init_fts()` both back-fill rows that already exist, whichever order you create
+the index and write the rows, and the Python search API and SQL `MATCH()`
+agree on which tables are enabled. `ANALYZE` and `REINDEX` also work, keeping
+their statistics and postings in process memory.
 
 ## Databases
 

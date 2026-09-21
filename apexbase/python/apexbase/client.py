@@ -994,6 +994,10 @@ class ApexClient:
             None
         """
         if self._in_memory:
+            # A process-local database has no fts_config.json; mirror the
+            # process-local Rust config so SQL DDL and the Python search API
+            # agree on which tables have FTS enabled.
+            self._load_memory_fts_config()
             return
         try:
             try:
@@ -1022,6 +1026,39 @@ class ApexClient:
             self._fts_initialized_tables.clear()
             self._fts_config_known_present = False
             self._fts_config_mtime_ns = None
+
+    def _load_memory_fts_config(self) -> None:
+        """
+        Refresh Python FTS state for a process-local database.
+
+        The Rust layer owns the authoritative config for ``:memory:``
+        databases, so a SQL ``CREATE`` / ``ALTER`` / ``DROP FTS INDEX`` must be
+        mirrored back before the Python search API consults it.
+
+        Returns:
+            None
+        """
+        table = self._current_table
+        storage = self._storage
+        if not table or storage is None:
+            return
+        try:
+            raw = storage._fts_table_config()
+        except Exception:
+            return
+        if not raw:
+            return
+        try:
+            entry = json.loads(raw)
+        except Exception:
+            return
+        if not isinstance(entry, dict):
+            return
+        self._fts_tables[table] = entry
+        # The SQL DDL path already registered a manager; dropping the
+        # initialised marker makes the next search reuse it through
+        # _init_fts() instead of trusting a stale Python-side view.
+        self._fts_initialized_tables.discard(table)
 
     def _save_fts_config(self) -> None:
         """

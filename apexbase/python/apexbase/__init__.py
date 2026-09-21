@@ -585,7 +585,14 @@ class ResultView:
         if self._num_rows == 0:
             return (0, 0)
         if self._arrow_table is not None:
-            return (self._arrow_table.num_rows, self._arrow_table.num_columns)
+            show_id = bool(getattr(self, "_show_internal_id", False))
+            num_columns = self._arrow_table.num_columns
+            if not show_id and "_id" in self._arrow_table.column_names:
+                # ``columns`` hides the internal row id, so shape must not
+                # count it either; otherwise ``shape[1]`` disagreed with
+                # ``len(columns)`` for ``SELECT *``.
+                num_columns -= 1
+            return (self._arrow_table.num_rows, num_columns)
         if self._data:
             show_id = bool(getattr(self, "_show_internal_id", False))
             cols = list(self._data[0].keys())

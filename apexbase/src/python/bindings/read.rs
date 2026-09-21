@@ -1339,6 +1339,26 @@ impl ApexStorageImpl {
         self.fts_index_fields.read().get(&table_name).cloned()
     }
 
+    /// Return the effective FTS config document for the current table as JSON.
+    ///
+    /// Filesystem databases keep it in ``fts_config.json``; in-memory databases
+    /// keep the same document in a process-local registry that the Python layer
+    /// cannot read from disk.
+    #[pyo3(name = "_fts_table_config")]
+    fn fts_table_config(&self) -> Option<String> {
+        let table_name = self.current_table.read().clone();
+        if table_name.is_empty() {
+            return None;
+        }
+        let base_dir = self.current_base_dir();
+        let config = crate::Database::read_fts_config(&base_dir);
+        let entry = config.get(&table_name)?;
+        if entry.is_null() {
+            return None;
+        }
+        Some(entry.to_string())
+    }
+
     #[pyo3(signature = (query, limit=None))]
     fn search_text(
         &self,

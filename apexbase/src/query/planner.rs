@@ -329,8 +329,12 @@ pub fn store_table_stats(table_key: &str, mut stats: TableStats) {
     stats.schema_version = STATS_SCHEMA_VERSION;
     stats.schema_generation = 0;
     stats.data_generation = 0;
-    if let Ok(data) = bincode::serialize(&stats) {
-        let _ = std::fs::write(stats_sidecar_path(table_key), data);
+    // Process-local tables have no sidecar to write; their statistics live in
+    // the in-process cache only.
+    if !crate::storage::is_memory_path(std::path::Path::new(table_key)) {
+        if let Ok(data) = bincode::serialize(&stats) {
+            let _ = std::fs::write(stats_sidecar_path(table_key), data);
+        }
     }
     let epoch = crate::storage::epoch::current(std::path::Path::new(table_key));
     stats_cache_insert(&mut STATS_CACHE.write(), table_key, stats, epoch);
@@ -2136,5 +2140,29 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn memory_table_stats_stay_in_memory() {
+        // ANALYZE on a process-local table must update the in-process stats
+        // cache without trying to write a filesystem sidecar for a path that
+        // does not exist.
+        let key = "apexbase_memory:planner-stats/t.apex";
+        store_table_stats(
+            key,
+            TableStats {
+                schema_version: 0,
+                schema_generation: 0,
+                data_generation: 0,
+                row_count: 3,
+                columns: HashMap::new(),
+                collected_at: 0,
+                source_size: 0,
+            },
+        );
+
+        assert!(!stats_sidecar_path(key).exists());
+        let stats = get_table_stats(key).expect("in-process stats must be cached");
+        assert_eq!(stats.row_count, 3);
     }
 }

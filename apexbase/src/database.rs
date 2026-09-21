@@ -617,6 +617,27 @@ impl Database {
         ApexExecutor::fts_backfill_table(base_dir, table, fields, manager)
     }
 
+    /// Record the enabled FTS configuration for a table.
+    ///
+    /// Filesystem databases persist `fts_config.json`; process-local databases
+    /// keep the same document in a process-local registry.
+    #[inline]
+    pub(crate) fn enable_fts_config(
+        base_dir: &Path,
+        table: &str,
+        fields: Option<&[String]>,
+        lazy_load: bool,
+        cache_size: usize,
+    ) {
+        ApexExecutor::enable_fts_config(base_dir, table, fields, lazy_load, cache_size);
+    }
+
+    /// Read the effective FTS configuration document for a database directory.
+    #[inline]
+    pub(crate) fn read_fts_config(base_dir: &Path) -> serde_json::Value {
+        ApexExecutor::read_fts_config(base_dir)
+    }
+
     pub fn write(
         table_path: &Path,
         rows: &[HashMap<String, Value>],

@@ -965,9 +965,15 @@ impl StorageEngine {
                 table_path, durability, schema,
             )?,
         );
-        self.memory_tables
-            .write()
-            .insert(table_path.to_path_buf(), backend);
+        // Only process-local tables belong in the in-memory registry; a
+        // filesystem path registered here would make `memory_backend()` and
+        // `table_exists()` answer from a backend that no reader path
+        // invalidates.
+        if crate::storage::is_memory_path(table_path) {
+            self.memory_tables
+                .write()
+                .insert(table_path.to_path_buf(), backend);
+        }
         Ok(())
     }
 
