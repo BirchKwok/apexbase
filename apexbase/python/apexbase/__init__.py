@@ -92,7 +92,7 @@ def _lance_safe_columns(names):
         result[i] = candidate
     return result
 
-__version__ = "1.34.0"
+__version__ = "1.35.0"
 
 
 class _InstanceRegistry:

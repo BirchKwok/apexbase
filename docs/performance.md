@@ -4,6 +4,71 @@ This page records the latest complete public cross-engine benchmark. It is a
 reproducible snapshot, not a universal claim: rerun the suite on your own
 hardware and workload.
 
+## v1.35.0 Public No-Cache Snapshot
+
+- **Date / source**: 2026-09-21, v1.35.0 release tree (commit `ffba5de`); runtime code was measured immediately before the metadata-only version bump
+- **System**: macOS 27.0, Apple arm64 (10 cores), 32 GB RAM
+- **Tabular stack**: Python 3.12.2, ApexBase 1.35.0 runtime, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
+- **Vector stack**: Python 3.12.2, ApexBase 1.35.0 runtime, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1
+- **Build**: maturin 1.9.1, rustc 1.92.0, release profile
+- **Tabular dataset**: 1,000,000 rows x 5 columns
+- **Vector dataset**: 1,000,000 Float32 vectors x 128 dimensions, `k=10`, 10 exact batch queries; quantized module 20 queries with `candidate_k=100` and seed `20260821`
+- **Method**: result cache disabled for every ApexBase client (`enable_cache=False`), 2 warmup iterations + 5 timed iterations, materialized results
+- **Retained report**: `local-perf-results/memory-fts-parity-20260921-080412/public-benchmark-final2.json`
+
+The no-cache public suite completed all **117/117 named rows**: 103 tabular,
+6 exact-vector, and 8 ApexBase quantized precision rows. ApexBase won every row
+that has a direct competitor — **115/115**: 103/103 tabular, 6/6 exact vector,
+and 6/6 quantized codecs shared with sqlite-vector. Float16 and BFloat16 remain
+ApexBase-only quantized formats and are excluded from the comparable total.
+
+| Scope | Metrics | Apex wins | Ties | Slower |
+| --- | ---: | ---: | ---: | ---: |
+| OLAP fair | 71 | 71 | 0 | 0 |
+| OLTP fair | 32 | 32 | 0 | 0 |
+| Exact vector similarity | 6 | 6 | 0 | 0 |
+| Quantized vector, shared codecs | 6 | 6 | 0 | 0 |
+| **Comparable total** | **115** | **115** | **0** | **0** |
+
+Representative medians from the retained run:
+
+| Metric | ApexBase | SQLite | DuckDB | ApexBase vs best competitor |
+| --- | ---: | ---: | ---: | ---: |
+| COUNT(*) | 0.062 ms | 7.851 ms | 0.458 ms | 7.45x faster |
+| Projection full scan (3 cols) | 204.896 ms | 875.487 ms | 629.557 ms | 3.07x faster |
+| GROUP BY + HAVING | 0.650 ms | 343.608 ms | 2.834 ms | 4.36x faster |
+| Boolean Filter+GROUP+HAVING+TopK | 3.982 ms | 182.182 ms | 4.409 ms | 1.11x faster |
+| NOT filter (age NOT BETWEEN, name NOT LIKE) | 1.992 ms | 58.469 ms | 3.124 ms | 1.57x faster |
+| ORDER BY score LIMIT 100 | 1.904 ms | 53.783 ms | 5.014 ms | 2.63x faster |
+| Bulk Insert (N rows; default fair) | 219.892 ms | 989.950 ms | 146.49 s | 4.50x faster |
+| FTS Index Build (name,city,category) | 1.469 ms | 1.52 s | 1.21 s | 821.84x faster |
+
+Exact vector medians for the same run:
+
+| Metric | ApexBase | SQLite + sqlite-vector | DuckDB |
+| --- | ---: | ---: | ---: |
+| TopK L2 | 6.139 ms | 149.805 ms | 28.752 ms |
+| TopK Cosine | 6.178 ms | 171.305 ms | 34.643 ms |
+| TopK Dot | 6.856 ms | 147.032 ms | 28.779 ms |
+| Batch TopK L2 (10 queries) | 50.186 ms | 1,531.393 ms | 278.580 ms |
+| Batch TopK Cosine (10 queries) | 56.231 ms | 1,700.752 ms | 372.599 ms |
+| Batch TopK Dot (10 queries) | 46.646 ms | 1,469.580 ms | 275.547 ms |
+
+Quantized batch-amortized retrieval for the same run (20 queries, `k=10`,
+`candidate_k=100`):
+
+| Codec | Apex quantized | Apex recall | Apex exact-rescore | Rescore recall | sqlite-vector quantized | SQLite recall |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| INT8 | 1.146 ms | 0.975 | 15.950 ms | 1.000 | 8.484 ms | 0.945 |
+| UINT8 | 3.576 ms | 0.985 | 19.041 ms | 1.000 | 8.545 ms | 0.960 |
+| 1-bit | 0.645 ms | 0.140 | 13.100 ms | 0.415 | 1.933 ms | 0.100 |
+| TurboQuant 2-bit | 4.663 ms | 0.450 | 18.103 ms | 0.870 | 26.715 ms | 0.535 |
+| TurboQuant 3-bit | 16.608 ms | 0.595 | 32.906 ms | 0.990 | 65.008 ms | 0.725 |
+| TurboQuant 4-bit | 8.624 ms | 0.760 | 23.765 ms | 1.000 | 51.266 ms | 0.840 |
+
+ApexBase-only derived columns in the same run: Float16 at 2.009 ms quantized
+with 1.000 recall, and BFloat16 at 9.546 ms with 1.000 recall.
+
 ## v1.34.0 Public No-Cache Snapshot
 
 - **Date / source**: 2026-09-20, v1.34.0 release tree (commit `41f3400`)

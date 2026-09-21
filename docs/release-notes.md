@@ -3,6 +3,68 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.35.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.35.0)
+*2026-09-21*
+
+[Compare with v1.34.0](https://github.com/BirchKwok/ApexBase/compare/v1.34.0...v1.35.0)
+
+### Highlights
+
+v1.35.0 is a correctness and documentation release. It closes the remaining
+process-local (`:memory:`) gaps in full-text search and table maintenance so an
+in-memory database behaves like a filesystem database, turns three silent
+failure modes into explicit errors or results, and refreshes the user,
+reference, and internals documentation against the v1.34.0 runtime. The V4 file
+format and the public Python, Rust, PostgreSQL-wire, and Flight entry points are
+unchanged.
+
+### In-Memory FTS Parity
+
+- Report the FTS mmap lane as unavailable when a table has no persisted V4 base instead of returning an empty result, so a back-fill falls through to the generic Arrow read instead of silently indexing zero rows
+- Mark process-local FTS engines as needing their first rebuild, so an `init_fts()` issued after writes back-fills the rows that already exist
+- Mirror the process-local FTS configuration into the Python client, so SQL `CREATE` / `ALTER` / `DROP FTS INDEX` and the Python search API agree on enabled tables and `MATCH()` resolves on `:memory:` databases
+
+### SQL Surface
+
+- Accept `CREATE FTS INDEX ... WITH (lazy_load=..., cache_size=...)`; the tokenizer emits `Token::With`, so the previous `Identifier("WITH")` check never matched and the whole statement failed to parse
+- Run `ANALYZE` and `REINDEX` on `:memory:` tables, keeping statistics and rebuilt postings in process memory instead of addressing a path that does not exist
+
+### Explicit Failure Modes And Result Shape
+
+- Reject unknown `add_column` type names with `ValueError` listing the supported names instead of silently creating a `String` column, matching `create_table()`
+- Stop counting the hidden internal `_id` column in `ResultView.shape`, so `shape[1]` always equals `len(result.columns)` unless the result is requested with `show_internal_id=True`
+- Register only process-local tables in the storage engine's in-memory registry; a filesystem path created with an explicit schema object is no longer cached there
+- Route the FTS configuration accessors through the `Database` façade, keeping the bindings free of direct executor calls
+
+### Documentation
+
+- Add the read-path capability matrix, the resource-ownership inventory, and the fused-kernel design note to the documentation navigation and index
+- Record the v1.34.0 public benchmark snapshot and label the retained v1.30 tables as historical
+- Correct FTS options, durability levels, column and result semantics, vector SQL syntax, SQL type aliases, and method signatures against the built package
+- Document the transaction commit-outcome contract, WAL durability, `REINDEX` recovery, `EXPLAIN ANALYZE` route/divergence/feedback, the per-query aggregation memory budget, and the parallel-scan worker budget
+- Document the measured rationale for keeping the fused `GROUP BY` kernel as the default route in `docs/FUSED_GROUP_AGG_DESIGN.md`
+
+### Validation And Performance
+
+- Release build and complete serial Python suite passed: 1,820 tests
+- Complete Rust suites passed: 601 unit + 6 documentation tests for default features, and 605 unit + 6 documentation tests with Flight
+- Public 1-million-row benchmark completed with ApexBase winning 103/103 tabular, 6/6 exact-vector and 6/6 shared quantized-vector comparisons on the release runtime
+- Same-machine canary passed 64/64
+- Every fix carries Rust unit tests and Python regression tests, including a new `test/test_memory_table_sql_parity.py` suite
+- The retained historical public-baseline comparison is cross-date (macOS 27.0 against the 26.6.2 baseline) and flags a small set of bimodal microbenchmarks; the same-machine comparison remains the regression decision
+
+### Upgrade Notes
+
+- No public API or `.apex` file-format migration is required
+- `add_column` now raises `ValueError` for an unrecognized type name; callers that relied on the implicit `String` fallback must pass an explicit type
+- `ResultView.shape` no longer includes the internal `_id` column; use `get_ids()` or `show_internal_id=True` when the row id is needed
+- `:memory:` FTS indexes back-fill in either creation order, and SQL FTS DDL is visible to the Python search API
+- `ANALYZE` and `REINDEX` on `:memory:` tables keep their state in process memory and write no files
+- Update the Rust crate and Python package version metadata to 1.35.0
+
+---
+
+
 ## [v1.34.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.34.0)
 *2026-09-20*
 
