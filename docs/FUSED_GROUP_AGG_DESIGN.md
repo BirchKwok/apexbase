@@ -223,6 +223,23 @@ taken during v1.33.0 development and is kept as the design record.
   `benchmarks/latest_public_baseline.json`, canary gate, and `--mode full`
   local perf guard before release.
 
+## Why The Fused Route Stays The Default
+
+The fused kernel dispatches before the batched/parallel
+`Filter -> GROUP BY -> HAVING -> TopK` slice and keeps the shapes it owns. A
+one-off A/B measurement (fused gate temporarily disabled so the batched slice
+took over) on the public `Boolean Filter+GROUP+HAVING+TopK` query at 1M rows:
+
+| Route | Latency |
+| --- | --- |
+| Fused kernel (`fast_fused_group_by`, default) | 3.95 ms |
+| Batched/parallel pipeline (16 batches, 8 workers) | 11.26 ms |
+
+The batched slice is therefore the fallback for shapes outside the fused
+grammar, not an alternative route for fused-eligible ones, even though it can
+use multiple workers. Re-measure with the same harness mean (2 warmups + 5
+timed iterations) before changing the routing.
+
 ## Risk notes
 
 - Epsilon/strict-bound semantics of the numeric range leaf must be reused
