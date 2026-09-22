@@ -3,6 +3,106 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.36.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.36.0)
+*2026-09-23*
+
+[Compare with v1.35.0](https://github.com/BirchKwok/ApexBase/compare/v1.35.0...v1.36.0)
+
+### Highlights
+
+v1.36.0 fixes the engine defects that surfaced while building the new
+end-to-end example suite. Concurrent writers no longer lose rows, a `replace()`
+followed by `delete()` no longer leaves a duplicated or unreachable row, a
+value a write does not supply reads as `NULL` on every read path instead of the
+column type's default, outer-join anti-joins and aggregate-free `GROUP BY`
+return the documented rows, and window functions become general expressions
+that can be nested inside scalar functions and arithmetic. The release also
+ships a 17-scenario Python and 9-example Rust usage-example suite. The V4 file
+format and the public Python, Rust, PostgreSQL-wire, and Flight entry points
+are unchanged.
+
+### Window Functions As Expressions
+
+- Parse a window call anywhere an expression is allowed, not only as a bare projection: `ROUND(SUM(amt) OVER (PARTITION BY g), 2)`, `SUM(amt) OVER (PARTITION BY g) / 2`, `CAST(SUM(x) OVER (PARTITION BY g) AS INT)`; the executor computes the window and then finishes the surrounding expression
+- Parse explicit `ROWS` / `RANGE` frames, including the `BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`, `UNBOUNDED PRECEDING`, `n PRECEDING`, and `n FOLLOWING` endpoints, and reject a frame the executor does not compute with `Unsupported window frame for <FUNC>: ...` instead of silently answering with a whole-partition value
+- Keep the v1.35.0 window surface working unchanged: `PARTITION BY`, `ORDER BY ... ASC|DESC NULLS FIRST|LAST`, the ranking functions, `LAG` / `LEAD`, `FIRST_VALUE` / `LAST_VALUE` / `NTH_VALUE` / `NTILE`, and the cumulative `SUM` / `RUNNING_SUM`
+- Window support is still SELECT-list only: a window in `WHERE`, `HAVING`, `ON`, or `ORDER BY` fails with `Unsupported expression type ...`, two windows in one projection item are not executed yet, and a window combined with an aggregate in the same query currently returns the bare window value because that statement rebuild drops the projection wrapper
+
+### Query Correctness
+
+- Run aggregate-free `GROUP BY`: `SELECT cat FROM t GROUP BY cat` returns one row per group instead of one row per input row
+- Stop pushing `IS NULL` conjuncts below the null-producing side of an outer join, so `... LEFT JOIN ... WHERE r.col IS NULL` returns the anti-join rows only; null-rejecting predicates (`IS NOT NULL`, comparisons, `LIKE`, `IN`, `BETWEEN`) still push down
+- Return a named one-column batch for the join `COUNT(*)` fast path so a result alias is preserved
+- Disable the bounded `ROW_NUMBER()` derived-table pushdown that could panic inside `arrow::compute::take`; the window is computed over the full input and the outer predicate filters afterwards, with retained row positions bounds-checked
+- Keep in-memory `__cte_*` batches away from the cached-backend probe, so a CTE that reaches a join fast path no longer fails with `failed to open table '.../__cte_...'`
+
+### Write Path Durability And Concurrency
+
+- Hold a per-table write lock across the whole read-modify-write **including the flush** in every mutation entry point (`write`, `delete`, `delete_one`, `replace`, the column DDL operations, and both typed write routes), so two writers on one table can no longer interleave and lose each other's rows
+- Publish base files under a per-path rewrite lock and a unique scratch name (`<stem>.apex.<pid>.<seq>.tmp`) instead of the shared `<table>.apex.tmp` that a concurrent rewrite or table open could consume
+- Apply deferred deletes before an append derives its footer from disk, and publish deletion vectors under the rewrite lock, so a deferred delete cannot be undone by a concurrent append
+- Record file length and mtime in the deferred-delete snapshot and discard it when either changed, instead of writing a stale snapshot over a newer file
+- Serialize first-time table materialization, re-check the backend cache under that lock, and retry an open that lands between footer and header publication (8 attempts, 50 µs backoff) instead of surfacing `Corrupt Apex file: invalid footer offset` or `No such file or directory`
+- Never reuse an mmap-only read backend for a write, and record the real V4 format flag in the schema cache so a V4 table is not routed down the legacy delta append
+- Record the rows a delta-file compaction brings into memory, so the following save is not skipped and the merged rows are neither lost nor their ids reused
+- Keep `next_id` raise-only against the delta high-water mark, so an INSERT after reopen cannot overwrite a delta row
+- Write row groups with ascending ids and binary-search groups that are not implicitly contiguous, so a row re-appended by `replace()` or a group with gaps after deletes stays reachable
+- Stop `append_row_group` from pushing persisted rows into the pending id buffer, and key the "base is loaded" decision on `v4_base_loaded` instead of the first buffered id
+- Do not count a delete twice when the row is already deleted in the delta overlay
+
+### NULL And Type Coercion
+
+- A value a write does not supply now reads as SQL `NULL` on every path (full scan, projection, point lookup, `retrieve()`), not `0` / `0.0` / `false` / `''` / empty bytes
+- Widen an integer value written into a `FLOAT` / `DOUBLE` column on the typed, columnar, delta, and row-wise insert routes (`1` stores `1.0`)
+- Promote a columnar column whose integer-typed list contains a float to `Float64`; `[1, 2.5, 3]` used to be stored as `[1, 0, 3]`
+- Store an uncoercible value as `NULL` (1.5 into an `INT` column, `"1.5"` into a `DOUBLE` column, `1` into a `BOOL` column) instead of the type's default
+- Mark the rows padded by a later column addition as `NULL`, and read a row group written before a column existed as `NULL`
+- Return the real count from `count_rows()` / `row_count()` on `:memory:` tables, which reported `0`
+
+### Python And Embedded API Behavior
+
+- Publish the single-row memtable before any other write route runs, so `store({...})` followed by `store([...])` no longer drops the single row
+- Persist the memtable and the pending overlay and invalidate the table before SQL DML, so an `INSERT` no longer reuses an `_id` held by a buffered row
+- Fall through to the general delete/replace path when the DeltaStore overlay declines an id, so `delete()` / `replace()` on a `replace()`d row performs the operation (and returns `True`) instead of returning `False` and leaving the row in place
+- Skip the overlay fast path for process-local (`:memory:`) tables in `delete`, `delete_batch`, and `replace`
+- Serve an `_id` projection over an empty result instead of raising `RuntimeError("Projected column '_id' does not exist")`
+- `Table::retrieve` falls back to the query path while rows are buffered or when the table has a vector column, so a live row is no longer reported absent
+- `Table::execute` publishes a concurrent writer's buffered rows before running a query, and `Table::flush` is a no-op when nothing is dirty or pending instead of rewriting the file from a possibly stale backend
+- `ResultSet::scalar()` returns the count for a one-cell `Data` batch, and `arrow_value_at` decodes a `FixedSizeList` vector column into `Value::FixedList`
+- Decline the typed delta encoding for a row whose value type it cannot represent, instead of storing the type's default
+
+### Usage Examples
+
+- Add 17 runnable Python scenarios (`usage-examples/Python/py01` ... `py17`) and 9 Rust examples (`usage-examples/Rust/r01` ... `r09`) covering analytics, HTAP transactions, SQLite migration, data quality, DataFrame interop, window functions, full-text search, vector search, hybrid retrieval, RAG, and a multi-source lake
+- Index them in `usage-examples/README.md` with the verified SQL capability boundaries, three defect postmortems with measurements, and the exact run and verification loops
+- Register the Rust examples as `[[example]]` targets so `cargo run --example r01_config_store --no-default-features` works from the repository root
+
+### Documentation
+
+- FTS: `ALTER FTS INDEX ... DISABLE` makes full-text reads unavailable (`MATCH()`, `FUZZY_MATCH()`, `FTS_SCORE()`, `search_text()`) instead of answering from a snapshot that is stale by definition
+- Rust embedded API: document that `execute` synchronizes with a writer only while it still has buffered rows and re-checks under the table lock, and that `retrieve` / `retrieve_many` account for buffered rows before reporting a miss
+
+### Validation And Performance
+
+- Release build completed on this tree (Rust release profile and the CPython 3.12 wheel); the complete serial Python suite and the complete Rust suites for the default and `flight` feature sets were run against it before the release commit
+- The frozen tree passed the same-machine base/current canary against `origin/main`: 64/64 metrics, no regression (`local-perf-results/20260923-000901/`)
+- The full same-machine comparison in this cycle (1,000,000 rows, 109 metrics) and the extended index, parallel-scan, QPS, and quantized-vector comparisons passed against the same base (`local-perf-results/20260922-141339/`)
+- Regression coverage added: 74 Python cases in `test/test_engine_defect_regressions.py` (33) and `test/test_write_scenarios.py` (41), plus 26 Rust tests across `apexbase/src/embedded/mod.rs`, `apexbase/src/query/sql_parser.rs`, and `apexbase/src/storage/on_demand/tests.rs`
+
+### Upgrade Notes
+
+- No `.apex` file-format change and no migration: `FORMAT_VERSION_V4` is still 4, and row groups written by this release remain readable by v1.35
+- A value a write does not supply is now `NULL` rather than `0` / `0.0` / `false` / `''`; this changes `WHERE col = 0`, `COUNT(col)`, aggregates, and point lookups on data written from now on
+- `delete()` returns `False` for a row that is already deleted (previously `True`), while `active_row_count()` becomes correct
+- `SELECT cat FROM t GROUP BY cat` now returns one row per group, and `SELECT * FROM t GROUP BY x` is routed to the grouped engine
+- A Rust caller matching `ApexResult` sees `Data` instead of `Scalar` for the join `COUNT(*)` fast path, and the column is named after the alias
+- A bare `rows` or `range` used as an implicit result alias directly after a window specification is now parsed as a frame keyword; write `AS rows` / `AS range`
+- Base-file rewrites now publish from `<stem>.apex.<pid>.<seq>.tmp`; a crash can leave such a scratch file behind, and dropping a table does not reap it
+- Update the Rust crate and Python package version metadata to 1.36.0
+
+---
+
+
 ## [v1.35.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.35.0)
 *2026-09-21*
 
