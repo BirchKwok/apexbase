@@ -741,7 +741,10 @@ for h in handles { h.join().unwrap(); }
 **Notes:**
 
 - `ApexDB::clone()` and `Table::clone()` are `O(1)` — they share the same `Arc<DbInner>`.
-- Reads (`execute`, `retrieve`, `retrieve_many`, `count`) are lock-free on V4 mmap-only tables.
+- Reads (`execute`, `retrieve`, `retrieve_many`, `count`) are lock-free on V4 mmap-only
+  tables. `execute` only synchronizes with a writer while that writer still has rows
+  buffered in memory: it flushes them first so the query sees them, and re-checks under
+  the table lock so a concurrent flush makes its own flush a no-op.
 - Writes are serialized per-table via an internal write lock in the storage engine.
 - `use_database()` modifies shared state; avoid calling it from multiple threads concurrently.
 
@@ -842,8 +845,8 @@ fn process(db: &ApexDB) -> apexbase::Result<()> {
 
 | Method | Return type | Description |
 |--------|-------------|-------------|
-| `retrieve(id)` | `Result<Option<Row>>` | Point lookup by `_id` |
-| `retrieve_many(ids)` | `Result<RecordBatch>` | Batch lookup by `_id`s (V4 mmap fast-path) |
+| `retrieve(id)` | `Result<Option<Row>>` | Point lookup by `_id`. Served from the base file; rows still buffered by a writer (delta sidecar, DeltaStore overlay, in-memory append buffer) are read through the query path, so a miss is only reported once they are accounted for |
+| `retrieve_many(ids)` | `Result<RecordBatch>` | Batch lookup by `_id`s (V4 mmap fast-path, SQL fallback while rows are buffered) |
 | `count()` | `Result<u64>` | Active row count (O(1) for V4 tables) |
 | `exists(id)` | `Result<bool>` | Check if row with `_id` exists |
 | `path()` | `&Path` | Absolute path to the `.apex` file |

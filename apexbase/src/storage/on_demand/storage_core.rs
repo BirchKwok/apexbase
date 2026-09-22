@@ -1006,7 +1006,14 @@ impl OnDemandStorage {
         }
 
         // V4 Row Group format: read schema from footer
-        let file_len = file.metadata()?.len();
+        let mut file_len = file.metadata()?.len();
+        // A concurrent writer appends a Row Group and then publishes a new
+        // footer, so the header can point past the length observed before it
+        // was read. Re-read the length once: the file grew, which is not
+        // corruption.
+        if header.footer_offset > file_len {
+            file_len = file.metadata()?.len();
+        }
         if header.footer_offset < HEADER_SIZE as u64 || header.footer_offset > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1174,6 +1181,7 @@ impl OnDemandStorage {
     pub fn open_for_read_with_file(path: &Path, file: File, file_len: u64) -> io::Result<Self> {
         // Apply pending delete state before creating the mmap so reads see fresh data
         let _ = apply_pending_deletes(path);
+        let mut file_len = file_len;
         let mut mmap_cache = MmapCache::new();
 
         let mut header_bytes = [0u8; HEADER_SIZE];
@@ -1187,6 +1195,13 @@ impl OnDemandStorage {
             ));
         }
 
+        // A concurrent writer appends a Row Group and then publishes a new
+        // footer, so the header can point past the length observed before it
+        // was read. Re-read the length once: the file grew, which is not
+        // corruption.
+        if header.footer_offset > file_len {
+            file_len = file.metadata()?.len();
+        }
         if header.footer_offset < HEADER_SIZE as u64 || header.footer_offset > file_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -3308,7 +3323,8 @@ impl OnDemandStorage {
                 if col_idx < nulls.len() {
                     nulls[col_idx] = Vec::new();
                 } else {
-                    nulls.push(Vec::new());
+                    // The rows already on disk have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(total_rows));
                 }
                 continue;
             }
@@ -3567,13 +3583,18 @@ impl OnDemandStorage {
                         int_columns.get_mut(col_name).unwrap().push(v);
                     }
                     ColumnType::Float64 | ColumnType::Float32 => {
+                        // Accept an integer as a float. Without this coercion a
+                        // `DOUBLE` column written from a Python `int` (or a bound
+                        // integer parameter) silently landed as 0.0, because this
+                        // delta append matches the exact variant and defaults the
+                        // rest. The SQL `execute_insert` path already coerces
+                        // Int64 -> Float64, so this restores parity between the
+                        // delta/`store()` path and the SQL path.
                         let v = val
-                            .and_then(|v| {
-                                if let ColumnValueRef::Float64(n) = v.as_delta_column_value_ref() {
-                                    Some(n)
-                                } else {
-                                    None
-                                }
+                            .and_then(|v| match v.as_delta_column_value_ref() {
+                                ColumnValueRef::Float64(n) => Some(n),
+                                ColumnValueRef::Int64(n) => Some(n as f64),
+                                _ => None,
                             })
                             .unwrap_or(0.0);
                         float_columns.get_mut(col_name).unwrap().push(v);
@@ -3877,20 +3898,29 @@ impl OnDemandStorage {
             return Ok(false);
         }
         let pending_start = ids_len - pending;
-        if ids.first().copied().unwrap_or(0) == 1 && pending_start < on_disk_rows {
+        // Whether the in-memory prefix *is* the persisted base is decided by
+        // `v4_base_loaded`, never by the first buffered ID. A loaded base does not
+        // have to start at `_id` 1 — after `replace()` re-appends a row the base
+        // can start at any ID — and reading that as "append-only buffer" skipped
+        // both guards below, so the replacement's delete of the old copy was
+        // dropped and the base copy stayed visible next to the appended one.
+        let base_buffered = self.v4_base_loaded.load(Ordering::SeqCst);
+        if base_buffered && pending_start < on_disk_rows {
             // Some persisted base rows are mixed into the in-memory prefix. Fall back to a
             // full save so we do not misclassify base rows as pending append-only rows.
             return Ok(false);
         }
         let deleted = self.deleted.read();
-        if ids.first().copied().unwrap_or(0) == 1 {
-            for row_idx in 0..pending_start.min(on_disk_rows) {
-                let byte_idx = row_idx / 8;
-                let bit_idx = row_idx % 8;
-                if byte_idx < deleted.len() && ((deleted[byte_idx] >> bit_idx) & 1 == 1) {
-                    // Persisted-base deletes require a full rewrite or delete-vector update.
-                    return Ok(false);
-                }
+        if base_buffered {
+            // A deleted *base* row cannot be expressed in the append-only delta
+            // file — the base copy would stay visible — so it needs a full rewrite
+            // or an in-place deletion-vector update. Scanning whole bytes is
+            // conservative for the final partial byte, which only costs a full
+            // save in the rare case where a pending row shares it.
+            let base_rows = pending_start.min(on_disk_rows);
+            let base_bytes = (base_rows + 7) / 8;
+            if deleted.iter().take(base_bytes).any(|&byte| byte != 0) {
+                return Ok(false);
             }
         }
         if pending == 1 {
@@ -4249,8 +4279,8 @@ impl OnDemandStorage {
     /// (updates/deletes) into the base V4 file Row Group by Row Group via mmap.
     /// Base data is never loaded wholesale: peak memory is O(largest Row Group +
     /// delta payloads), so tables larger than physical memory can be compacted.
-    /// The output is written to `.apex.tmp` and atomically renamed over the
-    /// original, mirroring the `save_v4` atomic-write protocol.
+    /// The output is written to a private scratch file and atomically renamed
+    /// over the original, mirroring the `save_v4` atomic-write protocol.
     pub fn compact_streaming_v4(&self) -> io::Result<()> {
         self.stream_rewrite_v4(true, false)
     }
@@ -4267,6 +4297,12 @@ impl OnDemandStorage {
     /// (when present), DeltaStore updates/deletes, and optionally the
     /// in-memory deletion bitmap, Row Group by Row Group via mmap.
     fn stream_rewrite_v4(&self, require_delta: bool, filter_mem_deletes: bool) -> io::Result<()> {
+        // Apply any deferred delete state before taking the rewrite lock: the
+        // application is itself a base-file mutation and takes the same lock.
+        let _ = apply_pending_deletes(&self.path);
+
+        // Serialize base-file replacement per table (see `table_save_lock`).
+        let _rewrite_guard = crate::storage::table_save_lock::rewrite_lock(&self.path);
         let header = self.header.read();
         if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
             return Err(err_data("streaming V4 rewrite requires a V4 base file"));
@@ -4279,10 +4315,7 @@ impl OnDemandStorage {
         if require_delta && !has_delta {
             return Ok(());
         }
-        let tmp_path = self.path.with_extension("apex.tmp");
-
-        // Apply any deferred delete state first (idempotent).
-        let _ = apply_pending_deletes(&self.path);
+        let tmp_path = atomic_rewrite_tmp_path(&self.path);
 
         // Bounded delta payloads: the append-only delta file is capped by
         // DELTA_COMPACT_SIZE / DELTA_COMPACT_ROWS; the DeltaStore is bounded by
@@ -4300,6 +4333,7 @@ impl OnDemandStorage {
             .as_ref()
             .map(|(ids, _)| ids.clone())
             .unwrap_or_default();
+
         // Footer must be loaded before acquiring mmap_cache.write() below
         // (get_or_load_footer takes the mmap write lock internally).
         let footer = self
@@ -4870,6 +4904,8 @@ impl OnDemandStorage {
     /// targets are encoded from their source column one Row Group at a time;
     /// removed columns are omitted. Peak memory remains O(largest Row Group).
     pub fn rewrite_v4_drop_columns(&self) -> io::Result<()> {
+        // Serialize base-file replacement per table (see `table_save_lock`).
+        let _rewrite_guard = crate::storage::table_save_lock::rewrite_lock(&self.path);
         let header = self.header.read();
         if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
             return Err(err_data("rewrite_v4_drop_columns requires a V4 base file"));
@@ -4877,7 +4913,7 @@ impl OnDemandStorage {
         let rg_size_target = (header.row_group_size as usize).max(1024);
         drop(header);
 
-        let tmp_path = self.path.with_extension("apex.tmp");
+        let tmp_path = atomic_rewrite_tmp_path(&self.path);
         let footer = self
             .get_or_load_footer()?
             .ok_or_else(|| err_data("V4 footer missing"))?;
@@ -5408,6 +5444,12 @@ impl OnDemandStorage {
                 HashMap::new(), // binary columns (not implemented in delta yet)
                 bool_columns,
             )?;
+            // These rows are in memory but not on disk yet. Without recording
+            // them the following `save()` sees "no new rows" and takes the
+            // deletion-vector-only path, so the merged rows were dropped when the
+            // delta file was removed — `delete` + SQL write lost the appended row
+            // (and handed its ID to the next insert).
+            self.record_pending_rows(delta_ids.len())?;
         }
 
         Ok(())

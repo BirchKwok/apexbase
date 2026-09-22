@@ -23,7 +23,26 @@ impl ApexExecutor {
         if let Some(count) = Self::try_count_only_join(&stmt, &joins, base_dir, default_table_path)?
         {
             crate::query::executor::record_path("join_count_fast_path");
-            return Ok(ApexResult::Scalar(count));
+            // Emit a named one-cell batch rather than an anonymous scalar.
+            // `ApexResult::Scalar` carries no schema, so the SELECT alias was
+            // lost and the column surfaced as "result"; the single-table COUNT
+            // path already names its output from the alias.
+            let output_name = match stmt.columns.first() {
+                Some(SelectColumn::Aggregate { alias, .. }) => alias
+                    .clone()
+                    .unwrap_or_else(|| "COUNT(*)".to_string()),
+                _ => "COUNT(*)".to_string(),
+            };
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                output_name,
+                ArrowDataType::Int64,
+                false,
+            )]));
+            let array: ArrayRef = Arc::new(Int64Array::from(vec![count]));
+            return Ok(ApexResult::Data(
+                RecordBatch::try_new(schema, vec![array])
+                    .map_err(|error| err_data(error.to_string()))?,
+            ));
         }
 
         if let Some(result) = Self::try_preaggregated_dimension_join(
@@ -196,9 +215,18 @@ impl ApexExecutor {
             } else {
                 vec![where_clause.clone()]
             };
+            // Rows produced by the base relation can be null-extended when a
+            // later RIGHT/FULL join finds no match there, so a predicate that is
+            // TRUE on NULL must not be pushed.
+            let base_nullable = stmt.joins.iter().any(|join_clause| {
+                matches!(join_clause.join_type, JoinType::Right | JoinType::Full)
+            });
             let pushable: Vec<SqlExpr> = conjuncts
                 .into_iter()
-                .filter(|conjunct| Self::predicate_is_local(&result_batch, conjunct, &source_names))
+                .filter(|conjunct| {
+                    Self::predicate_is_local(&result_batch, conjunct, &source_names)
+                        && (!base_nullable || Self::predicate_is_null_rejecting(conjunct))
+                })
                 .collect();
             if !pushable.is_empty() {
                 let combined = pushable.into_iter().reduce(|left, right| SqlExpr::BinaryOp {
@@ -344,10 +372,18 @@ impl ApexExecutor {
                 } else {
                     vec![where_clause.clone()]
                 };
+                // The right side is null-extended by LEFT/FULL joins, so a
+                // predicate that is TRUE on NULL (e.g. `o.col IS NULL`) must not
+                // be pushed: it would drop exactly the rows the anti-join needs.
+                let right_nullable = matches!(
+                    join_clause.join_type,
+                    JoinType::Left | JoinType::Full
+                );
                 let pushable: Vec<SqlExpr> = conjuncts
                     .into_iter()
                     .filter(|conjunct| {
                         Self::predicate_is_local(&right_batch, conjunct, &source_names)
+                            && (!right_nullable || Self::predicate_is_null_rejecting(conjunct))
                     })
                     .collect();
                 if !pushable.is_empty() {
@@ -689,6 +725,7 @@ impl ApexExecutor {
                     partition_by,
                     order_by,
                     alias,
+                    ..
                 } = col
                 {
                     let mut resolved_order = order_by.clone();
@@ -726,6 +763,8 @@ impl ApexExecutor {
                         partition_by: partition_by.clone(),
                         order_by: resolved_order,
                         alias: alias.clone(),
+                        wrapper: None,
+                        frame: None,
                     });
                 }
             }
@@ -826,6 +865,12 @@ impl ApexExecutor {
             }
             _ => return Ok(None),
         };
+        // A shared CTE is materialized in memory under a synthetic path and never
+        // written to disk; opening it as a backend would fail. Bail out so the
+        // cache-aware route handles this statement instead.
+        if has_cached_cte_batch(&left_path) || has_cached_cte_batch(&right_path) {
+            return Ok(None);
+        }
         let left_backend = get_cached_backend(&left_path)?;
         let right_backend = get_cached_backend(&right_path)?;
         if !matches!(
@@ -1153,6 +1198,12 @@ impl ApexExecutor {
             }
             _ => return Ok(None),
         };
+        // A shared CTE is materialized in memory under a synthetic path and never
+        // written to disk; opening it as a backend would fail. Bail out so the
+        // cache-aware route handles this statement instead.
+        if has_cached_cte_batch(&left_path) || has_cached_cte_batch(&right_path) {
+            return Ok(None);
+        }
         let left_backend = get_cached_backend(&left_path)?;
         let right_backend = get_cached_backend(&right_path)?;
         let right_batch = right_backend.read_columns_to_arrow(Some(&[right_key_clean.as_str()]), 0, None)?;
@@ -1373,6 +1424,12 @@ impl ApexExecutor {
         let left_key = plain_key(&left_key);
         let right_key = plain_key(&right_key);
 
+        // A shared CTE is materialized in memory under a synthetic path and never
+        // written to disk; opening it as a backend would fail. Bail out so the
+        // cache-aware route handles this statement instead.
+        if has_cached_cte_batch(&left_path) || has_cached_cte_batch(&right_path) {
+            return Ok(None);
+        }
         let left_backend = get_cached_backend(&left_path)?;
         let right_backend = get_cached_backend(&right_path)?;
 
@@ -1626,6 +1683,12 @@ impl ApexExecutor {
             return Ok(None);
         }
 
+        // A shared CTE is materialized in memory under a synthetic path and never
+        // written to disk; opening it as a backend would fail. Bail out so the
+        // cache-aware route handles this statement instead.
+        if has_cached_cte_batch(&left_path) || has_cached_cte_batch(&right_path) {
+            return Ok(None);
+        }
         let left_backend = get_cached_backend(&left_path)?;
         let right_backend = get_cached_backend(&right_path)?;
 
@@ -1654,14 +1717,30 @@ impl ApexExecutor {
         // after the join, which pre-filtering cannot express.
         let mut left_filters: Vec<SqlExpr> = Vec::new();
         let mut right_filters: Vec<SqlExpr> = Vec::new();
+        // A WHERE conjunct may only be pushed onto an outer join's nullable side
+        // when it is TRUE for no NULL row (`IS NOT NULL`, comparisons, ...).
+        // `IS NULL` is TRUE exactly on the null-extended rows, so pushing it
+        // there would silently turn an anti-join into a no-op filter.
+        let left_nullable = matches!(join_type, JoinType::Right | JoinType::Full);
+        let right_nullable = matches!(join_type, JoinType::Left | JoinType::Full);
         for conjunct in &where_conjuncts {
             let on_left =
                 Self::predicate_is_local(&left_batch, conjunct, &left_names);
             let on_right =
                 Self::predicate_is_local(&right_batch, conjunct, &right_names);
             match (on_left, on_right) {
-                (true, false) => left_filters.push(conjunct.clone()),
-                (false, true) => right_filters.push(conjunct.clone()),
+                (true, false) => {
+                    if left_nullable && !Self::predicate_is_null_rejecting(conjunct) {
+                        return Ok(None);
+                    }
+                    left_filters.push(conjunct.clone());
+                }
+                (false, true) => {
+                    if right_nullable && !Self::predicate_is_null_rejecting(conjunct) {
+                        return Ok(None);
+                    }
+                    right_filters.push(conjunct.clone());
+                }
                 _ => return Ok(None), // cross-side or ambiguous
             }
         }
@@ -1944,7 +2023,14 @@ impl ApexExecutor {
         };
         let mut left_filters: Vec<SqlExpr> = Vec::new();
         let mut right_filters: Vec<SqlExpr> = Vec::new();
+        // This helper exists for the FULL JOIN path, where *both* sides can be
+        // null-extended. Pre-filtering with a predicate that is TRUE on NULL
+        // (`col IS NULL`) would remove the very rows the outer join must emit,
+        // so only null-rejecting predicates are safe to push here.
         for conjunct in Self::split_conjuncts(w) {
+            if !Self::predicate_is_null_rejecting(&conjunct) {
+                return Ok(None);
+            }
             let on_left = Self::predicate_is_local(left, &conjunct, left_names);
             let on_right = Self::predicate_is_local(right, &conjunct, right_names);
             match (on_left, on_right) {
@@ -2067,6 +2153,50 @@ impl ApexExecutor {
     /// Qualified references must name that relation and bare references must
     /// exist in the input batch.  AND/OR are deliberately treated as a whole
     /// expression, so an OR crossing relations is never pushed down.
+    /// True when `expr` can never evaluate to TRUE on a row whose referenced
+    /// columns are all NULL.
+    ///
+    /// Only such predicates may be pushed below the null-producing side of an
+    /// outer join. `IS NULL` is the classic counter-example: it is *true*
+    /// exactly on the null-extended rows, so filtering with it before the join
+    /// destroys the anti-join semantics.
+    fn predicate_is_null_rejecting(expr: &SqlExpr) -> bool {
+        use crate::query::sql_parser::BinaryOperator;
+        match expr {
+            // `IS NOT NULL` rejects NULL; `IS NULL` accepts it.
+            SqlExpr::IsNull { negated, .. } => *negated,
+            // These are all false (or unknown) when the tested value is NULL.
+            SqlExpr::Like { .. }
+            | SqlExpr::Regexp { .. }
+            | SqlExpr::In { .. }
+            | SqlExpr::Between { .. } => true,
+            SqlExpr::BinaryOp { left, op, right } => match op {
+                BinaryOperator::Eq
+                | BinaryOperator::NotEq
+                | BinaryOperator::Lt
+                | BinaryOperator::Le
+                | BinaryOperator::Gt
+                | BinaryOperator::Ge => true,
+                // De Morgan: AND rejects if either side rejects, OR only if both do.
+                BinaryOperator::And => {
+                    Self::predicate_is_null_rejecting(left)
+                        || Self::predicate_is_null_rejecting(right)
+                }
+                BinaryOperator::Or => {
+                    Self::predicate_is_null_rejecting(left)
+                        && Self::predicate_is_null_rejecting(right)
+                }
+                _ => false,
+            },
+            SqlExpr::Paren(inner) | SqlExpr::Cast { expr: inner, .. } => {
+                Self::predicate_is_null_rejecting(inner)
+            }
+            // NOT, function calls (COALESCE/NULLIF/IFNULL), subqueries and FTS can
+            // all be TRUE on NULL — stay conservative and keep them post-join.
+            _ => false,
+        }
+    }
+
     fn predicate_is_local(
         batch: &RecordBatch,
         expr: &SqlExpr,
@@ -2102,6 +2232,27 @@ impl ApexExecutor {
             SqlExpr::Function { args, .. } => args
                 .iter()
                 .all(|arg| Self::predicate_is_local(batch, arg, source_names)),
+            SqlExpr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                // A window function is evaluated after the join, so it is "local"
+                // only when every input it reads comes from the local side.
+                args.iter()
+                    .all(|arg| Self::predicate_is_local(batch, arg, source_names))
+                    && partition_by
+                        .iter()
+                        .all(|name| column_is_local(batch, name, source_names))
+                    && order_by.iter().all(|clause| {
+                        clause
+                            .expr
+                            .as_ref()
+                            .map_or(true, |expr| Self::predicate_is_local(batch, expr, source_names))
+                            && column_is_local(batch, &clause.column, source_names)
+                    })
+            }
             SqlExpr::Case {
                 when_then,
                 else_expr,

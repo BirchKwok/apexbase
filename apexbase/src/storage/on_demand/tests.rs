@@ -8,10 +8,26 @@ fn insert_pending_delete(
     footer_offset: u64,
     footer: &[u8],
 ) {
-    let mut buf = Vec::with_capacity(24 + 12 + footer.len());
+    // Record the snapshot the deferred state describes, exactly as the delete
+    // path does: file identity plus the length/mtime the footer belongs to.
+    let (len, modified) = std::fs::metadata(path)
+        .map(|meta| {
+            (
+                meta.len(),
+                meta.modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|since| since.as_nanos() as u64)
+                    .unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    let mut buf = Vec::with_capacity(36 + 12 + footer.len());
     buf.extend_from_slice(b"APXP");
     buf.extend_from_slice(&dev_id.to_le_bytes());
     buf.extend_from_slice(&ino_id.to_le_bytes());
+    buf.extend_from_slice(&len.to_le_bytes());
+    buf.extend_from_slice(&modified.to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // zero row-group rewrites
     buf.extend_from_slice(&footer_offset.to_le_bytes());
     buf.extend_from_slice(&(footer.len() as u32).to_le_bytes());
@@ -87,6 +103,36 @@ fn apply_pending_deletes_discards_state_for_recreated_file() {
     // The fresh file must be untouched.
     assert_eq!(std::fs::metadata(&table_path).unwrap().len(), 100);
     assert_eq!(std::fs::read(&table_path).unwrap(), vec![0u8; 100]);
+}
+
+#[test]
+fn apply_pending_deletes_discards_a_snapshot_overtaken_by_a_rewrite() {
+    let dir = tempdir().unwrap();
+    let table_path = dir.path().join("overtaken.apex");
+    std::fs::write(&table_path, vec![0u8; 100]).unwrap();
+
+    // Deferred state recorded for the current file, then the file changes size
+    // (an append publishes a new footer at a new offset). Applying the recorded
+    // footer would resurrect rows the snapshot still describes and orphan the
+    // rows appended since, so the state must be dropped instead.
+    let footer = vec![0u8; 64];
+    insert_pending_delete(&table_path, 0, 0, 4096, &footer);
+    std::fs::write(&table_path, vec![0u8; 120]).unwrap();
+
+    apply_pending_deletes(&table_path).unwrap();
+
+    assert!(
+        !global_pending_deletes()
+            .read()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .contains_key(&table_path),
+        "the stale snapshot must be dropped"
+    );
+    let bytes = std::fs::read(&table_path).unwrap();
+    assert_eq!(bytes.len(), 120, "the newer file must be left untouched");
+    assert!(bytes.iter().all(|&byte| byte == 0));
 }
 
 #[test]
@@ -804,6 +850,136 @@ fn test_v4_save_and_open() {
         } else {
             panic!("Expected String for name column");
         }
+    }
+}
+
+/// Loading the base must not lower the ID high-water mark below the delta's.
+///
+/// The open path folds the delta sidecar's maximum ID into `next_id`, and the
+/// base loader used to store its base-only value on top: after `delete` plus a
+/// delta append, the next SQL `INSERT` was handed the delta row's ID and
+/// overwrote it instead of appending.
+#[test]
+fn open_v4_data_keeps_the_delta_id_high_water_mark() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("delta_high_water.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("n".to_string(), vec![0i64, 1, 2, 3]);
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    // Append a row through the delta sidecar (the single-row store route).
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let mut row = HashMap::new();
+    row.insert("n".to_string(), crate::data::Value::Int64(4));
+    let ids = storage.insert_value_rows_to_delta(&[row]).unwrap();
+    assert_eq!(ids, vec![5]);
+    storage.save().unwrap();
+    drop(storage);
+
+    // A full load (what a write opens with) must keep next_id above the delta row.
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(storage.read_ids(0, None).unwrap(), vec![1, 2, 3, 4, 5]);
+    storage.open_v4_data().unwrap();
+    assert_eq!(
+        storage.next_id_value(),
+        6,
+        "the base loader must not lower the delta-aware ID high-water mark"
+    );
+    let assigned = storage
+        .insert_value_rows_to_delta(&[{
+            let mut row = HashMap::new();
+            row.insert("n".to_string(), crate::data::Value::Int64(99));
+            row
+        }])
+        .unwrap();
+    assert_eq!(assigned, vec![6], "the appended row must get a fresh ID");
+}
+
+/// Compaction must publish the delta rows it merged, not just the deletions.
+///
+/// `merge_delta_file` inserted the delta rows without recording them as pending,
+/// so the following `save()` saw "no new rows" and took the deletion-vector-only
+/// path — and `compact()` then removed the delta file, losing those rows.
+#[test]
+fn compact_after_delete_keeps_the_appended_delta_row() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("compact_keeps_delta.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("n".to_string(), vec![0i64, 1, 2, 3]);
+        let mut string_cols = HashMap::new();
+        string_cols.insert(
+            "k".to_string(),
+            vec!["k0".to_string(), "k1".to_string(), "k2".to_string(), "k3".to_string()],
+        );
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let mut row = HashMap::new();
+    row.insert("k".to_string(), crate::data::Value::String("k4".to_string()));
+    row.insert("n".to_string(), crate::data::Value::Int64(4));
+    assert_eq!(storage.insert_value_rows_to_delta(&[row]).unwrap(), vec![5]);
+    storage.save().unwrap();
+    drop(storage);
+
+    // Delete row 4 through the DeltaStore overlay, exactly as the API delete does.
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert!(storage.delta_delete_row(4).unwrap());
+    storage.save_delta_store().unwrap();
+    drop(storage);
+
+    // A write opens the table and compacts the delta before writing.
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(storage.next_id_value(), 6);
+    storage.compact().unwrap();
+    drop(storage);
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(
+        storage.read_ids(0, None).unwrap(),
+        vec![1, 2, 3, 5],
+        "row 4 is deleted and the delta row 5 must survive the compaction"
+    );
+    assert_eq!(
+        storage.next_id_value(),
+        6,
+        "the surviving delta row keeps its ID reserved"
+    );
+    let cols = storage.read_columns(Some(&["k"]), 0, None).unwrap();
+    match &cols["k"] {
+        ColumnData::String { offsets, data } => {
+            let values: Vec<&str> = (0..4)
+                .map(|i| {
+                    std::str::from_utf8(&data[offsets[i] as usize..offsets[i + 1] as usize])
+                        .unwrap()
+                })
+                .collect();
+            assert_eq!(values, vec!["k0", "k1", "k2", "k4"]);
+        }
+        other => panic!("unexpected k column: {other:?}"),
     }
 }
 

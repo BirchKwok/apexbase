@@ -46,8 +46,14 @@ impl ApexStorageImpl {
 
     fn row_count(&self, py: Python<'_>) -> PyResult<u64> {
         let table_path = self.get_current_table_path()?;
-        // If file doesn't exist (e.g., after drop_if_exists), return 0
-        if !py.allow_threads(|| table_path.exists()) {
+        // If file doesn't exist (e.g., after drop_if_exists), return 0.
+        //
+        // A process-local table never has a file — its `apexbase_memory:` path is
+        // not a legal filesystem name — so this check must not short-circuit it
+        // to 0 while it holds rows.
+        if !crate::storage::is_memory_path(&table_path)
+            && !py.allow_threads(|| table_path.exists())
+        {
             return Ok(0);
         }
 

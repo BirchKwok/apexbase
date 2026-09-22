@@ -1709,11 +1709,13 @@ impl OnDemandStorage {
                                         pos += del_vec_len; // skip deletion vector
                                         let null_bitmap_len = (rg_rows + 7) / 8;
                                         // Navigate to the right column's null bitmap
+                                        let mut column_in_rg = false;
                                         for ci in 0..f_col_count {
                                             if pos + null_bitmap_len > body.len() { break; }
                                             let null_bytes = &body[pos..pos + null_bitmap_len];
                                             pos += null_bitmap_len;
                                             if ci == col_idx {
+                                                column_in_rg = true;
                                                 // Extract null bits for rows in range
                                                 for ri in 0..rg_rows {
                                                     let global_ri = global_row + ri;
@@ -1736,6 +1738,21 @@ impl OnDemandStorage {
                                             if let Ok(c) = consumed {
                                                 pos += c;
                                             } else { break; }
+                                        }
+                                        if !column_in_rg {
+                                            // Schema evolution: this Row Group was written
+                                            // before the column existed, so it stores neither
+                                            // a value nor a null bit for it. Without this the
+                                            // mask stayed "not null" and the reader published
+                                            // the empty/zero padding as a real value — and
+                                            // only when a delta row forced this reader
+                                            // instead of the null-aware Arrow path.
+                                            for ri in 0..rg_rows {
+                                                let global_ri = global_row + ri;
+                                                if global_ri >= start_row && global_ri < start_row + row_count {
+                                                    result[global_ri - start_row] = true;
+                                                }
+                                            }
                                         }
                                         global_row += rg_rows;
                                     }
@@ -3421,16 +3438,24 @@ impl OnDemandStorage {
     /// `ids/columns` until save()/flush() persists them as a row group. If the
     /// full base table has been loaded into memory, only rows beyond the on-disk
     /// footer count are considered pending.
+    ///
+    /// `v4_base_loaded` is what tells the two states apart, and it has to be a
+    /// flag rather than an inspection of the buffered IDs. A loaded base does not
+    /// necessarily start at `_id` 1: after `replace()` re-appends a row, the
+    /// first base ID can be any value, so "the buffer does not start at 1" once
+    /// misread a *fully loaded* base as an append-only buffer and reported every
+    /// base row as pending — which made the next `save()` spill the whole table
+    /// into the delta file on top of the base copy already there.
     #[inline]
     pub fn pending_v4_in_memory_rows(&self) -> usize {
         if !self.is_v4_format() {
             return 0;
         }
-        // Take the id facts, then drop the guard: the footer reload below takes
+        // Take the row count, then drop the guard: the footer reload below takes
         // the footer write lock and must not run while a read guard is alive.
-        let (ids_len, first_id) = {
+        let ids_len = {
             let ids = self.ids.read();
-            (ids.len(), ids.first().copied().unwrap_or(0))
+            ids.len()
         };
         if ids_len == 0 || !self.has_v4_in_memory_data() {
             return 0;
@@ -3450,14 +3475,16 @@ impl OnDemandStorage {
             }
         }
         if on_disk_rows == 0 {
+            // Nothing on disk yet — every buffered row is new.
             ids_len
-        } else if first_id != 1 {
-            // Insert backends for mmap-only V4 files hold only newly appended
-            // IDs, e.g. base has rows 1..N while memory starts at N+1.
+        } else if !self.v4_base_loaded.load(Ordering::SeqCst) {
+            // Mmap-only backend: `ids` holds only the rows appended since the
+            // base was last written, so all of them are pending.
             ids_len
         } else if ids_len < on_disk_rows {
             ids_len
         } else {
+            // The buffer holds the whole base plus anything appended after it.
             ids_len.saturating_sub(on_disk_rows)
         }
     }

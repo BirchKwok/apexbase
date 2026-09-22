@@ -1002,19 +1002,56 @@ impl ApexExecutor {
 
     /// Execute window function (ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, SUM, AVG, etc.)
     fn execute_window_function(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<ApexResult> {
-        // Collect window specs: (func_name, args, partition_by, order_by, output_name)
-        let mut window_specs: Vec<(String, Vec<String>, Vec<String>, Vec<crate::query::OrderByClause>, String)> = Vec::new();
+        // Collect window specs:
+        // (func_name, args, partition_by, order_by, output_name, frame)
+        let mut window_specs: Vec<(
+            String,
+            Vec<String>,
+            Vec<String>,
+            Vec<crate::query::OrderByClause>,
+            String,
+            Option<crate::query::sql_parser::WindowFrame>,
+        )> = Vec::new();
         
         let supported = ["ROW_NUMBER", "RANK", "DENSE_RANK", "NTILE", "PERCENT_RANK", "CUME_DIST", "LAG", "LEAD", "FIRST_VALUE", "LAST_VALUE", "NTH_VALUE", "SUM", "AVG", "COUNT", "MIN", "MAX", "RUNNING_SUM"];
         
         for col in &stmt.columns {
-            if let SelectColumn::WindowFunction { name, args, partition_by, order_by, alias } = col {
+            if let SelectColumn::WindowFunction { name, args, partition_by, order_by, alias, frame, .. } = col {
                 if !supported.iter().any(|s| name.eq_ignore_ascii_case(s)) {
                     return Err(err_input(format!("Unsupported window function: {}", name)));
                 }
                 let out_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
                 let upper = name.to_ascii_uppercase();
-                window_specs.push((upper, args.clone(), partition_by.clone(), order_by.clone(), out_name));
+                // Frame validation.
+                //
+                // The executor implements the default frame and the cumulative
+                // `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` form. A
+                // *bounded* frame (e.g. `2 PRECEDING`) is not evaluated, and
+                // silently ignoring it would return a whole-partition value where
+                // the query asked for a windowed one — a wrong answer that looks
+                // plausible. Reject it explicitly instead.
+                if let Some(spec) = frame {
+                    use crate::query::sql_parser::WindowFrameBound as Bound;
+                    let cumulative = spec.rows
+                        && matches!(spec.start, Bound::UnboundedPreceding)
+                        && matches!(spec.end, Bound::CurrentRow);
+                    let implicit_default = !spec.rows
+                        && matches!(spec.start, Bound::UnboundedPreceding)
+                        && matches!(spec.end, Bound::CurrentRow);
+                    if !cumulative && !implicit_default {
+                        return Err(err_input(format!(
+                            "Unsupported window frame for {upper}: only the cumulative                              `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW` frame is                              implemented; a bounded frame would be silently ignored"
+                        )));
+                    }
+                }
+                window_specs.push((
+                    upper,
+                    args.clone(),
+                    partition_by.clone(),
+                    order_by.clone(),
+                    out_name,
+                    frame.clone(),
+                ));
             }
         }
 
@@ -1025,7 +1062,7 @@ impl ApexExecutor {
         let num_rows = batch.num_rows();
         let use_float: Vec<bool> = window_specs
             .iter()
-            .map(|(func_name, func_args, _, _, _)| {
+            .map(|(func_name, func_args, _, _, _, _)| {
                 let source_is_float = func_args
                     .first()
                     .and_then(|name| Self::get_column_by_name(batch, name.trim_matches('"')))
@@ -1049,7 +1086,7 @@ impl ApexExecutor {
         // work, so retain the ordered row groups for the duration of this SELECT.
         let mut ordered_group_cache: AHashMap<String, Arc<Vec<Vec<usize>>>> = AHashMap::new();
 
-        for (spec_idx, (func_name, func_args, partition_by, order_by, _)) in window_specs.iter().enumerate() {
+        for (spec_idx, (func_name, func_args, partition_by, order_by, _, frame)) in window_specs.iter().enumerate() {
             let cache_key = format!("{:?}|{:?}", partition_by, order_by);
             let order_cols: Vec<(ArrayRef, bool)> = order_by
                 .iter()
@@ -1360,13 +1397,21 @@ impl ApexExecutor {
 
         let row_number_keep: Option<Vec<u32>> =
             stmt.window_row_number_limit.as_ref().and_then(|(limit_alias, limit)| {
-                let spec_idx = window_specs.iter().position(|(func_name, _, _, _, out_name)| {
+                let spec_idx = window_specs.iter().position(|(func_name, _, _, _, out_name, _)| {
                     func_name == "ROW_NUMBER" && out_name.eq_ignore_ascii_case(limit_alias)
                 })?;
+                // Keep only row positions that exist in *this* batch. The rows
+                // retained by the `ROW_NUMBER() <= k` pushdown are later gathered
+                // with `take`, and a position beyond the batch makes `take` panic
+                // (`index out of bounds`). Guarding here turns a latent crash into
+                // a correct (if unbounded) window evaluation.
                 let keep = per_int[spec_idx]
                     .iter()
                     .enumerate()
                     .filter_map(|(row_idx, rank)| {
+                        if row_idx >= num_rows {
+                            return None;
+                        }
                         rank.and_then(|rank| {
                             if rank >= 1 && (rank as usize) <= *limit {
                                 Some(row_idx as u32)
@@ -1447,10 +1492,16 @@ impl ApexExecutor {
                         result_arrays.push(array);
                     }
                 }
-                SelectColumn::WindowFunction { name, alias, .. } => {
+                SelectColumn::WindowFunction {
+                    name,
+                    alias,
+                    wrapper,
+                    ..
+                } => {
                     let out_name = alias.clone().unwrap_or_else(|| name.to_lowercase());
-                    if use_float[spec_idx] {
-                        result_fields.push(Field::new(&out_name, ArrowDataType::Float64, true));
+                    // Materialize the raw window value under a private column name
+                    // so a surrounding expression can reference it.
+                    let window_array: ArrayRef = if use_float[spec_idx] {
                         let values: Vec<Option<f64>> = if let Some(indices) = &row_number_keep {
                             indices
                                 .iter()
@@ -1459,9 +1510,8 @@ impl ApexExecutor {
                         } else {
                             per_flt[spec_idx].clone()
                         };
-                        result_arrays.push(Arc::new(Float64Array::from(values)));
+                        Arc::new(Float64Array::from(values))
                     } else {
-                        result_fields.push(Field::new(&out_name, ArrowDataType::Int64, true));
                         let values: Vec<Option<i64>> = if let Some(indices) = &row_number_keep {
                             indices
                                 .iter()
@@ -1470,7 +1520,53 @@ impl ApexExecutor {
                         } else {
                             per_int[spec_idx].clone()
                         };
-                        result_arrays.push(Arc::new(Int64Array::from(values)));
+                        Arc::new(Int64Array::from(values))
+                    };
+
+                    match wrapper {
+                        // Nested / arithmetic window: substitute the computed value
+                        // into the surrounding expression and evaluate it. Without
+                        // this the wrapper was silently dropped and
+                        // `SUM(x) OVER (...) / 2` returned the raw sum.
+                        Some(expr) => {
+                            let synthetic = format!("__window_value_{spec_idx}");
+                            let mut fields = batch
+                                .schema()
+                                .fields()
+                                .iter()
+                                .map(|f| f.as_ref().clone())
+                                .collect::<Vec<_>>();
+                            fields.push(Field::new(&synthetic, window_array.data_type().clone(), true));
+                            let mut arrays: Vec<ArrayRef> =
+                                (0..batch.num_columns()).map(|i| batch.column(i).clone()).collect();
+                            arrays.push(Arc::clone(&window_array));
+                            let with_window = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                                .map_err(|e| err_data(e.to_string()))?;
+
+                            let rewritten = Self::replace_first_window(expr, &synthetic);
+                            let array = Self::evaluate_expr_to_array(&with_window, &rewritten)?;
+                            result_fields.push(Field::new(&out_name, array.data_type().clone(), true));
+                            if let Some(indices) = &row_number_take {
+                                result_arrays.push(
+                                    compute::take(array.as_ref(), indices, None)
+                                        .map_err(|e| err_data(e.to_string()))?,
+                                );
+                            } else {
+                                result_arrays.push(array);
+                            }
+                        }
+                        None => {
+                            let data_type = window_array.data_type().clone();
+                            result_fields.push(Field::new(&out_name, data_type, true));
+                            if let Some(indices) = &row_number_take {
+                                result_arrays.push(
+                                    compute::take(window_array.as_ref(), indices, None)
+                                        .map_err(|e| err_data(e.to_string()))?,
+                                );
+                            } else {
+                                result_arrays.push(window_array);
+                            }
+                        }
                     }
                     spec_idx += 1;
                 }
@@ -1495,6 +1591,46 @@ impl ApexExecutor {
         }
 
         Ok(ApexResult::Data(result))
+    }
+
+    /// Replace the first `Window` node in `expr` with a reference to `name`.
+    ///
+    /// Used after the window value has been materialized as a column: the
+    /// remaining expression tree is then an ordinary scalar expression over that
+    /// column and can reuse the standard evaluator.
+    fn replace_first_window(expr: &SqlExpr, name: &str) -> SqlExpr {
+        fn walk(expr: &SqlExpr, name: &str, replaced: &mut bool) -> SqlExpr {
+            if *replaced {
+                return expr.clone();
+            }
+            match expr {
+                SqlExpr::Window { .. } => {
+                    *replaced = true;
+                    SqlExpr::Column(name.to_string())
+                }
+                SqlExpr::BinaryOp { left, op, right } => SqlExpr::BinaryOp {
+                    left: Box::new(walk(left, name, replaced)),
+                    op: op.clone(),
+                    right: Box::new(walk(right, name, replaced)),
+                },
+                SqlExpr::UnaryOp { op, expr: inner } => SqlExpr::UnaryOp {
+                    op: op.clone(),
+                    expr: Box::new(walk(inner, name, replaced)),
+                },
+                SqlExpr::Paren(inner) => SqlExpr::Paren(Box::new(walk(inner, name, replaced))),
+                SqlExpr::Cast { expr: inner, data_type } => SqlExpr::Cast {
+                    expr: Box::new(walk(inner, name, replaced)),
+                    data_type: data_type.clone(),
+                },
+                SqlExpr::Function { name: fname, args } => SqlExpr::Function {
+                    name: fname.clone(),
+                    args: args.iter().map(|a| walk(a, name, replaced)).collect(),
+                },
+                other => other.clone(),
+            }
+        }
+        let mut replaced = false;
+        walk(expr, name, &mut replaced)
     }
 
     /// Compare two array values for sorting

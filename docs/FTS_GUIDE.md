@@ -207,6 +207,11 @@ ALTER FTS INDEX ON table_name DISABLE
 - Sets `enabled = false` in `fts_config.json`.
 - **Does not** delete index files.
 - While disabled, SQL `INSERT` / `DELETE` writes are **not** synced to the FTS index.
+- **Full-text reads are unavailable while disabled**: `MATCH()`,
+  `FUZZY_MATCH()`, `FTS_SCORE()` and `search_text()` fail for this table instead
+  of answering from the retained index. The retained snapshot is stale by
+  definition (writes made while disabled were not indexed), so failing loudly is
+  safer than returning incomplete results. Re-enable the index to read again.
 - Useful when temporarily suspending FTS to avoid write overhead during a large bulk load.
 
 **Enable:**

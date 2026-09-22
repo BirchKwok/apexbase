@@ -66,6 +66,9 @@ local-perf-results/
 .windsurf/
 .vscode/
 
+# Generated run artifacts from usage-examples scenarios
+usage-examples/Python/_out/
+
 AGENTS.md
 
 .claude/

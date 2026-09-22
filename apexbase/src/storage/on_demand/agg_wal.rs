@@ -8394,6 +8394,10 @@ impl OnDemandStorage {
             for (key, col) in float_columns.iter_mut() {
                 let (val, is_null) = match row.get(key).map(|v| v.as_column_value_ref()) {
                     Some(ColumnValueRef::Float64(v)) => (v, false),
+                    // An integer bound for a float column widens, matching the SQL
+                    // INSERT path. Without this the value fell to the wildcard and
+                    // was published as NULL.
+                    Some(ColumnValueRef::Int64(v)) => (v as f64, false),
                     Some(ColumnValueRef::Null) | None => (0.0, true),
                     _ => (0.0, true),
                 };

@@ -401,6 +401,19 @@ pub enum SelectColumn {
         partition_by: Vec<String>,
         order_by: Vec<OrderByClause>,
         alias: Option<String>,
+        /// Present when this window is *nested* or combined arithmetically, e.g.
+        /// `ROUND(SUM(x) OVER (PARTITION BY g), 2)` or
+        /// `SUM(x) OVER (PARTITION BY g) / 2`.
+        ///
+        /// The window itself is still computed from `name`/`args`/`partition_by`/
+        /// `order_by`; this field carries the surrounding expression so the
+        /// executor can substitute the computed window value and finish the
+        /// arithmetic. `None` means the projection is just the bare window.
+        #[serde(default)]
+        wrapper: Option<SqlExpr>,
+        /// Explicit `ROWS`/`RANGE` frame, when the query specifies one.
+        #[serde(default)]
+        frame: Option<WindowFrame>,
     },
 }
 
@@ -522,6 +535,50 @@ pub enum SqlExpr {
         inner: Box<SqlExpr>,
         names: Vec<String>,
     },
+    /// Window function call: `FUNC(args) OVER (PARTITION BY ... ORDER BY ... [frame])`.
+    ///
+    /// This is the general form; unlike the legacy top-level
+    /// [`SelectColumn::WindowFunction`] it can appear *anywhere* an expression is
+    /// allowed, so a window function may be nested inside another function or
+    /// participate in arithmetic (`ROUND(SUM(x) OVER (...), 2)`,
+    /// `SUM(x) OVER (...) / 2`, `... ORDER BY ROW_NUMBER() OVER (...)`).
+    Window {
+        /// Upper-cased function name (`SUM`, `ROW_NUMBER`, ...).
+        name: String,
+        args: Vec<SqlExpr>,
+        partition_by: Vec<String>,
+        order_by: Vec<OrderByClause>,
+        frame: Option<WindowFrame>,
+    },
+}
+
+/// Explicit window frame: `ROWS|RANGE BETWEEN <start> AND <end>`.
+///
+/// `ROWS` frames are evaluated over physical row positions; `RANGE` frames are
+/// currently restricted to the default whole-partition behaviour because a
+/// value-based range needs the peer-group comparison the execution layer does
+/// not model yet.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowFrame {
+    /// `true` for `ROWS`, `false` for `RANGE`.
+    pub rows: bool,
+    pub start: WindowFrameBound,
+    pub end: WindowFrameBound,
+}
+
+/// One endpoint of a [`WindowFrame`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum WindowFrameBound {
+    /// `UNBOUNDED PRECEDING`
+    UnboundedPreceding,
+    /// `n PRECEDING`
+    Preceding(i64),
+    /// `CURRENT ROW`
+    CurrentRow,
+    /// `n FOLLOWING`
+    Following(i64),
+    /// `UNBOUNDED FOLLOWING`
+    UnboundedFollowing,
 }
 
 /// Binary operators
@@ -842,6 +899,32 @@ impl SelectStatement {
             SqlExpr::ArrayIndex { array, index } => {
                 Self::extract_columns_from_expr(array, columns);
                 Self::extract_columns_from_expr(index, columns);
+            }
+            SqlExpr::Window {
+                args,
+                partition_by,
+                order_by,
+                ..
+            } => {
+                // The source columns of a window function are its arguments, its
+                // PARTITION BY keys and its ORDER BY keys — all of them must be
+                // read even when they are not otherwise projected.
+                for arg in args {
+                    Self::extract_columns_from_expr(arg, columns);
+                }
+                for column in partition_by {
+                    Self::extract_columns_from_expr(&SqlExpr::Column(column.clone()), columns);
+                }
+                for clause in order_by {
+                    if let Some(expr) = &clause.expr {
+                        Self::extract_columns_from_expr(expr, columns);
+                    } else {
+                        Self::extract_columns_from_expr(
+                            &SqlExpr::Column(clause.column.clone()),
+                            columns,
+                        );
+                    }
+                }
             }
             _ => {}
         }
@@ -4136,31 +4219,46 @@ impl SqlParser {
                     break;
                 }
 
-                // Check if this is a window function (has OVER clause)
+                // Check if this is a window function (has OVER clause).
+                //
+                // A window is emitted as a normal expression node so it can be
+                // nested inside functions and combined arithmetically. `*` and
+                // `COUNT()` carry no argument.
                 if matches!(self.current(), Token::Over) {
-                    // Convert aggregate to window function
+                    let simple_args: Vec<SqlExpr> = column
+                        .clone()
+                        .map(SqlExpr::Column)
+                        .into_iter()
+                        .collect();
                     let func_name = format!("{}", func);
-                    let args: Vec<String> = column.clone().into_iter().collect();
-
-                    self.advance(); // consume OVER
-                    self.expect(Token::LParen)?;
-
-                    let mut partition_by = Vec::new();
-                    if matches!(self.current(), Token::Partition) {
+                    let mut window_expr = self.maybe_parse_over(SqlExpr::Function {
+                        name: func_name,
+                        args: simple_args,
+                    })?;
+                    while matches!(
+                        self.current(),
+                        Token::Plus
+                            | Token::Minus
+                            | Token::Star
+                            | Token::Slash
+                            | Token::Percent
+                    ) {
+                        let op = match self.current() {
+                            Token::Plus => BinaryOperator::Add,
+                            Token::Minus => BinaryOperator::Sub,
+                            Token::Star => BinaryOperator::Mul,
+                            Token::Slash => BinaryOperator::Div,
+                            Token::Percent => BinaryOperator::Mod,
+                            _ => unreachable!(),
+                        };
                         self.advance();
-                        self.expect(Token::By)?;
-                        partition_by = self.parse_column_list()?;
+                        let right = self.parse_unary()?;
+                        window_expr = SqlExpr::BinaryOp {
+                            left: Box::new(window_expr),
+                            op,
+                            right: Box::new(right),
+                        };
                     }
-
-                    let order_by = if matches!(self.current(), Token::Order) {
-                        self.advance();
-                        self.expect(Token::By)?;
-                        self.parse_order_by()?
-                    } else {
-                        Vec::new()
-                    };
-
-                    self.expect(Token::RParen)?;
 
                     let alias = if matches!(self.current(), Token::As) {
                         self.advance();
@@ -4169,13 +4267,65 @@ impl SqlParser {
                         self.parse_alias_identifier()
                     };
 
-                    columns.push(SelectColumn::WindowFunction {
-                        name: func_name,
-                        args,
+                    // A projection containing two independent windows
+                    // (`SUM(x) OVER (..) - AVG(x) OVER (..)`) cannot be carried
+                    // by the single-window node, so it stays a plain expression.
+                    if window_count(&window_expr) > 1 {
+                        columns.push(SelectColumn::Expression {
+                            expr: window_expr,
+                            alias,
+                        });
+                        if matches!(self.current(), Token::Comma) {
+                            self.advance();
+                            continue;
+                        }
+                        break;
+                    }
+
+                    // Otherwise keep the dedicated window node (so the optimised
+                    // window executor runs); `wrapper` carries any surrounding
+                    // expression such as ROUND(...) or `/ 2`.
+                    if let SqlExpr::Window {
+                        name,
                         partition_by,
                         order_by,
-                        alias,
-                    });
+                        frame,
+                        ..
+                    } = &window_expr
+                    {
+                        columns.push(SelectColumn::WindowFunction {
+                            name: name.clone(),
+                            args: column.clone().into_iter().collect(),
+                            partition_by: partition_by.clone(),
+                            order_by: order_by.clone(),
+                            alias,
+                            wrapper: None,
+                            frame: frame.clone(),
+                        });
+                    } else {
+                        let (name, partition_by, order_by, frame) = match &window_expr {
+                            SqlExpr::BinaryOp { .. } => {
+                                let found = first_window(&window_expr)
+                                    .expect("arithmetic around a window must contain a window");
+                                (found.name, found.partition_by, found.order_by, found.frame)
+                            }
+                            _ => unreachable!("window_expr is either a Window or wraps one"),
+                        };
+                        columns.push(SelectColumn::WindowFunction {
+                            name,
+                            args: column.clone().into_iter().collect(),
+                            partition_by,
+                            order_by,
+                            alias,
+                            wrapper: Some(window_expr.clone()),
+                            frame,
+                        });
+                    }
+                    if matches!(self.current(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
                 } else {
                     let alias = if matches!(self.current(), Token::As) {
                         self.advance();
@@ -4223,48 +4373,39 @@ impl SqlParser {
                     let mut func_expr = self.parse_function_call_from_name(name.clone())?;
 
                     if matches!(self.current(), Token::Over) {
-                        // Window function: func(args...) OVER (PARTITION BY ... ORDER BY ...)
-                        // Extract args from the function expression
-                        let args = if let SqlExpr::Function {
-                            args: func_args, ..
-                        } = &func_expr
-                        {
-                            func_args
-                                .iter()
-                                .filter_map(|a| {
-                                    if let SqlExpr::Column(c) = a {
-                                        Some(c.clone())
-                                    } else if let SqlExpr::Literal(v) = a {
-                                        Some(format!("{:?}", v))
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-
-                        self.advance();
-                        self.expect(Token::LParen)?;
-
-                        let mut partition_by = Vec::new();
-                        if matches!(self.current(), Token::Partition) {
+                        // Window function: `func(args...) OVER (...)`.
+                        //
+                        // A window is parsed as an ordinary expression node so it
+                        // can be nested inside functions and participate in
+                        // arithmetic. Continuing the operator loop afterwards is
+                        // what makes `SUM(x) OVER (...) / 2` work, and the same
+                        // loop already handled the non-window `func(...) op ...`
+                        // spelling below.
+                        let mut window_expr = self.maybe_parse_over(func_expr)?;
+                        while matches!(
+                            self.current(),
+                            Token::Plus
+                                | Token::Minus
+                                | Token::Star
+                                | Token::Slash
+                                | Token::Percent
+                        ) {
+                            let op = match self.current() {
+                                Token::Plus => BinaryOperator::Add,
+                                Token::Minus => BinaryOperator::Sub,
+                                Token::Star => BinaryOperator::Mul,
+                                Token::Slash => BinaryOperator::Div,
+                                Token::Percent => BinaryOperator::Mod,
+                                _ => unreachable!(),
+                            };
                             self.advance();
-                            self.expect(Token::By)?;
-                            partition_by = self.parse_column_list()?;
+                            let right = self.parse_unary()?;
+                            window_expr = SqlExpr::BinaryOp {
+                                left: Box::new(window_expr),
+                                op,
+                                right: Box::new(right),
+                            };
                         }
-
-                        let order_by = if matches!(self.current(), Token::Order) {
-                            self.advance();
-                            self.expect(Token::By)?;
-                            self.parse_order_by()?
-                        } else {
-                            Vec::new()
-                        };
-
-                        self.expect(Token::RParen)?;
-
                         let alias = if matches!(self.current(), Token::As) {
                             self.advance();
                             self.parse_alias_identifier()
@@ -4272,12 +4413,16 @@ impl SqlParser {
                             self.parse_alias_identifier()
                         };
 
+                        let (name, partition_by, order_by, frame, wrapper) =
+                            Self::window_node_parts(&window_expr);
                         columns.push(SelectColumn::WindowFunction {
                             name,
-                            args,
+                            args: window_args_as_strings(&window_expr),
                             partition_by,
                             order_by,
                             alias,
+                            wrapper,
+                            frame,
                         });
                     } else {
                         while matches!(
@@ -4310,6 +4455,51 @@ impl SqlParser {
                         } else {
                             self.parse_alias_identifier()
                         };
+
+                        // A window can hide inside a scalar function call, e.g.
+                        // `ROUND(SUM(x) OVER (PARTITION BY g), 2)`. Promote it to
+                        // a window projection carrying the full expression as its
+                        // wrapper, otherwise the window executor never sees it and
+                        // the raw `Window` node reaches the scalar evaluator.
+                        if window_count(&func_expr) > 0 {
+                            let (name, partition_by, order_by, frame, wrapper) =
+                                Self::window_node_parts(&func_expr);
+                            columns.push(SelectColumn::WindowFunction {
+                                name,
+                                args: window_args_as_strings(&func_expr),
+                                partition_by,
+                                order_by,
+                                alias,
+                                wrapper,
+                                frame,
+                            });
+                            if matches!(self.current(), Token::Comma) {
+                                self.advance();
+                                continue;
+                            }
+                            break;
+                        }
+
+                        // `CAST(SUM(x) OVER (...) AS INT)` reaches here as a Cast
+                        // node wrapping a window, so promote that shape too.
+                        if window_count(&func_expr) > 0 {
+                            let (name, partition_by, order_by, frame, wrapper) =
+                                Self::window_node_parts(&func_expr);
+                            columns.push(SelectColumn::WindowFunction {
+                                name,
+                                args: window_args_as_strings(&func_expr),
+                                partition_by,
+                                order_by,
+                                alias,
+                                wrapper,
+                                frame,
+                            });
+                            if matches!(self.current(), Token::Comma) {
+                                self.advance();
+                                continue;
+                            }
+                            break;
+                        }
 
                         columns.push(SelectColumn::Expression {
                             expr: func_expr,
@@ -4446,7 +4636,26 @@ impl SqlParser {
                     } else {
                         self.parse_alias_identifier()
                     };
-                    columns.push(SelectColumn::Expression { expr, alias });
+                    // `CAST(SUM(x) OVER (...) AS INT)` and other keyword-led
+                    // expressions arrive here. Promote a contained window to a
+                    // window projection carrying the full expression as its
+                    // wrapper, otherwise the raw Window node reaches the scalar
+                    // evaluator and fails.
+                    if window_count(&expr) > 0 {
+                        let (name, partition_by, order_by, frame, wrapper) =
+                            Self::window_node_parts(&expr);
+                        columns.push(SelectColumn::WindowFunction {
+                            name,
+                            args: window_args_as_strings(&expr),
+                            partition_by,
+                            order_by,
+                            alias,
+                            wrapper,
+                            frame,
+                        });
+                    } else {
+                        columns.push(SelectColumn::Expression { expr, alias });
+                    }
                 } else {
                     break;
                 }
@@ -4894,6 +5103,205 @@ impl SqlParser {
                 other
             ))),
         }
+    }
+
+    /// Attach an `OVER (...)` window specification to `expr` when one follows.
+    ///
+    /// Used as a postfix step after parsing any function call, which is what
+    /// allows a window function to appear wherever an expression is allowed
+    /// rather than only as a top-level SELECT item.
+    fn maybe_parse_over(&mut self, expr: SqlExpr) -> Result<SqlExpr, ApexError> {
+        if !matches!(self.current(), Token::Over) {
+            return Ok(expr);
+        }
+        let SqlExpr::Function { name, args } = expr else {
+            return Err(ApexError::QueryParseError(
+                "OVER must follow a function call".to_string(),
+            ));
+        };
+        self.advance(); // consume OVER
+        self.expect(Token::LParen)?;
+
+        let mut partition_by: Vec<String> = Vec::new();
+        if matches!(self.current(), Token::Partition) {
+            self.advance();
+            self.expect(Token::By)?;
+            partition_by = self.parse_column_list()?;
+        }
+
+        let order_by = if matches!(self.current(), Token::Order) {
+            self.advance();
+            self.expect(Token::By)?;
+            self.parse_order_by()?
+        } else {
+            Vec::new()
+        };
+
+        let frame = self.parse_optional_window_frame()?;
+
+        self.expect(Token::RParen)?;
+
+        Ok(SqlExpr::Window {
+            name: name.to_ascii_uppercase(),
+            args,
+            partition_by,
+            order_by,
+            frame,
+        })
+    }
+
+    /// Parse an optional `ROWS|RANGE BETWEEN <start> AND <end>` frame clause.
+    ///
+    /// `ROWS` and `RANGE` are not reserved words in this dialect, so they are
+    /// matched as case-insensitive identifiers.
+    fn parse_optional_window_frame(&mut self) -> Result<Option<WindowFrame>, ApexError> {
+        let rows = match self.current() {
+            Token::Identifier(word) if word.eq_ignore_ascii_case("rows") => true,
+            Token::Identifier(word) if word.eq_ignore_ascii_case("range") => false,
+            _ => return Ok(None),
+        };
+        self.advance(); // consume ROWS / RANGE
+
+        // `BETWEEN` is optional: `ROWS UNBOUNDED PRECEDING` means
+        // `ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`.
+        let (start, end) = if matches!(self.current(), Token::Between) {
+            self.advance();
+            let start = self.parse_window_frame_bound()?;
+            self.expect(Token::And)?;
+            let end = self.parse_window_frame_bound()?;
+            (start, end)
+        } else {
+            (self.parse_window_frame_bound()?, WindowFrameBound::CurrentRow)
+        };
+
+        Ok(Some(WindowFrame { rows, start, end }))
+    }
+
+    /// Parse one {@link WindowFrameBound} endpoint.
+    fn parse_window_frame_bound(&mut self) -> Result<WindowFrameBound, ApexError> {
+        let signed_offset = |parser: &mut Self| -> Result<Option<i64>, ApexError> {
+            match parser.current().clone() {
+                Token::IntLit(value) => {
+                    parser.advance();
+                    Ok(Some(value))
+                }
+                Token::Minus => {
+                    parser.advance();
+                    match parser.current().clone() {
+                        Token::IntLit(value) => {
+                            parser.advance();
+                            Ok(Some(-value))
+                        }
+                        other => Err(ApexError::QueryParseError(format!(
+                            "Expected a number after '-' in window frame bound, got {:?}",
+                            other
+                        ))),
+                    }
+                }
+                _ => Ok(None),
+            }
+        };
+
+        match self.current().clone() {
+            Token::Identifier(word) if word.eq_ignore_ascii_case("unbounded") => {
+                self.advance();
+                let lower = match self.current().clone() {
+                    Token::Identifier(direction) => {
+                        self.advance();
+                        direction.to_ascii_lowercase()
+                    }
+                    other => {
+                        return Err(ApexError::QueryParseError(format!(
+                            "Expected PRECEDING or FOLLOWING after UNBOUNDED, got {:?}",
+                            other
+                        )))
+                    }
+                };
+                match lower.as_str() {
+                    "preceding" => Ok(WindowFrameBound::UnboundedPreceding),
+                    "following" => Ok(WindowFrameBound::UnboundedFollowing),
+                    _ => Err(ApexError::QueryParseError(format!(
+                        "Expected PRECEDING or FOLLOWING after UNBOUNDED, got {lower}"
+                    ))),
+                }
+            }
+            Token::Identifier(word) if word.eq_ignore_ascii_case("current") => {
+                self.advance();
+                match self.current().clone() {
+                    Token::Identifier(row) if row.eq_ignore_ascii_case("row") => {
+                        self.advance();
+                        Ok(WindowFrameBound::CurrentRow)
+                    }
+                    other => Err(ApexError::QueryParseError(format!(
+                        "Expected ROW after CURRENT, got {:?}",
+                        other
+                    ))),
+                }
+            }
+            _ => {
+                let offset = signed_offset(self)?;
+                let lower = match self.current().clone() {
+                    Token::Identifier(direction) => {
+                        self.advance();
+                        direction.to_ascii_lowercase()
+                    }
+                    other => {
+                        return Err(ApexError::QueryParseError(format!(
+                            "Expected PRECEDING or FOLLOWING in window frame bound, got {:?}",
+                            other
+                        )))
+                    }
+                };
+                let offset = offset.unwrap_or(0);
+                match lower.as_str() {
+                    "preceding" => Ok(WindowFrameBound::Preceding(offset)),
+                    "following" => Ok(WindowFrameBound::Following(offset)),
+                    _ => Err(ApexError::QueryParseError(format!(
+                        "Expected PRECEDING or FOLLOWING in window frame bound, got {lower}"
+                    ))),
+                }
+            }
+        }
+    }
+
+    /// Split a parsed window projection into the parts the executor needs.
+    ///
+    /// Returns `(name, partition_by, order_by, frame, wrapper)` where `wrapper`
+    /// is `None` for a bare window and `Some(full_expr)` when the window is
+    /// nested inside a function or arithmetic expression.
+    fn window_node_parts(
+        expr: &SqlExpr,
+    ) -> (
+        String,
+        Vec<String>,
+        Vec<OrderByClause>,
+        Option<WindowFrame>,
+        Option<SqlExpr>,
+    ) {
+        if let SqlExpr::Window {
+            name,
+            partition_by,
+            order_by,
+            frame,
+            ..
+        } = expr
+        {
+            return (
+                name.clone(),
+                partition_by.clone(),
+                order_by.clone(),
+                frame.clone(),
+                None,
+            );
+        }
+        let found = first_window(expr).expect("projection must contain a window function");
+        (
+            found.name,
+            found.partition_by,
+            found.order_by,
+            found.frame,
+            Some(expr.clone()),
+        )
     }
 
     fn parse_function_call_from_name(&mut self, name: String) -> Result<SqlExpr, ApexError> {
@@ -5555,7 +5963,8 @@ impl SqlParser {
                         self.expect(Token::RParen)?;
                         return Ok(SqlExpr::FtsScore { query });
                     }
-                    return self.parse_function_call_from_name(name);
+                    let call = self.parse_function_call_from_name(name)?;
+                    return self.maybe_parse_over(call);
                 }
 
                 let mut full = name;
@@ -5581,23 +5990,28 @@ impl SqlParser {
             }
             Token::Count => {
                 self.advance();
-                self.parse_function_call_from_name("count".to_string())
+                let call = self.parse_function_call_from_name("count".to_string())?;
+                self.maybe_parse_over(call)
             }
             Token::Sum => {
                 self.advance();
-                self.parse_function_call_from_name("sum".to_string())
+                let call = self.parse_function_call_from_name("sum".to_string())?;
+                self.maybe_parse_over(call)
             }
             Token::Avg => {
                 self.advance();
-                self.parse_function_call_from_name("avg".to_string())
+                let call = self.parse_function_call_from_name("avg".to_string())?;
+                self.maybe_parse_over(call)
             }
             Token::Min => {
                 self.advance();
-                self.parse_function_call_from_name("min".to_string())
+                let call = self.parse_function_call_from_name("min".to_string())?;
+                self.maybe_parse_over(call)
             }
             Token::Max => {
                 self.advance();
-                self.parse_function_call_from_name("max".to_string())
+                let call = self.parse_function_call_from_name("max".to_string())?;
+                self.maybe_parse_over(call)
             }
             Token::If => {
                 self.advance();
@@ -6937,5 +7351,272 @@ mod tests {
         assert_eq!(fields.unwrap(), vec!["body".to_string()]);
         assert!(!lazy_load);
         assert_eq!(cache_size, 10_000);
+    }
+}
+
+/// Count the `Window` nodes reachable from `expr`.
+fn window_count(expr: &SqlExpr) -> usize {
+    let mut found = Vec::new();
+    collect_all_windows(expr, &mut found);
+    found.len()
+}
+
+fn collect_all_windows(expr: &SqlExpr, out: &mut Vec<()>) {
+    match expr {
+        SqlExpr::Window { .. } => out.push(()),
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_all_windows(left, out);
+            collect_all_windows(right, out);
+        }
+        SqlExpr::UnaryOp { expr: inner, .. }
+        | SqlExpr::Paren(inner)
+        | SqlExpr::Cast { expr: inner, .. } => collect_all_windows(inner, out),
+        SqlExpr::Function { args, .. } => {
+            for arg in args {
+                collect_all_windows(arg, out);
+            }
+        }
+        SqlExpr::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (when_expr, then_expr) in when_then {
+                collect_all_windows(when_expr, out);
+                collect_all_windows(then_expr, out);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_all_windows(else_expr, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The window specification extracted from an expression tree.
+struct WindowParts {
+    name: String,
+    partition_by: Vec<String>,
+    order_by: Vec<OrderByClause>,
+    frame: Option<WindowFrame>,
+}
+
+/// Depth-first search for the first `Window` node inside `expr`.
+fn first_window(expr: &SqlExpr) -> Option<WindowParts> {
+    let mut found = None;
+    collect_first_window(expr, &mut found);
+    found
+}
+
+fn collect_first_window(expr: &SqlExpr, found: &mut Option<WindowParts>) {
+    if found.is_some() {
+        return;
+    }
+    match expr {
+        SqlExpr::Window {
+            name,
+            partition_by,
+            order_by,
+            frame,
+            ..
+        } => {
+            *found = Some(WindowParts {
+                name: name.clone(),
+                partition_by: partition_by.clone(),
+                order_by: order_by.clone(),
+                frame: frame.clone(),
+            });
+        }
+        SqlExpr::BinaryOp { left, right, .. } => {
+            collect_first_window(left, found);
+            collect_first_window(right, found);
+        }
+        SqlExpr::UnaryOp { expr: inner, .. }
+        | SqlExpr::Paren(inner)
+        | SqlExpr::Cast { expr: inner, .. } => collect_first_window(inner, found),
+        SqlExpr::Function { args, .. } => {
+            for arg in args {
+                collect_first_window(arg, found);
+            }
+        }
+        SqlExpr::Case {
+            when_then,
+            else_expr,
+        } => {
+            for (when_expr, then_expr) in when_then {
+                collect_first_window(when_expr, found);
+                collect_first_window(then_expr, found);
+            }
+            if let Some(else_expr) = else_expr {
+                collect_first_window(else_expr, found);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Render the window's own arguments as the strings the window executor reads.
+fn window_args_as_strings(expr: &SqlExpr) -> Vec<String> {
+    fn render(arg: &SqlExpr) -> Option<String> {
+        match arg {
+            SqlExpr::Column(name) => Some(name.clone()),
+            SqlExpr::Literal(value) => Some(format!("{value:?}")),
+            _ => None,
+        }
+    }
+    let Some(parts) = first_window(expr) else {
+        return Vec::new();
+    };
+    // Re-walk to reach the window's argument list.
+    fn args_of(expr: &SqlExpr) -> Option<Vec<String>> {
+        match expr {
+            SqlExpr::Window { args, .. } => Some(args.iter().filter_map(render).collect()),
+            SqlExpr::BinaryOp { left, right, .. } => args_of(left).or_else(|| args_of(right)),
+            SqlExpr::UnaryOp { expr: inner, .. }
+            | SqlExpr::Paren(inner)
+            | SqlExpr::Cast { expr: inner, .. } => args_of(inner),
+            SqlExpr::Function { args, .. } => args.iter().find_map(args_of),
+            _ => None,
+        }
+    }
+    let _ = parts;
+    args_of(expr).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod window_parse_tests {
+    use super::*;
+
+    /// Recursively collect every `Window` node reachable from `expr`.
+    fn collect_windows(expr: &SqlExpr, out: &mut Vec<(String, Option<WindowFrame>)>) {
+        match expr {
+            SqlExpr::Window { name, frame, .. } => out.push((name.clone(), frame.clone())),
+            SqlExpr::BinaryOp { left, right, .. } => {
+                collect_windows(left, out);
+                collect_windows(right, out);
+            }
+            SqlExpr::UnaryOp { expr: inner, .. }
+            | SqlExpr::Paren(inner)
+            | SqlExpr::Cast { expr: inner, .. } => collect_windows(inner, out),
+            SqlExpr::Function { args, .. } => {
+                for arg in args {
+                    collect_windows(arg, out);
+                }
+            }
+            SqlExpr::Case {
+                when_then,
+                else_expr,
+            } => {
+                for (when_expr, then_expr) in when_then {
+                    collect_windows(when_expr, out);
+                    collect_windows(then_expr, out);
+                }
+                if let Some(else_expr) = else_expr {
+                    collect_windows(else_expr, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Parse a `SELECT` and return every window in its projection list as
+    /// `(name, frame)`, plus how it was represented.
+    fn windows_in_projection(sql: &str) -> Vec<(String, Option<WindowFrame>)> {
+        let SqlStatement::Select(select) = SqlParser::parse(sql).unwrap() else {
+            panic!("expected a SELECT statement");
+        };
+        let mut found = Vec::new();
+        for column in &select.columns {
+            match column {
+                SelectColumn::Expression { expr, .. } => collect_windows(expr, &mut found),
+                SelectColumn::WindowFunction { name, frame, .. } => {
+                    found.push((name.to_ascii_uppercase(), frame.clone()))
+                }
+                _ => {}
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn window_parses_as_expression_node() {
+        let windows = windows_in_projection(
+            "SELECT SUM(amt) OVER (PARTITION BY g ORDER BY amt) AS total FROM s",
+        );
+        assert_eq!(windows.len(), 1, "expected exactly one window node");
+        assert_eq!(windows[0].0, "SUM");
+    }
+
+    #[test]
+    fn window_nested_inside_function() {
+        // Used to fail with `Syntax error: Expected RParen, got Over`.
+        let windows =
+            windows_in_projection("SELECT ROUND(SUM(amt) OVER (PARTITION BY g), 2) AS r FROM s");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].0, "SUM");
+    }
+
+    #[test]
+    fn window_inside_arithmetic() {
+        let windows =
+            windows_in_projection("SELECT SUM(amt) OVER (PARTITION BY g) / 2 AS half FROM s");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].0, "SUM");
+    }
+
+    #[test]
+    fn multiple_windows_in_one_expression() {
+        let windows = windows_in_projection(
+            "SELECT SUM(amt) OVER (PARTITION BY g) - AVG(amt) OVER (PARTITION BY g) AS d FROM s",
+        );
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].0, "SUM");
+        assert_eq!(windows[1].0, "AVG");
+    }
+
+    #[test]
+    fn window_rows_frame_between() {
+        let windows = windows_in_projection(
+            "SELECT SUM(amt) OVER (ORDER BY amt ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS run FROM s",
+        );
+        assert_eq!(windows.len(), 1);
+        let frame = windows[0].1.clone().expect("frame should be parsed");
+        assert!(frame.rows, "ROWS frame expected");
+        assert_eq!(frame.start, WindowFrameBound::UnboundedPreceding);
+        assert_eq!(frame.end, WindowFrameBound::CurrentRow);
+    }
+
+    #[test]
+    fn window_rows_frame_shorthand_and_offsets() {
+        // `ROWS UNBOUNDED PRECEDING` implies `AND CURRENT ROW`.
+        let windows = windows_in_projection(
+            "SELECT SUM(amt) OVER (ORDER BY amt ROWS UNBOUNDED PRECEDING) AS run FROM s",
+        );
+        let frame = windows[0].1.clone().expect("frame should be parsed");
+        assert_eq!(frame.end, WindowFrameBound::CurrentRow);
+
+        let windows = windows_in_projection(
+            "SELECT AVG(amt) OVER (ORDER BY amt ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS m FROM s",
+        );
+        let frame = windows[0].1.clone().expect("frame should be parsed");
+        assert_eq!(frame.start, WindowFrameBound::Preceding(1));
+        assert_eq!(frame.end, WindowFrameBound::Following(1));
+    }
+
+    #[test]
+    fn window_partition_and_order_keys_become_required_columns() {
+        // If these were not discovered the on-demand reader would never load
+        // them and the window would evaluate over missing data.
+        let SqlStatement::Select(select) = SqlParser::parse(
+            "SELECT ROW_NUMBER() OVER (PARTITION BY region ORDER BY revenue DESC) AS rn FROM sales",
+        )
+        .unwrap() else {
+            panic!("expected SELECT");
+        };
+        let columns = select.required_columns().expect("columns should be known");
+        assert!(columns.iter().any(|c| c == "region"), "region must be read");
+        assert!(
+            columns.iter().any(|c| c == "revenue"),
+            "revenue must be read"
+        );
     }
 }

@@ -18,6 +18,7 @@ pub mod mvcc;
 pub mod on_demand;
 pub(crate) mod scan;
 pub mod table_catalog;
+pub(crate) mod table_save_lock;
 
 pub(crate) use scan::{
     BatchMorselOutcome, BatchMorselStream, Morsel, ScanBound, ScanComparison, ScanPredicate,

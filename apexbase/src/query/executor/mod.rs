@@ -96,6 +96,19 @@ fn get_cached_cte_batch(path: &Path) -> Option<RecordBatch> {
     CTE_BATCH_CACHE.get(path).map(|entry| entry.value().clone())
 }
 
+/// True when `path` addresses a CTE batch that lives only in memory.
+///
+/// A shared (multi-consumer) CTE is materialized into [`CTE_BATCH_CACHE`] under a
+/// synthetic `__cte_<name>_<pid>_<n>.apex` path and is deliberately never written
+/// to disk. Fast paths that go straight to `get_cached_backend(path)` would try
+/// to open that non-existent file and fail with
+/// `failed to open table '.../__cte_...'`. They must bail out instead so the
+/// regular (cache-aware) route handles the statement.
+#[inline]
+pub(in crate::query::executor) fn has_cached_cte_batch(path: &Path) -> bool {
+    CTE_BATCH_CACHE.contains_key(path)
+}
+
 /// Removes the statement-scoped CTE batch on every exit path (success, error,
 /// cancellation). The batch is keyed by a per-execution temp path, so a path
 /// left behind by a failing statement would never be looked up again and

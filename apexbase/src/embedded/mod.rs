@@ -580,12 +580,36 @@ impl Table {
     // ── Read Operations ───────────────────────────────────────────────────────
 
     /// Retrieve a single record by `_id`. Returns `None` if not found.
+    ///
+    /// The lookup runs on the base file, which is what makes it a point lookup.
+    /// Rows a writer has only buffered so far — the delta sidecar, the DeltaStore
+    /// overlay, or the in-memory append buffer — are not in that file yet, so a
+    /// base miss on such a table is answered through the query path (SQL merges
+    /// all of them) instead of being reported as "no such row".
     pub fn retrieve(&self, id: u64) -> Result<Option<Row>> {
         let backend = crate::Database::read_backend(&self.path)?;
-        match backend.storage.retrieve_rcix(id)? {
-            None => Ok(None),
-            Some(cols) => Ok(Some(cols.into_iter().collect())),
+        if let Some(cols) = backend.storage.retrieve_rcix(id)? {
+            return Ok(Some(cols.into_iter().collect()));
         }
+        // A base-file miss is only authoritative when the point lookup can decode
+        // every column of this table; vector/quantized columns are scan-only, so
+        // their rows would otherwise be reported as absent.
+        let point_lookup_covers_schema = backend
+            .storage
+            .get_schema()
+            .iter()
+            .all(|(_, column_type)| column_type.point_lookup_decodable());
+        let buffered_outside_base = backend.has_delta()
+            || backend.has_pending_deltas()
+            || backend.pending_v4_in_memory_rows() > 0;
+        if !buffered_outside_base && point_lookup_covers_schema {
+            return Ok(None);
+        }
+        let sql = format!("SELECT * FROM \"{}\" WHERE _id = {}", self.name, id);
+        let batch = self.execute(&sql)?.to_record_batch()?;
+        Ok(crate::embedded::record_batch_to_rows(&batch)?
+            .into_iter()
+            .next())
     }
 
     /// Retrieve multiple records by `_id`. Returns an Arrow [`RecordBatch`].
@@ -648,9 +672,26 @@ impl Table {
             sig,
             crate::query::query_signature::QuerySignature::CountStar { .. }
         ) {
-            let backend = crate::Database::read_backend(&self.path)?;
-            if backend.pending_v4_in_memory_rows() > 0 {
-                backend.save()?;
+            // A query must see rows a concurrent writer has already buffered in
+            // memory, so flush them first. The check and the flush have to be
+            // atomic with respect to that writer: `StorageEngine::write` holds
+            // the table's write lock across its whole read-modify-write, and two
+            // readers that both flushed would each rewrite the base file (one of
+            // them from an already-drained buffer). Re-checking under the lock
+            // makes the flush a no-op once somebody else has persisted the rows.
+            let pending = crate::Database::read_backend(&self.path)?.pending_v4_in_memory_rows();
+            if pending > 0 {
+                let _write_guard = crate::storage::table_save_lock::write_lock(&self.path);
+                // Re-fetch the backend *inside* the lock. The one inspected above
+                // may have gone stale while this thread waited: a writer that ran
+                // meanwhile published the very rows the buffer held, and saving
+                // the old instance would rewrite the base file from its stale
+                // state — resurrecting rows another writer had deleted and
+                // leaving the header and footer row counts disagreeing.
+                let backend = crate::Database::read_backend(&self.path)?;
+                if backend.pending_v4_in_memory_rows() > 0 {
+                    backend.save()?;
+                }
             }
         }
 
@@ -711,9 +752,22 @@ impl Table {
     // ── Maintenance ───────────────────────────────────────────────────────────
 
     /// Flush pending in-memory data to disk.
+    ///
+    /// Serialized per table, like every other mutation, and conditional on there
+    /// being something to publish: a cached read-only backend holds no column
+    /// buffers, so saving one rewrites the base file from that empty state and
+    /// drops every row. Rows buffered by a write are published by
+    /// `StorageEngine::write` before it returns, so a flush normally has nothing
+    /// left to do; a DeltaStore overlay does.
     pub fn flush(&self) -> Result<()> {
-        let backend = crate::Database::write_backend(&self.path, self.inner.durability)?;
-        backend.save()?;
+        let _write_guard = crate::storage::table_save_lock::write_lock(&self.path);
+        let backend = crate::Database::read_backend(&self.path)?;
+        if backend.is_dirty()
+            || backend.has_pending_deltas()
+            || backend.pending_v4_in_memory_rows() > 0
+        {
+            backend.save()?;
+        }
         Ok(())
     }
 
@@ -756,12 +810,57 @@ impl ResultSet {
     }
 
     /// For scalar results (e.g., `COUNT(*)`), return the single `i64` value.
+    ///
+    /// The executor may represent `SELECT COUNT(*) AS n ...` either as
+    /// [`ApexResult::Scalar`] or as a one-row, one-column [`ApexResult::Data`]
+    /// batch depending on which execution path handled the query (temp tables,
+    /// FTS-filtered queries, cross-database joins, ...). Both spellings must
+    /// behave identically here, otherwise callers silently receive `None` for a
+    /// perfectly valid count.
     pub fn scalar(&self) -> Option<i64> {
-        if let ApexResult::Scalar(v) = &self.inner {
-            Some(*v)
-        } else {
-            None
+        match &self.inner {
+            ApexResult::Scalar(v) => Some(*v),
+            ApexResult::Data(batch) => Self::first_cell_i64(batch),
+            // An empty schema carries no value at all.
+            ApexResult::Empty(_) => None,
         }
+    }
+
+    /// Read the top-left cell of a batch as `i64` when it is a single cell.
+    ///
+    /// Returns `None` for multi-row, multi-column, NULL, or non-numeric results
+    /// so `scalar()` keeps its "this is a scalar aggregate" contract.
+    fn first_cell_i64(batch: &RecordBatch) -> Option<i64> {
+        if batch.num_rows() != 1 || batch.num_columns() != 1 {
+            return None;
+        }
+        let column = batch.column(0);
+        if column.is_null(0) {
+            return None;
+        }
+        let column = column.as_ref();
+        macro_rules! read_int {
+            ($ty:ty) => {
+                column
+                    .as_any()
+                    .downcast_ref::<$ty>()
+                    .map(|array| array.value(0) as i64)
+            };
+        }
+        read_int!(Int64Array)
+            .or_else(|| read_int!(Int32Array))
+            .or_else(|| read_int!(Int16Array))
+            .or_else(|| read_int!(Int8Array))
+            .or_else(|| read_int!(UInt64Array))
+            .or_else(|| read_int!(UInt32Array))
+            .or_else(|| read_int!(UInt16Array))
+            .or_else(|| read_int!(UInt8Array))
+            .or_else(|| {
+                column
+                    .as_any()
+                    .downcast_ref::<Float64Array>()
+                    .map(|array| array.value(0) as i64)
+            })
     }
 
     /// Column names in result order.
@@ -957,6 +1056,43 @@ pub fn arrow_value_at(arr: &ArrayRef, row: usize) -> Value {
                 .value(row)
                 .to_vec(),
         ),
+        // Vector columns arrive as Arrow lists. Decoding the payload keeps the
+        // row API usable for a table that carries a vector: without it every
+        // vector column read back as `Value::Null`, so a written row looked
+        // empty and "all types round-trip" could not be asserted.
+        ArrowDataType::FixedSizeList(_, _) => {
+            let Some(list) = arr
+                .as_any()
+                .downcast_ref::<arrow::array::FixedSizeListArray>()
+            else {
+                return Value::Null;
+            };
+            let values = list.value(row);
+            let floats: Vec<f32> = match values.data_type() {
+                ArrowDataType::Float32 => {
+                    let payload = values
+                        .as_any()
+                        .downcast_ref::<Float32Array>()
+                        .expect("FixedSizeList<Float32> payload");
+                    (0..payload.len()).map(|i| payload.value(i)).collect()
+                }
+                ArrowDataType::Float16 => {
+                    let payload = values
+                        .as_any()
+                        .downcast_ref::<arrow::array::Float16Array>()
+                        .expect("FixedSizeList<Float16> payload");
+                    (0..payload.len())
+                        .map(|i| crate::storage::on_demand::f16_to_f32(payload.value(i).to_bits()))
+                        .collect()
+                }
+                _ => return Value::Null,
+            };
+            let mut bytes = Vec::with_capacity(floats.len() * 4);
+            for value in floats {
+                bytes.extend_from_slice(&value.to_le_bytes());
+            }
+            Value::FixedList(bytes)
+        }
         _ => Value::Null,
     }
 }
@@ -1021,6 +1157,1557 @@ mod tests {
         let id = table.insert(r).unwrap();
         assert!(table.delete(id).unwrap());
         assert_eq!(table.count().unwrap(), 0);
+    }
+
+    /// Concurrent writers to the *same* table must all succeed and must not lose
+    /// rows.
+    ///
+    /// The V4 store keeps a private in-memory column buffer per backend and
+    /// persists it by rewriting/appending the shared `.apex` file. Before writes
+    /// were serialized per table, all but one of N threads failed with
+    /// `No such file or directory`, and the surviving writes lost rows.
+    #[test]
+    fn test_concurrent_writes_to_same_table() {
+        let (_dir, db) = temp_db();
+        let table = db.create_table("conc_t").unwrap();
+
+        const THREADS: usize = 4;
+        const BATCHES: usize = 10;
+        const PER_BATCH: usize = 10;
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|worker| {
+                let table = table.clone();
+                std::thread::spawn(move || -> Result<usize> {
+                    let mut written = 0usize;
+                    for batch in 0..BATCHES {
+                        let rows: Vec<Row> = (0..PER_BATCH)
+                            .map(|seq| {
+                                let mut row = Row::new();
+                                row.insert(
+                                    "v".to_string(),
+                                    Value::Int64((worker * 100_000 + batch * 1_000 + seq) as i64),
+                                );
+                                row
+                            })
+                            .collect();
+                        written += table.insert_batch(&rows)?.len();
+                    }
+                    Ok(written)
+                })
+            })
+            .collect();
+
+        let mut total_written = 0usize;
+        for handle in handles {
+            let written = handle.join().expect("writer thread panicked").unwrap();
+            total_written += written;
+        }
+
+        let expected = (THREADS * BATCHES * PER_BATCH) as u64;
+        assert_eq!(total_written as u64, expected, "every writer must report success");
+        assert_eq!(
+            table.count().unwrap(),
+            expected,
+            "concurrent writes must not lose or duplicate rows"
+        );
+    }
+
+    /// Readers running `execute()` on the same table as concurrent writers must
+    /// neither fail nor break the writers.
+    ///
+    /// `Table::execute` flushes rows a writer has buffered in memory so the query
+    /// can see them. That flush used to run unsynchronized: it raced the writer's
+    /// own read-modify-write, and both rewrote the base file through the *same*
+    /// scratch path (`<table>.apex.tmp`), so one of them failed with
+    /// `No such file or directory` while the table still received the rows —
+    /// `written` and `count` disagreed.
+    #[test]
+    fn test_concurrent_reads_and_writes_to_same_table() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        let (_dir, db) = temp_db();
+        let table = db.create_table("rw_t").unwrap();
+
+        const READERS: usize = 2;
+        const WRITERS: usize = 2;
+        const BATCHES: usize = 10;
+        const PER_BATCH: usize = 10;
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let read_queries = Arc::new(AtomicUsize::new(0));
+        let reader_errors: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
+        let readers: Vec<_> = (0..READERS)
+            .map(|_| {
+                let table = table.clone();
+                let stop = stop.clone();
+                let counter = read_queries.clone();
+                let errors = reader_errors.clone();
+                std::thread::spawn(move || {
+                    // `SELECT COUNT(*) AS n` deliberately takes the general query
+                    // path (a bare `SELECT COUNT(*) FROM t` skips the flush).
+                    while !stop.load(Ordering::SeqCst) {
+                        match table.execute("SELECT COUNT(*) AS n FROM rw_t") {
+                            Ok(_) => {
+                                counter.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Err(error) => errors.lock().unwrap().push(error.to_string()),
+                        }
+                    }
+                })
+            })
+            .collect();
+
+        let writers: Vec<_> = (0..WRITERS)
+            .map(|worker| {
+                let table = table.clone();
+                std::thread::spawn(move || -> Result<usize> {
+                    let mut written = 0usize;
+                    for batch in 0..BATCHES {
+                        let rows: Vec<Row> = (0..PER_BATCH)
+                            .map(|seq| {
+                                let mut row = Row::new();
+                                row.insert(
+                                    "v".to_string(),
+                                    Value::Int64((worker * 100_000 + batch * 1_000 + seq) as i64),
+                                );
+                                row
+                            })
+                            .collect();
+                        written += table.insert_batch(&rows)?.len();
+                    }
+                    Ok(written)
+                })
+            })
+            .collect();
+
+        let mut total_written = 0usize;
+        for handle in writers {
+            total_written += handle.join().expect("writer thread panicked").unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        for handle in readers {
+            handle.join().expect("reader thread panicked");
+        }
+
+        let errors = reader_errors.lock().unwrap().clone();
+        assert!(errors.is_empty(), "reader queries must not fail: {errors:?}");
+        assert!(
+            read_queries.load(Ordering::SeqCst) > 0,
+            "the reader threads must actually run queries"
+        );
+
+        let expected = (WRITERS * BATCHES * PER_BATCH) as u64;
+        assert_eq!(total_written as u64, expected, "every writer must report success");
+        assert_eq!(
+            table.count().unwrap(),
+            expected,
+            "interleaved readers must not make writers lose or duplicate rows"
+        );
+    }
+
+    /// `replace()` must not disturb the row set, before or after a `delete()`.
+    ///
+    /// The V4 store decides whether buffered rows are new or already on disk from
+    /// `v4_base_loaded`. It used to infer that from "the buffer does not start at
+    /// `_id` 1", which stops holding the moment `replace()` re-appends a row:
+    ///
+    /// * the loaded base was then reported as pending, so the next flush spilled
+    ///   the whole table into the delta sidecar *on top of* the base copy already
+    ///   on disk — `5 rows -> replace -> delete` counted 9 rows;
+    /// * the append-only spill also skipped its "a persisted row is deleted" guard
+    ///   for the same reason, so a later `replace()` published the new row while
+    ///   leaving the old copy visible.
+    ///
+    /// Both symptoms are covered here, together with the repeated deletes the old
+    /// behaviour magnified each time.
+    #[test]
+    fn test_replace_then_delete_keeps_row_counts() {
+        let (_dir, db) = temp_db();
+        let table = db.create_table("rd_t").unwrap();
+
+        let insert = |id_name: &str| {
+            let mut row = Row::new();
+            row.insert("k".to_string(), Value::String(id_name.to_string()));
+            table.insert(row).unwrap();
+        };
+        let replace = |id: u64, value: &str| {
+            let mut row = Row::new();
+            row.insert("k".to_string(), Value::String(value.to_string()));
+            assert!(table.replace(id, row).unwrap(), "replace({id}) must find the row");
+        };
+        // Every visible `_id`, in query order.
+        let visible_ids = || -> Vec<i64> {
+            let mut ids: Vec<i64> = table
+                .execute("SELECT _id FROM rd_t")
+                .unwrap()
+                .to_rows()
+                .unwrap()
+                .iter()
+                .filter_map(|r| match r.get("_id") {
+                    Some(Value::Int64(v)) => Some(*v),
+                    _ => None,
+                })
+                .collect();
+            ids.sort_unstable();
+            ids
+        };
+        let value_of = |id: u64| -> Option<String> {
+            table.retrieve(id).unwrap().and_then(|row| match row.get("k") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+        };
+        let count = || table.count().unwrap();
+
+        for i in 0..5 {
+            insert(&format!("k{i}"));
+        }
+        assert_eq!(count(), 5);
+        assert_eq!(visible_ids(), vec![1, 2, 3, 4, 5]);
+
+        // replace() alone keeps the row count and publishes the new value.
+        replace(1, "replaced-1");
+        assert_eq!(count(), 5, "replace must not change the row count");
+        assert_eq!(value_of(1).as_deref(), Some("replaced-1"));
+
+        // The reported defect: replace() then delete().
+        assert!(table.delete(2).unwrap());
+        assert_eq!(count(), 4, "delete after replace must remove exactly one row");
+        assert_eq!(visible_ids(), vec![1, 3, 4, 5]);
+        assert_eq!(value_of(2), None, "the deleted row must be gone");
+
+        // Further deletes must keep removing exactly one row each.
+        assert!(table.delete(4).unwrap());
+        assert_eq!(count(), 3);
+        assert_eq!(visible_ids(), vec![1, 3, 5]);
+
+        // A second replace() must not leave the old copy of the row visible.
+        replace(3, "replaced-3");
+        assert_eq!(count(), 3, "a repeated replace must not duplicate the row");
+        assert_eq!(visible_ids(), vec![1, 3, 5]);
+        assert_eq!(value_of(3).as_deref(), Some("replaced-3"));
+
+        assert!(table.delete(3).unwrap());
+        assert_eq!(count(), 2);
+        assert_eq!(visible_ids(), vec![1, 5]);
+
+        // Deleting a missing row reports `false` and changes nothing.
+        assert!(!table.delete(99).unwrap());
+        assert_eq!(count(), 2);
+
+        // Appending after the replace/delete cycle still works.
+        insert("k6");
+        insert("k7");
+        assert_eq!(count(), 4);
+        assert_eq!(visible_ids(), vec![1, 5, 6, 7]);
+        assert!(table.delete(6).unwrap());
+        assert_eq!(count(), 3);
+        assert_eq!(visible_ids(), vec![1, 5, 7]);
+    }
+
+    /// Rewriting a row must preserve every other row's values, including NULLs.
+    ///
+    /// `save_v4` reorders the buffered rows when they are not in ascending ID order
+    /// (a `replace()` is what puts them out of order). That reorder gathers every
+    /// column *and* every null bitmap, so a mistake there would silently shift values
+    /// or NULL flags between rows instead of failing loudly. NULLs come from the
+    /// Arrow path, which is the one that maintains a null bitmap.
+    #[test]
+    fn test_replace_preserves_values_and_nulls_across_reorder() {
+        use arrow::array::{Float64Array, Int64Array, StringArray};
+        use arrow::datatypes::{DataType as ArrowDT, Field, Schema as ArrowSchema};
+        use arrow::record_batch::RecordBatch;
+
+        let (_dir, db) = temp_db();
+        let table = db.create_table("reorder_t").unwrap();
+
+        const ROWS: usize = 9;
+        // Every third row leaves `note` NULL.
+        let notes: Vec<Option<String>> = (0..ROWS)
+            .map(|i| if i % 3 == 1 { None } else { Some(format!("note-{i}")) })
+            .collect();
+        let schema = Arc::new(ArrowSchema::new(vec![
+            Field::new("label", ArrowDT::Utf8, false),
+            Field::new("num", ArrowDT::Int64, false),
+            Field::new("score", ArrowDT::Float64, false),
+            Field::new("note", ArrowDT::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(
+                    (0..ROWS).map(|i| format!("row-{i}")).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    (0..ROWS).map(|i| i as i64 * 10).collect::<Vec<_>>(),
+                )),
+                Arc::new(Float64Array::from(
+                    (0..ROWS).map(|i| i as f64 / 2.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(notes.clone())),
+            ],
+        )
+        .unwrap();
+        assert_eq!(table.insert_arrow(&batch).unwrap().len(), ROWS);
+
+        // Rewrite the middle row: its ID is re-appended, which is what puts the
+        // buffered rows out of ID order and triggers the reorder on save.
+        let mut replacement = Row::new();
+        replacement.insert("label".to_string(), Value::String("row-4".to_string()));
+        replacement.insert("num".to_string(), Value::Int64(999));
+        replacement.insert("score".to_string(), Value::Float64(4.5));
+        replacement.insert("note".to_string(), Value::Null);
+        assert!(table.replace(5, replacement).unwrap());
+        assert_eq!(table.count().unwrap(), ROWS as u64);
+
+        for index in 0..ROWS {
+            let id = index as u64 + 1;
+            let stored = table.retrieve(id).unwrap().expect("row must exist");
+            assert_eq!(
+                stored.get("num"),
+                Some(&Value::Int64(if id == 5 { 999 } else { index as i64 * 10 })),
+                "num of row {id} must not move"
+            );
+            assert_eq!(
+                stored.get("label"),
+                Some(&Value::String(format!("row-{index}"))),
+                "label of row {id} must not move"
+            );
+            assert_eq!(
+                stored.get("score"),
+                Some(&Value::Float64(if id == 5 { 4.5 } else { index as f64 / 2.0 })),
+                "score of row {id} must not move"
+            );
+            let expected_note = if id == 5 {
+                Value::Null
+            } else {
+                match &notes[index] {
+                    Some(text) => Value::String(text.clone()),
+                    None => Value::Null,
+                }
+            };
+            assert_eq!(
+                stored.get("note"),
+                Some(&expected_note),
+                "note of row {id} must not move"
+            );
+        }
+    }
+
+    /// Every write route must keep `Value::Null`, not just the batch ones.
+    ///
+    /// `StorageEngine::classify_write` routes a V4 table to the V4 write path and a
+    /// legacy table to the append-only delta file, and the delta encoding has no
+    /// null bitmap. Backend materialization used to record `is_v4: false` in the
+    /// schema cache no matter what the file was, so the very next single-row write
+    /// to a V4 table was classified as "legacy delta" and its NULLs silently became
+    /// the column defaults.
+    #[test]
+    fn test_null_survives_every_write_route() {
+        let (_dir, db) = temp_db();
+        let table = db.create_table("null_t").unwrap();
+
+        let row = |value: Option<&str>| {
+            let mut r = Row::new();
+            r.insert(
+                "s".to_string(),
+                match value {
+                    Some(text) => Value::String(text.to_string()),
+                    None => Value::Null,
+                },
+            );
+            r.insert("n".to_string(), Value::Int64(value.map_or(0, |_| 7)));
+            r
+        };
+        let note_of = |id: u64| -> Option<Value> {
+            table.retrieve(id).unwrap().and_then(|row| row.get("s").cloned())
+        };
+
+        // 1. First write creates the file.
+        table.insert(row(Some("a"))).unwrap();
+        // 2. A single-row insert into the materialized table (the route that used
+        //    to be misclassified) with an explicit NULL.
+        table.insert(row(None)).unwrap();
+        // 3. A batch write, and 4. another single-row insert after it.
+        table
+            .insert_batch(&[row(Some("c")), row(None), row(Some("e"))])
+            .unwrap();
+        table.insert(row(None)).unwrap();
+
+        assert_eq!(table.count().unwrap(), 6);
+        for id in 1..=6u64 {
+            let expected = match id {
+                1 | 3 | 5 => Some(Value::String(format!("{}", (b'a' + (id - 1) as u8) as char))),
+                _ => Some(Value::Null),
+            };
+            assert_eq!(note_of(id), expected, "row {id} must keep its NULL/state");
+        }
+
+        // SQL agrees with the point-read API.
+        let rows = table
+            .execute("SELECT _id, s FROM null_t ORDER BY _id")
+            .unwrap()
+            .to_rows()
+            .unwrap();
+        let nulls: Vec<i64> = rows
+            .iter()
+            .filter(|r| matches!(r.get("s"), Some(Value::Null)))
+            .filter_map(|r| match r.get("_id") {
+                Some(Value::Int64(id)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nulls, vec![2, 4, 6]);
+    }
+
+    /// `retrieve` must find a row in a table that has a vector column.
+    ///
+    /// The V4 point lookup decodes scalar columns only, so it reports a base miss
+    /// for vector tables — which used to surface as "no such row" for a row that
+    /// exists. It now falls back to the query path, which also proves the vector
+    /// itself survived every write route.
+    #[test]
+    fn test_retrieve_finds_rows_in_vector_tables() {
+        use arrow::array::Array;
+
+        let (_dir, db) = temp_db();
+        let table = db.create_table("vec_t").unwrap();
+
+        let vector_row = |value: f32| {
+            let mut r = Row::new();
+            r.insert("name".to_string(), Value::String(format!("v{value}")));
+            r.insert("emb".to_string(), Value::FixedList(value.to_le_bytes().to_vec()));
+            r
+        };
+        // Batch write (full path), then a single-row write (the route that used to
+        // drop non-scalar columns into the delta encoding).
+        table.insert_batch(&[vector_row(1.0), vector_row(2.0)]).unwrap();
+        table.insert(vector_row(3.0)).unwrap();
+        assert_eq!(table.count().unwrap(), 3);
+
+        for id in 1..=3u64 {
+            let stored = table.retrieve(id).unwrap();
+            let stored = stored.unwrap_or_else(|| panic!("row {id} must be found"));
+            assert_eq!(
+                stored.get("name"),
+                Some(&Value::String(format!("v{id}"))),
+                "row {id} must keep its scalar column"
+            );
+        }
+
+        // The vectors are really there (one f32 per row) and in write order.
+        let batch = table
+            .execute("SELECT _id, emb FROM vec_t ORDER BY _id")
+            .unwrap()
+            .to_record_batch()
+            .unwrap();
+        let vectors = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<arrow::array::FixedSizeListArray>()
+            .expect("emb must read back as FixedSizeList<Float32>")
+            .clone();
+        assert_eq!(vectors.value_length(), 1);
+        for id in 0..3usize {
+            let values = vectors.value(id);
+            let floats = values
+                .as_any()
+                .downcast_ref::<arrow::array::Float32Array>()
+                .expect("vector payload must be Float32");
+            assert_eq!(floats.value(0), id as f32 + 1.0, "vector {id} must survive");
+        }
+        assert_eq!(batch.num_rows(), 3);
+    }
+
+    /// The point-read APIs must see a row no matter which write path produced it.
+    ///
+    /// `retrieve` looks rows up in the base file, but a small single-row `insert`
+    /// appends to the delta sidecar, and a `replace` re-appends its row — both leave
+    /// the newest copy outside the base. A base-only lookup then reported existing
+    /// rows as absent, and a rewritten row group whose IDs were not ascending made
+    /// *unrelated* rows unreachable too (the lookup guesses the row position from
+    /// `id - min_id` and otherwise binary-searches the group's ID section).
+    #[test]
+    fn test_retrieve_sees_rows_from_every_write_path() {
+        let (_dir, db) = temp_db();
+        let table = db.create_table("rv_t").unwrap();
+
+        let row = |value: &str| {
+            let mut r = Row::new();
+            r.insert("k".to_string(), Value::String(value.to_string()));
+            r
+        };
+        let value_of = |id: u64| -> Option<String> {
+            table.retrieve(id).unwrap().and_then(|row| match row.get("k") {
+                Some(Value::String(s)) => Some(s.clone()),
+                _ => None,
+            })
+        };
+
+        // Each of these is a separate write, so the later ones sit in the delta
+        // sidecar rather than in the freshly written base file.
+        for i in 0..3 {
+            table.insert(row(&format!("k{i}"))).unwrap();
+        }
+        for id in 1..=3 {
+            assert_eq!(value_of(id), Some(format!("k{}", id - 1)), "row {id} must be readable");
+        }
+        assert_eq!(value_of(9), None, "a missing id must stay missing");
+
+        // A larger batch is written straight into the base.
+        let batch: Vec<Row> = (3..6).map(|i| row(&format!("k{i}"))).collect();
+        table.insert_batch(&batch).unwrap();
+        assert_eq!(
+            table.retrieve_many(&[2, 6]).unwrap().num_rows(),
+            2,
+            "the batch API must see buffered and base rows alike"
+        );
+
+        // Rewriting a row must publish the new value, keep the row count, and leave
+        // the other rows reachable.
+        assert!(table.replace(2, row("replaced-2")).unwrap());
+        assert_eq!(value_of(2).as_deref(), Some("replaced-2"));
+        assert!(table.replace(2, row("replaced-2b")).unwrap());
+        assert_eq!(value_of(2).as_deref(), Some("replaced-2b"));
+        assert_eq!(table.count().unwrap(), 6, "replace must not add a row");
+        for id in [1, 3, 4, 5, 6] {
+            assert!(value_of(id).is_some(), "row {id} must survive the rewrite");
+        }
+
+        // Deleting removes exactly that row, and nothing else becomes unreachable.
+        assert!(table.delete(3).unwrap());
+        assert_eq!(value_of(3), None);
+        for id in [1, 2, 4, 5, 6] {
+            assert!(value_of(id).is_some(), "row {id} must survive the delete");
+        }
+
+        // Force another rewrite: the row group is compacted now (ID 3 is gone), so
+        // the `id - min_id` guess overshoots for the highest IDs and the lookup has
+        // to search the group's ID section instead.
+        assert!(table.replace(5, row("replaced-5")).unwrap());
+        assert_eq!(table.count().unwrap(), 5, "replace must not add a row");
+        assert_eq!(value_of(5).as_deref(), Some("replaced-5"));
+        for id in [1, 2, 4, 6] {
+            assert!(
+                value_of(id).is_some(),
+                "row {id} must stay reachable after a rewrite with an ID gap"
+            );
+        }
+        assert_eq!(value_of(3), None, "the deleted row must stay deleted");
+
+        // The SQL point lookup agrees with the point-read API.
+        for id in [1u64, 5, 6] {
+            let rows = table
+                .execute(&format!("SELECT k FROM rv_t WHERE _id = {id}"))
+                .unwrap()
+                .to_rows()
+                .unwrap();
+            assert_eq!(rows.len(), 1, "SQL must find row {id} after a rewrite");
+        }
+
+        // Buffered rows stay readable after an explicit flush.
+        table.flush().unwrap();
+        assert_eq!(value_of(2).as_deref(), Some("replaced-2b"));
+        assert_eq!(value_of(5).as_deref(), Some("replaced-5"));
+        assert!(value_of(6).is_some());
+        assert_eq!(value_of(3), None);
+        assert_eq!(table.count().unwrap(), 5);
+    }
+
+    /// `scalar()` must return the value for `SELECT COUNT(*)` no matter which
+    /// execution path produced it. Temp tables / FTS-filtered queries return a
+    /// one-row `Data` batch instead of `ApexResult::Scalar`, and callers used to
+    /// silently get `None` there.
+    #[test]
+    fn test_scalar_reads_count_from_data_batch() {
+        let (_dir, db) = temp_db();
+        let table = db.create_table("scalar_t").unwrap();
+
+        // Plain table: the executor reports the count as ApexResult::Scalar.
+        assert_eq!(
+            table.execute("SELECT COUNT(*) AS n FROM scalar_t").unwrap().scalar(),
+            Some(0)
+        );
+
+        for i in 0..5 {
+            let mut r = Row::new();
+            r.insert("v".to_string(), Value::Int64(i));
+            table.insert(r).unwrap();
+        }
+        assert_eq!(
+            table.execute("SELECT COUNT(*) AS n FROM scalar_t").unwrap().scalar(),
+            Some(5)
+        );
+
+        // A temp table goes through the batch path; the count must still work.
+        let csv = _dir.path().join("scalar_src.csv");
+        std::fs::write(&csv, "a,b\n1,x\n2,y\n3,z\n").unwrap();
+        db.register_temp_table("scalar_temp", csv.to_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            db.execute("SELECT COUNT(*) AS n FROM scalar_temp")
+                .unwrap()
+                .scalar(),
+            Some(3)
+        );
+
+        // A multi-row result is not a scalar and must not be coerced.
+        assert_eq!(
+            table.execute("SELECT v FROM scalar_t").unwrap().scalar(),
+            None
+        );
+    }
+
+    // ── Write-scenario matrix ────────────────────────────────────────────────
+
+    /// The row set as seen through the three read paths a write can land in.
+    ///
+    /// They are served by different code (`count()` reads the O(1) active row
+    /// count, `COUNT(*)` goes through the executor, the ID list is a scan), so a
+    /// write defect typically shows up as a disagreement between them.
+    fn write_view(table: &Table) -> (u64, i64, Vec<i64>) {
+        let count = table.count().unwrap();
+        let sql_count = table
+            .execute(&format!("SELECT COUNT(*) AS n FROM {}", table.name))
+            .unwrap()
+            .scalar()
+            .expect("COUNT(*) must be readable as a scalar");
+        let mut ids: Vec<i64> = table
+            .execute(&format!("SELECT _id FROM {} ORDER BY _id", table.name))
+            .unwrap()
+            .to_rows()
+            .unwrap()
+            .iter()
+            .filter_map(|row| match row.get("_id") {
+                Some(Value::Int64(id)) => Some(*id),
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        (count, sql_count, ids)
+    }
+
+    /// Assert the three read paths agree and describe exactly `expected_ids`.
+    fn assert_row_set(table: &Table, expected_ids: &[i64], context: &str) {
+        let (count, sql_count, ids) = write_view(table);
+        assert_eq!(ids, expected_ids, "{context}: SQL must see exactly these ids");
+        assert_eq!(
+            count,
+            expected_ids.len() as u64,
+            "{context}: count() must match the SQL row set"
+        );
+        assert_eq!(
+            sql_count,
+            expected_ids.len() as i64,
+            "{context}: COUNT(*) must match the SQL row set"
+        );
+    }
+
+    /// The five-column row every route in this group writes.
+    fn matrix_row(tag: &str, num: i64, score: f64, flag: bool, payload: &[u8]) -> Row {
+        let mut row = Row::new();
+        row.insert("tag".to_string(), Value::String(tag.to_string()));
+        row.insert("num".to_string(), Value::Int64(num));
+        row.insert("score".to_string(), Value::Float64(score));
+        row.insert("flag".to_string(), Value::Bool(flag));
+        row.insert("payload".to_string(), Value::Binary(payload.to_vec()));
+        row
+    }
+
+    /// A table with one column of every scalar type a route can carry.
+    fn matrix_table(db: &ApexDB, name: &str) -> Table {
+        db.create_table_with_schema(
+            name,
+            &[
+                ("tag".to_string(), ColumnType::String),
+                ("num".to_string(), ColumnType::Int64),
+                ("score".to_string(), ColumnType::Float64),
+                ("flag".to_string(), ColumnType::Bool),
+                ("payload".to_string(), ColumnType::Binary),
+            ],
+        )
+        .unwrap()
+    }
+
+    /// Every scalar column of one row, read back through the point-read API.
+    ///
+    /// `None` for `payload` means the column read back as SQL `NULL`.
+    fn matrix_cells(table: &Table, id: u64) -> (String, i64, f64, bool, Option<Vec<u8>>) {
+        let row = match table.retrieve(id) {
+            Ok(Some(row)) => row,
+            Ok(None) => panic!("row {id} must be retrievable"),
+            Err(error) => panic!("retrieve({id}) failed: {error}"),
+        };
+        let tag = match row.get("tag") {
+            Some(Value::String(text)) => text.clone(),
+            other => panic!("row {id} tag is {other:?}"),
+        };
+        let num = match row.get("num") {
+            Some(Value::Int64(value)) => *value,
+            other => panic!("row {id} num is {other:?}"),
+        };
+        let score = match row.get("score") {
+            Some(Value::Float64(value)) => *value,
+            other => panic!("row {id} score is {other:?}"),
+        };
+        let flag = match row.get("flag") {
+            Some(Value::Bool(value)) => *value,
+            other => panic!("row {id} flag is {other:?}"),
+        };
+        let payload = match row.get("payload") {
+            Some(Value::Binary(bytes)) => Some(bytes.clone()),
+            Some(Value::Null) => None,
+            other => panic!("row {id} payload is {other:?}"),
+        };
+        (tag, num, score, flag, payload)
+    }
+
+    /// Each write route must publish the same values, in the same columns.
+    ///
+    /// The single-row insert, the batch insert, the Arrow import and SQL all end
+    /// up in the same base file through different writers (delta append, V4 row
+    /// group append, typed columns, row-oriented buckets). This walks all four
+    /// into one table, then re-opens the database and checks the values survive
+    /// the round trip.
+    #[test]
+    fn test_write_matrix_every_route_keeps_values() {
+        let dir = TempDir::new().unwrap();
+        {
+            let db = ApexDB::open(dir.path()).unwrap();
+            let table = matrix_table(&db, "wm");
+
+            // 1. Single-row insert (delta append for an existing V4 table).
+            assert_eq!(table.insert(matrix_row("r1", 1, 1.5, true, b"one")).unwrap(), 1);
+            assert_row_set(&table, &[1], "after single insert");
+
+            // 2. Batch insert (V4 row-group append).
+            let batch = vec![
+                matrix_row("r2", 2, 2.5, false, b"two"),
+                matrix_row("r3", 3, 3.5, true, b""),
+            ];
+            assert_eq!(table.insert_batch(&batch).unwrap(), vec![2, 3]);
+            assert_row_set(&table, &[1, 2, 3], "after batch insert");
+
+            // 3. SQL INSERT. A text literal is not reinterpreted as binary, so
+            //    this route writes no payload and the column stays NULL.
+            table
+                .execute("INSERT INTO wm (tag, num, score, flag) VALUES ('r4', 4, 4.5, false)")
+                .unwrap();
+            assert_row_set(&table, &[1, 2, 3, 4], "after SQL insert");
+
+            // 4. Arrow import.
+            let arrow_batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    arrow::datatypes::Field::new("tag", ArrowDataType::Utf8, false),
+                    arrow::datatypes::Field::new("num", ArrowDataType::Int64, false),
+                    arrow::datatypes::Field::new("score", ArrowDataType::Float64, false),
+                    arrow::datatypes::Field::new("flag", ArrowDataType::Boolean, false),
+                    arrow::datatypes::Field::new("payload", ArrowDataType::Binary, false),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec!["r5", "r6"])),
+                    Arc::new(Int64Array::from(vec![5, 6])),
+                    Arc::new(Float64Array::from(vec![5.5, 6.5])),
+                    Arc::new(BooleanArray::from(vec![true, false])),
+                    Arc::new(BinaryArray::from_vec(vec![b"five".as_ref(), b"six".as_ref()])),
+                ],
+            )
+            .unwrap();
+            assert_eq!(table.insert_arrow(&arrow_batch).unwrap(), vec![5, 6]);
+            assert_row_set(&table, &[1, 2, 3, 4, 5, 6], "after arrow import");
+
+            // Every route wrote the values it was given.
+            let expected: Vec<(&str, i64, f64, bool, Option<&[u8]>)> = vec![
+                ("r1", 1, 1.5, true, Some(b"one")),
+                ("r2", 2, 2.5, false, Some(b"two")),
+                ("r3", 3, 3.5, true, Some(b"")),
+                ("r4", 4, 4.5, false, None),
+                ("r5", 5, 5.5, true, Some(b"five")),
+                ("r6", 6, 6.5, false, Some(b"six")),
+            ];
+            for (index, (tag, num, score, flag, payload)) in expected.iter().enumerate() {
+                let id = index as u64 + 1;
+                assert_eq!(
+                    matrix_cells(&table, id),
+                    (
+                        tag.to_string(),
+                        *num,
+                        *score,
+                        *flag,
+                        payload.map(|bytes| bytes.to_vec())
+                    ),
+                    "row {id} written through route {} must keep its values",
+                    index + 1
+                );
+            }
+
+            // An explicit flush must not disturb the row set.
+            table.flush().unwrap();
+            assert_row_set(&table, &[1, 2, 3, 4, 5, 6], "after flush");
+        }
+
+        // Re-open: every route's rows are in the base file, with the same values.
+        let db = ApexDB::open(dir.path()).unwrap();
+        let reopened = db.table("wm").unwrap();
+        assert_row_set(&reopened, &[1, 2, 3, 4, 5, 6], "after reopen");
+        assert_eq!(matrix_cells(&reopened, 1).0, "r1");
+        assert_eq!(
+            matrix_cells(&reopened, 4),
+            ("r4".to_string(), 4, 4.5, false, None)
+        );
+        assert_eq!(matrix_cells(&reopened, 6).4, Some(b"six".to_vec()));
+    }
+
+    /// The write routes must compose: insert, batch, SQL, replace, delete and
+    /// flush in one sequence, with the exact row set checked after every step.
+    #[test]
+    fn test_write_matrix_interleaved_routes_keep_row_set_exact() {
+        let (_dir, db) = temp_db();
+        let table = matrix_table(&db, "mix");
+
+        table.insert(matrix_row("a", 1, 1.0, true, b"a")).unwrap();
+        assert_row_set(&table, &[1], "insert");
+
+        table
+            .insert_batch(&[
+                matrix_row("b", 2, 2.0, false, b"b"),
+                matrix_row("c", 3, 3.0, true, b"c"),
+            ])
+            .unwrap();
+        assert_row_set(&table, &[1, 2, 3], "batch insert");
+
+        // Delete in the middle, then keep writing around the hole.
+        assert!(table.delete(2).unwrap());
+        assert_row_set(&table, &[1, 3], "delete");
+
+        table.insert(matrix_row("d", 4, 4.0, false, b"d")).unwrap();
+        assert_row_set(&table, &[1, 3, 4], "insert after delete");
+
+        // Rewrite a surviving row.
+        assert!(table.replace(3, matrix_row("c2", 33, 33.5, false, b"c2")).unwrap());
+        assert_row_set(&table, &[1, 3, 4], "replace");
+        assert_eq!(
+            matrix_cells(&table, 3),
+            ("c2".to_string(), 33, 33.5, false, Some(b"c2".to_vec()))
+        );
+
+        // SQL UPDATE and DELETE join the same sequence.
+        table.execute("UPDATE mix SET num = 100 WHERE _id = 1").unwrap();
+        assert_eq!(matrix_cells(&table, 1).1, 100, "SQL update must land");
+        table.execute("DELETE FROM mix WHERE _id = 4").unwrap();
+        assert_row_set(&table, &[1, 3], "SQL delete");
+
+        table
+            .insert_batch(&[
+                matrix_row("e", 5, 5.0, true, b"e"),
+                matrix_row("f", 6, 6.0, false, b"f"),
+                matrix_row("g", 7, 7.0, true, b"g"),
+            ])
+            .unwrap();
+        assert_row_set(&table, &[1, 3, 5, 6, 7], "batch after SQL delete");
+
+        table.flush().unwrap();
+        assert_row_set(&table, &[1, 3, 5, 6, 7], "flush");
+
+        // A second flush is a no-op, not a rewrite that loses rows.
+        table.flush().unwrap();
+        assert_row_set(&table, &[1, 3, 5, 6, 7], "second flush");
+
+        // Deletes keep removing exactly one row each time.
+        assert!(table.delete(5).unwrap());
+        assert_row_set(&table, &[1, 3, 6, 7], "delete after flush");
+        assert!(table.delete(1).unwrap());
+        assert_row_set(&table, &[3, 6, 7], "second delete");
+    }
+
+    /// An integer written into a `DOUBLE` column must be stored as that number.
+    ///
+    /// The SQL INSERT path and the delta/durable append path both coerce
+    /// `Int64 -> Float64` for a float column. The typed and row-oriented writers
+    /// matched the value variant exactly instead, so an integer landed in no
+    /// bucket at all: the column stayed short and the row read back as `NULL`
+    /// (`0` on the V4 append fast path) while the identical SQL write stored
+    /// `1.0`.
+    #[test]
+    fn test_integer_writes_land_in_float_columns() {
+        let (_dir, db) = temp_db();
+
+        let score_of = |table: &Table, id: u64| -> Option<f64> {
+            match table.retrieve(id).unwrap().and_then(|row| row.get("score").cloned()) {
+                Some(Value::Float64(value)) => Some(value),
+                _ => None,
+            }
+        };
+        let int_row = |tag: &str, value: i64| {
+            let mut row = Row::new();
+            row.insert("tag".to_string(), Value::String(tag.to_string()));
+            row.insert("score".to_string(), Value::Int64(value));
+            row
+        };
+
+        // Route 1: single-row insert into a freshly created typed table.
+        let table = db
+            .create_table_with_schema(
+                "ints",
+                &[
+                    ("tag".to_string(), ColumnType::String),
+                    ("score".to_string(), ColumnType::Float64),
+                ],
+            )
+            .unwrap();
+        table.insert(int_row("a", 1)).unwrap();
+        assert_eq!(score_of(&table, 1), Some(1.0), "single insert must coerce int -> double");
+
+        // Route 2: batch insert, mixing integers and floats in one call.
+        table
+            .insert_batch(&[
+                int_row("b", 2),
+                {
+                    let mut row = Row::new();
+                    row.insert("tag".to_string(), Value::String("c".to_string()));
+                    row.insert("score".to_string(), Value::Float64(3.5));
+                    row
+                },
+            ])
+            .unwrap();
+        assert_eq!(score_of(&table, 2), Some(2.0), "batch insert must coerce int -> double");
+        assert_eq!(score_of(&table, 3), Some(3.5), "float values must be untouched");
+
+        // Route 3: SQL INSERT with an integer literal.
+        table
+            .execute("INSERT INTO ints (tag, score) VALUES ('d', 4)")
+            .unwrap();
+        assert_eq!(score_of(&table, 4), Some(4.0), "SQL insert must coerce int -> double");
+
+        // Route 4: Arrow import with an int64 column feeding a double column.
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                arrow::datatypes::Field::new("tag", ArrowDataType::Utf8, false),
+                arrow::datatypes::Field::new("score", ArrowDataType::Int64, false),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec!["e", "f"])),
+                Arc::new(Int64Array::from(vec![5, 6])),
+            ],
+        )
+        .unwrap();
+        table.insert_arrow(&batch).unwrap();
+        assert_eq!(score_of(&table, 5), Some(5.0), "arrow int column must coerce int -> double");
+        assert_eq!(score_of(&table, 6), Some(6.0), "arrow int column must coerce int -> double");
+
+        // Route 5: an append into the materialized table (delta/typed append).
+        table.insert(int_row("g", 7)).unwrap();
+        assert_eq!(score_of(&table, 7), Some(7.0), "append must coerce int -> double");
+
+        assert_row_set(&table, &[1, 2, 3, 4, 5, 6, 7], "after every int route");
+        table.flush().unwrap();
+        for id in 1..=7u64 {
+            assert!(
+                score_of(&table, id).is_some(),
+                "row {id} must keep a float value after the flush"
+            );
+        }
+    }
+
+    /// Deleting or replacing a row that is not there must change nothing.
+    ///
+    /// A repeated `delete()` used to report `true` again, and when the first
+    /// delete went through the delta overlay the second one fell through to the
+    /// base-file tombstones and decremented the active row count a second time —
+    /// `count()` disagreed with every other read path.
+    #[test]
+    fn test_repeated_delete_and_missing_replace_are_noops() {
+        let (_dir, db) = temp_db();
+        let table = db.create_table("noop").unwrap();
+        for i in 0..5 {
+            let mut row = Row::new();
+            row.insert("v".to_string(), Value::Int64(i));
+            table.insert(row).unwrap();
+        }
+        assert_row_set(&table, &[1, 2, 3, 4, 5], "initial");
+
+        // A row deleted once is gone; deleting it again is not a deletion.
+        assert!(table.delete(2).unwrap());
+        assert_row_set(&table, &[1, 3, 4, 5], "first delete");
+        assert!(!table.delete(2).unwrap(), "second delete must report false");
+        assert_row_set(&table, &[1, 3, 4, 5], "second delete must be a no-op");
+
+        // The same holds after a flush, which rewrites the base file.
+        table.flush().unwrap();
+        assert!(!table.delete(2).unwrap(), "delete after flush must report false");
+        assert_row_set(&table, &[1, 3, 4, 5], "delete after flush must be a no-op");
+
+        // IDs that never existed behave the same way, in both APIs.
+        assert!(!table.delete(99).unwrap());
+        assert_eq!(table.delete_batch(&[99]).unwrap(), 0);
+        assert_row_set(&table, &[1, 3, 4, 5], "missing ids");
+
+        // A batch delete counts duplicates once and ignores missing ids.
+        assert_eq!(table.delete_batch(&[3, 3, 99]).unwrap(), 1);
+        assert_row_set(&table, &[1, 4, 5], "batch delete with duplicates");
+        assert_eq!(table.delete_batch(&[3]).unwrap(), 0, "already deleted");
+        assert_row_set(&table, &[1, 4, 5], "batch delete of a deleted id");
+
+        // Replacing a row that is gone reports false and does not create it.
+        let mut replacement = Row::new();
+        replacement.insert("v".to_string(), Value::Int64(42));
+        assert!(!table.replace(3, replacement.clone()).unwrap(), "replace of a deleted row");
+        assert!(!table.replace(99, replacement.clone()).unwrap(), "replace of a missing row");
+        assert_row_set(&table, &[1, 4, 5], "failed replaces must not add rows");
+        assert!(table.replace(4, replacement).unwrap(), "replace of a live row");
+        assert_row_set(&table, &[1, 4, 5], "replace of a live row keeps the count");
+
+        // Empty writes are no-ops too.
+        assert!(table.insert_batch(&[]).unwrap().is_empty());
+        assert_eq!(table.delete_batch(&[]).unwrap(), 0);
+        assert_row_set(&table, &[1, 4, 5], "empty writes");
+    }
+
+    /// Writes to a table whose schema changed must still land correctly.
+    #[test]
+    fn test_writes_after_schema_change() {
+        let (_dir, db) = temp_db();
+        let table = db.create_table("evolve").unwrap();
+        let row = |v: i64| {
+            let mut row = Row::new();
+            row.insert("v".to_string(), Value::Int64(v));
+            row
+        };
+        table.insert(row(1)).unwrap();
+
+        // A new column starts out NULL for existing rows and accepts writes.
+        table.add_column("extra", DataType::String).unwrap();
+        let mut row2 = Row::new();
+        row2.insert("v".to_string(), Value::Int64(2));
+        row2.insert("extra".to_string(), Value::String("two".to_string()));
+        table.insert(row2).unwrap();
+        assert_row_set(&table, &[1, 2], "insert after add_column");
+
+        let extra_of = |id: u64| -> Option<Value> {
+            table.retrieve(id).unwrap().and_then(|row| row.get("extra").cloned())
+        };
+        assert_eq!(extra_of(1), Some(Value::Null), "the old row must read NULL");
+        assert_eq!(extra_of(2), Some(Value::String("two".to_string())));
+
+        // Batch writes, replaces and deletes still work on the wider schema.
+        let mut row3 = Row::new();
+        row3.insert("v".to_string(), Value::Int64(3));
+        row3.insert("extra".to_string(), Value::String("three".to_string()));
+        table.insert_batch(&[row3]).unwrap();
+        assert!(table.replace(1, {
+            let mut row = Row::new();
+            row.insert("v".to_string(), Value::Int64(10));
+            row.insert("extra".to_string(), Value::String("ten".to_string()));
+            row
+        }).unwrap());
+        assert_eq!(extra_of(1), Some(Value::String("ten".to_string())));
+        assert!(table.delete(2).unwrap());
+        assert_row_set(&table, &[1, 3], "writes after schema evolution");
+
+        // Renaming a column keeps the data addressable by the new name.
+        table.rename_column("extra", "label").unwrap();
+        let label_of = |id: u64| -> Option<Value> {
+            table.retrieve(id).unwrap().and_then(|row| row.get("label").cloned())
+        };
+        assert_eq!(label_of(1), Some(Value::String("ten".to_string())));
+        table.insert({
+            let mut row = Row::new();
+            row.insert("v".to_string(), Value::Int64(4));
+            row.insert("label".to_string(), Value::String("four".to_string()));
+            row
+        }).unwrap();
+        assert_row_set(&table, &[1, 3, 4], "insert after rename_column");
+
+        // Dropping a column leaves the remaining ones writable.
+        table.drop_column("label").unwrap();
+        table.insert(row(5)).unwrap();
+        assert_row_set(&table, &[1, 3, 4, 5], "insert after drop_column");
+        assert_eq!(v_column_of(&table, 5), Some(5));
+    }
+
+    /// Read the `v` column of a row as an integer.
+    fn v_column_of(table: &Table, id: u64) -> Option<i64> {
+        match table.retrieve(id).unwrap().and_then(|row| row.get("v").cloned()) {
+            Some(Value::Int64(value)) => Some(value),
+            _ => None,
+        }
+    }
+
+    /// Values at the edges of each column type must survive every write route.
+    /// Values of one row spanning every column type a table can carry.
+    fn all_types_row(tag: &str, variant: i64) -> Row {
+        let mut row = Row::new();
+        row.insert("tag".to_string(), Value::String(tag.to_string()));
+        row.insert("i".to_string(), Value::Int64(variant));
+        row.insert("f".to_string(), Value::Float64(variant as f64 / 2.0));
+        row.insert("b".to_string(), Value::Bool(variant % 2 == 0));
+        row.insert(
+            "s".to_string(),
+            Value::String(format!("text-{variant}-✓")),
+        );
+        row.insert(
+            "by".to_string(),
+            Value::Binary(vec![variant as u8, 0, 255, 7]),
+        );
+        row.insert(
+            "emb".to_string(),
+            Value::FixedList((variant as f32).to_le_bytes().to_vec()),
+        );
+        row.insert("nul".to_string(), Value::Null);
+        row
+    }
+
+    /// Every column's value as read through the point API, as comparable text.
+    fn all_types_cells(table: &Table, id: u64) -> Vec<String> {
+        let row = match table.retrieve(id) {
+            Ok(Some(row)) => row,
+            Ok(None) => panic!("row {id} must be retrievable"),
+            Err(error) => panic!("retrieve({id}) failed: {error}"),
+        };
+        let mut cells = Vec::new();
+        for column in [
+            "tag", "i", "f", "b", "s", "by", "emb", "nul",
+        ] {
+            cells.push(format!("{column}={:?}", row.get(column)));
+        }
+        cells
+    }
+
+    /// Every expected value of one row, in the same order as [`all_types_cells`].
+    ///
+    /// The SQL route cannot express a binary payload or a vector literal, so
+    /// those two columns stay NULL there.
+    fn all_types_expected(route: &str, tag: &str, variant: i64) -> Vec<String> {
+        let payload = if route == "sql" {
+            Some(Value::Null)
+        } else {
+            Some(Value::Binary(vec![variant as u8, 0, 255, 7]))
+        };
+        let vector = if route == "sql" {
+            Some(Value::Null)
+        } else {
+            Some(Value::FixedList((variant as f32).to_le_bytes().to_vec()))
+        };
+        vec![
+            format!("tag={:?}", Some(Value::String(tag.to_string()))),
+            format!("i={:?}", Some(Value::Int64(variant))),
+            format!("f={:?}", Some(Value::Float64(variant as f64 / 2.0))),
+            format!("b={:?}", Some(Value::Bool(variant % 2 == 0))),
+            format!("s={:?}", Some(Value::String(format!("text-{variant}-✓")))),
+            format!("by={payload:?}"),
+            format!("emb={vector:?}"),
+            format!("nul={:?}", Some(Value::Null)),
+        ]
+    }
+
+    /// Every supported column type must survive every write route.
+    ///
+    /// One table carries an integer, a double, a boolean, a string, a binary
+    /// payload, a vector and a NULL-only column; each route writes one row and
+    /// the row is then read back through the point API, `retrieve_many` and SQL,
+    /// before and after a flush and a reopen.
+    #[test]
+    fn test_every_column_type_through_every_write_route() {
+        let dir = TempDir::new().unwrap();
+        let routes: [(&str, i64); 4] = [
+            ("insert", 1),
+            ("insert_batch", 2),
+            ("sql", 3),
+            ("arrow", 4),
+        ];
+
+        {
+            let db = ApexDB::open(dir.path()).unwrap();
+            let table = db
+                .create_table_with_schema(
+                    "types",
+                    &[
+                        ("tag".to_string(), ColumnType::String),
+                        ("i".to_string(), ColumnType::Int64),
+                        ("f".to_string(), ColumnType::Float64),
+                        ("b".to_string(), ColumnType::Bool),
+                        ("s".to_string(), ColumnType::String),
+                        ("by".to_string(), ColumnType::Binary),
+                        ("emb".to_string(), ColumnType::FixedList),
+                        ("nul".to_string(), ColumnType::Null),
+                    ],
+                )
+                .unwrap();
+
+            // Route 1: single-row insert.
+            table.insert(all_types_row("insert", 1)).unwrap();
+            // Route 2: batch insert.
+            table
+                .insert_batch(&[all_types_row("insert_batch", 2)])
+                .unwrap();
+            // Route 3: SQL INSERT, which cannot express a binary payload or a
+            // vector, so those stay NULL for this row.
+            table
+                .execute(
+                    "INSERT INTO types (tag, i, f, b, s, nul) VALUES \
+                     ('sql', 3, 1.5, false, 'text-3-✓', NULL)",
+                )
+                .unwrap();
+            // Route 4: Arrow import.
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![
+                    arrow::datatypes::Field::new("tag", ArrowDataType::Utf8, false),
+                    arrow::datatypes::Field::new("i", ArrowDataType::Int64, false),
+                    arrow::datatypes::Field::new("f", ArrowDataType::Float64, false),
+                    arrow::datatypes::Field::new("b", ArrowDataType::Boolean, false),
+                    arrow::datatypes::Field::new("s", ArrowDataType::Utf8, false),
+                    arrow::datatypes::Field::new("by", ArrowDataType::Binary, false),
+                    arrow::datatypes::Field::new(
+                        "emb",
+                        ArrowDataType::FixedSizeList(
+                            Arc::new(arrow::datatypes::Field::new(
+                                "item",
+                                ArrowDataType::Float32,
+                                true,
+                            )),
+                            1,
+                        ),
+                        false,
+                    ),
+                    arrow::datatypes::Field::new("nul", ArrowDataType::Utf8, true),
+                ])),
+                vec![
+                    Arc::new(StringArray::from(vec!["arrow"])),
+                    Arc::new(Int64Array::from(vec![4])),
+                    Arc::new(Float64Array::from(vec![2.0])),
+                    Arc::new(BooleanArray::from(vec![true])),
+                    Arc::new(StringArray::from(vec!["text-4-✓"])),
+                    Arc::new(BinaryArray::from_vec(vec![b"\x04\x00\xff\x07".as_ref()])),
+                    Arc::new(
+                        arrow::array::FixedSizeListArray::try_new(
+                            Arc::new(arrow::datatypes::Field::new(
+                                "item",
+                                ArrowDataType::Float32,
+                                true,
+                            )),
+                            1,
+                            Arc::new(Float32Array::from(vec![4.0f32])),
+                            None,
+                        )
+                        .unwrap(),
+                    ),
+                    Arc::new(StringArray::from(vec![None as Option<&str>])),
+                ],
+            )
+            .unwrap();
+            table.insert_arrow(&batch).unwrap();
+
+            assert_row_set(&table, &[1, 2, 3, 4], "all types through every route");
+
+            for (index, (_, variant)) in routes.iter().enumerate() {
+                let id = index as u64 + 1;
+                assert_eq!(
+                    all_types_cells(&table, id),
+                    all_types_expected(routes[index].0, routes[index].0, *variant),
+                    "row {id} written by route '{}' must keep every column",
+                    routes[index].0
+                );
+            }
+
+            // The SQL row has no binary payload or vector.
+            let sql_row = table.retrieve(3).unwrap().unwrap();
+            assert_eq!(sql_row.get("by"), Some(&Value::Null));
+            assert_eq!(sql_row.get("emb"), Some(&Value::Null));
+
+            // A replace republishes every column of the row.
+            let mut replacement = all_types_row("replace", 5);
+            replacement.insert("nul".to_string(), Value::Null);
+            assert!(table.replace(1, replacement).unwrap());
+            assert_eq!(
+                all_types_cells(&table, 1),
+                all_types_expected("replace", "replace", 5),
+                "replace must publish every column"
+            );
+            assert_row_set(&table, &[1, 2, 3, 4], "after replace");
+            // SQL UPDATE writes one column of an existing row.
+            table
+                .execute("UPDATE types SET s = 'updated' WHERE _id = 2")
+                .unwrap();
+            let updated = table.retrieve(2).unwrap().unwrap();
+            assert_eq!(updated.get("s"), Some(&Value::String("updated".to_string())));
+            assert_eq!(updated.get("i"), Some(&Value::Int64(2)));
+            // Row 2 keeps every other column, with the updated string.
+            let mut row_two_expected = all_types_expected("insert_batch", "insert_batch", 2);
+            row_two_expected[4] = format!("s={:?}", Some(Value::String("updated".to_string())));
+
+            // `retrieve_many` agrees with the point lookups.
+            let many = table.retrieve_many(&[1, 2, 3, 4]).unwrap();
+            assert_eq!(many.num_rows(), 4);
+
+            // SQL sees the same values.
+            let rows = table
+                .execute("SELECT tag, i, f, b, s FROM types ORDER BY _id")
+                .unwrap()
+                .to_rows()
+                .unwrap();
+            assert_eq!(rows.len(), 4);
+            assert_eq!(rows[0].get("i"), Some(&Value::Int64(5)));
+            assert_eq!(rows[0].get("s"), Some(&Value::String("text-5-✓".to_string())));
+            assert_eq!(rows[1].get("s"), Some(&Value::String("updated".to_string())));
+            assert_eq!(rows[3].get("s"), Some(&Value::String("text-4-✓".to_string())));
+
+            table.flush().unwrap();
+            assert_eq!(
+                all_types_cells(&table, 1),
+                all_types_expected("replace", "replace", 5),
+                "row 1 must keep the values the replace published"
+            );
+            for (index, (_, variant)) in routes.iter().enumerate().skip(1) {
+                let id = index as u64 + 1;
+                if id == 2 {
+                    assert_eq!(
+                        all_types_cells(&table, id),
+                        row_two_expected,
+                        "row 2 must keep every column, with the SQL update applied"
+                    );
+                    continue;
+                }
+                assert_eq!(
+                    all_types_cells(&table, id),
+                    all_types_expected(routes[index].0, routes[index].0, *variant),
+                    "row {id} must keep every column after a flush"
+                );
+            }
+        }
+
+        // Reopen: the same values are in the file.
+        let db = ApexDB::open(dir.path()).unwrap();
+        let table = db.table("types").unwrap();
+        assert_row_set(&table, &[1, 2, 3, 4], "after reopen");
+        assert_eq!(
+            all_types_cells(&table, 1),
+            all_types_expected("replace", "replace", 5),
+            "row 1 must keep the replaced values after a reopen"
+        );
+        let mut row_two_expected = all_types_expected("insert_batch", "insert_batch", 2);
+        row_two_expected[4] = format!("s={:?}", Some(Value::String("updated".to_string())));
+        for (index, (name, variant)) in routes.iter().enumerate().skip(1) {
+            let id = index as u64 + 1;
+            if id == 2 {
+                assert_eq!(all_types_cells(&table, id), row_two_expected, "row 2 reopened");
+                continue;
+            }
+            assert_eq!(
+                all_types_cells(&table, id),
+                all_types_expected(name, name, *variant),
+                "row {id} must keep every column after a reopen"
+            );
+        }
+    }
+
+    #[test]
+    fn test_write_edge_values_round_trip() {
+        let (_dir, db) = temp_db();
+        let table = db
+            .create_table_with_schema(
+                "edge",
+                &[
+                    ("s".to_string(), ColumnType::String),
+                    ("n".to_string(), ColumnType::Int64),
+                ],
+            )
+            .unwrap();
+
+        let long_text = "x".repeat(64 * 1024);
+        let rows: Vec<(String, i64)> = vec![
+            (String::new(), 0),
+            ("héllo wörld ✓ 中文 🎉".to_string(), -1),
+            (long_text.clone(), i64::MAX),
+            ("tab\tnewline\nquote\"back\\slash".to_string(), i64::MIN),
+        ];
+        let batch: Vec<Row> = rows
+            .iter()
+            .map(|(text, number)| {
+                let mut row = Row::new();
+                row.insert("s".to_string(), Value::String(text.clone()));
+                row.insert("n".to_string(), Value::Int64(*number));
+                row
+            })
+            .collect();
+        table.insert_batch(&batch).unwrap();
+        assert_row_set(&table, &[1, 2, 3, 4], "edge values");
+
+        // NULLs in every column, written one row at a time.
+        table
+            .insert({
+                let mut row = Row::new();
+                row.insert("s".to_string(), Value::Null);
+                row.insert("n".to_string(), Value::Null);
+                row
+            })
+            .unwrap();
+        assert_row_set(&table, &[1, 2, 3, 4, 5], "null row");
+
+        for (index, (text, number)) in rows.iter().enumerate() {
+            let id = index as u64 + 1;
+            let stored = table.retrieve(id).unwrap().expect("row must exist");
+            assert_eq!(
+                stored.get("s"),
+                Some(&Value::String(text.clone())),
+                "row {id} string must round-trip"
+            );
+            assert_eq!(stored.get("n"), Some(&Value::Int64(*number)), "row {id} int");
+        }
+        let null_row = table.retrieve(5).unwrap().expect("null row must exist");
+        assert_eq!(null_row.get("s"), Some(&Value::Null));
+        assert_eq!(null_row.get("n"), Some(&Value::Null));
+
+        // The multi-megabyte string is the one that can be truncated silently.
+        table.flush().unwrap();
+        assert_eq!(
+            table.retrieve(3).unwrap().and_then(|row| row.get("s").cloned()),
+            Some(Value::String(long_text))
+        );
+    }
+
+    /// Writers of every kind running on one table must not lose or duplicate
+    /// rows.
+    ///
+    /// `insert`/`insert_batch` serialize on the table write lock, but `delete`,
+    /// `replace` and `flush` did not take it, so they interleaved their own
+    /// read-modify-write of the base file with a concurrent write's. The row set
+    /// then disagreed with what the writers reported: a deleted row came back,
+    /// because a later writer republished a snapshot taken before the delete.
+    ///
+    /// Readers are left out on purpose. A concurrent *query* still has to open
+    /// the table, and that open applies deferred deletion state to the base file
+    /// in place; the reader/writer interaction around that path is a separate,
+    /// still-open defect that this test would turn into a flaky failure.
+    #[test]
+    fn test_concurrent_mixed_writes_keep_the_row_set() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Mutex;
+
+        let (_dir, db) = temp_db();
+        let table = db.create_table("mixed").unwrap();
+        let tag_row = |value: i64| {
+            let mut row = Row::new();
+            row.insert("worker".to_string(), Value::Int64(value % 4));
+            row.insert("seq".to_string(), Value::Int64(value));
+            row
+        };
+
+        const PER_WRITER: i64 = 40;
+        const WRITERS: i64 = 3;
+
+        // Phase 1: three writers fill the table.
+        let ids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let handles: Vec<_> = (0..WRITERS)
+            .map(|worker| {
+                let table = table.clone();
+                let ids = ids.clone();
+                std::thread::spawn(move || -> Result<()> {
+                    for seq in 0..PER_WRITER {
+                        let value = worker * 1_000 + seq;
+                        let id = table.insert(tag_row(value))?;
+                        ids.lock().unwrap().push(id);
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+        for handle in handles {
+            handle.join().expect("writer thread panicked").unwrap();
+        }
+
+        let mut all_ids = ids.lock().unwrap().clone();
+        all_ids.sort_unstable();
+        assert_row_set(&table, &all_ids.iter().map(|id| *id as i64).collect::<Vec<_>>(), "after inserts");
+        let inserted = all_ids.len() as u64;
+        assert_eq!(inserted, (WRITERS * PER_WRITER) as u64);
+
+        // Phase 2: deleters, replacers, flushers and more inserters run together
+        // on disjoint ID ranges, so the expected row set stays deterministic.
+        let deleted: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let deleters: Vec<_> = all_ids
+            .chunks(all_ids.len() / 2)
+            .map(|chunk| {
+                let table = table.clone();
+                let target: Vec<u64> = chunk.iter().copied().take(PER_WRITER as usize).collect();
+                let deleted = deleted.clone();
+                std::thread::spawn(move || -> Result<()> {
+                    for id in target {
+                        if table.delete(id)? {
+                            deleted.lock().unwrap().push(id);
+                        }
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        let replacers: Vec<_> = all_ids
+            .chunks(all_ids.len() / 2)
+            .map(|chunk| {
+                let table = table.clone();
+                let target: Vec<u64> = chunk
+                    .iter()
+                    .copied()
+                    .rev()
+                    .take(PER_WRITER as usize)
+                    .collect();
+                std::thread::spawn(move || -> Result<()> {
+                    for id in target {
+                        table.replace(id, tag_row(-1))?;
+                    }
+                    Ok(())
+                })
+            })
+            .collect();
+
+        let flusher = {
+            let table = table.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || -> Result<()> {
+                while !stop.load(Ordering::SeqCst) {
+                    table.flush()?;
+                    // Bound the rewrite rate: a tight flush loop would spend the
+                    // whole test inside `rename` instead of racing the writers.
+                    std::thread::sleep(std::time::Duration::from_micros(250));
+                }
+                Ok(())
+            })
+        };
+
+
+        for handle in deleters.into_iter().chain(replacers) {
+            handle.join().expect("mutation thread panicked").unwrap();
+        }
+        stop.store(true, Ordering::SeqCst);
+        flusher.join().expect("flusher thread panicked").unwrap();
+
+        let removed: std::collections::HashSet<u64> =
+            deleted.lock().unwrap().iter().copied().collect();
+        let expected: Vec<i64> = all_ids
+            .iter()
+            .filter(|id| !removed.contains(id))
+            .map(|id| *id as i64)
+            .collect();
+        assert!(!removed.is_empty(), "the deleters must actually delete rows");
+        assert_row_set(&table, &expected, "after mixed concurrent writes");
+
+        // Every surviving row is still point-readable, with a value the last
+        // writer of that row published.
+        for id in all_ids.iter().filter(|id| !removed.contains(id)) {
+            let row = table
+                .retrieve(*id)
+                .unwrap()
+                .unwrap_or_else(|| panic!("row {id} survived the deletes but is unreadable"));
+            assert!(
+                matches!(row.get("seq"), Some(Value::Int64(_))),
+                "row {id} must keep its seq column"
+            );
+        }
     }
 
     #[test]

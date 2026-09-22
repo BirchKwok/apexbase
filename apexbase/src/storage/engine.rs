@@ -32,7 +32,7 @@ use std::time::{Instant, SystemTime};
 
 use ahash::AHashMap;
 use once_cell::sync::Lazy;
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use super::backend::TableStorageBackend;
 use super::on_demand::ColumnType;
@@ -237,6 +237,72 @@ pub struct StorageEngine {
     /// Authoritative process-local tables. Unlike the bounded disk caches,
     /// these entries are pinned until their memory database is dropped.
     memory_tables: RwLock<AHashMap<PathBuf, Arc<TableStorageBackend>>>,
+    /// Serializes backend *materialization* (creating or opening the table file).
+    ///
+    /// The backend caches above are released before the file is touched, so
+    /// without this two threads racing on a not-yet-materialized table both call
+    /// the lazy-create path and one of them fails with `No such file or
+    /// directory`. The lock is held only on a cache miss and only while the file
+    /// is created/opened, never on the cached hot read path.
+    materialize_lock: Mutex<()>,
+}
+
+/// Mark every one of `rows` rows NULL in a column's null bitmap.
+///
+/// Used when an append carries no value of the column's type: the fixed-stride
+/// slot still has to be filled, but the padding must read back as SQL `NULL`
+/// rather than as a fabricated `0` / `0.0` / `false` / `''`.
+fn mark_all_null(bitmap: &mut Vec<u8>, rows: usize) {
+    bitmap.clear();
+    bitmap.resize((rows + 7) / 8, 0xFF);
+    if rows % 8 != 0 {
+        if let Some(last) = bitmap.last_mut() {
+            *last = (1u8 << (rows % 8)) - 1;
+        }
+    }
+}
+
+/// How many times a reader retries opening a table whose file is transiently
+/// absent because a concurrent writer is replacing it.
+const RETRY_OPEN_ATTEMPTS: usize = 8;
+/// Base backoff between those retries, in microseconds (linear growth).
+const RETRY_OPEN_BACKOFF_MICROS: u64 = 50;
+
+
+/// True when an open failure can be a transient mid-publication read.
+///
+/// A concurrent append rewrites the footer and then the header, so an open that
+/// lands between the two can see a header/footer pair that does not describe one
+/// snapshot (`Corrupt Apex file: ...`). Retrying re-reads the file; a genuinely
+/// corrupt file fails the same way on every attempt.
+fn is_transient_open_error(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound
+        || (error.kind() == io::ErrorKind::InvalidData
+            && error.to_string().contains("Corrupt Apex file"))
+}
+
+/// Open a table file, retrying briefly on a transient failure.
+fn open_with_retry<T>(
+    mut open: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    let mut last_error = None;
+    for attempt in 0..RETRY_OPEN_ATTEMPTS {
+        match open() {
+            Ok(value) => return Ok(value),
+            Err(error) if is_transient_open_error(&error) => {
+                last_error = Some(error);
+                if attempt + 1 < RETRY_OPEN_ATTEMPTS {
+                    std::thread::sleep(std::time::Duration::from_micros(
+                        RETRY_OPEN_BACKOFF_MICROS * (attempt as u64 + 1),
+                    ));
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "table is unavailable")
+    }))
 }
 
 impl StorageEngine {
@@ -247,6 +313,7 @@ impl StorageEngine {
             schema_cache: RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES * 2)),
             insert_cache: RwLock::new(AHashMap::with_capacity(MAX_CACHE_ENTRIES)),
             memory_tables: RwLock::new(AHashMap::new()),
+            materialize_lock: Mutex::new(()),
         }
     }
 
@@ -300,6 +367,7 @@ impl StorageEngine {
     /// Invalidate cache for a specific table
     pub fn invalidate(&self, table_path: &Path) {
         // Use path directly without canonicalize for speed (already absolute in most cases)
+        //
         self.cache.write().remove(table_path);
         self.insert_cache.write().remove(table_path);
         self.schema_cache.write().remove(table_path);
@@ -394,8 +462,18 @@ impl StorageEngine {
             let mut cache = self.cache.write();
             if let Some(entry) = cache.get_mut(&cache_key) {
                 if entry.epoch == epoch && entry.modified_time >= modified && !entry.has_delta {
-                    entry.last_access = Instant::now();
-                    return Ok(entry.backend.clone());
+                    // Only reuse a backend that actually holds the table's data.
+                    //
+                    // A cached *read* backend is opened mmap-only (`is_mmap_only`),
+                    // and the shared cache is populated by readers. A writer that
+                    // mutated such a backend tombstones rows only in its private
+                    // bitmaps, and `save()` then takes the mmap-only schema-only
+                    // path — so the deletion was never published and the next
+                    // writer to rewrite the file brought the row back.
+                    if !entry.backend.is_mmap_only() || entry.backend.storage.row_count() == 0 {
+                        entry.last_access = Instant::now();
+                        return Ok(entry.backend.clone());
+                    }
                 }
             }
         }
@@ -409,19 +487,39 @@ impl StorageEngine {
             self.schema_cache.write().remove(&cache_key);
         }
 
-        // Open fresh backend
-        let backend = if table_path.exists() {
-            TableStorageBackend::open_for_write_with_durability(table_path, durability)?
-        } else {
-            // Lazy table: materialize with the schema recorded in the table
-            // catalog when CREATE deferred the per-table file write.
-            crate::storage::table_catalog::materialize_table_backend(
-                table_path,
-                durability,
-            )?
-        };
+        // Open fresh backend.
+        //
+        // Serialize materialization and re-check the cache after acquiring the
+        // lock: two threads can reach this point concurrently for the same
+        // not-yet-created table, and both would try to create the file. The
+        // second one then observes the first one's backend instead.
+        let backend = {
+            let _guard = self.materialize_lock.lock();
 
-        let backend = Arc::new(backend);
+            let mut cache = self.cache.write();
+            if let Some(entry) = cache.get_mut(&cache_key) {
+                let current_epoch = crate::storage::epoch::current(table_path);
+                if entry.epoch == current_epoch {
+                    entry.last_access = Instant::now();
+                    return Ok(entry.backend.clone());
+                }
+            }
+            drop(cache);
+
+            let backend = open_with_retry(|| {
+                if table_path.exists() {
+                    TableStorageBackend::open_for_write_with_durability(table_path, durability)
+                } else {
+                    // Lazy table: materialize with the schema recorded in the table
+                    // catalog when CREATE deferred the per-table file write.
+                    crate::storage::table_catalog::materialize_table_backend(
+                        table_path,
+                        durability,
+                    )
+                }
+            })?;
+            Arc::new(backend)
+        };
         let new_modified = Self::get_modified_time(table_path);
 
         // Cache the backend and update schema cache
@@ -448,6 +546,11 @@ impl StorageEngine {
                 .map(|(name, _)| name)
                 .collect();
             let row_count = backend.row_count();
+            // Record the backend's real format: `classify_write` treats a cached
+            // `is_v4: false` entry as "this table still uses the delta path", so a
+            // hardcoded `false` here routed V4 writes to the legacy delta append —
+            // which has no null bitmap and ignores binary/blob/vector columns.
+            let is_v4 = backend.storage.is_v4_format();
             let mut schema_cache = self.schema_cache.write();
             schema_cache.insert(
                 cache_key,
@@ -455,7 +558,7 @@ impl StorageEngine {
                     columns: schema_cols,
                     row_count,
                     modified_time: new_modified,
-                    is_v4: false,
+                    is_v4,
                     epoch,
                 },
             );
@@ -489,19 +592,26 @@ impl StorageEngine {
         // was not yet materialized is created empty (with its catalog schema);
         // unregistered paths keep failing with NotFound instead of creating
         // stray files.
-        let backend = if table_path.exists() {
-            Arc::new(TableStorageBackend::open(table_path)?)
-        } else if crate::storage::table_catalog::file_exists_or_registered(table_path)? {
-            Arc::new(crate::storage::table_catalog::materialize_table_backend(
-                table_path,
-                DurabilityLevel::Fast,
-            )?)
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("table '{}' does not exist", table_path.display()),
-            ));
-        };
+        // A concurrent writer replaces the base file when it flushes, so the file
+        // can be momentarily absent between `exists()` and `open()`. That window is
+        // short, so retry briefly instead of surfacing a spurious NotFound to the
+        // reader. Bounded so a genuinely missing table still fails fast.
+        let backend = open_with_retry(|| {
+            if table_path.exists() {
+                TableStorageBackend::open(table_path).map(Arc::new)
+            } else if crate::storage::table_catalog::file_exists_or_registered(table_path)? {
+                crate::storage::table_catalog::materialize_table_backend(
+                    table_path,
+                    DurabilityLevel::Fast,
+                )
+                .map(Arc::new)
+            } else {
+                Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("table '{}' does not exist", table_path.display()),
+                ))
+            }
+        })?;
         let new_modified = Self::get_modified_time(table_path);
 
         // Cache it
@@ -528,6 +638,11 @@ impl StorageEngine {
                 .map(|(name, _)| name)
                 .collect();
             let row_count = backend.row_count();
+            // Record the backend's real format: `classify_write` treats a cached
+            // `is_v4: false` entry as "this table still uses the delta path", so a
+            // hardcoded `false` here routed V4 writes to the legacy delta append —
+            // which has no null bitmap and ignores binary/blob/vector columns.
+            let is_v4 = backend.storage.is_v4_format();
             let mut schema_cache = self.schema_cache.write();
             schema_cache.insert(
                 cache_key,
@@ -535,7 +650,7 @@ impl StorageEngine {
                     columns: schema_cols,
                     row_count,
                     modified_time: new_modified,
-                    is_v4: false,
+                    is_v4,
                     epoch,
                 },
             );
@@ -567,10 +682,25 @@ impl StorageEngine {
             }
         }
 
-        // Open new insert backend
-        let backend = Arc::new(TableStorageBackend::open_for_insert_with_durability(
-            table_path, durability,
-        )?);
+        // Open new insert backend.
+        //
+        // The cache check above is not enough: the write-ahead file is created
+        // lazily on first open, so concurrent writers on a fresh table would all
+        // call the open path and one of them would fail with `No such file or
+        // directory`. Serialize, then re-check so exactly one thread creates it.
+        let backend = {
+            let _guard = self.materialize_lock.lock();
+            let cache = self.insert_cache.read();
+            if let Some(entry) = cache.get(&cache_key) {
+                if entry.epoch == epoch {
+                    return Ok(Arc::clone(&entry.backend));
+                }
+            }
+            drop(cache);
+            Arc::new(open_with_retry(|| {
+                TableStorageBackend::open_for_insert_with_durability(table_path, durability)
+            })?)
+        };
 
         // Cache it
         {
@@ -611,6 +741,21 @@ impl StorageEngine {
         if rows.is_empty() {
             return Ok(Vec::new());
         }
+        // Serialize writes to this table for the whole read-modify-write.
+        //
+        // The V4 store keeps a private in-memory column buffer per backend and
+        // persists it by rewriting/appending the shared `.apex` file. Two writers
+        // interleaving that sequence lose rows and raise
+        // `No such file or directory`, so the documented "writes are serialized
+        // per-table" guarantee is enforced here, at the mutation entry point —
+        // taking the lock only inside `save()` is too late and would also nest
+        // the lock, since `save()` is called from here.
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
+        // A delete can leave its deletion vectors deferred in process memory (no
+        // file I/O on Unix). Publish them before this write reads the base file:
+        // an append publishes a footer derived from what is on disk, so a
+        // deferred delete that is not applied first is silently undone by it.
+        let _ = crate::storage::on_demand::apply_pending_deletes(table_path);
         let epoch_write = crate::storage::epoch::logical_write(table_path);
 
         // Stored vector accelerators are derived state. Expand row-oriented
@@ -873,6 +1018,11 @@ impl StorageEngine {
         if ids.is_empty() {
             return Ok(0);
         }
+        // Same per-table serialization as `write`: the delete tombstones rows and
+        // flushes the base file, which must not interleave with another writer's
+        // read-modify-write.
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
+        let _ = crate::storage::on_demand::apply_pending_deletes(table_path);
         let epoch_write = crate::storage::epoch::logical_write(table_path);
 
         // Invalidate before delete
@@ -984,6 +1134,9 @@ impl StorageEngine {
         id: u64,
         durability: DurabilityLevel,
     ) -> io::Result<bool> {
+        // Same per-table serialization as `write`: see `delete`.
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
+        let _ = crate::storage::on_demand::apply_pending_deletes(table_path);
         let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
         let backend = self.get_write_backend(table_path, durability)?;
@@ -1006,6 +1159,10 @@ impl StorageEngine {
         fields: &HashMap<String, Value>,
         durability: DurabilityLevel,
     ) -> io::Result<bool> {
+        // Same per-table serialization as `write`: a replace is a read-modify-write
+        // of the base file, so it must not interleave with another writer's.
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
+        let _ = crate::storage::on_demand::apply_pending_deletes(table_path);
         let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
         let backend = self.get_write_backend(table_path, durability)?;
@@ -1070,6 +1227,9 @@ impl StorageEngine {
     ) -> io::Result<()> {
         let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
+        // Same per-table serialization as `write`: schema evolution rewrites the
+        // base file (or its footer) and must not interleave with a writer.
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
         if Self::is_v4_file(table_path) {
             // V4: schema-only DDL on the metadata insert backend. save() updates
             // the footer schema in place (no data load, no rewrite); reads
@@ -1129,6 +1289,9 @@ impl StorageEngine {
         crate::storage::table_catalog::ensure_table_file(table_path, durability)?;
         let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
+        // Same per-table serialization as `write`: the backfill publishes a new
+        // base file and must not interleave with a writer.
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
         let backend = self.get_insert_backend(table_path, durability)?;
         let schema = backend.storage.get_schema();
         let source_type = schema
@@ -1192,6 +1355,9 @@ impl StorageEngine {
     ) -> io::Result<()> {
         let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
+        // Same per-table serialization as `write`: the physical rewrite of the
+        // base file must not interleave with a writer.
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
         if Self::is_v4_file(table_path) {
             // V4: logical drop in schema, then a streaming RG-by-RG rewrite
             // that physically removes the column without loading the table.
@@ -1249,6 +1415,9 @@ impl StorageEngine {
     ) -> io::Result<()> {
         let epoch_write = crate::storage::epoch::logical_write(table_path);
         self.invalidate(table_path);
+        // Same per-table serialization as `write`: the footer rewrite must not
+        // interleave with a writer.
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
         if Self::is_v4_file(table_path) {
             // V4: modify schema in-memory then update footer only (no data reload)
             let backend = self.get_insert_backend(table_path, durability)?;
@@ -1288,6 +1457,35 @@ impl StorageEngine {
     pub fn write_typed(
         &self,
         table_path: &Path,
+        int_columns: HashMap<String, Vec<i64>>,
+        float_columns: HashMap<String, Vec<f64>>,
+        string_columns: HashMap<String, Vec<String>>,
+        binary_columns: HashMap<String, Vec<Vec<u8>>>,
+        fixedlist_columns: HashMap<String, Vec<Vec<u8>>>,
+        bool_columns: HashMap<String, Vec<bool>>,
+        null_positions: HashMap<String, Vec<bool>>,
+        durability: DurabilityLevel,
+    ) -> io::Result<Vec<u64>> {
+        // Serialize with every other writer of this table for the whole
+        // read-modify-write (see `StorageEngine::write`).
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
+        self.write_typed_locked(
+            table_path,
+            int_columns,
+            float_columns,
+            string_columns,
+            binary_columns,
+            fixedlist_columns,
+            bool_columns,
+            null_positions,
+            durability,
+        )
+    }
+
+    /// [`StorageEngine::write_typed`] with the table write lock already held.
+    fn write_typed_locked(
+        &self,
+        table_path: &Path,
         mut int_columns: HashMap<String, Vec<i64>>,
         mut float_columns: HashMap<String, Vec<f64>>,
         string_columns: HashMap<String, Vec<String>>,
@@ -1314,6 +1512,7 @@ impl StorageEngine {
         if row_count == 0 {
             return Ok(Vec::new());
         }
+        let _ = crate::storage::on_demand::apply_pending_deletes(table_path);
 
         // FAST PATH: V4 append for existing tables with matching schema
         // Check if file exists, is V4, and schema matches
@@ -1405,6 +1604,11 @@ impl StorageEngine {
                                                     moved_int_columns.push(schema_idx);
                                                     vals
                                                 } else {
+                                                    // No value of this column's type was written.
+                                                    // Keep the slot but publish it as NULL: a
+                                                    // fabricated 0 is a wrong value, not a
+                                                    // missing one.
+                                                    mark_all_null(&mut new_nulls[schema_idx], row_count);
                                                     vec![0; row_count]
                                                 };
                                             new_columns.push(ColumnData::Int64(vals));
@@ -1415,7 +1619,15 @@ impl StorageEngine {
                                             {
                                                 moved_float_columns.push(schema_idx);
                                                 vals
+                                            } else if let Some(vals) = int_columns.remove(col_name) {
+                                                // An integer bound for a float column widens,
+                                                // matching the SQL INSERT path and the delta
+                                                // append. Dropping it here published NULL for a
+                                                // value the caller supplied.
+                                                moved_int_columns.push(schema_idx);
+                                                vals.into_iter().map(|value| value as f64).collect()
                                             } else {
+                                                mark_all_null(&mut new_nulls[schema_idx], row_count);
                                                 vec![0.0; row_count]
                                             };
                                             new_columns.push(ColumnData::Float64(vals));
@@ -1435,6 +1647,7 @@ impl StorageEngine {
                                                 new_columns
                                                     .push(ColumnData::String { offsets, data });
                                             } else {
+                                                mark_all_null(&mut new_nulls[schema_idx], row_count);
                                                 let offsets = vec![0u64; row_count + 1];
                                                 new_columns.push(ColumnData::String {
                                                     offsets,
@@ -1456,6 +1669,7 @@ impl StorageEngine {
                                                     len: vals.len(),
                                                 });
                                             } else {
+                                                mark_all_null(&mut new_nulls[schema_idx], row_count);
                                                 new_columns.push(ColumnData::Bool {
                                                     data: vec![0u8; (row_count + 7) / 8],
                                                     len: row_count,
@@ -1482,6 +1696,7 @@ impl StorageEngine {
                                                 new_columns
                                                     .push(ColumnData::Binary { offsets, data });
                                             } else {
+                                                mark_all_null(&mut new_nulls[schema_idx], row_count);
                                                 let offsets = vec![0u64; row_count + 1];
                                                 new_columns.push(ColumnData::Binary {
                                                     offsets,
@@ -1593,13 +1808,22 @@ impl StorageEngine {
                                         // full-write path. Append failures are rare, so keep
                                         // recovery off the successful hot path.
                                         for schema_idx in moved_int_columns {
-                                            if let ColumnData::Int64(values) =
-                                                &mut new_columns[schema_idx]
-                                            {
-                                                int_columns.insert(
-                                                    schema[schema_idx].0.clone(),
-                                                    std::mem::take(values),
-                                                );
+                                            match &mut new_columns[schema_idx] {
+                                                ColumnData::Int64(values) => {
+                                                    int_columns.insert(
+                                                        schema[schema_idx].0.clone(),
+                                                        std::mem::take(values),
+                                                    );
+                                                }
+                                                // Widened into a float column: hand it back as
+                                                // the float data it became.
+                                                ColumnData::Float64(values) => {
+                                                    float_columns.insert(
+                                                        schema[schema_idx].0.clone(),
+                                                        std::mem::take(values),
+                                                    );
+                                                }
+                                                _ => {}
                                             }
                                         }
                                         for schema_idx in moved_float_columns {
@@ -1674,6 +1898,10 @@ impl StorageEngine {
         if row_count == 0 {
             return Ok(Vec::new());
         }
+        // Serialize with every other writer of this table for the whole
+        // read-modify-write (see `StorageEngine::write`).
+        let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
+        let _ = crate::storage::on_demand::apply_pending_deletes(table_path);
 
         if self.table_exists(table_path) {
             let backend = self.get_insert_backend(table_path, durability)?;
@@ -1719,7 +1947,9 @@ impl StorageEngine {
                                 let ids: Vec<u64> =
                                     (start_id..start_id + row_count as u64).collect();
 
-                                for (col_name, col_type) in schema.iter() {
+                                for (schema_idx, (col_name, col_type)) in
+                                    schema.iter().enumerate()
+                                {
                                     let null_bitmap =
                                         if let Some(null_vec) = null_positions.get(col_name) {
                                             let mut bitmap = vec![0u8; (row_count + 7) / 8];
@@ -1752,14 +1982,27 @@ impl StorageEngine {
                                         | ColumnType::Date => {
                                             let vals = match col {
                                                 Some(ColumnData::Int64(v)) => v,
-                                                _ => vec![0; row_count],
+                                                _ => {
+                                                    mark_all_null(&mut new_nulls[schema_idx], row_count);
+                                                    vec![0; row_count]
+                                                }
                                             };
                                             new_columns.push(ColumnData::Int64(vals));
                                         }
                                         ColumnType::Float64 | ColumnType::Float32 => {
                                             let vals = match col {
                                                 Some(ColumnData::Float64(v)) => v,
-                                                _ => vec![0.0; row_count],
+                                                // Widening an integer into a float column,
+                                                // exactly as the typed/bucket path and the
+                                                // SQL INSERT path do.
+                                                Some(ColumnData::Int64(v)) => v
+                                                    .into_iter()
+                                                    .map(|value| value as f64)
+                                                    .collect(),
+                                                _ => {
+                                                    mark_all_null(&mut new_nulls[schema_idx], row_count);
+                                                    vec![0.0; row_count]
+                                                }
                                             };
                                             new_columns.push(ColumnData::Float64(vals));
                                         }
@@ -1773,6 +2016,7 @@ impl StorageEngine {
                                                 });
                                             }
                                             _ => {
+                                                mark_all_null(&mut new_nulls[schema_idx], row_count);
                                                 new_columns.push(ColumnData::String {
                                                     offsets: vec![0u64; row_count + 1],
                                                     data: Vec::new(),
@@ -1785,7 +2029,10 @@ impl StorageEngine {
                                                     debug_assert_eq!(len, row_count);
                                                     data
                                                 }
-                                                _ => vec![0u8; (row_count + 7) / 8],
+                                                _ => {
+                                                    mark_all_null(&mut new_nulls[schema_idx], row_count);
+                                                    vec![0u8; (row_count + 7) / 8]
+                                                }
                                             };
                                             new_columns.push(ColumnData::Bool {
                                                 data: packed,
@@ -1824,6 +2071,7 @@ impl StorageEngine {
                                                 }
                                             }
                                             _ => {
+                                                mark_all_null(&mut new_nulls[schema_idx], row_count);
                                                 new_columns.push(ColumnData::Binary {
                                                     offsets: vec![0u64; row_count + 1],
                                                     data: Vec::new(),
@@ -2038,7 +2286,7 @@ impl StorageEngine {
             }
         }
 
-        self.write_typed(
+        self.write_typed_locked(
             table_path,
             int_columns,
             float_columns,
@@ -2067,70 +2315,6 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
-    fn write_typed_columns_slow_then_fast_path() {
-        use crate::storage::on_demand::{ColumnData, ColumnType};
-
-        let dir = tempdir().unwrap();
-        let table_path = dir.path().join("typed_cols.apex");
-        let engine = engine();
-
-        // First write: new table -> slow path (schema inferred from data).
-        let mut cols: HashMap<String, ColumnData> = HashMap::new();
-        cols.insert(
-            "name".to_string(),
-            ColumnData::String {
-                offsets: vec![0u64, 3, 6],
-                data: b"abcdef".to_vec(),
-            },
-        );
-        cols.insert("score".to_string(), ColumnData::Int64(vec![1, 2]));
-        let ids = engine
-            .write_typed_columns(&table_path, cols, HashMap::new(), DurabilityLevel::Fast)
-            .unwrap();
-        assert_eq!(ids, vec![1, 2]);
-
-        // Second write: V4 append fast path with matching schema.
-        let mut cols2: HashMap<String, ColumnData> = HashMap::new();
-        cols2.insert(
-            "name".to_string(),
-            ColumnData::String {
-                offsets: vec![0u64, 2, 4],
-                data: b"xyzw".to_vec(),
-            },
-        );
-        cols2.insert("score".to_string(), ColumnData::Int64(vec![3, 4]));
-        let ids2 = engine
-            .write_typed_columns(&table_path, cols2, HashMap::new(), DurabilityLevel::Fast)
-            .unwrap();
-        assert_eq!(ids2, vec![3, 4]);
-
-        // Verify both row groups are readable with correct values.
-        let backend = engine.get_read_backend(&table_path).unwrap();
-        assert_eq!(backend.row_count(), 4);
-        let batch = backend
-            .read_columns_to_arrow(Some(&["name", "score"]), 0, None)
-            .unwrap();
-        assert_eq!(batch.num_rows(), 4);
-        use arrow::array::Array;
-        let names = batch
-            .column_by_name("name")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .unwrap();
-        assert_eq!(names.value(0), "abc");
-        assert_eq!(names.value(1), "def");
-        assert_eq!(names.value(2), "xy");
-        assert_eq!(names.value(3), "zw");
-        let scores = batch
-            .column_by_name("score")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .unwrap();
-        assert_eq!(scores.values(), &[1, 2, 3, 4]);
-    }
-
     #[test]
     fn write_typed_columns_converts_fixedlist_to_float16_schema() {
         use crate::storage::on_demand::{ColumnData, ColumnType};

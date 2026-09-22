@@ -3205,6 +3205,10 @@ class ApexClient:
                             requested = _simple_projection_columns(sql)
                             if requested:
                                 available = set(self.list_fields())
+                                # `_id` is a system column of every table and is
+                                # not reported by list_fields(), so an empty table
+                                # must not be treated as missing it.
+                                available.add('_id')
                                 if any(column not in available for column in requested):
                                     return _HOT_CACHE_MISS
                             rv = ResultView(lazy_pydict=columns_dict)
@@ -4038,6 +4042,9 @@ class ApexClient:
                                 requested = _simple_projection_columns(sql)
                                 if requested:
                                     available = set(self.list_fields())
+                                    # `_id` is a system column of every table and is
+                                    # not reported by list_fields().
+                                    available.add('_id')
                                     missing = [
                                         column for column in requested
                                         if column not in available

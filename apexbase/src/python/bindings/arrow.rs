@@ -24,6 +24,14 @@ impl ApexStorageImpl {
         // run with no per-client backend still mapping the table file, or
         // Windows rejects the file rewrite with OS error 1224.
         self.release_backends_for_file_replacing_sql(&sql);
+        if is_write && !table_name.is_empty() {
+            // Rows buffered in the warm memtable backend are invisible to the SQL
+            // executor, which opens its own backend. Without this an INSERT picked
+            // an ID those rows already use and overwrote one of them.
+            self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
+            self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
+            crate::Database::invalidate(&table_path);
+        }
         // Execute query in Rust thread pool
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
             let result = crate::Session::new(&base_dir, &table_path)

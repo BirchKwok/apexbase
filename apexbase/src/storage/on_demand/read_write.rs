@@ -33,6 +33,12 @@ fn pending_delete_matches_file(_: &std::path::Path, _: u64, _: u64) -> bool {
 /// Called on fresh open so reads see the latest state.
 /// Returns Ok(()) even if no pending state exists.
 pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
+    // Applying the state writes deletion vectors, the footer and the active row
+    // count into the base file, so it is a base-file mutation like any rewrite
+    // and takes the same per-table lock. Without it a reader that opened the
+    // table could publish the recorded (older) footer while another thread was
+    // appending to it.
+    let _rewrite_guard = crate::storage::table_save_lock::rewrite_lock(path);
     let buf = {
         let pending = global_pending_deletes().read().unwrap();
         pending.as_ref().and_then(|m| m.get(path).cloned())
@@ -47,12 +53,35 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
     }
     let dev_id = u64::from_le_bytes(buf[4..12].try_into().unwrap());
     let ino_id = u64::from_le_bytes(buf[12..20].try_into().unwrap());
+    let recorded_len = u64::from_le_bytes(buf[20..28].try_into().unwrap());
+    let recorded_modified = u64::from_le_bytes(buf[28..36].try_into().unwrap());
     // The deferred delete state belongs to one specific file incarnation. If the
     // file was deleted and recreated at the same path (drop_if_exists, external
     // temp-dir cleanup), the recorded offsets and footer no longer describe the
     // current file; applying them would corrupt the fresh file with stale
     // deletion vectors. Discard the stale entry instead.
-    if !pending_delete_matches_file(path, dev_id, ino_id) {
+    //
+    // The same check covers a file that merely *changed* since the state was
+    // deferred — most importantly an append by another writer, which publishes a
+    // new footer at a new offset. The recorded footer is a snapshot of the older
+    // file, so writing it back would resurrect the deleted rows and orphan the
+    // rows appended since the snapshot.
+    let current = std::fs::metadata(path)
+        .map(|meta| {
+            (
+                meta.len(),
+                meta.modified()
+                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                    .map(|since| since.as_nanos() as u64)
+                    .unwrap_or(0),
+            )
+        })
+        .unwrap_or((0, 0));
+    if !pending_delete_matches_file(path, dev_id, ino_id)
+        || current.0 != recorded_len
+        || current.1 != recorded_modified
+    {
         global_pending_deletes()
             .write()
             .unwrap()
@@ -60,7 +89,7 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
             .map(|m| m.remove(path));
         return Ok(());
     }
-    let mut pos = 20;
+    let mut pos = 36;
     let rg_count = u32::from_le_bytes(buf[pos..pos + 4].try_into().unwrap()) as usize;
     pos += 4;
     let mut rg_writes: Vec<(usize, u64, Vec<u8>)> = Vec::new();
@@ -386,7 +415,8 @@ impl OnDemandStorage {
                     }
                 }
                 columns.push(col);
-                nulls.push(Vec::new());
+                // The padded rows have no value for this column: mark them NULL.
+                nulls.push(missing_rows_null_bitmap(existing_row_count));
             }
         }
 
@@ -579,7 +609,8 @@ impl OnDemandStorage {
                     }
                 }
                 columns.push(col);
-                nulls.push(Vec::new());
+                // The padded rows have no value for this column: mark them NULL.
+                nulls.push(missing_rows_null_bitmap(existing_row_count));
             }
         }
 
@@ -865,7 +896,8 @@ impl OnDemandStorage {
                     }
                     columns.push(col);
                     // Mark all existing rows as NULL for new column
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in float_columns.keys() {
@@ -877,7 +909,8 @@ impl OnDemandStorage {
                         v.resize(existing_row_count, 0.0);
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in string_columns.keys() {
@@ -892,7 +925,8 @@ impl OnDemandStorage {
                         }
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in binary_columns.keys() {
@@ -906,7 +940,8 @@ impl OnDemandStorage {
                         }
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in fixedlist_columns.keys() {
@@ -920,7 +955,8 @@ impl OnDemandStorage {
                 while columns.len() <= idx {
                     let col = ColumnData::new(actual_type);
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in blob_columns.keys() {
@@ -934,7 +970,8 @@ impl OnDemandStorage {
                         }
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in bool_columns.keys() {
@@ -946,7 +983,8 @@ impl OnDemandStorage {
                         *len = existing_row_count;
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
         }
@@ -1019,10 +1057,45 @@ impl OnDemandStorage {
             }
         }
 
-        // Update null bitmaps for each column
+        // Columns this write carried no value for: pad the slot and mark the rows
+        // NULL. The bucket appenders only touch columns that have data, so a
+        // column whose value type did not match (or that the row omitted) stayed
+        // short — and the row-group writer then published the type's default,
+        // `0` / `0.0` / `false`, as a real value on the point-lookup path while
+        // scans reported NULL. The check is a length comparison per column, so a
+        // write that fills every column pays nothing beyond it.
         {
+            let expected_len = self.ids.read().len();
+            // Rows this write appended start here, for the null positions below.
+            let base_row = expected_len - row_count;
             let mut nulls = self.nulls.write();
-            let base_row = self.ids.read().len() - row_count;
+            let mut columns = self.columns.write();
+            let schema = self.schema.read();
+            for (col_idx, _) in schema.columns.iter().enumerate() {
+                let Some(column) = columns.get_mut(col_idx) else {
+                    continue;
+                };
+                let produced = column.len();
+                if produced >= expected_len {
+                    continue;
+                }
+                for _ in produced..expected_len {
+                    push_default_value(column);
+                }
+                if nulls.len() <= col_idx {
+                    nulls.resize(col_idx + 1, Vec::new());
+                }
+                let bitmap = &mut nulls[col_idx];
+                for row_idx in produced..expected_len {
+                    let byte_idx = row_idx / 8;
+                    while bitmap.len() <= byte_idx {
+                        bitmap.push(0);
+                    }
+                    bitmap[byte_idx] |= 1 << (row_idx % 8);
+                }
+            }
+            drop(schema);
+            drop(columns);
 
             for (col_name, is_null_vec) in null_positions {
                 if let Some(&col_idx) = col_name_to_idx.get(&col_name) {
@@ -1087,6 +1160,13 @@ impl OnDemandStorage {
     /// Delete a row by ID (soft delete)
     /// Returns true if the row was found and deleted
     pub fn delete(&self, id: u64) -> bool {
+        // A row the delta overlay already deleted is gone, and the two deletion
+        // records are counted independently: `active_row_count` subtracts both
+        // the base tombstone and the delta delete, so re-deleting here removed
+        // the row from the count a second time while every read still showed it.
+        if self.delta_store.read().is_deleted(id) {
+            return false;
+        }
         self.ensure_id_index();
         let id_to_idx = self.id_to_idx.read();
         let map = id_to_idx.as_ref().unwrap();
@@ -1109,7 +1189,9 @@ impl OnDemandStorage {
 
             // Set the deleted bit
             deleted[byte_idx] |= 1 << bit_idx;
-            true
+            // A row that was already tombstoned is not deleted again, so the
+            // caller hears about a no-op instead of a second successful delete.
+            !was_deleted
         } else {
             false
         }
@@ -1555,10 +1637,13 @@ impl OnDemandStorage {
                 None => return Ok(None),
             };
             let rg_meta = &footer.row_groups[rg_i];
-            if rg_i >= footer.col_offsets.len() || footer.col_offsets[rg_i].len() < col_count {
+            if rg_i >= footer.col_offsets.len() {
                 return Ok(None);
             }
-            // Clone only the small per-RG slice and per-column schema (names + types)
+            // A Row Group written before a footer-only `ALTER TABLE ADD COLUMN`
+            // carries fewer per-column offsets than the schema. Those trailing
+            // columns simply have no value in this group — they must read back as
+            // NULL, not make the whole point lookup report "no such row".
             let col_offsets_rg: Vec<u32> = footer.col_offsets[rg_i].clone();
             let col_schema: Vec<(String, ColumnType)> = footer.schema.columns.clone();
             (
@@ -1603,8 +1688,21 @@ impl OnDemandStorage {
                     }
                 }
             }
-        } else {
+        } else if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+            // Contiguous IDs are fully described by the guess, so an out-of-range
+            // guess means the row is genuinely absent.
             return Ok(None);
+        } else {
+            // The guess only holds when the group's IDs are contiguous. A group can
+            // hold a sparse ID set (a rewrite after deletes leaves gaps), so search
+            // the ID section instead of giving up — the row may well be in it.
+            let mut ids_buf = vec![0u8; id_section_len];
+            self.read_cached_bytes(body_base, &mut ids_buf)?;
+            let ids_cow = bytes_as_u64_slice(&ids_buf, rg_rows);
+            match ids_cow.binary_search(&id) {
+                Ok(i) => i,
+                Err(_) => return Ok(None),
+            }
         };
 
         // Deletion check
@@ -1622,8 +1720,14 @@ impl OnDemandStorage {
         let mut result = Vec::with_capacity(col_count + 1);
         result.push(("_id".to_string(), Value::Int64(id as i64)));
 
+        let columns_in_group = col_offsets.len().min(col_count);
         for col_idx in 0..col_count {
             let col_name = col_schema[col_idx].0.clone();
+            if col_idx >= columns_in_group {
+                // Schema evolution: this Row Group predates the column.
+                result.push((col_name, Value::Null));
+                continue;
+            }
             let col_type = col_schema[col_idx].1;
             let col_start = col_offsets[col_idx] as usize;
 
@@ -1968,8 +2072,21 @@ impl OnDemandStorage {
                     }
                 }
             }
-        } else {
+        } else if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+            // Contiguous IDs are fully described by the guess, so an out-of-range
+            // guess means the row is genuinely absent.
             return Ok(None);
+        } else {
+            // The guess only holds when the group's IDs are contiguous. A rewrite
+            // after deletes leaves gaps, so search the ID section instead of giving
+            // up — the row may well be in it.
+            let mut ids_buf = vec![0u8; id_section_len];
+            self.read_cached_bytes(body_base, &mut ids_buf)?;
+            let ids_cow = bytes_as_u64_slice(&ids_buf, rg_rows);
+            match ids_cow.binary_search(&id) {
+                Ok(i) => i,
+                Err(_) => return Ok(None),
+            }
         };
 
         let mut del_buf = [0u8; 1];
@@ -3888,7 +4005,8 @@ impl OnDemandStorage {
                         v.resize(existing_row_count, 0);
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in float_columns.keys() {
@@ -3899,7 +4017,8 @@ impl OnDemandStorage {
                         v.resize(existing_row_count, 0.0);
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in string_columns.keys() {
@@ -3913,7 +4032,8 @@ impl OnDemandStorage {
                         }
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in binary_columns.keys() {
@@ -3926,7 +4046,8 @@ impl OnDemandStorage {
                         }
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in fixedlist_columns.keys() {
@@ -3934,7 +4055,8 @@ impl OnDemandStorage {
                 let actual_type = schema.columns[idx].1;
                 while columns.len() <= idx {
                     columns.push(ColumnData::new(actual_type));
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in blob_columns.keys() {
@@ -3947,7 +4069,8 @@ impl OnDemandStorage {
                         }
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
             for name in bool_columns.keys() {
@@ -3958,7 +4081,8 @@ impl OnDemandStorage {
                         *len = existing_row_count;
                     }
                     columns.push(col);
-                    nulls.push(Vec::new());
+                    // The padded rows have no value for this column: mark them NULL.
+                    nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
         }
@@ -4332,6 +4456,22 @@ impl OnDemandStorage {
         result
     }
 
+    /// Reorder a null bitmap by `order`: output row `i` takes input row `order[i]`.
+    ///
+    /// Companion to `slice_null_bitmap` for the reordering `save_v4` performs when
+    /// the buffered rows are not in ascending ID order.
+    fn gather_null_bitmap(nulls: &[u8], order: &[usize]) -> Vec<u8> {
+        let mut result = vec![0u8; (order.len() + 7) / 8];
+        for (new_idx, &old_idx) in order.iter().enumerate() {
+            let ob = old_idx / 8;
+            let obit = old_idx % 8;
+            if ob < nulls.len() && (nulls[ob] >> obit) & 1 == 1 {
+                result[new_idx / 8] |= 1 << (new_idx % 8);
+            }
+        }
+        result
+    }
+
     /// Save in V4 Row Group format.
     /// Splits data into Row Groups of DEFAULT_ROW_GROUP_SIZE rows each.
     /// Each RG is self-contained with IDs, deletion vector, and per-column data.
@@ -4341,6 +4481,11 @@ impl OnDemandStorage {
     /// [Header 256B] [RG0] [RG1] ... [V4Footer]
     /// ```
     pub fn save_v4(&self) -> io::Result<()> {
+        // One base-file rewrite at a time per table: the scratch file is
+        // published with `rename`, so overlapping rewrites could otherwise
+        // publish out of order (losing the newer snapshot) or find their scratch
+        // file already consumed by the other participant.
+        let _rewrite_guard = crate::storage::table_save_lock::rewrite_lock(&self.path);
         self.mmap_cache.write().invalidate();
         self.invalidate_page_cache();
         *self.file.write() = None;
@@ -4356,7 +4501,7 @@ impl OnDemandStorage {
         // directly; updates keep the atomic tmp+rename so a crash never
         // corrupts an existing table.
         let is_fresh_create = !self.path.exists();
-        let tmp_path = self.path.with_extension("apex.tmp");
+        let tmp_path = atomic_rewrite_tmp_path(&self.path);
         let write_path = if is_fresh_create {
             self.path.clone()
         } else {
@@ -4376,7 +4521,7 @@ impl OnDemandStorage {
         // Phase 1: Build filtered (active) data under read guards.
         // This produces clean flat columns/ids/nulls with deleted rows removed
         // and missing columns padded. Used for both disk write and in-memory state.
-        let active_ids: Vec<u64>;
+        let mut active_ids: Vec<u64>;
         let mut active_columns: Vec<ColumnData>;
         let mut active_nulls: Vec<Vec<u8>>;
         let active_count: usize;
@@ -4449,6 +4594,27 @@ impl OnDemandStorage {
                 }
             }
         } // All read guards dropped here
+
+        // Row groups must keep their IDs ascending. Point lookups pick a group by
+        // `[min_id, max_id]` and then locate the row with a direct `id - min_id`
+        // guess plus a binary search over the group's ID section, so an unsorted
+        // group makes some of its rows unreachable (a `replace()` re-appends a
+        // reused ID, which is exactly how an unsorted group appears). Sorting here
+        // is also stable for the caller: it puts a replaced row back at its ID
+        // position instead of at the end of the table.
+        if !active_ids.windows(2).all(|pair| pair[0] < pair[1]) {
+            let mut order: Vec<usize> = (0..active_ids.len()).collect();
+            order.sort_unstable_by_key(|&idx| active_ids[idx]);
+            active_ids = order.iter().map(|&idx| active_ids[idx]).collect();
+            active_columns = active_columns
+                .iter()
+                .map(|column| column.filter_by_indices(&order))
+                .collect();
+            active_nulls = active_nulls
+                .iter()
+                .map(|bitmap| Self::gather_null_bitmap(bitmap, &order))
+                .collect();
+        }
 
         // Phase 2: Write V4 format from active data (no lock contention).
         let adaptive_rg_size =
@@ -5194,7 +5360,27 @@ impl OnDemandStorage {
         }
         *self.deleted.write() = all_deleted;
 
-        self.next_id.store(next_id, Ordering::SeqCst);
+        // Raise, never lower: the open path already folded the delta sidecar's
+        // high-water mark into `next_id`, and a delta row can carry the highest
+        // ID in the table. Storing the base-only value here handed the next
+        // writer an ID the delta file already uses — an `INSERT` after a delete
+        // overwrote that row instead of appending.
+        let delta_next_id = {
+            let delta_path = Self::delta_path(&self.path);
+            if delta_path.exists() {
+                Self::get_max_id_from_delta_fast(&delta_path)
+                    .ok()
+                    .map(|id| id.saturating_add(1))
+                    .unwrap_or(next_id)
+            } else {
+                next_id
+            }
+        };
+        let candidate = next_id.max(delta_next_id);
+        let current = self.next_id.load(Ordering::SeqCst);
+        if candidate > current {
+            self.next_id.store(candidate, Ordering::SeqCst);
+        }
         self.active_count
             .store(total_rows as u64 - total_deleted, Ordering::SeqCst);
         // Track actual on-disk row count (total rows in RGs, including deleted)
@@ -5877,7 +6063,7 @@ impl OnDemandStorage {
 
             // Serialize pending state to global map (no file I/O)
             let footer_bytes = footer_mut.to_bytes();
-            let mut buf = Vec::with_capacity(24 + rg_writes.len() * 20 + 12 + footer_bytes.len());
+            let mut buf = Vec::with_capacity(36 + rg_writes.len() * 20 + 12 + footer_bytes.len());
             buf.extend_from_slice(b"APXP");
             // Record the file identity so the deferred state is only applied to
             // the same file incarnation. A table recreated at the same path
@@ -5889,6 +6075,24 @@ impl OnDemandStorage {
                 .unwrap_or((0, 0));
             buf.extend_from_slice(&meta.0.to_le_bytes());
             buf.extend_from_slice(&meta.1.to_le_bytes());
+            // Also record the file length and mtime the snapshot describes. If
+            // either changed by the time the state is applied, another writer
+            // published a newer base file and this snapshot's footer must not be
+            // written back (see `apply_pending_deletes`).
+            let snapshot = std::fs::metadata(&self.path)
+                .map(|m| {
+                    (
+                        m.len(),
+                        m.modified()
+                            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+                            .map(|since| since.as_nanos() as u64)
+                            .unwrap_or(0),
+                    )
+                })
+                .unwrap_or((0, 0));
+            buf.extend_from_slice(&snapshot.0.to_le_bytes());
+            buf.extend_from_slice(&snapshot.1.to_le_bytes());
             buf.extend_from_slice(&(rg_writes.len() as u32).to_le_bytes());
             for (rg_i, wr) in &rg_writes {
                 let del_vec_len = (footer_mut.row_groups[*rg_i].row_count as usize + 7) / 8;
@@ -6143,6 +6347,12 @@ impl OnDemandStorage {
         new_nulls: &[Vec<u8>],
         pending_delete_start: Option<usize>,
     ) -> io::Result<()> {
+        // An append rewrites the header and the footer in place, so it is a
+        // base-file mutation like a full rewrite and shares the per-table lock.
+        // Concurrently applying deferred deletes (which also writes the footer
+        // and the header) used to interleave with it and publish the older
+        // footer — resurrecting deleted rows and orphaning the new Row Group.
+        let _rewrite_guard = crate::storage::table_save_lock::rewrite_lock(&self.path);
         let header = self.header.read();
         if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
             return Err(err_data("write_row_group_to_disk requires V4 format file"));
@@ -6393,7 +6603,7 @@ impl OnDemandStorage {
 
     /// Append a new Row Group to an existing V4 file without rewriting.
     /// Overwrites old footer, writes new RG + updated footer, fixes header.
-    /// Also updates in-memory state (IDs, active_count).
+    /// Also publishes the new ID range, active count and next ID.
     /// Use this when adding NEW data that is NOT already in memory.
     pub fn append_row_group(
         &self,
@@ -6404,11 +6614,12 @@ impl OnDemandStorage {
         let rg_rows = new_ids.len();
         self.write_row_group_to_disk(new_ids, new_columns, new_nulls, None)?;
 
-        // Update in-memory state (caller hasn't added these rows yet)
-        {
-            let mut ids = self.ids.write();
-            ids.extend_from_slice(new_ids);
-        }
+        // Deliberately do NOT extend `ids` here. These rows are persisted, and
+        // `ids` / `columns` / `nulls` are the *pending* buffer — a parallel trio
+        // that must stay the same length. Appending to `ids` alone left the trio
+        // ragged, so the next in-memory insert recorded its null bit at an
+        // absolute index while its column data sat at a relative one, and the
+        // following flush sliced the wrong bytes out of both.
         let next_id = new_ids
             .iter()
             .max()

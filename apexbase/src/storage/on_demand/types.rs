@@ -40,6 +40,35 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
+    /// True when the V4 point lookup (`retrieve_rcix`) can decode this column.
+    ///
+    /// Vector and quantized columns are read by the scan/query paths only, so a
+    /// base-file point lookup on a table that has one cannot answer "row absent"
+    /// honestly — it must fall back to the query path instead.
+    #[inline]
+    pub fn point_lookup_decodable(self) -> bool {
+        matches!(
+            self,
+            ColumnType::Bool
+                | ColumnType::Int8
+                | ColumnType::Int16
+                | ColumnType::Int32
+                | ColumnType::Int64
+                | ColumnType::UInt8
+                | ColumnType::UInt16
+                | ColumnType::UInt32
+                | ColumnType::UInt64
+                | ColumnType::Float32
+                | ColumnType::Float64
+                | ColumnType::String
+                | ColumnType::StringDict
+                | ColumnType::Binary
+                | ColumnType::Blob
+                | ColumnType::Timestamp
+                | ColumnType::Date
+        )
+    }
+
     pub fn from_u8(v: u8) -> Option<Self> {
         match v {
             TYPE_NULL => Some(ColumnType::Null),
@@ -339,6 +368,24 @@ impl FileSchema {
 // Column Data Storage
 // ============================================================================
 
+/// Null bitmap marking `rows` pre-existing rows that a column has no value for.
+///
+/// A column materialized after its rows already exist — a footer-only
+/// `ALTER TABLE ADD COLUMN`, or a schema column that no row group stores yet —
+/// has no value for those rows. The data buffer still has to be padded to the
+/// table's row count (the layout is fixed-stride), but leaving the null bitmap
+/// empty publishes that padding as a real value: `NULL` reads back as `''`, `0`
+/// or `false`, and the difference survives a flush and a reopen.
+pub(crate) fn missing_rows_null_bitmap(rows: usize) -> Vec<u8> {
+    let mut bitmap = vec![0xFFu8; (rows + 7) / 8];
+    if rows % 8 != 0 {
+        if let Some(last) = bitmap.last_mut() {
+            *last = (1u8 << (rows % 8)) - 1;
+        }
+    }
+    bitmap
+}
+
 /// Efficient column data storage
 #[derive(Debug, Clone)]
 pub enum ColumnData {
@@ -623,9 +670,21 @@ impl ColumnData {
         }
     }
 
+    /// Append integer values, coercing when the column is a float column.
+    ///
+    /// The append matches on the target column's type, so an integer bound for a
+    /// `FLOAT`/`DOUBLE` column would otherwise be dropped entirely: the column
+    /// stays short, the row reads back as `NULL`, and the identical SQL insert
+    /// stores `1.0`. Integer -> float is the one lossless widening the SQL
+    /// `INSERT` path and the delta append already perform.
     pub fn extend_i64(&mut self, values: &[i64]) {
-        if let ColumnData::Int64(v) = self {
-            v.extend_from_slice(values);
+        match self {
+            ColumnData::Int64(v) => v.extend_from_slice(values),
+            ColumnData::Float64(v) => {
+                v.reserve(values.len());
+                v.extend(values.iter().map(|&value| value as f64));
+            }
+            _ => {}
         }
     }
 

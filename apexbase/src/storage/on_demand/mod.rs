@@ -282,6 +282,25 @@ impl MmapCache {
     }
 }
 
+/// Scratch path for an atomic base-file replacement.
+///
+/// A rewrite writes a complete new file and `rename`s it over the table, so the
+/// scratch name must be private to the operation performing it. A single fixed
+/// name (`<table>.apex.tmp`) is shared by every rewrite path — and by the
+/// stale-scratch cleanup in `open_with_durability` — so a concurrent rewrite, or
+/// any thread that opens the table while a rewrite is in flight, can consume or
+/// unlink the scratch file underneath it. The loser's `rename` then fails with
+/// `No such file or directory`, and interleaved writers can publish a stale
+/// snapshot over a newer file.
+///
+/// The process id keeps separate processes (and separate `ApexDB` handles in
+/// tests) apart; the counter keeps threads of one process apart.
+pub(crate) fn atomic_rewrite_tmp_path(table_path: &Path) -> PathBuf {
+    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    table_path.with_extension(format!("apex.{}.{}.tmp", std::process::id(), seq))
+}
+
 /// Open a file optimised for sequential access.
 /// On Windows, adds FILE_FLAG_SEQUENTIAL_SCAN (0x08000000) so the OS doubles
 /// read-ahead and avoids random-access caching overhead.

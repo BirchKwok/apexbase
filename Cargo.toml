@@ -125,6 +125,45 @@ tonic = { version = "0.14", features = ["transport"], optional = true }
 name = "bench_fts"
 path = "examples/bench_fts.rs"
 
+# ── Usage scenarios (ready-to-run, heavily commented) ────────────────────────
+# Run one with:
+#   cargo run --example r01_config_store --no-default-features
+[[example]]
+name = "r01_config_store"
+path = "usage-examples/Rust/r01_config_store.rs"
+
+[[example]]
+name = "r02_concurrent_writes"
+path = "usage-examples/Rust/r02_concurrent_writes.rs"
+
+[[example]]
+name = "r03_batch_etl_csv"
+path = "usage-examples/Rust/r03_batch_etl_csv.rs"
+
+[[example]]
+name = "r04_fulltext_search"
+path = "usage-examples/Rust/r04_fulltext_search.rs"
+
+[[example]]
+name = "r05_vector_search"
+path = "usage-examples/Rust/r05_vector_search.rs"
+
+[[example]]
+name = "r06_shared_file_analytics"
+path = "usage-examples/Rust/r06_shared_file_analytics.rs"
+
+[[example]]
+name = "r07_rag_pipeline"
+path = "usage-examples/Rust/r07_rag_pipeline.rs"
+
+[[example]]
+name = "r08_hybrid_retrieval"
+path = "usage-examples/Rust/r08_hybrid_retrieval.rs"
+
+[[example]]
+name = "r09_embedded_data_lake"
+path = "usage-examples/Rust/r09_embedded_data_lake.rs"
+
 [[bin]]
 name = "apexbase-server"
 path = "apexbase/src/bin/server_main.rs"

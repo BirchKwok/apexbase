@@ -7,12 +7,18 @@ use crate::storage::ColumnData;
 impl ApexStorageImpl {
     fn has_secondary_indexes(&self, py: Python<'_>) -> PyResult<bool> {
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
         Ok(self.table_has_secondary_indexes(py, &table_path, &table_name))
     }
 
     fn store(&self, py: Python<'_>, data: &Bound<'_, PyDict>) -> PyResult<i64> {
         let fields = dict_to_values(data)?;
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
         let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let durability = self.durability;
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
@@ -59,6 +65,9 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
         let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let durability = self.durability;
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
@@ -240,6 +249,9 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
         let durability = self.durability;
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
         let result = py.allow_threads(|| {
@@ -277,6 +289,9 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
         if self.table_has_secondary_indexes(py, &table_path, &table_name) {
             return Ok(None);
         }
@@ -458,6 +473,7 @@ impl ApexStorageImpl {
         Ok(Some(result.into_iter().map(|id| id as i64).collect()))
     }
 
+
     fn store_one_delta(
         &self,
         py: Python<'_>,
@@ -484,6 +500,9 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
         // Keep indexed tables on the existing path until index maintenance for
         // delta-only rows is fully covered.
         if self.table_has_secondary_indexes(py, &table_path, &table_name) {
@@ -506,6 +525,7 @@ impl ApexStorageImpl {
             || fields
                 .keys()
                 .any(|name| !schema.iter().any(|(schema_name, _)| schema_name == name))
+            || !delta_row_types_match(&schema, &fields)
         {
             return Ok(None);
         }
@@ -567,6 +587,9 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
         if self.table_has_secondary_indexes(py, &table_path, &table_name) {
             return Ok(None);
         }
@@ -588,6 +611,7 @@ impl ApexStorageImpl {
                 || fields
                     .keys()
                     .any(|name| !schema.iter().any(|(schema_name, _)| schema_name == name))
+                || !delta_row_types_match(&schema, fields)
             {
                 return Ok(None);
             }
@@ -643,6 +667,9 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
         if self.table_has_secondary_indexes(py, &table_path, &table_name) {
             return Ok(None);
         }
@@ -788,18 +815,55 @@ impl ApexStorageImpl {
 
             match col_type {
                 Some("int") => {
+                    // `[1, 2.5]` is a float column with an integer row, not an
+                    // integer column with a lost value: promote the whole column
+                    // the moment a float element shows up. The promotion runs
+                    // only when the list actually contains one, so an all-integer
+                    // column still costs a single pass.
                     let mut vals = Vec::with_capacity(col_len);
                     let mut nulls = Vec::with_capacity(col_len);
+                    let mut floats: Option<Vec<f64>> = None;
                     for item in list.iter() {
                         let is_null = item.is_none();
                         nulls.push(is_null);
-                        vals.push(if is_null {
-                            0
-                        } else {
-                            item.extract::<i64>().unwrap_or(0)
-                        });
+                        if let Some(promoted) = floats.as_mut() {
+                            promoted.push(if is_null {
+                                0.0
+                            } else {
+                                item.extract::<f64>().unwrap_or(0.0)
+                            });
+                            continue;
+                        }
+                        if is_null {
+                            vals.push(0);
+                            continue;
+                        }
+                        match item.extract::<i64>() {
+                            Ok(value) => vals.push(value),
+                            Err(_) => match item.extract::<f64>() {
+                                Ok(value) => {
+                                    let mut promoted: Vec<f64> =
+                                        vals.iter().map(|&v| v as f64).collect();
+                                    promoted.push(value);
+                                    floats = Some(promoted);
+                                }
+                                Err(_) => {
+                                    // Not a number at all: keep the value absent
+                                    // instead of publishing a fabricated 0.
+                                    vals.push(0);
+                                    *nulls.last_mut().unwrap() = true;
+                                }
+                            },
+                        }
                     }
-                    columns_map.insert(col_name.clone(), ColumnData::Int64(vals));
+                    match floats {
+                        Some(promoted) => {
+                            columns_map.insert(col_name.clone(), ColumnData::Float64(promoted));
+                        }
+                        None => {
+                            columns_map.insert(col_name.clone(), ColumnData::Int64(vals));
+                        }
+                    }
                     null_positions.insert(col_name, nulls);
                 }
                 Some("float") => {
@@ -807,12 +871,21 @@ impl ApexStorageImpl {
                     let mut nulls = Vec::with_capacity(col_len);
                     for item in list.iter() {
                         let is_null = item.is_none();
-                        nulls.push(is_null);
-                        vals.push(if is_null {
-                            0.0
-                        } else {
-                            item.extract::<f64>().unwrap_or(0.0)
-                        });
+                        if is_null {
+                            nulls.push(true);
+                            vals.push(0.0);
+                            continue;
+                        }
+                        match item.extract::<f64>() {
+                            Ok(value) => {
+                                nulls.push(false);
+                                vals.push(value);
+                            }
+                            Err(_) => {
+                                nulls.push(true);
+                                vals.push(0.0);
+                            }
+                        }
                     }
                     columns_map.insert(col_name.clone(), ColumnData::Float64(vals));
                     null_positions.insert(col_name, nulls);
@@ -821,13 +894,23 @@ impl ApexStorageImpl {
                     let mut vals = Vec::with_capacity(col_len);
                     let mut nulls = Vec::with_capacity(col_len);
                     for item in list.iter() {
-                        let is_null = item.is_none();
-                        nulls.push(is_null);
-                        vals.push(if is_null {
-                            false
-                        } else {
-                            item.extract::<bool>().unwrap_or(false)
-                        });
+                        if item.is_none() {
+                            nulls.push(true);
+                            vals.push(false);
+                            continue;
+                        }
+                        match item.extract::<bool>() {
+                            Ok(value) => {
+                                nulls.push(false);
+                                vals.push(value);
+                            }
+                            Err(_) => {
+                                // A value that is not a boolean stays absent
+                                // rather than becoming `false`.
+                                nulls.push(true);
+                                vals.push(false);
+                            }
+                        }
                     }
                     let byte_count = (vals.len() + 7) / 8;
                     let mut packed = vec![0u8; byte_count];
@@ -851,17 +934,21 @@ impl ApexStorageImpl {
                     let mut nulls = Vec::with_capacity(col_len);
                     offsets.push(0u64);
                     for item in list.iter() {
-                        let is_null = item.is_none();
-                        nulls.push(is_null);
-                        if is_null {
+                        if item.is_none() {
+                            nulls.push(true);
                             offsets.push(data.len() as u64);
                         } else if let Ok(b) = item.downcast::<pyo3::types::PyBytes>() {
+                            nulls.push(false);
                             data.extend_from_slice(b.as_bytes());
                             offsets.push(data.len() as u64);
                         } else if let Ok(s) = item.extract::<Vec<u8>>() {
+                            nulls.push(false);
                             data.extend_from_slice(&s);
                             offsets.push(data.len() as u64);
                         } else {
+                            // Not bytes: keep the value absent instead of
+                            // publishing an empty payload.
+                            nulls.push(true);
                             offsets.push(data.len() as u64);
                         }
                     }
@@ -987,15 +1074,18 @@ impl ApexStorageImpl {
                     let mut nulls = Vec::with_capacity(col_len);
                     offsets.push(0u64);
                     for item in list.iter() {
-                        let is_null = item.is_none();
-                        nulls.push(is_null);
-                        if is_null {
+                        if item.is_none() {
+                            nulls.push(true);
                             offsets.push(data.len() as u64);
                         } else if let Ok(s) = item.extract::<&str>() {
                             // Borrowed Python str buffer — single copy into `data`.
+                            nulls.push(false);
                             data.extend_from_slice(s.as_bytes());
                             offsets.push(data.len() as u64);
                         } else {
+                            // Not a string: keep the value absent instead of
+                            // publishing an empty string.
+                            nulls.push(true);
                             offsets.push(data.len() as u64);
                         }
                     }
@@ -1014,6 +1104,9 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
         let durability = self.durability;
         self.persist_pending_overlay_for_table(py, &table_path, &table_name)?;
 
@@ -1199,7 +1292,13 @@ impl ApexStorageImpl {
 
         let replace_cache_key = Self::replace_row_cache_key(&table_path, &table_name, id as u64);
 
-        if durability == DurabilityLevel::Fast
+        // Process-local tables keep their authoritative state in the backend's own
+        // buffers, which their scan path reads directly. The DeltaStore overlay is
+        // only merged by the file-backed read paths, so a delete recorded there
+        // lowered `count_rows()` while the row stayed visible in every scan.
+        let is_memory_table = crate::storage::is_memory_path(&table_path);
+        if !is_memory_table
+            && durability == DurabilityLevel::Fast
             && !self.table_has_secondary_indexes(py, &table_path, &table_name)
         {
             let backend = self.get_backend_for_overlay(py, &table_path, &table_name)?;
@@ -1226,10 +1325,22 @@ impl ApexStorageImpl {
                     self.replace_exact_row_cache.remove(&replace_cache_key);
                     crate::Database::cache_backend(&table_path, Arc::clone(&backend));
                     crate::query::planner::invalidate_table_stats(&table_path.to_string_lossy());
+                    return Ok(true);
                 }
-                return Ok(result);
+                // The delta overlay refused the id: it is not an active delta row.
+                // That is the normal case for a row that lives in the *base*
+                // store — in particular one that was `replace()`d, because the
+                // replacement goes to the base while `pending_v4_in_memory_rows()`
+                // drops back to 0. Returning `false` here silently swallowed the
+                // delete; fall through to the general delete path instead, which
+                // tombstones base rows.
             }
         }
+
+        // The overlay refused the id: this is the general path, which opens its
+        // own backend and therefore cannot see rows a single-row fast path
+        // buffered in the warm memtable. Publish them first.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
 
         let result = py.allow_threads(|| -> PyResult<bool> {
             // Skip file lock for 'fast' durability
@@ -1263,7 +1374,10 @@ impl ApexStorageImpl {
         let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let durability = self.durability;
 
-        if durability == DurabilityLevel::Fast
+        // See `delete`: a process-local table's scans do not merge the DeltaStore.
+        let is_memory_table = crate::storage::is_memory_path(&table_path);
+        if !is_memory_table
+            && durability == DurabilityLevel::Fast
             && !self.table_has_secondary_indexes(py, &table_path, &table_name)
         {
             let backend = self.get_backend_for_overlay(py, &table_path, &table_name)?;
@@ -1306,6 +1420,10 @@ impl ApexStorageImpl {
             }
         }
 
+        // The overlay handled what it could; the general path below opens its own
+        // backend, so rows a single-row fast path buffered must be published first.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
+
         let ids_u64: Vec<u64> = ids.into_iter().map(|id| id as u64).collect();
         let deleted = py.allow_threads(|| -> PyResult<usize> {
             // Skip file lock for 'fast' durability
@@ -1331,6 +1449,9 @@ impl ApexStorageImpl {
 
     fn delete_where(&self, py: Python<'_>, where_clause: &str) -> PyResult<i64> {
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
 
         // Build DELETE SQL statement
         let sql = format!("DELETE FROM {} WHERE {}", table_name, where_clause);
@@ -1359,6 +1480,9 @@ impl ApexStorageImpl {
 
     fn delete_all(&self, py: Python<'_>) -> PyResult<i64> {
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
 
         // Build DELETE SQL statement without WHERE
         let sql = format!("DELETE FROM {}", table_name);
@@ -1396,6 +1520,11 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        pyo3::Python::with_gil(|py| {
+            self.persist_schema_stable_memtable(py, &table_path, &table_name)
+        })?;
         let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let Some((backend, col_type)) =
             self.numeric_update_target(&table_path, &table_name, &column)
@@ -1465,6 +1594,11 @@ impl ApexStorageImpl {
         }
 
         let (table_path, table_name) = self.get_current_table_info()?;
+        // Rows a single-row fast path buffered in the warm memtable backend are
+        // invisible to this route; publish them before touching the table.
+        pyo3::Python::with_gil(|py| {
+            self.persist_schema_stable_memtable(py, &table_path, &table_name)
+        })?;
         let _epoch_write = crate::storage::epoch::logical_write(&table_path);
         let Some((backend, col_type)) =
             self.numeric_update_backend_and_type(&table_path, &table_name, &column)
@@ -1609,7 +1743,11 @@ impl ApexStorageImpl {
             }
         }
 
-        if durability == DurabilityLevel::Fast
+        // See `delete`: a process-local table's reads do not merge the DeltaStore
+        // overlay, so a replacement recorded there would never become visible.
+        let is_memory_table = crate::storage::is_memory_path(&table_path);
+        if !is_memory_table
+            && durability == DurabilityLevel::Fast
             && !fields.is_empty()
             && !self.table_has_secondary_indexes(py, &table_path, &table_name)
         {
@@ -1655,13 +1793,22 @@ impl ApexStorageImpl {
                         crate::query::planner::invalidate_table_stats(
                             &table_path.to_string_lossy(),
                         );
-                    } else {
-                        self.replace_exact_row_cache.remove(&replace_cache_key);
+                        return Ok(true);
                     }
-                    return Ok(result);
+                    // The delta overlay refused the id: it only holds rows this
+                    // backend already overlaid, and a row that lives in the
+                    // append-only delta file (or in the base) is not one of them.
+                    // Returning `false` here silently swallowed the replace; fall
+                    // through to the general replace path instead, which merges
+                    // the delta and rewrites the row.
+                    self.replace_exact_row_cache.remove(&replace_cache_key);
                 }
             }
         }
+
+        // The overlay refused the id; the general path opens its own backend, so
+        // rows a single-row fast path buffered must be published first.
+        self.persist_schema_stable_memtable(py, &table_path, &table_name)?;
 
         // Use StorageEngine for unified replace
         let result = py.allow_threads(|| -> PyResult<bool> {
@@ -2424,4 +2571,42 @@ impl ApexStorageImpl {
         }
         Some((backend, col_type))
     }
+}
+
+/// True when every value can be stored in its column by the append-only delta
+/// encoding.
+///
+/// That encoding is typed per column and carries no null bitmap, so a value of
+/// the wrong type is not stored as "missing" but as the type's default — a
+/// fabricated `0` / `0.0` / `false`. Routes that use it must decline the row and
+/// let the general path store the mismatched column as SQL `NULL` instead.
+fn delta_row_types_match(
+    schema: &[(String, crate::storage::on_demand::ColumnType)],
+    fields: &std::collections::HashMap<String, crate::storage::on_demand::ColumnValue>,
+) -> bool {
+    use crate::storage::on_demand::{ColumnType, ColumnValue};
+    schema.iter().all(|(name, col_type)| {
+        let Some(value) = fields.get(name) else {
+            return false;
+        };
+        match col_type {
+            ColumnType::Bool => matches!(value, ColumnValue::Bool(_)),
+            ColumnType::Int8
+            | ColumnType::Int16
+            | ColumnType::Int32
+            | ColumnType::Int64
+            | ColumnType::UInt8
+            | ColumnType::UInt16
+            | ColumnType::UInt32
+            | ColumnType::UInt64
+            | ColumnType::Timestamp
+            | ColumnType::Date => matches!(value, ColumnValue::Int64(_)),
+            ColumnType::Float32 | ColumnType::Float64 => {
+                matches!(value, ColumnValue::Float64(_) | ColumnValue::Int64(_))
+            }
+            ColumnType::String => matches!(value, ColumnValue::String(_)),
+            ColumnType::Binary => matches!(value, ColumnValue::Binary(_)),
+            _ => false,
+        }
+    })
 }

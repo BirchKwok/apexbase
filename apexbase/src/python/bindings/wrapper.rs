@@ -1330,6 +1330,48 @@ impl ApexStorageImpl {
         })))
     }
 
+    /// Publish rows a single-row fast path buffered in the schema-stable memtable.
+    ///
+    /// `store_one_memtable` keeps a warm insert backend and appends single rows to
+    /// it. Every other write route opens its own backend for the same table, so it
+    /// cannot see those buffered rows — `store({...})` followed by `store([...])`
+    /// silently dropped the single row. Publishing the writer before another route
+    /// touches the table keeps the routes in order.
+    fn persist_schema_stable_memtable(
+        &self,
+        py: Python<'_>,
+        table_path: &Path,
+        table_name: &str,
+    ) -> PyResult<()> {
+        let backend = {
+            let guard = self.schema_stable_memtable_writer.read();
+            match guard.as_ref() {
+                Some(writer)
+                    if writer.table_name == table_name && writer.table_path == table_path =>
+                {
+                    Some(Arc::clone(&writer.backend))
+                }
+                _ => None,
+            }
+        };
+        let Some(backend) = backend else {
+            return Ok(());
+        };
+        *self.schema_stable_memtable_writer.write() = None;
+
+        py.allow_threads(|| -> PyResult<()> {
+            // Serialize with the table's other writers, and publish deferred
+            // deletion state first: this save rewrites the header and footer from
+            // the backend's buffers, and a deletion still deferred in process
+            // memory would leave the two describing different row counts.
+            let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
+            let _ = crate::storage::on_demand::apply_pending_deletes(table_path);
+            backend
+                .save()
+                .map_err(|e| PyIOError::new_err(format!("Failed to flush buffered row: {}", e)))
+        })
+    }
+
     fn persist_pending_overlay_for_table(
         &self,
         py: Python<'_>,

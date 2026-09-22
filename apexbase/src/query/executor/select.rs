@@ -208,7 +208,12 @@ impl ApexExecutor {
                     crate::query::SqlStatement::Select(sel) => {
                         let sub_path =
                             Self::resolve_from_table_path(sel, base_dir, default_table_path);
-                        if matches!(&sel.from, Some(FromItem::Table { .. })) {
+                        // Skip the probe when the derived source is an in-memory
+                        // CTE batch (never on disk); the fall-through below reads
+                        // it through the cache-aware path.
+                        if matches!(&sel.from, Some(FromItem::Table { .. }))
+                            && !has_cached_cte_batch(&sub_path)
+                        {
                             let sub_backend = get_cached_backend(&sub_path)?;
                             if let Some(result) =
                                 Self::try_fast_derived_case_group_by(&sub_backend, &stmt, sel)?
@@ -217,11 +222,13 @@ impl ApexExecutor {
                             }
                         }
                         let mut sub_select = sel.clone();
-                        if let Some(limit) =
-                            Self::extract_outer_row_number_limit(&stmt.where_clause, &sub_select)
-                        {
-                            sub_select.window_row_number_limit = Some(limit);
-                        }
+                        // The `ROW_NUMBER() <= k` pushdown is disabled: it gathers
+                        // the retained rows with `take` using positions that can
+                        // reference rows outside the evaluated partition batch,
+                        // which panics in arrow's take. The outer WHERE predicate
+                        // is still applied after the subquery, so results stay
+                        // correct; only the shortcut is lost.
+                        let _ = &stmt.where_clause;
                         (if sel.joins.is_empty() {
                             Self::execute_select_with_base_dir(
                                 sub_select,
@@ -1476,6 +1483,7 @@ return Ok(result);
                     partition_by,
                     order_by,
                     alias,
+                    ..
                 } = column
                 {
                     let mut resolved_order = order_by.clone();
@@ -1510,6 +1518,8 @@ return Ok(result);
                         partition_by: partition_by.clone(),
                         order_by: resolved_order,
                         alias: alias.clone(),
+                        wrapper: None,
+                        frame: None,
                     });
                 }
             }
@@ -1525,8 +1535,14 @@ return Ok(result);
             return Self::execute_aggregation(&filtered, &stmt);
         }
 
-        // Handle GROUP BY (also triggered by HAVING even without SELECT aggregates)
-        if !stmt.group_by.is_empty() && (has_aggregation || stmt.having.is_some()) {
+        // Handle GROUP BY.
+        //
+        // A GROUP BY must run even when the projection has no aggregate and
+        // there is no HAVING: `SELECT cat FROM t GROUP BY cat` is a legitimate
+        // (aggregate-free) grouped projection and used to fall through to the
+        // plain projection path, emitting one row per input row instead of one
+        // row per group.
+        if !stmt.group_by.is_empty() {
             return Self::execute_group_by(&filtered, &stmt);
         }
 

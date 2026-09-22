@@ -747,7 +747,7 @@ FTS is implemented natively in Rust and available through all interfaces (Python
 | `CREATE FTS INDEX ON table` | Create FTS index on all string columns |
 | `CREATE FTS INDEX ON table WITH (opt=val)` | Create with `lazy_load` / `cache_size` options |
 | `DROP FTS INDEX ON table` | Drop index and delete files |
-| `ALTER FTS INDEX ON table DISABLE` | Suspend indexing, keep files |
+| `ALTER FTS INDEX ON table DISABLE` | Suspend indexing, keep files; `MATCH()` unavailable until ENABLE |
 | `ALTER FTS INDEX ON table ENABLE` | Resume indexing and back-fill any missed rows |
 | `SHOW FTS INDEXES` | List FTS-configured tables across all databases |
 | `WHERE MATCH('query')` | Exact full-text search |
@@ -786,6 +786,14 @@ Removes the index entry and deletes the ApexFTS `.afts` snapshot and WAL from di
 ALTER FTS INDEX ON table_name DISABLE
 ```
 Suspends FTS write-sync (INSERT / DELETE no longer update the index). Index files are kept on disk. Use `ALTER FTS INDEX ... ENABLE` to resume.
+
+While the index is disabled, **full-text reads are unavailable**: `MATCH()`,
+`FUZZY_MATCH()`, `FTS_SCORE()` and `search_text()` fail for that table rather
+than silently answering from the retained index. This is deliberate — writes
+made while disabled are not indexed, so serving reads from the stale snapshot
+would return incomplete results without any indication. Call
+`ALTER FTS INDEX ... ENABLE` first; it back-fills the rows written while the
+index was disabled.
 
 **`ALTER FTS INDEX ... ENABLE`**
 ```sql

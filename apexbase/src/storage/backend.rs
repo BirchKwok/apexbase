@@ -2436,6 +2436,14 @@ impl TableStorageBackend {
 
     /// Save changes to disk
     pub fn save(&self) -> io::Result<()> {
+        // NOTE: serialization for this flush lives at the mutation entry points
+        // (`StorageEngine::write` / `replace` / `delete`), which hold the table's
+        // write lock across the whole read-modify-write. Taking the lock here too
+        // would nest it and deadlock, because `RwLock` is not reentrant.
+        self.save_locked()
+    }
+
+    fn save_locked(&self) -> io::Result<()> {
         if self.storage.pending_v4_in_memory_rows() > 0
             && self.storage.spill_pending_v4_rows_to_delta()?
         {
