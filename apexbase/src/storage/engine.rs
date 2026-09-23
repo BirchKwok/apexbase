@@ -2322,6 +2322,70 @@ mod tests {
     use tempfile::tempdir;
 
     #[test]
+    fn write_typed_columns_slow_then_fast_path() {
+        use crate::storage::on_demand::{ColumnData, ColumnType};
+
+        let dir = tempdir().unwrap();
+        let table_path = dir.path().join("typed_cols.apex");
+        let engine = engine();
+
+        // First write: new table -> slow path (schema inferred from data).
+        let mut cols: HashMap<String, ColumnData> = HashMap::new();
+        cols.insert(
+            "name".to_string(),
+            ColumnData::String {
+                offsets: vec![0u64, 3, 6],
+                data: b"abcdef".to_vec(),
+            },
+        );
+        cols.insert("score".to_string(), ColumnData::Int64(vec![1, 2]));
+        let ids = engine
+            .write_typed_columns(&table_path, cols, HashMap::new(), DurabilityLevel::Fast)
+            .unwrap();
+        assert_eq!(ids, vec![1, 2]);
+
+        // Second write: V4 append fast path with matching schema.
+        let mut cols2: HashMap<String, ColumnData> = HashMap::new();
+        cols2.insert(
+            "name".to_string(),
+            ColumnData::String {
+                offsets: vec![0u64, 2, 4],
+                data: b"xyzw".to_vec(),
+            },
+        );
+        cols2.insert("score".to_string(), ColumnData::Int64(vec![3, 4]));
+        let ids2 = engine
+            .write_typed_columns(&table_path, cols2, HashMap::new(), DurabilityLevel::Fast)
+            .unwrap();
+        assert_eq!(ids2, vec![3, 4]);
+
+        // Verify both row groups are readable with correct values.
+        let backend = engine.get_read_backend(&table_path).unwrap();
+        assert_eq!(backend.row_count(), 4);
+        let batch = backend
+            .read_columns_to_arrow(Some(&["name", "score"]), 0, None)
+            .unwrap();
+        assert_eq!(batch.num_rows(), 4);
+        use arrow::array::Array;
+        let names = batch
+            .column_by_name("name")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "abc");
+        assert_eq!(names.value(1), "def");
+        assert_eq!(names.value(2), "xy");
+        assert_eq!(names.value(3), "zw");
+        let scores = batch
+            .column_by_name("score")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<arrow::array::Int64Array>()
+            .unwrap();
+        assert_eq!(scores.values(), &[1, 2, 3, 4]);
+    }
+
     #[test]
     fn write_typed_columns_converts_fixedlist_to_float16_schema() {
         use crate::storage::on_demand::{ColumnData, ColumnType};

@@ -3080,3 +3080,63 @@ fn delta_batch_cache_tracks_appends() {
     let (again, _) = OnDemandStorage::delta_complete_batches(&delta_path).unwrap();
     assert_eq!(again, after);
 }
+
+/// The production staleness threshold the open-path sweep runs with.
+fn scratch_stale_after_seconds() -> u64 {
+    SCRATCH_STALE_AFTER.as_secs()
+}
+
+#[test]
+fn scratch_sweep_removes_only_stale_rewrite_files() {
+    let dir = tempdir().unwrap();
+    let table_path = dir.path().join("t.apex");
+    let scratch = |stem: &str, pid: u32, seq: u64| {
+        dir.path().join(format!("{stem}.apex.{pid}.{seq}.tmp"))
+    };
+    let stale = scratch("t", std::process::id() as u32, 1);
+    let other_table = scratch("other", 4242, 7);
+    // Neither the legacy fixed-name scratch nor an unrelated `.tmp` file matches
+    // the rewrite pattern, so the sweep must leave them alone.
+    let legacy = dir.path().join("t.apex.tmp");
+    let unrelated = dir.path().join("notes.tmp");
+    let not_numeric = dir.path().join("t.apex.x.y.tmp");
+    for path in [&stale, &other_table, &legacy, &unrelated, &not_numeric] {
+        std::fs::write(path, b"x").unwrap();
+    }
+
+    // Zero minimum age makes every rewrite scratch file count as leftover.
+    sweep_scratch_files(&table_path, std::time::Duration::ZERO);
+    assert!(!stale.exists(), "a stale scratch file is leftover garbage");
+    assert!(
+        !other_table.exists(),
+        "one sweep clears the directory, not just one table"
+    );
+    assert!(legacy.exists(), "the fixed legacy name is not a rewrite scratch");
+    assert!(unrelated.exists(), "an unrelated .tmp file is untouched");
+    assert!(
+        not_numeric.exists(),
+        "only <stem>.apex.<pid>.<seq>.tmp is a rewrite scratch"
+    );
+
+    // A file younger than the threshold is a publish in flight elsewhere.
+    std::fs::write(&stale, b"x").unwrap();
+    sweep_scratch_files(&table_path, std::time::Duration::from_secs(3600));
+    assert!(stale.exists(), "a fresh scratch file belongs to a live writer");
+    assert_eq!(scratch_stale_after_seconds(), 60);
+
+    // The open path sweeps each directory once per process.
+    let memo_dir = tempdir().unwrap();
+    let memo_table = memo_dir.path().join("m.apex");
+    let leftover = memo_dir
+        .path()
+        .join(format!("m.apex.{}.9.tmp", std::process::id()));
+    std::fs::write(&leftover, b"x").unwrap();
+    sweep_scratch_files(&memo_table, std::time::Duration::ZERO);
+    assert!(!leftover.exists());
+    std::fs::write(&leftover, b"x").unwrap();
+    reap_stale_scratch_files(&memo_table);
+    assert!(
+        leftover.exists(),
+        "the open path sweeps a directory at most once per process"
+    );
+}

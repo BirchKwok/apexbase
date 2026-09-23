@@ -53,6 +53,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 
 use arrow::array::ArrayRef;
 use arrow::record_batch::RecordBatch;
+use dashmap::DashMap;
+use once_cell::sync::Lazy;
 use memmap2::Mmap;
 use parking_lot::RwLock;
 use rayon::prelude::*;
@@ -311,6 +313,89 @@ pub(crate) fn atomic_rewrite_tmp_path(table_path: &Path) -> PathBuf {
     static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
     let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
     table_path.with_extension(format!("apex.{}.{}.tmp", std::process::id(), seq))
+}
+
+/// Age after which a scratch file is treated as leftover garbage.
+///
+/// A publish keeps its scratch file for milliseconds, so anything untouched for
+/// a minute is the residue of a crashed or killed writer. The threshold is what
+/// makes the sweep safe: another process publishing this table right now still
+/// owns a fresh scratch file.
+const SCRATCH_STALE_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Directories already swept for leftover scratch files in this process.
+///
+/// The sweep runs once per directory, not once per table open: leftovers only
+/// survive a writer that died mid-publish, so a single listing finds them all,
+/// while opens sit on the hot path of temporary and cross-database scans where a
+/// directory listing per open is not affordable.
+static SCRATCH_SWEPT_DIRS: Lazy<DashMap<PathBuf, ()>> = Lazy::new(DashMap::new);
+
+/// Remove the rewrite scratch files an earlier crashed writer left for
+/// `table_path`. Runs at most once per directory per process.
+pub(crate) fn reap_stale_scratch_files(table_path: &Path) {
+    let Some(dir) = table_path.parent() else {
+        return;
+    };
+    if SCRATCH_SWEPT_DIRS.contains_key(dir) {
+        return;
+    }
+    SCRATCH_SWEPT_DIRS.insert(dir.to_path_buf(), ());
+    sweep_scratch_files(table_path, SCRATCH_STALE_AFTER);
+}
+
+/// Remove every stale rewrite scratch file in `table_path`'s directory, even if
+/// this process already swept that directory.
+///
+/// Used where the work is worth repeating (a table is dropped), so a dropped
+/// table cannot leave a scratch file behind just because the directory was swept
+/// earlier in the same process.
+pub(crate) fn sweep_stale_scratch_files(table_path: &Path) {
+    sweep_scratch_files(table_path, SCRATCH_STALE_AFTER);
+}
+
+fn sweep_scratch_files(table_path: &Path, min_age: std::time::Duration) {
+    let Some(dir) = table_path.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(name) = file_name.to_str() else {
+            continue;
+        };
+        // `<stem>.apex.<pid>.<seq>.tmp`, exactly as `atomic_rewrite_tmp_path`
+        // writes it: any other `*.tmp` in the directory belongs to something else.
+        let Some(middle) = name.strip_suffix(".tmp") else {
+            continue;
+        };
+        let Some((stem, tail)) = middle.rsplit_once(".apex.") else {
+            continue;
+        };
+        if stem.is_empty() {
+            continue;
+        }
+        let mut parts = tail.split('.');
+        let parsed = matches!(
+            (parts.next(), parts.next(), parts.next()),
+            (Some(pid), Some(seq), None)
+                if pid.parse::<u32>().is_ok() && seq.parse::<u64>().is_ok()
+        );
+        if !parsed {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age >= min_age);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
 }
 
 /// Open a file optimised for sequential access.

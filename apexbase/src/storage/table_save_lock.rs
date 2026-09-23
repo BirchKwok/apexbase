@@ -16,9 +16,13 @@
 //! * one `RwLock` per distinct table path, so unrelated tables stay fully
 //!   parallel;
 //! * writers (insert / replace / delete / flush) take it exclusively, so a
-//!   whole read-modify-write is atomic with respect to other writers;
-//! * readers that materialize a backend take it shared, so concurrent reads
-//!   keep running in parallel.
+//!   whole read-modify-write is atomic with respect to other writers.
+//!
+//! Readers do not take this lock: the documented contract is that reads are
+//! lock-free on V4 mmap-only tables, and they stay correct through atomic
+//! publication (a new base file is renamed into place), the per-table epoch
+//! that invalidates stale cached backends, and bounded retries around the
+//! short window in which a publish is visible.
 //!
 //! A second, independent lock per path ([`rewrite_lock`]) serializes base-file
 //! replacement. It cannot be the write lock above: that one is held across a
@@ -33,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
-use parking_lot::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use parking_lot::{Mutex, MutexGuard, RwLock, RwLockWriteGuard};
 
 /// One read/write lock per distinct table path.
 static TABLE_LOCKS: Lazy<DashMap<PathBuf, &'static RwLock<()>>> = Lazy::new(DashMap::new);
@@ -63,13 +67,13 @@ pub(crate) fn write_lock(path: &Path) -> RwLockWriteGuard<'static, ()> {
     lock_for(path).write()
 }
 
-
-/// Take the table's shared read lock.
+/// Take the table's exclusive write lock only when it is free.
 ///
-/// Used when a reader has to materialize or open the backend. Readers that hit
-/// an already-materialized mmap backend never reach this and stay lock-free.
-pub(crate) fn read_lock(path: &Path) -> RwLockReadGuard<'static, ()> {
-    lock_for(path).read()
+/// A path reached both from a mutation (which already owns the lock) and from a
+/// reader uses this: the caller is then either the exclusive owner already, or
+/// takes it for the section it is about to run.
+pub(crate) fn try_write_lock(path: &Path) -> Option<RwLockWriteGuard<'static, ()>> {
+    lock_for(path).try_write()
 }
 
 /// Fetch (or create) the base-file rewrite lock for `path`.
@@ -96,16 +100,4 @@ fn rewrite_lock_for(path: &Path) -> &'static Mutex<()> {
 /// mutation, and the flush runs inside that section.
 pub(crate) fn rewrite_lock(path: &Path) -> MutexGuard<'static, ()> {
     rewrite_lock_for(path).lock()
-}
-
-/// Run `operation` while holding the table's exclusive write lock.
-pub(crate) fn with_write_lock<T>(path: &Path, operation: impl FnOnce() -> T) -> T {
-    let _guard = write_lock(path);
-    operation()
-}
-
-/// Run `operation` while holding the table's shared read lock.
-pub(crate) fn with_read_lock<T>(path: &Path, operation: impl FnOnce() -> T) -> T {
-    let _guard = read_lock(path);
-    operation()
 }

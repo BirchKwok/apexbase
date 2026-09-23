@@ -971,6 +971,9 @@ impl OnDemandStorage {
         if tmp_path.exists() {
             let _ = std::fs::remove_file(&tmp_path);
         }
+        // Rewrites publish through `<stem>.apex.<pid>.<seq>.tmp`; reap the ones a
+        // crashed writer left behind (a live publish keeps its file fresh).
+        crate::storage::on_demand::reap_stale_scratch_files(path);
         // Clean up stale .deltastore.tmp from crashed DeltaStore save
         let ds_tmp = {
             let mut p = path.to_path_buf();

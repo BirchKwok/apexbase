@@ -860,6 +860,12 @@ pub fn file_exists_or_registered(table_path: &Path) -> io::Result<bool> {
 
 /// Create (materialize) a table file using the registered lazy schema when
 /// available, otherwise with the default empty schema.
+///
+/// A lazy table is registered by `CREATE TABLE` and materialized on first
+/// access, so a writer can be publishing that table's first rows at the same
+/// moment a reader materializes it. The file is therefore only created while it
+/// is still absent, under the base-file publication lock: an empty materialized
+/// file must never replace rows that are already on disk.
 pub fn materialize_table_backend(
     path: &Path,
     durability: crate::storage::DurabilityLevel,
@@ -875,14 +881,23 @@ pub fn materialize_table_backend(
             .iter()
             .any(|c| *c != crate::storage::on_demand::ColumnConstraints::default())
     });
-    if let Some(schema) = &schema {
-        crate::storage::TableStorageBackend::create_with_schema_and_durability(
-            path,
-            durability,
-            &schema.columns,
-        )?;
-    } else {
-        crate::storage::TableStorageBackend::create_with_durability(path, durability)?;
+    {
+        // Publishing a base file holds the rewrite lock for the whole
+        // scratch-write → `rename` sequence, so taking it here and re-checking the
+        // path under it means a file another writer published in the meantime is
+        // adopted instead of overwritten with an empty table.
+        let _publish_guard = crate::storage::table_save_lock::rewrite_lock(path);
+        if !path.exists() {
+            if let Some(schema) = &schema {
+                crate::storage::TableStorageBackend::create_with_schema_and_durability(
+                    path,
+                    durability,
+                    &schema.columns,
+                )?;
+            } else {
+                crate::storage::TableStorageBackend::create_with_durability(path, durability)?;
+            }
+        }
     }
     // The create path leaves the in-memory column vectors empty after writing
     // the initial file; reopen so inserts/queries see the footer schema.
@@ -897,7 +912,10 @@ pub fn materialize_table_backend(
                     backend.storage.set_column_constraints(column, cons.clone());
                 }
             }
-            // Persist the constraints into the footer schema (save_v4).
+            // Persist the constraints into the footer schema (save_v4). This path
+            // is reached from the write entry points, which already hold the
+            // table's write lock, so only take it when it is free.
+            let _write_guard = crate::storage::table_save_lock::try_write_lock(path);
             backend.save()?;
         }
     }
@@ -1080,6 +1098,10 @@ fn unlink_table_files(table_path: &Path) {
     for suffix in TABLE_FILE_SUFFIXES {
         let _ = fs::remove_file(&format!("{stem}{suffix}"));
     }
+    // Rewrite scratch files carry a pid and sequence number, so they are not
+    // matched by the fixed suffixes above and would otherwise stay behind in the
+    // directory after the table is dropped.
+    crate::storage::on_demand::sweep_stale_scratch_files(table_path);
 }
 
 fn fingerprint_matches(path: &Path, expected: &Fingerprint) -> bool {
@@ -1167,6 +1189,41 @@ mod tests {
         let data = fs::read(dir.join(TABLE_CATALOG_FILE)).unwrap();
         assert_eq!(&data[..8], CATALOG_V2_MAGIC);
         assert_ne!(data.first(), Some(&b'{'));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Materializing a lazy table must adopt a table file another writer already
+    /// published instead of replacing it with an empty one. `CREATE TABLE`
+    /// registers the table without writing a file, so the first access
+    /// materializes it while the first write is publishing rows.
+    #[test]
+    fn materialize_adopts_an_existing_table_file() {
+        let dir = temp_dir("materialize_existing");
+        let path = dir.join("t.apex");
+        let columns = [(
+            "k".to_string(),
+            crate::storage::on_demand::ColumnType::Int64,
+        )];
+        let backend = crate::storage::TableStorageBackend::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &columns,
+        )
+        .unwrap();
+        let mut row = std::collections::HashMap::new();
+        row.insert("k".to_string(), crate::data::Value::Int64(7));
+        backend.insert_rows(&[row]).unwrap();
+        backend.save().unwrap();
+        drop(backend);
+
+        let adopted =
+            materialize_table_backend(&path, crate::storage::DurabilityLevel::Fast).unwrap();
+        assert_eq!(adopted.active_row_count(), 1, "published rows survive");
+        let batch = adopted
+            .read_columns_to_arrow(Some(&["k"]), 0, None)
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }
