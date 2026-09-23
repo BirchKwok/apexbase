@@ -63,6 +63,7 @@ pub(crate) fn write_lock(path: &Path) -> RwLockWriteGuard<'static, ()> {
     lock_for(path).write()
 }
 
+
 /// Take the table's shared read lock.
 ///
 /// Used when a reader has to materialize or open the backend. Readers that hit

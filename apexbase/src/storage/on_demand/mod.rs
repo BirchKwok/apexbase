@@ -108,8 +108,20 @@ impl MmapCache {
     /// Get or create mmap Arc for the file, allowing the Arc to be cloned and held outside the lock.
     pub(crate) fn get_mmap_arc(&mut self, file: &File) -> io::Result<std::sync::Arc<Mmap>> {
         let metadata = file.metadata()?;
-        let current_size = metadata.len();
+        let mut current_size = metadata.len();
         if self.mmap.is_none() || self.file_size != current_size {
+            // A rewrite publishes a fully written scratch file with `rename`, so a
+            // reader that resolved the path mid-publication can hold a table file
+            // that is still empty. Wait briefly for the publisher to finish before
+            // reporting it as empty; a genuinely empty file fails the same way.
+            let mut attempts = 0;
+            while current_size == 0 && attempts < EMPTY_PUBLISH_RETRY_ATTEMPTS {
+                std::thread::sleep(std::time::Duration::from_micros(
+                    EMPTY_PUBLISH_RETRY_BACKOFF_MICROS,
+                ));
+                current_size = file.metadata()?.len();
+                attempts += 1;
+            }
             if current_size == 0 {
                 return Err(err_data("Empty file"));
             }
@@ -358,6 +370,11 @@ const FORMAT_VERSION_V4: u32 = 4;
 const HEADER_SIZE: usize = 256;
 const COLUMN_INDEX_ENTRY_SIZE: usize = 32;
 const DEFAULT_ROW_GROUP_SIZE: u32 = 65536;
+
+/// How many times a reader re-checks a zero-length table file before treating it
+/// as empty rather than mid-publication, and the pause between those checks.
+const EMPTY_PUBLISH_RETRY_ATTEMPTS: usize = 8;
+const EMPTY_PUBLISH_RETRY_BACKOFF_MICROS: u64 = 50;
 
 // V4 Row Group format constants
 const MAGIC_ROW_GROUP: &[u8; 4] = b"APXG";

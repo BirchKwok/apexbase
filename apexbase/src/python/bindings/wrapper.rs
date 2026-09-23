@@ -521,7 +521,11 @@ impl EpochBackendCache {
 
     #[inline]
     fn insert(&self, key: String, backend: Arc<TableStorageBackend>) -> Option<EpochBackendEntry> {
-        let epoch = crate::storage::epoch::current(backend.path());
+        // Tag with the epoch the backend's *data* was loaded from, never with the
+        // table's current epoch: the caller fetched this backend just before, so a
+        // write that commits in between would otherwise be attributed to it, and
+        // the entry would look current while it is missing the committed rows.
+        let epoch = backend.view_epoch();
         self.entries.insert(key, (backend, epoch))
     }
 

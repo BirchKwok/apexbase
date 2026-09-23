@@ -273,12 +273,19 @@ const RETRY_OPEN_BACKOFF_MICROS: u64 = 50;
 ///
 /// A concurrent append rewrites the footer and then the header, so an open that
 /// lands between the two can see a header/footer pair that does not describe one
-/// snapshot (`Corrupt Apex file: ...`). Retrying re-reads the file; a genuinely
-/// corrupt file fails the same way on every attempt.
+/// snapshot (`Corrupt Apex file: ...`). A rewrite publishes its scratch file with
+/// `rename`, so an open that lands there can also see a table file that is still
+/// empty. Retrying re-reads the file; a genuinely corrupt or empty file fails the
+/// same way on every attempt.
 fn is_transient_open_error(error: &io::Error) -> bool {
-    error.kind() == io::ErrorKind::NotFound
-        || (error.kind() == io::ErrorKind::InvalidData
-            && error.to_string().contains("Corrupt Apex file"))
+    if error.kind() == io::ErrorKind::NotFound {
+        return true;
+    }
+    if error.kind() != io::ErrorKind::InvalidData {
+        return false;
+    }
+    let message = error.to_string();
+    message.contains("Corrupt Apex file") || message.contains("Empty file")
 }
 
 /// Open a table file, retrying briefly on a transient failure.

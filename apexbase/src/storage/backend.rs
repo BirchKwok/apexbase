@@ -869,6 +869,13 @@ pub struct TableStorageBackend {
     /// High-cardinality string equality accelerator for `WHERE col = 'x' LIMIT 1`.
     /// Stores the first active row id for each distinct string value.
     first_string_row_id_cache: RwLock<HashMap<String, Arc<FirstStringRowIdCache>>>,
+    /// Table epoch this instance's in-memory view was loaded from.
+    ///
+    /// A cache that stores this backend must tag it with *this* epoch rather than
+    /// the table's current one: a reader can fetch the backend just before a
+    /// concurrent write commits, and recording the newer epoch would make the
+    /// entry look current forever while it is missing the committed rows.
+    view_epoch: AtomicU64,
 }
 
 /// Visible overlay flags for the row-store read lanes.
@@ -1121,6 +1128,7 @@ impl TableStorageBackend {
             dict_cache: RwLock::new(HashMap::new()),
             string_distinct_count_cache: RwLock::new(HashMap::new()),
             first_string_row_id_cache: RwLock::new(HashMap::new()),
+            view_epoch: AtomicU64::new(crate::storage::epoch::current(path)),
         }
     }
 
@@ -1162,6 +1170,7 @@ impl TableStorageBackend {
             dict_cache: RwLock::new(HashMap::new()),
             string_distinct_count_cache: RwLock::new(HashMap::new()),
             first_string_row_id_cache: RwLock::new(HashMap::new()),
+            view_epoch: AtomicU64::new(crate::storage::epoch::current(path)),
         })
     }
 
@@ -2764,6 +2773,12 @@ impl TableStorageBackend {
     /// Check if a row exists and is not deleted
     pub fn exists(&self, id: u64) -> bool {
         self.storage.exists(id)
+    }
+
+    /// Table epoch this instance's in-memory view was loaded from.
+    #[inline]
+    pub fn view_epoch(&self) -> u64 {
+        self.view_epoch.load(Ordering::Acquire)
     }
 
     /// Get active (non-deleted) row count

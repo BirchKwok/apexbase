@@ -1246,7 +1246,12 @@ fn get_cached_backend(path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         (
             Arc::clone(&backend),
             effective_modified,
-            crate::storage::epoch::current(path),
+            // Tag the entry with the epoch observed *before* the file was opened.
+            // Re-reading it here would let a write that commits in between be
+            // attributed to this backend: the entry would then look current while
+            // its row count still describes the older file, and every later read
+            // would keep serving it.
+            current_epoch,
             Arc::new(AtomicU64::new(now_nanos())),
         ),
     );

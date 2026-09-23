@@ -4497,21 +4497,18 @@ impl OnDemandStorage {
         super::engine::engine().invalidate(&self.path);
         crate::storage::epoch::bump(&self.path);
 
-        // Fresh tables have no pre-existing data, so the file is written
-        // directly; updates keep the atomic tmp+rename so a crash never
-        // corrupts an existing table.
-        let is_fresh_create = !self.path.exists();
+        // Always publish through a private scratch file and rename it over the
+        // table. A fresh table used to be written straight into the live path
+        // with `truncate(true)`, which exposed an empty or half-written file to
+        // any concurrent reader: mapping it failed with `Empty file`, and a
+        // reader that had already mapped the path raced the next truncate into
+        // a SIGBUS.
         let tmp_path = atomic_rewrite_tmp_path(&self.path);
-        let write_path = if is_fresh_create {
-            self.path.clone()
-        } else {
-            tmp_path.clone()
-        };
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .open(&write_path)?;
+            .open(&tmp_path)?;
         // On Windows, larger write buffers reduce syscall overhead significantly.
         #[cfg(windows)]
         let mut writer = BufWriter::with_capacity(2 * 1024 * 1024, file);
@@ -4945,37 +4942,35 @@ impl OnDemandStorage {
 
         drop(header);
         drop(writer);
-        if !is_fresh_create {
-            // Phase 3: Atomic rename .tmp → .apex
-            // POSIX rename is atomic; on crash the original file remains intact.
-            // On Windows, retry on transient failures from antivirus / Search Indexer / cloud sync
-            // that may briefly hold a sharing lock on the destination file.
-            #[cfg(windows)]
-            {
-                let mut last_err = None;
-                for attempt in 0u64..5 {
-                    match std::fs::rename(&tmp_path, &self.path) {
-                        Ok(()) => {
-                            last_err = None;
-                            break;
-                        }
-                        Err(e) => {
-                            last_err = Some(e);
-                            if attempt < 4 {
-                                std::thread::sleep(std::time::Duration::from_millis(
-                                    10 * (attempt + 1),
-                                ));
-                            }
+        // Phase 3: Atomic rename .tmp → .apex
+        // POSIX rename is atomic; on crash the original file remains intact.
+        // On Windows, retry on transient failures from antivirus / Search Indexer / cloud sync
+        // that may briefly hold a sharing lock on the destination file.
+        #[cfg(windows)]
+        {
+            let mut last_err = None;
+            for attempt in 0u64..5 {
+                match std::fs::rename(&tmp_path, &self.path) {
+                    Ok(()) => {
+                        last_err = None;
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        if attempt < 4 {
+                            std::thread::sleep(std::time::Duration::from_millis(
+                                10 * (attempt + 1),
+                            ));
                         }
                     }
                 }
-                if let Some(e) = last_err {
-                    return Err(e);
-                }
             }
-            #[cfg(not(windows))]
-            std::fs::rename(&tmp_path, &self.path)?;
+            if let Some(e) = last_err {
+                return Err(e);
+            }
         }
+        #[cfg(not(windows))]
+        std::fs::rename(&tmp_path, &self.path)?;
 
         // Write column stats sidecar for O(1) aggregation fast path
         self.write_col_stats_sidecar(&schema_clone, &active_columns);
