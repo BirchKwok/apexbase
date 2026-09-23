@@ -3,6 +3,51 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.36.1](https://github.com/BirchKwok/ApexBase/releases/tag/v1.36.1)
+*2026-09-23*
+
+[Compare with v1.36.0](https://github.com/BirchKwok/ApexBase/compare/v1.36.0...v1.36.1)
+
+### Highlights
+
+v1.36.1 is a correctness follow-up to v1.36.0. It closes the race in which a
+reader materializing a table `CREATE TABLE` had registered but not yet written
+could replace the rows a concurrent writer was publishing, restores a typed-write
+regression test that the v1.36.0 work dropped, and reaps the rewrite scratch files
+that the new atomic publish path can leave behind after a crash. The V4 file
+format and the public Python, Rust, PostgreSQL-wire, and Flight entry points are
+unchanged.
+
+### Lazy Table Materialization
+
+- Materialize a registered lazy table only while its path is still free, and do it under the same lock that serializes base-file publication, so an empty materialized file can never replace rows a writer published in the meantime; when the file is already there it is adopted instead of overwritten
+- Persist the catalog constraints of a materialized table under the table write lock, but only when the calling mutation does not already hold it
+
+### Write Path Housekeeping
+
+- Reap `<stem>.apex.<pid>.<seq>.tmp` rewrite scratch files after a crashed or killed writer: once per directory per process when a table is opened (a directory listing per open is not affordable on the temporary-table and cross-database read paths) and unconditionally when a table is dropped, which the fixed `TABLE_FILE_SUFFIXES` list could never match
+- Drop the unused `read_lock` / `with_read_lock` / `with_write_lock` helpers and document the read contract they claimed instead: reads stay lock-free and correct through atomic publication, the per-table epoch that invalidates stale cached backends, and bounded retries around the publish window
+
+### Tests
+
+- Restore the Rust test `write_typed_columns_slow_then_fast_path` (slow schema-inferring write, then the V4 append fast path, with both row groups verified) that the v1.36.0 work removed, and remove its leftover duplicate `#[test]` attribute
+- Add `materialize_adopts_an_existing_table_file`, which proves a published row survives materialization, and `scratch_sweep_removes_only_stale_rewrite_files`, which covers the stale-file threshold and the names the sweep must not touch
+- The concurrent reader/writer coverage added in v1.36.0 (`test_engine_defect_regressions.py`, `test_write_scenarios.py`) is the Python-side guard for the materialization race; it passed 20/20 runs under CPU load
+
+### Validation And Performance
+
+- Release build, the complete serial Python suite, and the complete Rust suites (630 unit + 6 documentation tests for the core feature set) passed on this tree
+- The public 1,000,000-row benchmark completed with ApexBase winning 103/103 tabular, 6/6 exact-vector, and 6/6 shared quantized-vector comparisons
+- The same-machine canary against `origin/main` passed 64/64; the full-mode same-machine gate reported 102/103 metrics inside the threshold, and the single flagged metric (`ORDER BY expression (LENGTH)`, +16.08%) was reproduced as machine noise: its fastest sample equals the base's, and a back-to-back A/B on that exact query measured 1.748 ms against 1.745 ms
+
+### Upgrade Notes
+
+- No `.apex` file-format change, no API change, and no migration from v1.36.0
+- Update the Rust crate and Python package version metadata to 1.36.1
+
+---
+
+
 ## [v1.36.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.36.0)
 *2026-09-23*
 
