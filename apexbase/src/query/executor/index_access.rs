@@ -9,7 +9,7 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         where_clause: &SqlExpr,
         spec: Option<&crate::query::planner::IndexExecutionSpec>,
-        base_dir: &Path,
+        _base_dir: &Path,
         storage_path: &Path,
     ) -> io::Result<Option<ApexResult>> {
         use crate::storage::index::index_manager::PredicateHint;

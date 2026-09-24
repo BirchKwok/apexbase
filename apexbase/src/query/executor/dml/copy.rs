@@ -135,7 +135,7 @@ enum CsvDistinctValue {
 impl ApexExecutor {
     pub(in crate::query::executor) fn execute_copy_to_parquet(
         storage_path: &Path,
-        table_name: &str,
+        _table_name: &str,
         file_path: &str,
     ) -> io::Result<ApexResult> {
         crate::storage::table_catalog::ensure_table_file(
@@ -588,7 +588,7 @@ impl ApexExecutor {
         bad_line_policy: CsvBadLinePolicy,
         max_rows: Option<usize>,
     ) -> io::Result<RecordBatch> {
-        use arrow::array::{BooleanArray, BooleanBuilder};
+        use arrow::array::BooleanBuilder;
         use arrow::buffer::{Buffer, NullBuffer, OffsetBuffer, ScalarBuffer};
         use arrow::datatypes::DataType;
 
@@ -1117,15 +1117,6 @@ impl ApexExecutor {
         }
     }
 
-    pub(in crate::query::executor) fn parse_u64_bytes(b: &[u8]) -> u64 {
-        let digits = if b.first() == Some(&b'+') { &b[1..] } else { b };
-        let mut v = 0u64;
-        for &d in digits {
-            v = v * 10 + (d.wrapping_sub(b'0')) as u64;
-        }
-        v
-    }
-
     pub(in crate::query::executor) fn get_csv_field(line: &[u8], col: usize, delimiter: u8) -> &[u8] {
         let mut count = 0usize;
         let mut start = 0usize;
@@ -1142,95 +1133,6 @@ impl ApexExecutor {
             &line[start..]
         } else {
             b""
-        }
-    }
-
-    pub(in crate::query::executor) fn extract_csv_column(
-        data: &[u8],
-        col_idx: usize,
-        dtype: &arrow::datatypes::DataType,
-        delimiter: u8,
-        n_rows: usize,
-    ) -> io::Result<arrow::array::ArrayRef> {
-        use arrow::array::{
-            BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
-        };
-        use arrow::datatypes::DataType;
-
-        // Shared line iterator body
-        macro_rules! scan_lines {
-            ($callback:expr) => {{
-                let mut ls = 0usize;
-                for nl in memchr::memchr_iter(b'\n', data) {
-                    let raw = &data[ls..nl];
-                    ls = nl + 1;
-                    let line = if raw.last() == Some(&b'\r') {
-                        &raw[..raw.len() - 1]
-                    } else {
-                        raw
-                    };
-                    if !line.is_empty() {
-                        $callback(Self::get_csv_field(line, col_idx, delimiter));
-                    }
-                }
-                if ls < data.len() {
-                    let raw = &data[ls..];
-                    let line = if raw.last() == Some(&b'\r') {
-                        &raw[..raw.len() - 1]
-                    } else {
-                        raw
-                    };
-                    if !line.is_empty() {
-                        $callback(Self::get_csv_field(line, col_idx, delimiter));
-                    }
-                }
-            }};
-        }
-
-        match dtype {
-            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
-                let mut b = Int64Builder::with_capacity(n_rows);
-                scan_lines!(|f: &[u8]| if f.is_empty() {
-                    b.append_null()
-                } else {
-                    b.append_value(Self::parse_i64_bytes(f))
-                });
-                Ok(Arc::new(b.finish()) as _)
-            }
-            DataType::UInt64 | DataType::UInt32 | DataType::UInt16 | DataType::UInt8 => {
-                let mut b = UInt64Builder::with_capacity(n_rows);
-                scan_lines!(|f: &[u8]| if f.is_empty() {
-                    b.append_null()
-                } else {
-                    b.append_value(Self::parse_u64_bytes(f))
-                });
-                Ok(Arc::new(b.finish()) as _)
-            }
-            DataType::Float64 | DataType::Float32 => {
-                let mut b = Float64Builder::with_capacity(n_rows);
-                scan_lines!(|f: &[u8]| match fast_float::parse::<f64, _>(f) {
-                    Ok(v) => b.append_value(v),
-                    Err(_) => b.append_null(),
-                });
-                Ok(Arc::new(b.finish()) as _)
-            }
-            DataType::Boolean => {
-                let mut b = BooleanBuilder::with_capacity(n_rows);
-                scan_lines!(|f: &[u8]| match f {
-                    b"true" | b"True" | b"TRUE" | b"1" => b.append_value(true),
-                    b"false" | b"False" | b"FALSE" | b"0" => b.append_value(false),
-                    _ => b.append_null(),
-                });
-                Ok(Arc::new(b.finish()) as _)
-            }
-            _ => {
-                let mut b = StringBuilder::with_capacity(n_rows, n_rows * 12);
-                scan_lines!(|f: &[u8]| {
-                    // SAFETY: CSV is text data — valid UTF-8 in practice
-                    b.append_value(unsafe { std::str::from_utf8_unchecked(f) });
-                });
-                Ok(Arc::new(b.finish()) as _)
-            }
         }
     }
 
@@ -3090,53 +2992,6 @@ impl ApexExecutor {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
-    pub(in crate::query::executor) fn normalize_json_to_ndjson(content: &str) -> io::Result<String> {
-        let trimmed = content.trim();
-        let value: serde_json::Value = match serde_json::from_str(trimmed) {
-            Ok(v) => v,
-            Err(_) => return Ok(content.to_owned()),
-        };
-        // Re-use the direct converter path, then serialize each row as NDJSON
-        // (COPY path only; read_json_to_batch uses json_value_to_batch directly)
-        match &value {
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                let batch = Self::json_value_to_batch(value)?;
-                // Serialize batch rows back to NDJSON for the COPY insert pipeline
-                let mut out = String::new();
-                let schema = batch.schema();
-                for row_i in 0..batch.num_rows() {
-                    let mut obj = serde_json::Map::with_capacity(schema.fields().len());
-                    for (col_i, field) in schema.fields().iter().enumerate() {
-                        let col = batch.column(col_i);
-                        let val = Self::arrow_value_at_col(col, row_i);
-                        let jval = match val {
-                            crate::data::Value::Int64(n) => serde_json::Value::Number(n.into()),
-                            crate::data::Value::Int32(n) => {
-                                serde_json::Value::Number((n as i64).into())
-                            }
-                            crate::data::Value::Float64(f) => serde_json::json!(f),
-                            crate::data::Value::Float32(f) => serde_json::json!(f as f64),
-                            crate::data::Value::String(s) => serde_json::Value::String(s),
-                            crate::data::Value::Bool(b) => serde_json::Value::Bool(b),
-                            _ => serde_json::Value::Null,
-                        };
-                        obj.insert(field.name().clone(), jval);
-                    }
-                    out.push_str(
-                        &serde_json::to_string(&obj)
-                            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?,
-                    );
-                    out.push('\n');
-                }
-                Ok(out)
-            }
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Unsupported JSON type",
-            )),
-        }
-    }
-
     pub(in crate::query::executor) fn read_parquet_to_batch(
         path: &str,
         options: &[(String, String)],
@@ -3470,7 +3325,6 @@ impl ApexExecutor {
             }
             if batch.num_rows() >= remaining {
                 collected.push(batch.slice(0, remaining));
-                remaining = 0;
                 break;
             }
             remaining -= batch.num_rows();

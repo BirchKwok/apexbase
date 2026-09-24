@@ -1,7 +1,7 @@
 // Vectorized JOIN utilities and filter optimization
 // This module provides helper functions for vectorized operations
 
-use arrow::array::{Array, ArrayRef, BooleanArray, Float64Array, Int64Array};
+use arrow::array::{Array, Float64Array, Int64Array};
 
 /// Zone map for column statistics
 #[derive(Debug, Clone)]
@@ -73,9 +73,9 @@ impl ZoneMapStats {
     /// Check if the zone can possibly match a predicate
     pub fn can_match_predicate(&self, predicate: i64, is_greater: bool) -> bool {
         match (self.min, self.max, is_greater) {
-            (Some(min), Some(max), true) => max > predicate, // v > predicate, need max > predicate
-            (Some(min), Some(max), false) => min < predicate, // v < predicate, need min < predicate
-            _ => true,                                       // Unknown range, assume can match
+            (Some(_), Some(max), true) => max > predicate, // v > predicate, need max > predicate
+            (Some(min), Some(_), false) => min < predicate, // v < predicate, need min < predicate
+            _ => true,                                      // Unknown range, assume can match
         }
     }
 }
@@ -400,6 +400,7 @@ pub use filter_optimize::{has_any_null, is_all_false, is_all_true};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::BooleanArray;
 
     #[test]
     fn test_zone_map_int64() {

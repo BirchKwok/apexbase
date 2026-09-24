@@ -235,12 +235,6 @@ impl MmapCache {
         Ok(self.mmap.as_ref().unwrap())
     }
 
-    /// Return mmap slice without any syscalls or staleness checks.
-    /// Caller must ensure the mmap is still valid (backend freshness checked by STORAGE_CACHE).
-    pub(crate) fn mmap_slice_unchecked(&self) -> Option<&[u8]> {
-        self.mmap.as_ref().map(|arc| -> &[u8] { arc.as_ref() })
-    }
-
     /// Read bytes at offset using mmap (zero-copy when possible)
     fn read_at(&mut self, file: &File, buf: &mut [u8], offset: u64) -> io::Result<()> {
         let mmap = self.get_or_create(file)?;
@@ -263,37 +257,12 @@ impl MmapCache {
         Ok(())
     }
 
-    /// Get a slice directly from mmap (true zero-copy)
-    fn slice(&mut self, file: &File, offset: u64, len: usize) -> io::Result<&[u8]> {
-        let mmap = self.get_or_create(file)?;
-        let start = offset as usize;
-        let end = start + len;
-
-        if end > mmap.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                format!(
-                    "Slice past EOF: offset={}, len={}, file_size={}",
-                    offset,
-                    len,
-                    mmap.len()
-                ),
-            ));
-        }
-
-        Ok(&mmap[start..end])
-    }
-
     /// Invalidate cache (call after writes)
     fn invalidate(&mut self) {
         self.mmap = None;
         self.file_size = 0;
     }
 
-    /// Return mmap size without any syscalls.
-    pub(crate) fn mmap_len(&self) -> usize {
-        self.mmap.as_ref().map(|m| m.len()).unwrap_or(0)
-    }
 }
 
 /// Scratch path for an atomic base-file replacement.
@@ -587,13 +556,6 @@ fn rg_id_at(
 const COL_ENCODING_FORWARD: u8 = 16; // Forward encoding (delta)
 const COL_ENCODING_DICTIONARY: u8 = 17; // Dictionary encoding for strings
 const COL_ENCODING_UNENCODED: u8 = 18; // Unencoded (raw bytes)
-
-// Character encoding hints for string columns (typically stored in schema, not per-column):
-// These are not column compression encodings, but we handle them gracefully if encountered.
-const CHAR_ENCODING_UTF8: u8 = 1; // UTF-8 (common)
-const CHAR_ENCODING_ASCII: u8 = 0; // ASCII (7-bit)
-const CHAR_ENCODING_LATIN1: u8 = 208; // ISO-8859-1 (Latin-1)
-const CHAR_ENCODING_UTF16: u8 = 209; // UTF-16
 
 /// Borrowed view over both legacy u32 and compact StringDict column payloads.
 /// Compact format adds one byte after the two u64 counts for the index width.
@@ -1397,7 +1359,7 @@ fn rle_decode_bool(bytes: &[u8]) -> io::Result<(ColumnData, usize)> {
 /// Tries RLE → Bit-pack → Plain, picks the smallest encoding.
 fn write_column_encoded<W: Write>(
     col: &ColumnData,
-    col_type: ColumnType,
+    _col_type: ColumnType,
     writer: &mut W,
 ) -> io::Result<()> {
     match col {

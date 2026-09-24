@@ -554,7 +554,6 @@ impl OnDemandStorage {
                         }
                         out
                     };
-                    let row_count = if dim_usize == 0 { 0 } else { f32_data.len() / dim_usize };
                     let float_arr = Float32Array::from(f32_data);
                     let list_dt = ArrowDataType::FixedSizeList(
                         Arc::new(Field::new("item", ArrowDataType::Float32, false)), dim_usize as i32,
@@ -606,7 +605,6 @@ impl OnDemandStorage {
                         let byte_len = row_count_full.min(active_count) * dim_usize * 4;
                         crate::storage::on_demand::f32_le_bytes_to_values(&data[..byte_len])
                     };
-                    let row_count = if dim_usize == 0 { 0 } else { selected_data.len() / dim_usize };
                     let float_arr = Float32Array::from(selected_data);
                     let list_dt = ArrowDataType::FixedSizeList(
                         Arc::new(Field::new("item", ArrowDataType::Float32, false)),
@@ -3487,16 +3485,6 @@ impl OnDemandStorage {
             // The buffer holds the whole base plus anything appended after it.
             ids_len.saturating_sub(on_disk_rows)
         }
-    }
-
-    /// Check if in-memory columns contain the FULL base dataset (not just write buffer).
-    /// Used by save() to decide between append vs full rewrite.
-    #[inline]
-    fn has_v4_in_memory_data_with_base(&self, on_disk_rows: usize) -> bool {
-        let cols = self.columns.read();
-        if cols.is_empty() { return false; }
-        // If any column has >= on_disk_rows elements, base data is loaded
-        cols.iter().any(|c| c.len() >= on_disk_rows)
     }
 
 }

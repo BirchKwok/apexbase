@@ -196,16 +196,19 @@ impl<'a> Session<'a> {
 }
 
 impl Database {
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn cached_backend(table_path: &Path) -> io::Result<Arc<TableStorageBackend>> {
         crate::query::executor::get_cached_backend_pub(table_path)
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn cache_backend(table_path: &Path, backend: Arc<TableStorageBackend>) {
         crate::query::executor::cache_backend_pub(table_path, backend);
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn open_backend(
         table_path: &Path,
@@ -217,6 +220,7 @@ impl Database {
         TableStorageBackend::open_with_durability(table_path, durability).map(Arc::new)
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn open_insert_backend(
         table_path: &Path,
@@ -228,17 +232,7 @@ impl Database {
         TableStorageBackend::open_for_insert_with_durability(table_path, durability).map(Arc::new)
     }
 
-    #[inline]
-    pub(crate) fn open_write_backend(
-        table_path: &Path,
-        durability: DurabilityLevel,
-    ) -> io::Result<Arc<TableStorageBackend>> {
-        if let Some(backend) = engine().memory_backend(table_path) {
-            return Ok(backend);
-        }
-        TableStorageBackend::open_for_write_with_durability(table_path, durability).map(Arc::new)
-    }
-
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn create_backend(
         table_path: &Path,
@@ -255,6 +249,7 @@ impl Database {
             .map(Arc::new)
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn temp_dir() -> Option<std::path::PathBuf> {
         crate::query::executor::get_temp_dir()
@@ -265,6 +260,7 @@ impl Database {
         crate::query::executor::clear_temp_dir();
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn invalidate_query_cache(table_path: &Path) {
         crate::query::executor::invalidate_storage_cache(table_path);
@@ -276,26 +272,31 @@ impl Database {
         crate::query::executor::ApexExecutor::invalidate_cache_for_dir(base_dir);
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn wait_fts_backfill(base_dir: &Path, table_name: &str) {
         crate::query::executor::wait_fts_backfill(base_dir, table_name);
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn has_fts_backfill(base_dir: &Path, table_name: &str) -> bool {
         crate::query::executor::has_fts_backfill(base_dir, table_name)
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn fts_manager(base_dir: &Path) -> Option<Arc<crate::fts::FtsManager>> {
         crate::query::executor::get_fts_manager(base_dir)
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn register_fts_manager(base_dir: &Path, manager: Arc<crate::fts::FtsManager>) {
         crate::query::executor::register_fts_manager(base_dir, manager);
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn unregister_fts_manager(base_dir: &Path) {
         crate::query::executor::unregister_fts_manager(base_dir);
@@ -607,6 +608,7 @@ impl Database {
         )
     }
 
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn fts_backfill(
         base_dir: &Path,
@@ -621,6 +623,7 @@ impl Database {
     ///
     /// Filesystem databases persist `fts_config.json`; process-local databases
     /// keep the same document in a process-local registry.
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn enable_fts_config(
         base_dir: &Path,
@@ -633,6 +636,7 @@ impl Database {
     }
 
     /// Read the effective FTS configuration document for a database directory.
+    #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn read_fts_config(base_dir: &Path) -> serde_json::Value {
         ApexExecutor::read_fts_config(base_dir)

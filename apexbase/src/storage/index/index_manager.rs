@@ -167,13 +167,6 @@ impl IndexInstance {
             IndexInstance::Hash(idx) => idx.clear(),
         }
     }
-
-    fn len(&self) -> u64 {
-        match self {
-            IndexInstance::BTree(idx) => idx.len(),
-            IndexInstance::Hash(idx) => idx.len(),
-        }
-    }
 }
 
 // ============================================================================

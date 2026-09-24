@@ -478,9 +478,6 @@ impl OnDemandStorage {
                 if data_len_off + 8 > g_data.len() {
                     continue;
                 }
-                let data_len =
-                    u64::from_le_bytes(g_data[data_len_off..data_len_off + 8].try_into().unwrap())
-                        as usize;
                 let data_start = data_len_off + 8;
                 GroupResolver::Plain {
                     count,

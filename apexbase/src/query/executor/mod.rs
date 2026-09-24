@@ -25,9 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use crate::query::jit::{
-    simd_max_i64, simd_min_i64, simd_sum_f64, simd_sum_i64, ExprJIT, FilterFnI64,
-};
+use crate::query::jit::{simd_sum_f64, simd_sum_i64};
 use crate::query::planner::{
     get_table_stats, invalidate_table_schema_stats, invalidate_table_stats, ExecutionStrategy,
     QueryPlanner,
@@ -54,10 +52,12 @@ use std::hash::{Hash, Hasher};
 
 pub(crate) mod memory;
 pub(in crate::query::executor) use memory::{
-    install_query_memory_budget, query_memory_budget, QueryMemoryBudget,
-    QueryMemoryBudgetGuard, DIRECT_INDEX_SLOT_BYTES, GROUP_BUDGET_CHECK_INTERVAL,
-    GROUP_INDEX_ENTRY_BYTES, GROUP_INDEX_INITIAL_CAPACITY, GROUP_STATE_ENTRY_BYTES,
+    query_memory_budget, QueryMemoryBudget, QueryMemoryBudgetGuard, DIRECT_INDEX_SLOT_BYTES,
+    GROUP_BUDGET_CHECK_INTERVAL, GROUP_INDEX_ENTRY_BYTES, GROUP_INDEX_INITIAL_CAPACITY,
+    GROUP_STATE_ENTRY_BYTES,
 };
+#[cfg(test)]
+pub(in crate::query::executor) use memory::install_query_memory_budget;
 
 // ============================================================================
 // Global SQL parse cache — avoids re-tokenizing/parsing the same SQL across cold iterations
@@ -361,12 +361,6 @@ fn err_data(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
 }
 
-/// Create an Unsupported error with message
-#[inline]
-fn err_unsupported(msg: impl Into<String>) -> io::Error {
-    io::Error::new(io::ErrorKind::Unsupported, msg.into())
-}
-
 /// Create a NotFound error with message
 #[inline]
 fn err_not_found(msg: impl Into<String>) -> io::Error {
@@ -437,33 +431,6 @@ where
         Ok(Arc::new(StringArray::from(
             result.iter().map(|s| s.as_deref()).collect::<Vec<_>>(),
         )))
-    } else {
-        Err(err_data(format!("{} requires string argument", func_name)))
-    }
-}
-
-/// Helper to apply a unary string function returning &str (no allocation)
-#[inline]
-fn map_string_unary_ref<'a, F>(
-    arr: &'a ArrayRef,
-    batch_rows: usize,
-    f: F,
-    func_name: &str,
-) -> io::Result<ArrayRef>
-where
-    F: Fn(&'a str) -> &'a str,
-{
-    if let Some(str_arr) = arr.as_any().downcast_ref::<StringArray>() {
-        let result: Vec<Option<&str>> = (0..batch_rows)
-            .map(|i| {
-                if str_arr.is_null(i) {
-                    None
-                } else {
-                    Some(f(str_arr.value(i)))
-                }
-            })
-            .collect();
-        Ok(Arc::new(StringArray::from(result)))
     } else {
         Err(err_data(format!("{} requires string argument", func_name)))
     }
@@ -625,7 +592,6 @@ where
     let result = f();
     // Release cross-process lock immediately
     if let Some(ref file) = lock.file {
-        use fs2::FileExt;
         let _ = file.unlock();
     }
     result
@@ -756,12 +722,14 @@ pub fn wait_fts_backfill(base_dir: &Path, table_name: &str) {
     }
 }
 
+#[cfg(feature = "python")]
 pub fn has_fts_backfill(base_dir: &Path, table_name: &str) -> bool {
     FTS_BACKFILL_TASKS
         .read()
         .contains_key(&(base_dir.to_path_buf(), table_name.to_string()))
 }
 
+#[cfg(any(feature = "python", test))]
 pub fn wait_fts_backfills_for_dir(base_dir: &Path) {
     let handles: Vec<_> = {
         let mut tasks = FTS_BACKFILL_TASKS.write();
@@ -784,6 +752,7 @@ pub fn wait_fts_backfills_for_dir(base_dir: &Path) {
 /// Used when a database directory is recreated in-process, so a later
 /// CREATE FTS INDEX builds fresh engines instead of reusing stale in-memory
 /// indexes whose files were deleted.
+#[cfg(any(feature = "python", test))]
 pub fn unregister_fts_manager(base_dir: &Path) {
     wait_fts_backfills_for_dir(base_dir);
     let manager = FTS_MANAGER_CACHE.write().remove(base_dir);
@@ -906,19 +875,15 @@ struct ZoneMap {
     max_int: Option<i64>,
     min_float: Option<f64>,
     max_float: Option<f64>,
-    has_nulls: bool,
 }
 
 impl ZoneMap {
     fn from_int64_array(arr: &Int64Array) -> Self {
         let mut min_val: Option<i64> = None;
         let mut max_val: Option<i64> = None;
-        let mut has_nulls = false;
 
         for i in 0..arr.len() {
-            if arr.is_null(i) {
-                has_nulls = true;
-            } else {
+            if !arr.is_null(i) {
                 let v = arr.value(i);
                 min_val = Some(min_val.map_or(v, |m| m.min(v)));
                 max_val = Some(max_val.map_or(v, |m| m.max(v)));
@@ -930,19 +895,15 @@ impl ZoneMap {
             max_int: max_val,
             min_float: None,
             max_float: None,
-            has_nulls,
         }
     }
 
     fn from_float64_array(arr: &Float64Array) -> Self {
         let mut min_val: Option<f64> = None;
         let mut max_val: Option<f64> = None;
-        let mut has_nulls = false;
 
         for i in 0..arr.len() {
-            if arr.is_null(i) {
-                has_nulls = true;
-            } else {
+            if !arr.is_null(i) {
                 let v = arr.value(i);
                 min_val = Some(min_val.map_or(v, |m| m.min(v)));
                 max_val = Some(max_val.map_or(v, |m| m.max(v)));
@@ -954,7 +915,6 @@ impl ZoneMap {
             max_int: None,
             min_float: min_val,
             max_float: max_val,
-            has_nulls,
         }
     }
 
@@ -1060,6 +1020,7 @@ fn refresh_storage_cache_signature(path: &Path) {
 ///
 /// Used by storage-level memtable appends: SQL reads should see the same warm
 /// backend instead of reopening the mmap-only file and missing pending rows.
+#[cfg(feature = "python")]
 #[inline]
 pub fn cache_backend_pub(path: &Path, backend: Arc<TableStorageBackend>) {
     if STORAGE_CACHE.len() >= MAX_CACHE_ENTRIES {

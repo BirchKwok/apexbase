@@ -1432,7 +1432,7 @@ impl OnDemandStorage {
     /// Returns a guard that releases the lock when dropped.
     /// Multiple readers can hold the lock simultaneously.
     #[inline]
-    pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<()> {
+    pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
         self.global_lock.read()
     }
 
@@ -1440,7 +1440,7 @@ impl OnDemandStorage {
     /// Returns a guard that releases the lock when dropped.
     /// Only one writer can hold the lock; readers are blocked while held.
     #[inline]
-    pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<()> {
+    pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
         self.global_lock.write()
     }
 
@@ -1608,17 +1608,6 @@ impl OnDemandStorage {
         // Re-save header to disk
         self.save()?;
         Ok(true)
-    }
-
-    /// Helper: Get file reference or return NotConnected error
-    /// Reduces boilerplate in read methods
-    #[inline]
-    fn get_file_ref(&self) -> io::Result<parking_lot::RwLockReadGuard<'_, Option<File>>> {
-        let guard = self.file.read();
-        if guard.is_none() {
-            return Err(err_not_conn("File not open"));
-        }
-        Ok(guard)
     }
 
     /// Create or open storage with default durability (Fast)
@@ -2669,7 +2658,6 @@ impl OnDemandStorage {
         delta_path: &Path,
         file_len: u64,
     ) -> io::Result<(Vec<(u64, u64)>, u64)> {
-        use std::io::Read;
         let mut file = File::open(delta_path)?;
         let mut batches: Vec<(u64, u64)> = Vec::new();
         let mut last_end = file_len;
@@ -2929,7 +2917,7 @@ impl OnDemandStorage {
         let (_, last_end) = Self::delta_complete_batches(&delta_path)?;
         let file_len = std::fs::metadata(&delta_path)?.len();
         if last_end < file_len {
-            let mut file = OpenOptions::new().write(true).open(&delta_path)?;
+            let file = OpenOptions::new().write(true).open(&delta_path)?;
             file.set_len(last_end)?;
             file.sync_all()?;
             let max_id = Self::get_max_id_from_delta(&delta_path)?;
@@ -2992,7 +2980,7 @@ impl OnDemandStorage {
             if let Some(cut) = cut {
                 let file_len = std::fs::metadata(&delta_path)?.len();
                 if cut < file_len {
-                    let mut file = OpenOptions::new()
+                    let file = OpenOptions::new()
                         .write(true)
                         .open(&delta_path)?;
                     file.set_len(cut)?;
@@ -3268,7 +3256,9 @@ impl OnDemandStorage {
         drop(schema);
         drop(column_index);
         self.ensure_ids_loaded()?;
-        let header = self.header.read();
+        // Hold the header read guard for the duration of the load so a concurrent
+        // writer cannot swap the on-disk layout under this snapshot.
+        let _header = self.header.read();
         let schema = self.schema.read();
         let column_index = self.column_index.read();
 
@@ -3779,6 +3769,7 @@ impl OnDemandStorage {
 
     /// Insert typed columns to delta file (memory efficient - doesn't load existing data)
     /// Returns the IDs assigned to the inserted rows
+    #[cfg(test)]
     fn insert_typed_to_delta(
         &self,
         int_columns: HashMap<String, Vec<i64>>,
@@ -3800,8 +3791,6 @@ impl OnDemandStorage {
         if row_count == 0 {
             return Ok(Vec::new());
         }
-
-        let delta_path = Self::delta_path(&self.path);
 
         // Allocate IDs
         let mut ids = Vec::with_capacity(row_count);
@@ -4332,10 +4321,6 @@ impl OnDemandStorage {
             let ds = self.delta_store.read();
             (ds.all_updates().clone(), ds.delete_bitmap().clone())
         };
-        let delta_ids: Vec<u64> = delta_data
-            .as_ref()
-            .map(|(ids, _)| ids.clone())
-            .unwrap_or_default();
 
         // Footer must be loaded before acquiring mmap_cache.write() below
         // (get_or_load_footer takes the mmap write lock internally).
@@ -4415,7 +4400,7 @@ impl OnDemandStorage {
         let compression = self.compression();
 
         macro_rules! flush_out_rg {
-            () => {
+            () => {{
                 flush_streamed_out_rg(
                     &mut writer,
                     &schema_cols,
@@ -4432,8 +4417,8 @@ impl OnDemandStorage {
                     &mut written_rows,
                     &mut column_stats,
                 )?;
-                out_row_count = out_ids.len();
-            };
+                out_ids.len()
+            }};
         }
 
         // Merge base Row Groups one at a time.
@@ -4501,11 +4486,11 @@ impl OnDemandStorage {
                 out_ids.push(id);
                 out_row_count += 1;
                 if out_row_count >= rg_size_target {
-                    flush_out_rg!();
+                    out_row_count = flush_out_rg!();
                 }
             }
         }
-        flush_out_rg!();
+        out_row_count = flush_out_rg!();
 
         // Merge appended delta rows (fresh IDs that do not collide with base).
         if has_delta {
@@ -4549,7 +4534,7 @@ impl OnDemandStorage {
                 out_ids.push(id);
                 out_row_count += 1;
                 if out_row_count >= rg_size_target {
-                    flush_out_rg!();
+                    out_row_count = flush_out_rg!();
                 }
             }
         }
@@ -5003,7 +4988,7 @@ impl OnDemandStorage {
         let compression = self.compression();
 
         macro_rules! flush_out_rg {
-            () => {
+            () => {{
                 flush_streamed_out_rg(
                     &mut writer,
                     &new_schema_cols,
@@ -5020,8 +5005,8 @@ impl OnDemandStorage {
                     &mut written_rows,
                     &mut column_stats,
                 )?;
-                out_row_count = out_ids.len();
-            };
+                out_ids.len()
+            }};
         }
 
         for rg_meta in &footer.row_groups {
@@ -5070,7 +5055,7 @@ impl OnDemandStorage {
                 out_ids.push(id);
                 out_row_count += 1;
                 if out_row_count >= rg_size_target {
-                    flush_out_rg!();
+                    out_row_count = flush_out_rg!();
                 }
             }
         }
@@ -5209,69 +5194,6 @@ impl OnDemandStorage {
         }
 
         Ok(())
-    }
-
-
-    /// Convert an Arrow ArrayRef to ColumnData, preserving nulls.
-    fn arrow_array_to_column_data(array: &dyn arrow::array::Array) -> ColumnData {
-        use arrow::array::{
-            Array, BinaryArray, BooleanArray, Float64Array, Int64Array, StringArray,
-        };
-        use arrow::datatypes::DataType as ArrowDT;
-        match array.data_type() {
-            ArrowDT::Int64 => {
-                let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
-                ColumnData::Int64(arr.values().to_vec())
-            }
-            ArrowDT::Float64 => {
-                let arr = array.as_any().downcast_ref::<Float64Array>().unwrap();
-                ColumnData::Float64(arr.values().to_vec())
-            }
-            ArrowDT::Utf8 => {
-                let arr = array.as_any().downcast_ref::<StringArray>().unwrap();
-                let mut offsets = Vec::with_capacity(arr.len() + 1);
-                let mut data = Vec::new();
-                offsets.push(0u64);
-                for j in 0..arr.len() {
-                    if arr.is_null(j) {
-                        offsets.push(data.len() as u64);
-                    } else {
-                        let s = arr.value(j).as_bytes();
-                        data.extend_from_slice(s);
-                        offsets.push(data.len() as u64);
-                    }
-                }
-                ColumnData::String { offsets, data }
-            }
-            ArrowDT::Boolean => {
-                let arr = array.as_any().downcast_ref::<BooleanArray>().unwrap();
-                let n = arr.len();
-                let byte_len = (n + 7) / 8;
-                let mut bits = vec![0u8; byte_len];
-                for j in 0..n {
-                    if !arr.is_null(j) && arr.value(j) {
-                        bits[j / 8] |= 1 << (j % 8);
-                    }
-                }
-                ColumnData::Bool { data: bits, len: n }
-            }
-            ArrowDT::Binary => {
-                let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();
-                let mut offsets = Vec::with_capacity(arr.len() + 1);
-                let mut data = Vec::new();
-                offsets.push(0u64);
-                for j in 0..arr.len() {
-                    if arr.is_null(j) {
-                        offsets.push(data.len() as u64);
-                    } else {
-                        data.extend_from_slice(arr.value(j));
-                        offsets.push(data.len() as u64);
-                    }
-                }
-                ColumnData::Binary { offsets, data }
-            }
-            _ => ColumnData::new(ColumnType::Int64),
-        }
     }
 
     /// Create a column filled with default values (0, 0.0, "", false).

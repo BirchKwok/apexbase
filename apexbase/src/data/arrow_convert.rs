@@ -188,44 +188,6 @@ pub(crate) fn record_batch_to_typed_columns(batch: &RecordBatch) -> Option<Typed
     has_user_columns.then_some(out)
 }
 
-// SAFETY: These wrapper types allow raw pointers to be sent across threads
-// The caller must ensure the pointers remain valid for the duration of parallel execution
-#[derive(Clone, Copy)]
-struct SendPtr<T>(usize, std::marker::PhantomData<*mut T>);
-unsafe impl<T> Send for SendPtr<T> {}
-unsafe impl<T> Sync for SendPtr<T> {}
-
-impl<T> SendPtr<T> {
-    #[inline(always)]
-    fn new(ptr: *mut T) -> Self {
-        Self(ptr as usize, std::marker::PhantomData)
-    }
-
-    #[inline(always)]
-    unsafe fn write(&self, offset: usize, val: T) {
-        let ptr = self.0 as *mut T;
-        *ptr.add(offset) = val;
-    }
-}
-
-#[derive(Clone, Copy)]
-struct SendConstPtr<T>(usize, std::marker::PhantomData<*const T>);
-unsafe impl<T> Send for SendConstPtr<T> {}
-unsafe impl<T> Sync for SendConstPtr<T> {}
-
-impl<T: Copy> SendConstPtr<T> {
-    #[inline(always)]
-    fn new(ptr: *const T) -> Self {
-        Self(ptr as usize, std::marker::PhantomData)
-    }
-
-    #[inline(always)]
-    unsafe fn read(&self, offset: usize) -> T {
-        let ptr = self.0 as *const T;
-        *ptr.add(offset)
-    }
-}
-
 /// Convert a vector of Rows to Arrow IPC format bytes
 pub fn rows_to_arrow_ipc(rows: &[Row]) -> Result<Vec<u8>, String> {
     if rows.is_empty() {

@@ -12,7 +12,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 
 use super::node::NodeId;
-use super::partition::{PartitionKey, PartitionStrategy};
+use super::partition::PartitionKey;
 
 // ============================================================================
 // Shard ID

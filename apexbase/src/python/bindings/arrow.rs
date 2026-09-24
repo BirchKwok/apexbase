@@ -8,7 +8,6 @@ impl ApexStorageImpl {
     fn _execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
         use crate::query::query_signature::{self, QuerySignature};
         use arrow::array::{Array, StructArray};
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
         let sql = sql.to_string();
         let sig = query_signature::classify(&sql);
@@ -69,7 +68,6 @@ impl ApexStorageImpl {
     /// use it for bounded (LIMIT) queries.
     fn _execute_pylist(&self, py: Python<'_>, sql: &str) -> PyResult<PyObject> {
         use crate::query::query_signature::{self, QuerySignature};
-        use arrow::array::Array;
 
         let sql = sql.to_string();
         let sig = query_signature::classify(&sql);
@@ -109,7 +107,6 @@ impl ApexStorageImpl {
     fn _execute_like_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
         use crate::query::query_signature::{self, QuerySignature};
         use arrow::array::{Array, StructArray};
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
         let sig = query_signature::classify(sql);
         let (table, col, pattern) = match sig {
@@ -343,6 +340,7 @@ impl ApexStorageImpl {
         Ok(PyBytes::new_bound(py, &buf).into())
     }
 
+    #[pyo3(signature = (where_clause, limit=None))]
     fn _query_arrow_ffi(
         &self,
         py: Python<'_>,
@@ -350,7 +348,6 @@ impl ApexStorageImpl {
         limit: Option<usize>,
     ) -> PyResult<(usize, usize)> {
         use arrow::array::{Array, StructArray};
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
         // Single read of current_table — avoids double RwLock acquire
         let table_name = self.current_table.read().clone();
@@ -427,7 +424,6 @@ impl ApexStorageImpl {
     ) -> PyResult<(usize, usize)> {
         use crate::compute::vector_ops::bytes_to_query_vec_f32;
         use arrow::array::{Array, StructArray};
-        use arrow::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 
         let query_f32 = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(

@@ -72,13 +72,13 @@ impl QueryMemoryBudget {
         }
     }
 
-    #[inline]
+    #[cfg(test)]
     pub fn limit(&self) -> usize {
         self.limit
     }
 
     /// Bytes currently charged by this query.
-    #[inline]
+    #[cfg(test)]
     pub fn used(&self) -> usize {
         self.used.load(Ordering::Relaxed)
     }

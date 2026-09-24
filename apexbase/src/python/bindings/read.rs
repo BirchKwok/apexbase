@@ -1,7 +1,6 @@
 //! PyO3 binding methods split by domain.
 
 use super::*;
-use arrow::array::StringArray;
 
 #[pymethods]
 impl ApexStorageImpl {

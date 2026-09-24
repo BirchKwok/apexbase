@@ -886,16 +886,6 @@ impl SelectStatement {
                     Self::extract_outer_refs_from_subquery(where_clause, columns);
                 }
             }
-            SqlExpr::InSubquery { column, stmt, .. } => {
-                // The column being compared (e.g., "user_id" in "user_id IN (SELECT ...)")
-                if column != "_id" {
-                    columns.push(column.clone());
-                }
-                // Also extract outer references from subquery WHERE clause
-                if let Some(ref where_clause) = stmt.where_clause {
-                    Self::extract_outer_refs_from_subquery(where_clause, columns);
-                }
-            }
             SqlExpr::ArrayIndex { array, index } => {
                 Self::extract_columns_from_expr(array, columns);
                 Self::extract_columns_from_expr(index, columns);
@@ -1283,12 +1273,6 @@ impl SqlParser {
         if self.sql_chars.is_none() {
             self.sql_chars = Some(self.sql_raw.chars().collect());
         }
-    }
-
-    /// Get sql_chars reference, building lazily if needed.
-    fn chars(&mut self) -> &[char] {
-        self.ensure_chars();
-        self.sql_chars.as_ref().unwrap()
     }
 
     /// Tokenize SQL string — returns token list.
@@ -4807,11 +4791,10 @@ impl SqlParser {
                 .to_string();
                 self.advance();
                 // Consume parenthesised argument(s) as opaque text
-                let mut depth = 0usize;
                 let mut arg = String::new();
                 if matches!(self.current(), Token::LParen) {
                     self.advance();
-                    depth = 1;
+                    let mut depth = 1usize;
                     while depth > 0 {
                         match self.current() {
                             Token::LParen => {

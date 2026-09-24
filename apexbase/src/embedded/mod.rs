@@ -3472,7 +3472,7 @@ mod tests {
 
     #[test]
     fn test_insert_arrow_empty() {
-        use arrow::array::{Int64Array, StringArray};
+        use arrow::array::Int64Array;
         use arrow::datatypes::{DataType as ArrowDT, Field, Schema as ArrowSchema};
         use arrow::record_batch::RecordBatch;
 

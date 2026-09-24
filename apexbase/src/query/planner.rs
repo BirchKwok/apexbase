@@ -595,8 +595,6 @@ const COST_SEQ_SCAN_PER_ROW: f64 = 1.0;
 const COST_INDEX_LOOKUP: f64 = 4.0;
 const COST_INDEX_SCAN_PER_ROW: f64 = 1.5;
 const COST_INDEX_BASE_FETCH_PER_ROW: f64 = 1.0;
-const COST_HASH_BUILD_PER_ROW: f64 = 2.0;
-const COST_HASH_PROBE_PER_ROW: f64 = 0.5;
 const COST_SORT_PER_ROW_LOG: f64 = 0.1;
 
 /// Estimated cost of an execution plan
@@ -628,16 +626,6 @@ impl PlanCost {
                 + output * (COST_INDEX_SCAN_PER_ROW + COST_INDEX_BASE_FETCH_PER_ROW),
             output_rows: output,
             rows_read: output,
-        }
-    }
-
-    fn hash_join(left: &PlanCost, right: &PlanCost) -> Self {
-        let build = left.output_rows * COST_HASH_BUILD_PER_ROW;
-        let probe = right.output_rows * COST_HASH_PROBE_PER_ROW;
-        Self {
-            total: left.total + right.total + build + probe,
-            output_rows: left.output_rows.min(right.output_rows),
-            rows_read: left.rows_read + right.rows_read,
         }
     }
 }
@@ -888,7 +876,7 @@ impl QueryPlanner {
     }
 
     /// Determine whether to use an index or full scan based on cost
-    pub fn should_use_index(col: &str, selectivity: f64, row_count: u64) -> bool {
+    pub fn should_use_index(_col: &str, selectivity: f64, row_count: u64) -> bool {
         let scan_cost = PlanCost::seq_scan(row_count as f64);
         let index_cost = PlanCost::index_scan(row_count as f64, selectivity);
         index_cost.total < scan_cost.total
@@ -1785,7 +1773,7 @@ impl QueryPlanner {
                 }
             }
             SqlExpr::Between {
-                column, low, high, ..
+                column, ..
             } => {
                 chars.range_filter_columns.push(column.clone());
                 chars.estimated_selectivity *= 0.2;

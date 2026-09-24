@@ -46,12 +46,6 @@ use crate::data::Value;
 /// Maximum number of cached table backends
 const MAX_CACHE_ENTRIES: usize = 64;
 
-/// Delta file size threshold for auto-compaction (10MB)
-const DELTA_COMPACT_SIZE: u64 = 10 * 1024 * 1024;
-
-/// Delta row count threshold for auto-compaction
-const DELTA_COMPACT_ROWS: usize = 100_000;
-
 /// Decode a Binary ColumnData (offsets + data) into per-row `Vec<u8>` values.
 fn binary_column_to_values(offsets: &[u64], data: &[u8], row_count: usize) -> Vec<Vec<u8>> {
     let mut values = Vec::with_capacity(row_count);
@@ -2323,7 +2317,7 @@ mod tests {
 
     #[test]
     fn write_typed_columns_slow_then_fast_path() {
-        use crate::storage::on_demand::{ColumnData, ColumnType};
+        use crate::storage::on_demand::ColumnData;
 
         let dir = tempdir().unwrap();
         let table_path = dir.path().join("typed_cols.apex");

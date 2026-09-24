@@ -126,7 +126,7 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
         .read(true)
         .write(true)
         .open(path)?;
-    for (rg_i, offset, del_bytes) in &rg_writes {
+    for (_rg_i, offset, del_bytes) in &rg_writes {
         file.seek(SeekFrom::Start(*offset))?;
         file.write_all(del_bytes)?;
     }
@@ -1484,37 +1484,6 @@ impl OnDemandStorage {
         Ok(Some(result))
     }
 
-    /// Read bytes from an already-locked page cache (no lock acquisition).
-    /// Returns false if any required page is missing (cache miss).
-    #[inline]
-    fn read_from_locked_cache(
-        cache: &std::collections::HashMap<u64, Box<[u8; 4096]>>,
-        abs_offset: u64,
-        dst: &mut [u8],
-    ) -> bool {
-        let len = dst.len();
-        if len == 0 {
-            return true;
-        }
-        let mut written = 0usize;
-        let mut cur_off = abs_offset;
-        while written < len {
-            let page_num = cur_off / 4096;
-            let page_off = (cur_off % 4096) as usize;
-            let to_copy = (len - written).min(4096 - page_off);
-            match cache.get(&page_num) {
-                Some(page) => {
-                    dst[written..written + to_copy]
-                        .copy_from_slice(&page[page_off..page_off + to_copy]);
-                    written += to_copy;
-                    cur_off += to_copy as u64;
-                }
-                None => return false,
-            }
-        }
-        true
-    }
-
     /// Zero-syscall RCIX point lookup using user-space page cache.
     /// Reads file bytes via cached heap pages (pread on miss), avoiding repeated macOS
     /// mmap soft page faults (~21µs each). After warmup, all accesses hit the heap cache
@@ -1624,7 +1593,6 @@ impl OnDemandStorage {
                 Some(f) => f,
                 None => return Ok(None),
             };
-            let col_count = footer.schema.column_count();
             let mut rg_i_found = None;
             for (i, rg) in footer.row_groups.iter().enumerate() {
                 if rg.min_id <= id && id <= rg.max_id && rg.row_count > 0 {
@@ -2955,7 +2923,6 @@ impl OnDemandStorage {
 
                 // Step 4: Check deletion bit.
                 let del_start = id_section_len;
-                let del_vec_len = (rg_rows + 7) / 8;
                 if del_start + local_idx / 8 >= body.len() {
                     return Ok(None);
                 }
@@ -3829,8 +3796,6 @@ impl OnDemandStorage {
         name: &str,
         dtype: crate::data::DataType,
     ) -> io::Result<()> {
-        use crate::data::DataType;
-
         let is_v4 = {
             let header = self.header.read();
             header.version == FORMAT_VERSION_V4 && header.footer_offset > 0
@@ -3981,9 +3946,6 @@ impl OnDemandStorage {
         }
 
         // Use insert_typed but override the ID
-        // First, determine row count (should be 1)
-        let row_count = 1;
-
         // Instead of using next_id, we'll use the original ID
         let ids = vec![id];
 
@@ -6172,7 +6134,7 @@ impl OnDemandStorage {
         }
 
         let footer_opt = self.get_or_load_footer()?;
-        let mut footer = match footer_opt {
+        let footer = match footer_opt {
             Some(f) => f,
             None => return Ok(None),
         };

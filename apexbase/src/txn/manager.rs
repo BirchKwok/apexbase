@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use once_cell::sync::Lazy;
 use parking_lot::RwLock;
 
-use super::conflict::{ConflictDetector, ConflictResult};
+use super::conflict::ConflictDetector;
 use super::context::{TxnContext, TxnWrite};
 use crate::storage::mvcc::gc::GarbageCollector;
 use crate::storage::mvcc::snapshot::{Snapshot, SnapshotManager};
@@ -50,6 +50,7 @@ pub(crate) struct PreparedCommit {
 }
 
 impl PreparedCommit {
+    #[cfg(test)]
     #[inline]
     pub(crate) fn txn_id(&self) -> TxnId {
         self.txn_id
@@ -97,7 +98,6 @@ struct ActiveTxn {
     context: TxnContext,
     snapshot: Snapshot,
     status: TxnStatus,
-    started_at: Instant,
     /// Last activity timestamp — refreshed on every with_context call.
     /// Timeout is based on idle time (elapsed since last activity), not total age.
     last_activity: Instant,
@@ -197,7 +197,6 @@ impl TxnManager {
                 context,
                 snapshot: snapshot.clone(),
                 status: TxnStatus::Active,
-                started_at: now,
                 last_activity: now,
             },
         );
@@ -221,7 +220,6 @@ impl TxnManager {
                 context,
                 snapshot: snapshot.clone(),
                 status: TxnStatus::Active,
-                started_at: now,
                 last_activity: now,
             },
         );

@@ -54,7 +54,7 @@ impl ApexExecutor {
         where_clause: Option<&SqlExpr>,
     ) -> io::Result<RecordBatch> {
         use crate::query::vector_ops::DistanceMetric;
-        use arrow::array::{BinaryArray, Float64Array, Int64Array};
+        use arrow::array::{Float64Array, Int64Array};
 
         if !storage_path.exists() {
             let tbl = storage_path
@@ -88,9 +88,7 @@ impl ApexExecutor {
         let dist_field = Field::new(&names[1], ArrowDataType::Float64, false);
         let out_schema = Arc::new(Schema::new(vec![id_field, dist_field]));
 
-        use crate::query::vector_ops::{
-            topk_heap_direct_parallel, topk_heap_direct_parallel_fixed, DistanceComputer,
-        };
+        use crate::query::vector_ops::DistanceComputer;
         let computer = DistanceComputer::new(metric_enum, query_f32);
 
         // A TopK expression is an aggregate over its input relation.  When a WHERE

@@ -229,7 +229,7 @@ impl ApexExecutor {
                 extra_names.push(name.clone());
                 let values: Vec<f64> = surviving
                     .iter()
-                    .map(|(slot, agg)| match func {
+                    .map(|(_slot, agg)| match func {
                         AggregateFunc::Count => agg.count as f64,
                         AggregateFunc::Sum => agg.sum,
                         AggregateFunc::Avg if agg.count > 0 => agg.sum / agg.count as f64,

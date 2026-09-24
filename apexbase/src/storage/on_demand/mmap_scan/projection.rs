@@ -99,10 +99,6 @@ impl OnDemandStorage {
         Ok(Some(footer))
     }
 
-    pub(super) fn invalidate_footer_cache(&self) {
-        *self.v4_footer.write() = None;
-    }
-
     pub fn to_arrow_batch_mmap(
         &self,
         column_names: Option<&[&str]>,
@@ -1188,19 +1184,6 @@ impl OnDemandStorage {
             return Ok(merged);
         }
         Ok(batch)
-    }
-
-    /// Stream row-group-sized `RecordBatch`es directly from the V4 mmap.
-    ///
-    /// Returns `Ok(None)` when the file has no persisted row groups. See
-    /// `RgBatchStream` for the stable read view contract.
-    pub(crate) fn scan_rg_batches<'a>(
-        &'a self,
-        column_names: Option<&[&str]>,
-        include_id: bool,
-        predicate: Option<&'a crate::storage::ScanPredicateExpr>,
-    ) -> io::Result<Option<RgBatchStream<'a>>> {
-        RgBatchStream::new(self, column_names, include_id, predicate)
     }
 
     /// B-phase fused parallel scan: `range_count` streams over
@@ -3977,6 +3960,7 @@ impl OnDemandStorage {
             .map(Some)
     }
 
+    #[cfg(feature = "python")]
     pub(crate) fn extract_rows_by_indices_mmap_columns(
         &self,
         indices: &[usize],
@@ -4450,7 +4434,8 @@ impl OnDemandStorage {
     /// Decode persisted rows for a projection. Only the requested columns are
     /// staged and decoded, which keeps small projected point/batch reads fast
     /// and avoids building unrequested column data.
-    pub fn retrieve_many_mmap_columns_projected(
+    #[cfg(feature = "python")]
+    pub(crate) fn retrieve_many_mmap_columns_projected(
         &self,
         ids: &[u64],
         columns: &[String],

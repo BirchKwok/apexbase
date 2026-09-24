@@ -761,7 +761,6 @@ impl WalRecord {
 // ============================================================================
 
 pub struct WalWriter {
-    path: PathBuf,
     file: BufWriter<File>,
     record_count: usize,
 }
@@ -865,7 +864,6 @@ impl WalWriter {
         writer.flush()?;
 
         Ok(Self {
-            path: path.to_path_buf(),
             file: writer,
             record_count: 0,
         })
@@ -906,7 +904,6 @@ impl WalWriter {
         #[cfg(not(windows))]
         let buf_writer = BufWriter::with_capacity(64 * 1024, file);
         Ok(Self {
-            path: path.to_path_buf(),
             file: buf_writer,
             record_count,
         })
@@ -1948,7 +1945,7 @@ impl ConcurrentWalWriter {
     /// Flush pending records to disk
     pub fn flush(&self) -> io::Result<()> {
         // Take all pending records
-        let mut pending = Vec::new();
+        let pending;
         {
             let mut buffer = self.buffer.lock();
             pending = std::mem::take(&mut *buffer);

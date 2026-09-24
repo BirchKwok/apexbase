@@ -81,8 +81,6 @@ pub struct StorageStats {
     active_readers: AtomicUsize,
     /// Current active writers (atomic for fast updates)
     active_writers: AtomicUsize,
-    /// Statistics snapshot timestamp
-    last_snapshot: AtomicU64,
     /// Snapshot interval in seconds
     snapshot_interval: u64,
 }
@@ -104,7 +102,6 @@ impl StorageStats {
             flush_count: AlignedCounter::new(),
             active_readers: AtomicUsize::new(0),
             active_writers: AtomicUsize::new(0),
-            last_snapshot: AtomicU64::new(0),
             snapshot_interval: 60, // Default 60 second interval
         }
     }
@@ -374,7 +371,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use std::thread;
-    use tempfile::tempdir;
 
     #[test]
     fn test_concurrent_stats() {

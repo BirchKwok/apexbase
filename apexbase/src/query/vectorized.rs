@@ -12,14 +12,10 @@
 //! 4. Minimal memory allocations
 
 use ahash::{AHashMap, AHasher};
-use arrow::array::{
-    Array, ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray, UInt64Array,
-};
-use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+use arrow::array::{Array, Float64Array, Int64Array, StringArray};
 use arrow::record_batch::RecordBatch;
 use std::hash::{Hash, Hasher};
 use std::io;
-use std::sync::Arc;
 
 /// Vector size for batch processing (DuckDB uses 2048)
 pub const VECTOR_SIZE: usize = 2048;

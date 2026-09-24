@@ -1007,11 +1007,6 @@ impl OnDemandStorage {
         &self,
         agg_cols: &[&str],
     ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
-        use arrow::array::PrimitiveArray;
-        use arrow::buffer::{Buffer, ScalarBuffer};
-        use arrow::datatypes::{Int64Type, Float64Type};
-        use std::sync::Arc;
-
         // Check if in-memory data is available for fast path
         let columns = self.columns.read();
         let has_in_memory = !columns.is_empty() && columns.iter().any(|c| c.len() > 0);

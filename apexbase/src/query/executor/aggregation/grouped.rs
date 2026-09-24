@@ -560,7 +560,7 @@ impl ApexExecutor {
             return Ok(None);
         }
 
-        let mut apply_row_ops = |row: usize, state: &mut State, pending: &mut usize| {
+        let apply_row_ops = |row: usize, state: &mut State, pending: &mut usize| {
             for op in &row_ops {
                 match op {
                     RowOp::Count { slot } => {
@@ -850,7 +850,7 @@ impl ApexExecutor {
         group_col_name: &str,
     ) -> io::Result<ApexResult> {
 
-        use crate::query::vectorized::{execute_vectorized_group_by, VectorizedHashAgg};
+        use crate::query::vectorized::execute_vectorized_group_by;
         use crate::query::AggregateFunc;
 
         // If group column has NULLs, fall back to incremental path which handles null keys
@@ -3396,7 +3396,6 @@ impl ApexExecutor {
         });
 
         // Parallel partitioned aggregation for large datasets
-        use rayon::prelude::*;
         let use_parallel = num_rows > 50_000;
 
         // S1: the generic keyed accumulator holds one state per distinct key.
@@ -4674,128 +4673,6 @@ impl ApexExecutor {
                 }
             }
             _ => None,
-        }
-    }
-
-    pub(in crate::query::executor) fn create_group_batch(        batch: &RecordBatch,
-        indices: &[usize],
-    ) -> io::Result<RecordBatch> {
-        let indices_array =
-            arrow::array::UInt64Array::from(indices.iter().map(|&i| i as u64).collect::<Vec<_>>());
-        compute::take_record_batch(batch, &indices_array).map_err(|e| err_data(e.to_string()))
-    }
-
-    pub(in crate::query::executor) fn evaluate_aggregate_condition(
-        batch: &RecordBatch,
-        expr: &SqlExpr,
-    ) -> io::Result<bool> {
-        match expr {
-            SqlExpr::BinaryOp { left, op, right } => {
-                // Check if this is a comparison operation
-                match op {
-                    BinaryOperator::Ge
-                    | BinaryOperator::Gt
-                    | BinaryOperator::Le
-                    | BinaryOperator::Lt
-                    | BinaryOperator::Eq
-                    | BinaryOperator::NotEq => {
-                        // Evaluate left and right, handling aggregates
-                        let left_val = Self::evaluate_aggregate_expr_scalar(batch, left)?;
-                        let right_val = Self::evaluate_aggregate_expr_scalar(batch, right)?;
-
-                        match op {
-                            BinaryOperator::Ge => Ok(left_val >= right_val),
-                            BinaryOperator::Gt => Ok(left_val > right_val),
-                            BinaryOperator::Le => Ok(left_val <= right_val),
-                            BinaryOperator::Lt => Ok(left_val < right_val),
-                            BinaryOperator::Eq => Ok((left_val - right_val).abs() < f64::EPSILON),
-                            BinaryOperator::NotEq => {
-                                Ok((left_val - right_val).abs() >= f64::EPSILON)
-                            }
-                            _ => unreachable!(),
-                        }
-                    }
-                    _ => {
-                        // For logical operators, evaluate as predicate
-                        let result = Self::evaluate_predicate(batch, expr)?;
-                        Ok(result.len() > 0 && result.value(0))
-                    }
-                }
-            }
-            _ => {
-                // For other expressions, try to evaluate as predicate
-                let result = Self::evaluate_predicate(batch, expr)?;
-                Ok(result.len() > 0 && result.value(0))
-            }
-        }
-    }
-
-    pub(in crate::query::executor) fn evaluate_aggregate_expr_scalar(
-        batch: &RecordBatch,
-        expr: &SqlExpr,
-    ) -> io::Result<f64> {
-        match expr {
-            SqlExpr::Function { name, args } => {
-                // Check if this is an aggregate function (zero-allocation)
-                let func_opt = if name.eq_ignore_ascii_case("SUM") {
-                    Some(AggregateFunc::Sum)
-                } else if name.eq_ignore_ascii_case("COUNT") {
-                    Some(AggregateFunc::Count)
-                } else if name.eq_ignore_ascii_case("AVG") {
-                    Some(AggregateFunc::Avg)
-                } else if name.eq_ignore_ascii_case("MIN") {
-                    Some(AggregateFunc::Min)
-                } else if name.eq_ignore_ascii_case("MAX") {
-                    Some(AggregateFunc::Max)
-                } else {
-                    None
-                };
-                if let Some(func) = func_opt {
-                    let col_name = if args.is_empty() {
-                        "*"
-                    } else if let SqlExpr::Column(c) = &args[0] {
-                        c.as_str()
-                    } else {
-                        "*"
-                    };
-                    // Create group indices covering all rows in the batch
-                    let all_indices: Vec<usize> = (0..batch.num_rows()).collect();
-                    let (_, result_arr) = Self::compute_aggregate_for_groups(
-                        batch,
-                        &func,
-                        &Some(col_name.to_string()),
-                        &None,
-                        &[all_indices],
-                        false,
-                    )?;
-                    if let Some(int_arr) = result_arr.as_any().downcast_ref::<Int64Array>() {
-                        Ok(if int_arr.len() > 0 && !int_arr.is_null(0) {
-                            int_arr.value(0) as f64
-                        } else {
-                            0.0
-                        })
-                    } else if let Some(float_arr) =
-                        result_arr.as_any().downcast_ref::<Float64Array>()
-                    {
-                        Ok(if float_arr.len() > 0 && !float_arr.is_null(0) {
-                            float_arr.value(0)
-                        } else {
-                            0.0
-                        })
-                    } else {
-                        Ok(0.0)
-                    }
-                } else {
-                    let arr = Self::evaluate_expr_to_array(batch, expr)?;
-                    Self::extract_scalar_from_array(&arr)
-                }
-            }
-            SqlExpr::Literal(Value::Int64(i)) => Ok(*i as f64),
-            SqlExpr::Literal(Value::Float64(f)) => Ok(*f),
-            _ => {
-                let arr = Self::evaluate_expr_to_array(batch, expr)?;
-                Self::extract_scalar_from_array(&arr)
-            }
         }
     }
 

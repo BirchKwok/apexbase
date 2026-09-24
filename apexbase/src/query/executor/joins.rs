@@ -589,7 +589,6 @@ impl ApexExecutor {
                             )?;
                             result_batch = Self::reorder_join_columns(
                                 &swapped,
-                                &result_batch,
                                 &right_batch,
                                 &right_key,
                             )?;
@@ -1293,16 +1292,6 @@ impl ApexExecutor {
         Ok(Some(ApexResult::Data(limited)))
     }
 
-    /// True when `name` is a column reference qualified with `qual`.
-    fn column_is_qualified_by(name: &str, qual: &str) -> bool {
-        let n = name.trim_matches('"');
-        let q = qual.trim_matches('"');
-        if q.is_empty() {
-            return false;
-        }
-        n.starts_with(&format!("{}.", q))
-    }
-
     fn source_names(from: &Option<FromItem>) -> Option<Vec<String>> {        match from.as_ref()? {
         FromItem::Table { table, alias } => {
 
@@ -1487,7 +1476,7 @@ impl ApexExecutor {
         let mut left_cols: Vec<String> = Vec::new();
         let mut right_cols: Vec<String> = Vec::new();
         {
-            let mut push = |cols: &mut Vec<String>, col: &str| {
+            let push = |cols: &mut Vec<String>, col: &str| {
                 let plain = col
                     .trim_matches('"')
                     .rsplit('.')
@@ -1651,7 +1640,7 @@ impl ApexExecutor {
         let mut left_cols: Vec<String> = Vec::new();
         let mut right_cols: Vec<String> = Vec::new();
         {
-            let mut push = |cols: &mut Vec<String>, col: &str| {
+            let push = |cols: &mut Vec<String>, col: &str| {
                 let plain = col
                     .trim_matches('"')
                     .rsplit('.')
@@ -2611,35 +2600,6 @@ impl ApexExecutor {
         }
     }
 
-    /// Resolve the table path for a point-lookup query by extracting the FROM clause table name.
-    /// Used by the QuerySignature::PointLookup pre-parse fast path.
-    fn resolve_point_lookup_table_path(
-        sql: &str,
-        base_dir: &Path,
-        default_table_path: &Path,
-    ) -> std::path::PathBuf {
-        let su = sql.trim().to_ascii_uppercase();
-        if let Some(fp) = su.find(" FROM ") {
-            let after_from = su[fp + 6..].trim_start();
-            let tn_end = after_from
-                .find(|c: char| c == ' ' || c == '\t' || c == '\n' || c == ';')
-                .unwrap_or(after_from.len());
-            let tname = after_from[..tn_end].trim_matches('"').to_lowercase();
-            if !tname.is_empty() {
-                let default_stem = default_table_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-                if tname == default_stem {
-                    return default_table_path.to_path_buf();
-                }
-                return base_dir.join(format!("{}.apex", tname));
-            }
-        }
-        default_table_path.to_path_buf()
-    }
-
     /// CBO: Reorder INNER JOIN clauses by ascending right-table row count.
     /// For up to eight relations this uses a bounded subset-DP memo.  Larger
     /// graphs intentionally keep their original order to avoid making planning
@@ -3272,8 +3232,8 @@ impl ApexExecutor {
         right_key: &str,
         join_type: &JoinType,
         right_alias: Option<&str>,
-        left_key_qualifier: Option<&str>,
-        right_key_qualifier: Option<&str>,
+        _left_key_qualifier: Option<&str>,
+        _right_key_qualifier: Option<&str>,
         extra_filter: &SqlExpr,
         storage_path: &Path,
     ) -> io::Result<RecordBatch> {
@@ -3382,7 +3342,7 @@ impl ApexExecutor {
             if !left_unmatched.is_empty() {
                 let indices = arrow::array::UInt32Array::from(left_unmatched);
                 let mut extra_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
-                for (idx, field) in left.schema().fields().iter().enumerate() {
+                for (idx, _field) in left.schema().fields().iter().enumerate() {
                     let taken = compute::take(left.column(idx).as_ref(), &indices, None)
                         .map_err(|e| err_data(e.to_string()))?;
                     extra_columns.push(taken);
@@ -3686,21 +3646,6 @@ impl ApexExecutor {
         }
     }
 
-    /// Convert expression to column name string (for display/field naming)
-    fn expr_to_column_name(expr: &SqlExpr) -> String {
-        match expr {
-            SqlExpr::Column(name) => {
-                // Handle table.column format - take the column part
-                if let Some(dot_pos) = name.rfind('.') {
-                    name[dot_pos + 1..].trim_matches('"').to_string()
-                } else {
-                    name.trim_matches('"').to_string()
-                }
-            }
-            _ => "group".to_string(),
-        }
-    }
-
     /// Perform hash join between two RecordBatches
     fn hash_join(
         left: &RecordBatch,
@@ -3721,7 +3666,7 @@ impl ApexExecutor {
         // RIGHT JOIN → LEFT JOIN with swapped tables, then reorder columns
         if *join_type == JoinType::Right {
             let swapped = Self::hash_join(right, left, right_key, left_key, &JoinType::Left)?;
-            return Self::reorder_join_columns(&swapped, left, right, right_key);
+            return Self::reorder_join_columns(&swapped, right, right_key);
         }
 
         // FULL OUTER JOIN → LEFT JOIN + append unmatched right rows
@@ -3769,8 +3714,15 @@ impl ApexExecutor {
         let should_swap =
             !matches!(join_type, JoinType::Left) && right.num_rows() > left.num_rows() * 2;
 
-        let (build_batch, probe_batch, build_key_col, probe_key_col, build_key, probe_key, swapped) =
-            if should_swap {
+        let (
+            build_batch,
+            probe_batch,
+            build_key_col,
+            probe_key_col,
+            _build_key,
+            _probe_key,
+            swapped,
+        ) = if should_swap {
                 (
                     left,
                     right,
@@ -3825,8 +3777,6 @@ impl ApexExecutor {
                 }
                 table
             };
-
-        let right_rows = right.num_rows();
 
         // Probe phase - use probe_batch (which may be swapped)
         let probe_rows = probe_batch.num_rows();
@@ -4243,13 +4193,11 @@ impl ApexExecutor {
     /// We need to put left cols first, right cols second (excluding join key from right).
     fn reorder_join_columns(
         swapped_result: &RecordBatch,
-        original_left: &RecordBatch,
         original_right: &RecordBatch,
         right_key: &str,
     ) -> io::Result<RecordBatch> {
         // swapped_result has: [right_columns..., left_columns_minus_join_key...]
         // We want:            [left_columns...(nullable), right_columns_minus_join_key...]
-        let left_ncols = original_left.num_columns();
         let right_ncols = original_right.num_columns();
         // In swapped result: first right_ncols are from original_right, rest are from original_left (minus key)
         let right_cols_in_result = right_ncols;
@@ -4675,8 +4623,6 @@ impl ApexExecutor {
     /// Take values from array with optional null indices (for LEFT JOIN)
     fn take_with_nulls(array: &ArrayRef, indices: &[Option<u32>]) -> io::Result<ArrayRef> {
         use arrow::array::*;
-
-        let len = indices.len();
 
         // Arrow's null-propagating take: a NULL index yields a NULL output row.
         // This is uniformly fast for primitive, string, and dictionary columns

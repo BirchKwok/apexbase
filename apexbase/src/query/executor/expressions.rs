@@ -1,8 +1,6 @@
 // Filter, predicate evaluation, expression evaluation, SQL functions
 
-use crate::query::vectorized_join::{
-    count_matching_float64, count_matching_int64, filter_float64_batch, filter_int64_batch,
-};
+use crate::query::vectorized_join::{filter_float64_batch, filter_int64_batch};
 use ahash::AHashSet;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -44,8 +42,6 @@ impl ApexExecutor {
         // This avoids unnecessary filter operation overhead
         let num_rows = batch.num_rows();
         if num_rows > 0 {
-            use arrow::array::BooleanArray;
-
             // OPTIMIZATION: Check if mask is all true (select all) - skip filtering
             if mask.null_count() == 0 {
                 // All values are non-null, check if all are true
@@ -749,8 +745,6 @@ impl ApexExecutor {
         outer_refs: &[String],
         subquery_path: &Path,
     ) -> io::Result<Option<BooleanArray>> {
-        use crate::query::sql_parser::BinaryOperator;
-
         // Extract correlation predicate: find "outer.col = inner.col" pattern
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
@@ -1193,7 +1187,6 @@ impl ApexExecutor {
         right: &SqlExpr,
     ) -> io::Result<BooleanArray> {
         use crate::query::sql_parser::BinaryOperator;
-        use arrow::array::Datum;
 
         // OPTIMIZATION: Fast path for column vs literal comparisons using scalar ops
         // This avoids broadcasting the literal to a full array
@@ -1254,7 +1247,6 @@ impl ApexExecutor {
         // FAST PATH: DictionaryArray<UInt32, Utf8> - compare using dictionary indices
         // OPTIMIZATION: Use direct buffer access instead of iterator for maximum speed
         use arrow::array::DictionaryArray;
-        use arrow::buffer::BooleanBuffer;
         use arrow::datatypes::UInt32Type;
         if let Some(dict_arr) = col_array
             .as_any()
@@ -2141,7 +2133,6 @@ impl ApexExecutor {
         idx: usize,
         lit: &Value,
     ) -> Option<std::cmp::Ordering> {
-        use std::cmp::Ordering;
         if array.is_null(idx) {
             return None;
         }
@@ -2270,13 +2261,12 @@ impl ApexExecutor {
         // Build the typed column.  INT/FLOAT mixtures are promoted to FLOAT;
         // STRING and BOOL columns stay in their native type.  All-NULL results
         // default to Int64, matching the non-correlated path.
-        let mut has_int = false;
         let mut has_float = false;
         let mut has_string = false;
         let mut has_bool = false;
         for value in &results {
             match value {
-                CorrelatedScalar::Int(_) => has_int = true,
+                CorrelatedScalar::Int(_) => {}
                 CorrelatedScalar::Float(_) => has_float = true,
                 CorrelatedScalar::String(_) => has_string = true,
                 CorrelatedScalar::Bool(_) => has_bool = true,
@@ -2322,35 +2312,6 @@ impl ApexExecutor {
             })
             .collect();
         Ok(Arc::new(Int64Array::from(values)))
-    }
-
-    /// Execute non-correlated scalar subquery (original implementation)
-    fn evaluate_scalar_subquery_simple(
-        batch: &RecordBatch,
-        stmt: &SelectStatement,
-        storage_path: &Path,
-    ) -> io::Result<ArrayRef> {
-        let sub_result = Self::execute_select(stmt.clone(), storage_path)?;
-        let sub_batch = sub_result.to_record_batch()?;
-
-        if sub_batch.num_rows() == 0 || sub_batch.num_columns() == 0 {
-            // Return null array
-            return Ok(Arc::new(Int64Array::from(vec![
-                None::<i64>;
-                batch.num_rows()
-            ])));
-        }
-
-        if sub_batch.num_rows() > 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Scalar subquery returned more than one row",
-            ));
-        }
-
-        // Get single value and broadcast
-        let sub_col = sub_batch.column(0);
-        Self::broadcast_scalar_array(sub_col, 0, batch.num_rows())
     }
 
     /// Broadcast a single value from array to num_rows
@@ -3202,13 +3163,11 @@ impl ApexExecutor {
                 // COALESCE follows normal SQL promotion: a DOUBLE input makes
                 // the whole expression DOUBLE, including integer fallbacks.
                 let mut has_string = false;
-                let mut has_int = false;
                 let mut has_float = false;
                 let mut arrays: Vec<ArrayRef> = Vec::new();
                 for arg in args {
                     let arr = Self::evaluate_expr_to_array(batch, arg)?;
                     has_string |= arr.as_any().downcast_ref::<StringArray>().is_some();
-                    has_int |= arr.as_any().downcast_ref::<Int64Array>().is_some();
                     has_float |= arr.as_any().downcast_ref::<Float64Array>().is_some();
                     arrays.push(arr);
                 }
@@ -3672,7 +3631,7 @@ impl ApexExecutor {
                     "SQRT",
                 )
             }
-            "MID" | "SUBSTR" | "SUBSTRING" => {
+            "MID" => {
                 if args.len() < 2 || args.len() > 3 {
                     return Err(err_input("SUBSTR requires 2-3 arguments"));
                 }
@@ -5614,7 +5573,7 @@ impl ApexExecutor {
 
         // Split path into segments
         let mut current = trimmed;
-        let mut owned = String::new();
+        let mut owned;
         for segment in path_str.split('.') {
             let (key, array_idx) = if let Some(bracket_pos) = segment.find('[') {
                 let key_part = &segment[..bracket_pos];
@@ -6210,130 +6169,6 @@ impl ApexExecutor {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
         Some(bytes)
-    }
-
-    /// Convert a SqlExpr back to a SQL string (for CHECK constraint persistence)
-    fn sql_expr_to_string(expr: &SqlExpr) -> String {
-        use crate::query::sql_parser::{BinaryOperator, UnaryOperator};
-        match expr {
-            SqlExpr::Column(name) => name.clone(),
-            SqlExpr::Literal(v) => match v {
-                Value::Int64(n) => n.to_string(),
-                Value::Int32(n) => n.to_string(),
-                Value::Float64(f) => format!("{}", f),
-                Value::Float32(f) => format!("{}", f),
-                Value::String(s) => format!("'{}'", s.replace('\'', "''")),
-                Value::Bool(b) => {
-                    if *b {
-                        "TRUE".to_string()
-                    } else {
-                        "FALSE".to_string()
-                    }
-                }
-                Value::Null => "NULL".to_string(),
-                _ => format!("{:?}", v),
-            },
-            SqlExpr::BinaryOp { left, op, right } => {
-                let op_str = match op {
-                    BinaryOperator::Eq => "=",
-                    BinaryOperator::NotEq => "!=",
-                    BinaryOperator::Lt => "<",
-                    BinaryOperator::Le => "<=",
-                    BinaryOperator::Gt => ">",
-                    BinaryOperator::Ge => ">=",
-                    BinaryOperator::And => "AND",
-                    BinaryOperator::Or => "OR",
-                    BinaryOperator::Add => "+",
-                    BinaryOperator::Sub => "-",
-                    BinaryOperator::Mul => "*",
-                    BinaryOperator::Div => "/",
-                    BinaryOperator::Mod => "%",
-                };
-                format!(
-                    "{} {} {}",
-                    Self::sql_expr_to_string(left),
-                    op_str,
-                    Self::sql_expr_to_string(right)
-                )
-            }
-            SqlExpr::UnaryOp { op, expr } => match op {
-                UnaryOperator::Not => format!("NOT {}", Self::sql_expr_to_string(expr)),
-                UnaryOperator::Minus => format!("-{}", Self::sql_expr_to_string(expr)),
-            },
-            SqlExpr::Paren(inner) => format!("({})", Self::sql_expr_to_string(inner)),
-            SqlExpr::Like {
-                column,
-                pattern,
-                negated,
-            } => {
-                if *negated {
-                    format!("{} NOT LIKE '{}'", column, pattern)
-                } else {
-                    format!("{} LIKE '{}'", column, pattern)
-                }
-            }
-            SqlExpr::In {
-                column,
-                values,
-                negated,
-            } => {
-                let vals: Vec<String> = values
-                    .iter()
-                    .map(|v| match v {
-                        Value::Int64(n) => n.to_string(),
-                        Value::String(s) => format!("'{}'", s),
-                        _ => format!("{:?}", v),
-                    })
-                    .collect();
-                if *negated {
-                    format!("{} NOT IN ({})", column, vals.join(", "))
-                } else {
-                    format!("{} IN ({})", column, vals.join(", "))
-                }
-            }
-            SqlExpr::IsNull { column, negated } => {
-                if *negated {
-                    format!("{} IS NOT NULL", column)
-                } else {
-                    format!("{} IS NULL", column)
-                }
-            }
-            SqlExpr::Between {
-                column,
-                low,
-                high,
-                negated,
-            } => {
-                if *negated {
-                    format!(
-                        "{} NOT BETWEEN {} AND {}",
-                        column,
-                        Self::sql_expr_to_string(low),
-                        Self::sql_expr_to_string(high)
-                    )
-                } else {
-                    format!(
-                        "{} BETWEEN {} AND {}",
-                        column,
-                        Self::sql_expr_to_string(low),
-                        Self::sql_expr_to_string(high)
-                    )
-                }
-            }
-            SqlExpr::Function { name, args } => {
-                let arg_strs: Vec<String> =
-                    args.iter().map(|a| Self::sql_expr_to_string(a)).collect();
-                format!("{}({})", name, arg_strs.join(", "))
-            }
-            SqlExpr::Cast { expr, data_type } => {
-                format!(
-                    "CAST({} AS {:?})",
-                    Self::sql_expr_to_string(expr),
-                    data_type
-                )
-            }
-            _ => format!("{:?}", expr),
-        }
     }
 
     /// Parse a date string to days since Unix epoch.

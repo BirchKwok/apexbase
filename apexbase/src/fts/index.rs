@@ -399,6 +399,7 @@ impl MmapTermDirectory {
         Ok(postings)
     }
 
+    #[cfg(test)]
     fn cached_len(&self) -> usize {
         self.cache.lock().0.len()
     }
@@ -753,27 +754,11 @@ impl IndexState {
         Ok(())
     }
 
-    fn base_term_count(&self) -> usize {
-        self.base_postings.len()
-            + self
-                .mmap_postings
-                .as_ref()
-                .map_or(0, |directory| directory.term_count)
-    }
-
     fn base_terms(&self) -> FtsResult<Vec<&str>> {
         let mut terms: Vec<&str> = self.base_postings.keys().map(String::as_str).collect();
         if let Some(directory) = &self.mmap_postings {
             terms.extend(directory.terms()?);
         }
         Ok(terms)
-    }
-
-    fn contains_base_term(&self, term: &str) -> bool {
-        self.base_postings.contains_key(term)
-            || self
-                .mmap_postings
-                .as_ref()
-                .is_some_and(|directory| directory.term_id(term).is_some())
     }
 }

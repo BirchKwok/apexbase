@@ -12,7 +12,7 @@ mod having;
 mod scalar;
 
 #[derive(Clone, Copy)]
-enum JsonProjectionTransform {
+pub(in crate::query::executor) enum JsonProjectionTransform {
     Scalar,
     StringArray,
 }
@@ -341,7 +341,6 @@ impl ApexExecutor {
         order_by: &[crate::query::OrderByClause],
     ) -> io::Result<RecordBatch> {
         use arrow::compute::SortColumn;
-        use rayon::prelude::*;
 
         // Pre-evaluate expression ORDER BY columns (e.g. ORDER BY array_distance(...))
         let batch_cow = if order_by.iter().any(|o| {
@@ -1027,23 +1026,6 @@ impl ApexExecutor {
         // OPTIMIZATION: For small k, use heap-based top-k (O(n log k))
         // For larger k, use partial sort (O(n + k log k))
         let indices: Vec<usize> = if k <= 100 {
-            // Heap-based approach for small k - maintains a max-heap of size k
-            use std::collections::BinaryHeap;
-
-            // Wrapper for reverse comparison (we want min-heap behavior for top-k)
-            struct HeapItem(usize);
-
-            impl PartialEq for HeapItem {
-                fn eq(&self, other: &Self) -> bool {
-                    self.0 == other.0
-                }
-            }
-            impl Eq for HeapItem {}
-
-            // Create comparison closure that captures typed_sort_cols
-            let mut heap: BinaryHeap<(std::cmp::Reverse<usize>, usize)> =
-                BinaryHeap::with_capacity(k + 1);
-
             // Simple approach: store (score, index) where score is computed once
             // For numeric DESC sorting, we can use the value directly as score
             if typed_sort_cols.len() == 1 {
@@ -1497,40 +1479,6 @@ impl ApexExecutor {
     /// Create a sub-batch containing only the specified row indices
     /// Evaluate condition that may contain aggregate functions
     /// Evaluate expression that may be an aggregate, returning scalar value
-    /// Extract scalar value from array
-    pub(in crate::query::executor) fn extract_scalar_from_array(arr: &ArrayRef) -> io::Result<f64> {
-        if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-            Ok(if int_arr.len() > 0 && !int_arr.is_null(0) {
-                int_arr.value(0) as f64
-            } else {
-                0.0
-            })
-        } else if let Some(float_arr) = arr.as_any().downcast_ref::<Float64Array>() {
-            Ok(if float_arr.len() > 0 && !float_arr.is_null(0) {
-                float_arr.value(0)
-            } else {
-                0.0
-            })
-        } else {
-            Ok(0.0)
-        }
-    }
-
-    /// Check if an expression contains a correlated subquery
-    pub(in crate::query::executor) fn has_correlated_subquery(expr: &SqlExpr) -> bool {
-        match expr {
-            SqlExpr::ExistsSubquery { .. }
-            | SqlExpr::InSubquery { .. }
-            | SqlExpr::ScalarSubquery { .. } => true,
-            SqlExpr::BinaryOp { left, right, .. } => {
-                Self::has_correlated_subquery(left) || Self::has_correlated_subquery(right)
-            }
-            SqlExpr::UnaryOp { expr, .. } => Self::has_correlated_subquery(expr),
-            SqlExpr::Paren(inner) => Self::has_correlated_subquery(inner),
-            _ => false,
-        }
-    }
-
     pub(in crate::query::executor) fn coerce_numeric_for_comparison(
         left: ArrayRef,
         right: ArrayRef,
@@ -1607,50 +1555,6 @@ impl ApexExecutor {
                 }
             }
         }
-        None
-    }
-
-    /// Extract simple string equality filter: column = 'literal' or 'literal' = column
-    /// Returns (column_name, literal_value, is_equality) if matches, None otherwise
-    #[inline]
-    pub(in crate::query::executor) fn extract_simple_string_filter(expr: &SqlExpr) -> Option<(String, String, bool)> {
-        use crate::query::sql_parser::BinaryOperator;
-
-        if let SqlExpr::BinaryOp { left, op, right } = expr {
-            let is_eq = matches!(op, BinaryOperator::Eq);
-            let is_neq = matches!(op, BinaryOperator::NotEq);
-
-            if !is_eq && !is_neq {
-                return None;
-            }
-
-            // Check column = 'literal' pattern
-            if let (SqlExpr::Column(col), SqlExpr::Literal(Value::String(lit))) =
-                (left.as_ref(), right.as_ref())
-            {
-                let col_name = col.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                    &col_name[dot_pos + 1..]
-                } else {
-                    col_name
-                };
-                return Some((actual_col.to_string(), lit.clone(), is_eq));
-            }
-
-            // Check 'literal' = column pattern
-            if let (SqlExpr::Literal(Value::String(lit)), SqlExpr::Column(col)) =
-                (left.as_ref(), right.as_ref())
-            {
-                let col_name = col.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                    &col_name[dot_pos + 1..]
-                } else {
-                    col_name
-                };
-                return Some((actual_col.to_string(), lit.clone(), is_eq));
-            }
-        }
-
         None
     }
 

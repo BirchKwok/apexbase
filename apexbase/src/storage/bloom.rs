@@ -4,7 +4,7 @@
 //! This significantly speeds up string equality filters on large tables.
 
 use bloomfilter::Bloom;
-use std::io::{self, Read, Write};
+use std::io;
 
 /// Row group bloom filter for string columns
 /// Each row group (default 64K rows) has its own bloom filter

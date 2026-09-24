@@ -72,7 +72,7 @@ pub trait PartitionStrategy: Send + Sync {
         &self,
         _low: &PartitionKey,
         _high: &PartitionKey,
-        shard_count: u32,
+        _shard_count: u32,
     ) -> Option<Vec<ShardId>> {
         None // Default: must scan all shards
     }
@@ -115,20 +115,6 @@ impl HashPartitioner {
             virtual_nodes,
             ring: None,
         }
-    }
-
-    /// Build the consistent hash ring for the given shard count
-    fn build_ring(&mut self, shard_count: u32) {
-        let mut ring = BTreeMap::new();
-        for shard_id in 0..shard_count {
-            for vn in 0..self.virtual_nodes {
-                let mut hasher = AHasher::default();
-                (shard_id, vn).hash(&mut hasher);
-                let hash = hasher.finish();
-                ring.insert(hash, shard_id);
-            }
-        }
-        self.ring = Some(ring);
     }
 
     /// Lookup on the consistent hash ring

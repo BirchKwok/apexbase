@@ -16,7 +16,6 @@ use parking_lot::RwLock;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
-use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -133,24 +132,6 @@ fn parse_agg_select(sql: &str) -> Option<Vec<(String, Option<String>, Option<Str
         None
     } else {
         Some(result)
-    }
-}
-
-/// Compute sum/min/max from an Arrow array (Int64 or Float64)
-fn agg_array_stats(arr: &dyn arrow::array::Array) -> (f64, f64, f64, bool) {
-    use arrow::array::{Float64Array, Int64Array};
-    if let Some(ia) = arr.as_any().downcast_ref::<Int64Array>() {
-        let sum: i64 = ia.iter().flatten().sum();
-        let min = ia.iter().flatten().min().unwrap_or(i64::MAX);
-        let max = ia.iter().flatten().max().unwrap_or(i64::MIN);
-        (sum as f64, min as f64, max as f64, true)
-    } else if let Some(fa) = arr.as_any().downcast_ref::<Float64Array>() {
-        let sum: f64 = fa.iter().flatten().sum();
-        let min = fa.iter().flatten().fold(f64::INFINITY, f64::min);
-        let max = fa.iter().flatten().fold(f64::NEG_INFINITY, f64::max);
-        (sum, min, max, false)
-    } else {
-        (0.0, 0.0, 0.0, false)
     }
 }
 
@@ -479,14 +460,6 @@ fn projected_values_to_row_dict<'py>(
     Ok(Some(row))
 }
 
-#[derive(Clone, Copy)]
-struct NumericUpdateCellCache {
-    footer_offset: u64,
-    null_byte_file_offset: u64,
-    null_mask: u8,
-    value_file_offset: u64,
-}
-
 /// Per-client backend cache validated by the storage-owned table epoch.
 /// The epoch is shared through the table lock mapping, so the hot path is an
 /// atomic load even when another process may commit the table.
@@ -586,8 +559,6 @@ pub struct ApexStorageImpl {
     cached_backends: EpochBackendCache,
     /// Verified `(table, column) -> ColumnType` entries for numeric `_id` update fast paths.
     update_by_id_numeric_cache: DashMap<String, (crate::storage::on_demand::ColumnType, u64)>,
-    /// Verified `(table, column, id) -> physical cell offsets` entries for repeated numeric updates.
-    update_by_id_cell_cache: DashMap<String, (NumericUpdateCellCache, u64)>,
     /// Exact full-row payloads for repeated idempotent `replace(id, row)` calls.
     replace_exact_row_cache: DashMap<String, (HashMap<String, Value>, u64)>,
     /// Tables written since the last flush; flush preopens their read backend
@@ -1410,34 +1381,6 @@ impl ApexStorageImpl {
         })
     }
 
-    /// Get backend for UPDATE/DELETE operations - loads all data into memory.
-    /// This is required because save() rewrites the entire file.
-    fn get_backend(&self) -> PyResult<Arc<TableStorageBackend>> {
-        let table_name = self.current_table.read().clone();
-        let table_path = self.get_current_table_path()?;
-        let cache_key = Self::backend_cache_key(&table_path, &table_name);
-
-        // Check if backend is already cached (lock-free read)
-        if let Some(entry) = self.cached_backends.get(&cache_key) {
-            return Ok(entry.clone());
-        }
-
-        // Create new backend with durability level and cache it
-        // Use open_for_write to ensure existing column data is loaded
-        // This is necessary because save() rewrites the entire file from in-memory columns
-        let backend = if table_path.exists() {
-            crate::Database::open_write_backend(&table_path, self.durability)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?
-        } else {
-            crate::Database::create_backend(&table_path, self.durability)
-                .map_err(|e| PyIOError::new_err(e.to_string()))?
-        };
-
-        self.cached_backends.insert(cache_key, backend.clone());
-
-        Ok(backend)
-    }
-
     fn get_read_backend_cached(&self, py: Python<'_>) -> PyResult<Arc<TableStorageBackend>> {
         let (table_path, table_name) = self.get_current_table_info()?;
         let cache_key = Self::backend_cache_key(&table_path, &table_name);
@@ -1479,9 +1422,6 @@ impl ApexStorageImpl {
         let update_cache_marker = format!("\0{table_name}\0");
         let legacy_prefix = format!("{table_name}\0");
         self.update_by_id_numeric_cache.retain(|key, _| {
-            !(key.starts_with(&legacy_prefix) || key.contains(&update_cache_marker))
-        });
-        self.update_by_id_cell_cache.retain(|key, _| {
             !(key.starts_with(&legacy_prefix) || key.contains(&update_cache_marker))
         });
         let replace_cache_marker = format!("\0{table_name}\0replace\0");
@@ -1621,7 +1561,6 @@ impl ApexStorageImpl {
             tables_scanned: RwLock::new(false),
             cached_backends: EpochBackendCache::new(),
             update_by_id_numeric_cache: DashMap::new(),
-            update_by_id_cell_cache: DashMap::new(),
             replace_exact_row_cache: DashMap::new(),
             flush_prewarm_tables: DashMap::new(),
             current_table: RwLock::new(String::new()),

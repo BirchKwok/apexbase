@@ -483,16 +483,6 @@ impl ApexExecutor {
         }
     }
 
-    /// Hash all column values in a single row to a u64 fingerprint
-    fn hash_row(batch: &RecordBatch, row: usize) -> u64 {
-        use std::hash::Hasher;
-        let mut hasher = AHasher::default();
-        for col in batch.columns() {
-            hasher.write_u64(Self::hash_array_value_fast(col, row));
-        }
-        hasher.finish()
-    }
-
     /// Row hash that resolves dictionary-encoded string columns through their
     /// key ids: O(dict) string hashing for the whole set operation instead of
     /// one hash per row.
@@ -977,29 +967,6 @@ impl ApexExecutor {
             .map_err(|e| err_data( e.to_string()))
     }
 
-    /// Append value signature for deduplication
-    fn append_value_signature(sig: &mut Vec<u8>, array: &ArrayRef, idx: usize) {
-        if array.is_null(idx) {
-            sig.push(0);
-            return;
-        }
-        sig.push(1);
-
-        if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
-            sig.extend_from_slice(&arr.value(idx).to_le_bytes());
-        } else if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
-            sig.extend_from_slice(&arr.value(idx).to_le_bytes());
-        } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-            sig.extend_from_slice(&arr.value(idx).to_bits().to_le_bytes());
-        } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-            let s = arr.value(idx);
-            sig.extend_from_slice(&(s.len() as u32).to_le_bytes());
-            sig.extend_from_slice(s.as_bytes());
-        } else if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
-            sig.push(if arr.value(idx) { 1 } else { 0 });
-        }
-    }
-
     /// Execute window function (ROW_NUMBER, RANK, DENSE_RANK, NTILE, PERCENT_RANK, CUME_DIST, LAG, LEAD, SUM, AVG, etc.)
     fn execute_window_function(batch: &RecordBatch, stmt: &SelectStatement) -> io::Result<ApexResult> {
         // Collect window specs:
@@ -1086,7 +1053,7 @@ impl ApexExecutor {
         // work, so retain the ordered row groups for the duration of this SELECT.
         let mut ordered_group_cache: AHashMap<String, Arc<Vec<Vec<usize>>>> = AHashMap::new();
 
-        for (spec_idx, (func_name, func_args, partition_by, order_by, _, frame)) in window_specs.iter().enumerate() {
+        for (spec_idx, (func_name, func_args, partition_by, order_by, _, _frame)) in window_specs.iter().enumerate() {
             let cache_key = format!("{:?}|{:?}", partition_by, order_by);
             let order_cols: Vec<(ArrayRef, bool)> = order_by
                 .iter()

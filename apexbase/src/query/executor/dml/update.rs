@@ -995,25 +995,6 @@ impl ApexExecutor {
         }
     }
 
-    pub(in crate::query::executor) fn get_value_at(array: &ArrayRef, row: usize) -> Option<Value> {
-        if array.is_null(row) {
-            return Some(Value::Null);
-        }
-        if let Some(arr) = array.as_any().downcast_ref::<Int64Array>() {
-            Some(Value::Int64(arr.value(row)))
-        } else if let Some(arr) = array.as_any().downcast_ref::<Float64Array>() {
-            Some(Value::Float64(arr.value(row)))
-        } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {
-            Some(Value::String(arr.value(row).to_string()))
-        } else if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
-            Some(Value::Bool(arr.value(row)))
-        } else if let Some(arr) = array.as_any().downcast_ref::<UInt64Array>() {
-            Some(Value::Int64(arr.value(row) as i64))
-        } else {
-            None
-        }
-    }
-
     pub(in crate::query::executor) fn evaluate_expr_to_value(
         batch: &RecordBatch,
         expr: &SqlExpr,

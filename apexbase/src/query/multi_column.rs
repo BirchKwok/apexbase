@@ -3,7 +3,7 @@
 //! This module extends the vectorized execution to support multi-column GROUP BY
 //! with efficient hash aggregation and parallel processing.
 
-use ahash::{AHashMap, AHashSet, AHasher};
+use ahash::{AHashMap, AHasher};
 use arrow::array::{
     Array, ArrayRef, BooleanArray, DictionaryArray, Float64Array, Int64Array, StringArray,
 };
@@ -14,7 +14,7 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::sync::Arc;
 
-use crate::query::vectorized::{AggregateState, GroupHash, VECTOR_SIZE};
+use crate::query::vectorized::{AggregateState, VECTOR_SIZE};
 
 /// Typed column reference for multi-column grouping
 #[derive(Clone, Copy)]
@@ -348,7 +348,6 @@ pub fn build_multi_column_result(
 ) -> io::Result<RecordBatch> {
     use crate::query::AggregateFunc;
 
-    let num_groups = hash_agg.num_groups();
     let first_indices = hash_agg.first_row_indices();
     let states = hash_agg.states();
 

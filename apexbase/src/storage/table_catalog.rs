@@ -64,6 +64,8 @@ static REGISTRY_CACHE: Lazy<
 /// A memory-mapped catalog file plus its persistent exclusive lock handle.
 struct MappedCatalog {
     base_dir: PathBuf,
+    // Held to keep the backing file handle open for the mapping's lifetime.
+    #[allow(dead_code)]
     file: fs::File,
     mapping: MmapMut,
     lock_file: fs::File,
@@ -288,6 +290,8 @@ impl MappedCatalog {
 /// `release()`/`clear()` drop the mapping so Windows can rewrite the file.
 struct MappedSchemas {
     base_dir: PathBuf,
+    // Held to keep the backing file handle open for the mapping's lifetime.
+    #[allow(dead_code)]
     file: fs::File,
     mapping: MmapMut,
     file_len: u64,

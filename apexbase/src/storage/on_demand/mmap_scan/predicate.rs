@@ -185,12 +185,6 @@ pub(crate) enum LikeKind {
     Regex(regex::Regex),
 }
 
-/// Pre-compiled finder for contains patterns (much faster than on-the-fly)
-/// Uses memchr's precompilation which caches SIMD state
-pub struct PrecompiledFinder {
-    finder: memchr::memmem::Finder<'static>,
-}
-
 /// Test whether a raw byte slice matches a LikeKind pattern.
 /// Must not allocate — called inside Rayon parallel closures.
 #[inline(always)]
@@ -682,7 +676,6 @@ impl OnDemandStorage {
                     if pos + null_bitmap_len > body.len() {
                         break;
                     }
-                    let null_bytes = &body[pos..pos + null_bitmap_len];
                     pos += null_bitmap_len;
                     let ct = schema.columns[ci].1;
                     if ci == col_idx {
@@ -2089,7 +2082,6 @@ impl OnDemandStorage {
             let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
             let body = &rg_bytes[32..];
             let null_bitmap_len = (rg_rows + 7) / 8;
-            let del_vec_len = null_bitmap_len;
 
             let col_off =
                 if rg_i < footer.col_offsets.len() && col_idx < footer.col_offsets[rg_i].len() {
@@ -3335,9 +3327,7 @@ impl OnDemandStorage {
         let Some((lo_idx, hi_idx)) = self.prefix_like_range_sorted(str_idx, prefix)? else {
             return Ok(None);
         };
-        let like_count = (hi_idx - lo_idx) as i64;
         let total = self.active_row_count() as i64;
-        let not_like = total - like_count;
 
         // |age ∈ [lo, hi]| via the numeric aggregation.
         let age_in = match self.execute_filtered_numeric_agg_mmap(num_col, lo, hi, &["*"])? {
@@ -4436,7 +4426,6 @@ impl OnDemandStorage {
             // Lazily copy and rewrite the SET value array only when at least one
             // matching row would physically change. Repeated idempotent UPDATEs
             // still return the matched-row count without dirtying the file.
-            use std::io::{Seek, SeekFrom, Write};
             let mut value_buf: Option<Vec<u8>> = None;
             let mut rg_updated = 0i64;
             match where_vals {

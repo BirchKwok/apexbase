@@ -5,7 +5,7 @@ impl ApexExecutor {
         expr: &crate::query::SqlExpr,
         select_cols: &[crate::query::SelectColumn],
     ) -> Vec<(crate::query::AggregateFunc, Option<String>)> {
-        use crate::query::{AggregateFunc, SelectColumn, SqlExpr};
+        use crate::query::{AggregateFunc, SelectColumn};
 
         // Build set of already-present aggregate output names
         let existing: Vec<String> = select_cols

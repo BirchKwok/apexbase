@@ -221,7 +221,7 @@ impl ApexExecutor {
                                 return Ok(result);
                             }
                         }
-                        let mut sub_select = sel.clone();
+                        let sub_select = sel.clone();
                         // The `ROW_NUMBER() <= k` pushdown is disabled: it gathers
                         // the retained rows with `take` using positions that can
                         // reference rows outside the evaluated partition batch,
@@ -644,11 +644,6 @@ return Ok(result);
                                 && !where_cols.is_empty();
 
                             // Late Materialization for ORDER BY: SELECT * with ORDER BY + LIMIT (no WHERE)
-                            let order_cols: Vec<String> = stmt
-                                .order_by
-                                .iter()
-                                .map(|o| o.column.trim_matches('"').to_string())
-                                .collect();
                             let can_late_materialize_order = stmt.is_select_star()
                                 && stmt.where_clause.is_none()
                                 && !stmt.order_by.is_empty()
@@ -1380,7 +1375,6 @@ return Ok(result);
         };
 
         // Determine row limit for early termination
-        let row_limit = stmt.limit;
 
         // Check for aggregation BEFORE checking empty batch
         // Aggregations like COUNT(*) should return 0 for empty tables
@@ -2157,95 +2151,6 @@ return Ok(result);
                     .as_deref()
                     .map_or(true, |c| c == "*" || c == "1")
             )
-    }
-
-    fn extract_outer_row_number_limit(
-        where_clause: &Option<SqlExpr>,
-        subquery: &SelectStatement,
-    ) -> Option<(String, usize)> {
-        let aliases: Vec<String> = subquery
-            .columns
-            .iter()
-            .filter_map(|column| {
-                if let SelectColumn::WindowFunction { name, alias, .. } = column {
-                    if name.eq_ignore_ascii_case("ROW_NUMBER") {
-                        return Some(
-                            alias
-                                .clone()
-                                .unwrap_or_else(|| "row_number".to_string())
-                                .to_ascii_lowercase(),
-                        );
-                    }
-                }
-                None
-            })
-            .collect();
-        if aliases.is_empty() {
-            return None;
-        }
-
-        fn clean_column(name: &str) -> String {
-            let trimmed = name.trim_matches('"');
-            trimmed
-                .rsplit('.')
-                .next()
-                .unwrap_or(trimmed)
-                .trim_matches('"')
-                .to_ascii_lowercase()
-        }
-
-        fn literal_usize(expr: &SqlExpr) -> Option<usize> {
-            match expr {
-                SqlExpr::Literal(Value::Int64(value)) if *value >= 0 => Some(*value as usize),
-                SqlExpr::Literal(Value::UInt64(value)) => Some(*value as usize),
-                _ => None,
-            }
-        }
-
-        fn visit(expr: &SqlExpr, aliases: &[String]) -> Option<(String, usize)> {
-            match expr {
-                SqlExpr::BinaryOp {
-                    left,
-                    op: BinaryOperator::And,
-                    right,
-                } => visit(left, aliases).or_else(|| visit(right, aliases)),
-                SqlExpr::BinaryOp { left, op, right } => {
-                    if let SqlExpr::Column(column) = left.as_ref() {
-                        let alias = clean_column(column);
-                        if aliases.iter().any(|known| known == &alias) {
-                            if let Some(value) = literal_usize(right) {
-                                return match op {
-                                    BinaryOperator::Le => Some((alias, value)),
-                                    BinaryOperator::Lt => {
-                                        value.checked_sub(1).map(|limit| (alias, limit))
-                                    }
-                                    _ => None,
-                                };
-                            }
-                        }
-                    }
-                    if let SqlExpr::Column(column) = right.as_ref() {
-                        let alias = clean_column(column);
-                        if aliases.iter().any(|known| known == &alias) {
-                            if let Some(value) = literal_usize(left) {
-                                return match op {
-                                    BinaryOperator::Ge => Some((alias, value)),
-                                    BinaryOperator::Gt => {
-                                        value.checked_sub(1).map(|limit| (alias, limit))
-                                    }
-                                    _ => None,
-                                };
-                            }
-                        }
-                    }
-                    None
-                }
-                SqlExpr::Paren(inner) => visit(inner, aliases),
-                _ => None,
-            }
-        }
-
-        where_clause.as_ref().and_then(|expr| visit(expr, &aliases))
     }
 
     /// Fast path for simple string equality filters on dictionary-encoded columns
@@ -3079,129 +2984,6 @@ return Ok(result);
         }
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
             .map_err(|error| err_data(error.to_string()))?;
-        Ok(Some(ApexResult::Data(batch)))
-    }
-
-    /// V4 FAST PATH: Simple aggregation (no GROUP BY, no WHERE)
-    /// Handles: SELECT COUNT(*), AVG(col), SUM(col), MIN(col), MAX(col) FROM table
-    fn try_fast_simple_agg(
-        backend: &TableStorageBackend,
-        stmt: &SelectStatement,
-    ) -> io::Result<Option<ApexResult>> {
-        if backend.has_pending_deltas() || backend.is_mmap_only() {
-            return Ok(None);
-        }
-
-        use crate::query::AggregateFunc;
-
-        // Collect unique column names needed for aggregation
-        let mut unique_cols: Vec<String> = Vec::new();
-        for col in &stmt.columns {
-            if let SelectColumn::Aggregate {
-                func,
-                column,
-                distinct,
-                ..
-            } = col
-            {
-                if *distinct {
-                    return Ok(None);
-                } // DISTINCT needs full scan
-                let name = column.as_deref().unwrap_or("*");
-                if name == "_id" {
-                    return Ok(None);
-                } // _id stored separately
-                if !unique_cols.contains(&name.to_string()) {
-                    unique_cols.push(name.to_string());
-                }
-            } else {
-                return Ok(None); // Non-aggregate column present
-            }
-        }
-        if unique_cols.is_empty() {
-            return Ok(None);
-        }
-
-        let col_refs: Vec<&str> = unique_cols.iter().map(|s| s.as_str()).collect();
-        let raw = match backend.execute_simple_agg(&col_refs)? {
-            Some(r) => r,
-            None => return Ok(None),
-        };
-
-        // Build result
-        let mut fields: Vec<Field> = Vec::new();
-        let mut arrays: Vec<ArrayRef> = Vec::new();
-
-        for col in &stmt.columns {
-            if let SelectColumn::Aggregate {
-                func,
-                column,
-                alias,
-                ..
-            } = col
-            {
-                let col_name = column.as_deref().unwrap_or("*");
-                let fn_name = match func {
-                    AggregateFunc::Count => "COUNT",
-                    AggregateFunc::Sum => "SUM",
-                    AggregateFunc::Avg => "AVG",
-                    AggregateFunc::Min => "MIN",
-                    AggregateFunc::Max => "MAX",
-                };
-                let output_name = alias.clone().unwrap_or_else(|| {
-                    if let Some(c) = column {
-                        format!("{}({})", fn_name, c)
-                    } else {
-                        format!("{}(*)", fn_name)
-                    }
-                });
-
-                let idx = unique_cols.iter().position(|s| s == col_name).unwrap_or(0);
-                let (count, sum, min_v, max_v, is_int) = raw[idx];
-
-                match func {
-                    AggregateFunc::Count => {
-                        fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
-                        arrays.push(Arc::new(Int64Array::from(vec![count])));
-                    }
-                    AggregateFunc::Sum => {
-                        if is_int {
-                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
-                            arrays.push(Arc::new(Int64Array::from(vec![sum as i64])));
-                        } else {
-                            fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
-                            arrays.push(Arc::new(Float64Array::from(vec![sum])));
-                        }
-                    }
-                    AggregateFunc::Avg => {
-                        let avg = if count > 0 { sum / count as f64 } else { 0.0 };
-                        fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
-                        arrays.push(Arc::new(Float64Array::from(vec![avg])));
-                    }
-                    AggregateFunc::Min => {
-                        if is_int {
-                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
-                            arrays.push(Arc::new(Int64Array::from(vec![min_v as i64])));
-                        } else {
-                            fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
-                            arrays.push(Arc::new(Float64Array::from(vec![min_v])));
-                        }
-                    }
-                    AggregateFunc::Max => {
-                        if is_int {
-                            fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
-                            arrays.push(Arc::new(Int64Array::from(vec![max_v as i64])));
-                        } else {
-                            fields.push(Field::new(&output_name, ArrowDataType::Float64, false));
-                            arrays.push(Arc::new(Float64Array::from(vec![max_v])));
-                        }
-                    }
-                }
-            }
-        }
-
-        let schema = Arc::new(Schema::new(fields));
-        let batch = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
         Ok(Some(ApexResult::Data(batch)))
     }
 
@@ -5107,7 +4889,7 @@ return Ok(result);
 
         // `raw` only lists groups with a non-zero CASE count, but GROUP BY
         // must emit every group (with 0 for groups that match no row).
-        let mut count_map: std::collections::HashMap<&str, i64> = raw
+        let count_map: std::collections::HashMap<&str, i64> = raw
             .iter()
             .map(|(group, _, count)| (group.as_str(), *count))
             .collect();
@@ -5349,7 +5131,6 @@ return Ok(result);
         };
 
         // Build result
-        let num_groups = raw.len();
         let group_values: Vec<&str> = raw.iter().map(|(k, _)| k.as_str()).collect();
 
         let mut fields: Vec<Field> = vec![Field::new(group_col, ArrowDataType::Utf8, false)];
@@ -6013,7 +5794,6 @@ return Ok(result);
     /// Extract OR chain of same-column numeric equalities: col = 1 OR col = 2 OR ...
     /// Returns (column_name, vec_of_i64_values) — equivalent to numeric IN.
     fn extract_or_numeric_equalities(expr: &SqlExpr) -> Option<(String, Vec<i64>)> {
-        use crate::query::sql_parser::BinaryOperator;
         let mut values = Vec::new();
         let mut col_name: Option<String> = None;
         Self::collect_or_numeric_equalities(expr, &mut col_name, &mut values)?;
@@ -6393,25 +6173,6 @@ return Ok(result);
             return Ok(Some(ApexResult::Data(projected)));
         }
         Ok(Some(ApexResult::Data(batch)))
-    }
-
-    /// Helper to extract boolean equality: col = true/false
-    fn extract_bool_equality(expr: &SqlExpr) -> Option<(String, bool)> {
-        use crate::query::sql_parser::BinaryOperator;
-        match expr {
-            SqlExpr::BinaryOp {
-                left,
-                op: BinaryOperator::Eq,
-                right,
-            } => match (left.as_ref(), right.as_ref()) {
-                (SqlExpr::Column(col), SqlExpr::Literal(Value::Bool(val)))
-                | (SqlExpr::Literal(Value::Bool(val)), SqlExpr::Column(col)) => {
-                    Some((col.trim_matches('"').to_string(), *val))
-                }
-                _ => None,
-            },
-            _ => None,
-        }
     }
 
     /// Helper to extract numeric comparison: col > N, col >= N, col < N, col <= N

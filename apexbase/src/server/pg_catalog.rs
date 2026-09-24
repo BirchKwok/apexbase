@@ -265,7 +265,7 @@ fn discover_tables(base_dir: &Path) -> Vec<String> {
             }
             // Also check subdirectories (table directories)
             if path.is_dir() {
-                if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+                if path.file_name().and_then(|s| s.to_str()).is_some() {
                     // Check if it contains .apex files
                     if let Ok(sub_entries) = std::fs::read_dir(&path) {
                         for sub_entry in sub_entries.flatten() {

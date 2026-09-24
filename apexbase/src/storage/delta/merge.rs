@@ -3,7 +3,6 @@
 //! Merges DeltaStore (updates + deletes) with base columnar data to produce
 //! a consistent view without modifying the base file.
 
-use std::collections::HashMap;
 use std::io;
 use std::sync::Arc;
 

@@ -530,7 +530,6 @@ impl ApexStorageImpl {
             return Ok(None);
         }
 
-        let durability = self.durability;
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
             let lock_file = Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -617,7 +616,6 @@ impl ApexStorageImpl {
             }
         }
 
-        let durability = self.durability;
         let ids = py.allow_threads(|| -> PyResult<Vec<u64>> {
             let lock_file = Self::acquire_write_lock(&table_path)
                         .map_err(|e| PyIOError::new_err(e.to_string()))?;
@@ -2187,7 +2185,6 @@ impl ApexStorageImpl {
         // Clear per-instance cached backends (releases per-instance references)
         self.cached_backends.clear();
         self.update_by_id_numeric_cache.clear();
-        self.update_by_id_cell_cache.clear();
         self.replace_exact_row_cache.clear();
         self.flush_prewarm_tables.clear();
 

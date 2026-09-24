@@ -766,8 +766,8 @@ fn lut_scatter(
 /// its comparisons as straight-line code (0 RangeI64, 1 RangeF64, 2 InI64,
 /// 3 InF64).
 #[inline(always)]
-fn lc_eval<const mode: u8>(r: &FusedLutWork, j: usize, i: usize) -> bool {
-    match mode {
+fn lc_eval<const MODE: u8>(r: &FusedLutWork, j: usize, i: usize) -> bool {
+    match MODE {
         0 => {
             if r.elem_width[j] == 1 {
                 let delta = unsafe { *r.pr[j].add(i) } as usize;
@@ -864,7 +864,7 @@ fn lut_loop_0(w: &mut FusedRgWork, r: &FusedLutWork) {
 }
 
 /// LUT row loop, k = 1.
-fn lut_loop_1<const m0: u8>(w: &mut FusedRgWork, r: &FusedLutWork) {
+fn lut_loop_1<const M0: u8>(w: &mut FusedRgWork, r: &FusedLutWork) {
     // Row-work fields are copied to locals once: the hot loop never
     // reloads them through the reference.
     let gids = w.gids;
@@ -885,7 +885,7 @@ fn lut_loop_1<const m0: u8>(w: &mut FusedRgWork, r: &FusedLutWork) {
             continue;
         }
         let gid = unsafe { *gids.get_unchecked(i) } as usize;
-        let b0 = lc_eval::<m0>(r, 0, i) as usize;
+        let b0 = lc_eval::<M0>(r, 0, i) as usize;
         let m = unsafe { *lut.get_unchecked((b0 << shift) | gid) };
         if m != 0 {
             unsafe { *counts.add(gid) += 1; }
@@ -895,7 +895,7 @@ fn lut_loop_1<const m0: u8>(w: &mut FusedRgWork, r: &FusedLutWork) {
 }
 
 /// LUT row loop, k = 2.
-fn lut_loop_2<const m0: u8, const m1: u8>(w: &mut FusedRgWork, r: &FusedLutWork) {
+fn lut_loop_2<const M0: u8, const M1: u8>(w: &mut FusedRgWork, r: &FusedLutWork) {
     // Row-work fields are copied to locals once: the hot loop never
     // reloads them through the reference.
     let gids = w.gids;
@@ -916,8 +916,8 @@ fn lut_loop_2<const m0: u8, const m1: u8>(w: &mut FusedRgWork, r: &FusedLutWork)
             continue;
         }
         let gid = unsafe { *gids.get_unchecked(i) } as usize;
-        let b0 = lc_eval::<m0>(r, 0, i) as usize;
-        let b1 = lc_eval::<m1>(r, 1, i) as usize;
+        let b0 = lc_eval::<M0>(r, 0, i) as usize;
+        let b1 = lc_eval::<M1>(r, 1, i) as usize;
         let m = unsafe { *lut.get_unchecked(((b0 | (b1 << 1)) << shift) | gid) };
         if m != 0 {
             unsafe { *counts.add(gid) += 1; }
@@ -927,7 +927,7 @@ fn lut_loop_2<const m0: u8, const m1: u8>(w: &mut FusedRgWork, r: &FusedLutWork)
 }
 
 /// LUT row loop, k = 3.
-fn lut_loop_3<const m0: u8, const m1: u8, const m2: u8>(
+fn lut_loop_3<const M0: u8, const M1: u8, const M2: u8>(
     w: &mut FusedRgWork,
     r: &FusedLutWork,
 ) {
@@ -951,9 +951,9 @@ fn lut_loop_3<const m0: u8, const m1: u8, const m2: u8>(
             continue;
         }
         let gid = unsafe { *gids.get_unchecked(i) } as usize;
-        let b0 = lc_eval::<m0>(r, 0, i) as usize;
-        let b1 = lc_eval::<m1>(r, 1, i) as usize;
-        let b2 = lc_eval::<m2>(r, 2, i) as usize;
+        let b0 = lc_eval::<M0>(r, 0, i) as usize;
+        let b1 = lc_eval::<M1>(r, 1, i) as usize;
+        let b2 = lc_eval::<M2>(r, 2, i) as usize;
         let m = unsafe {
             *lut.get_unchecked(((b0 | (b1 << 1) | (b2 << 2)) << shift) | gid)
         };

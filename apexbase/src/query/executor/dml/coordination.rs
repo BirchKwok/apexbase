@@ -13,7 +13,7 @@ mod insert;
 mod update;
 
 #[derive(Clone, Copy)]
-struct PushdownFilter {
+pub(in crate::query::executor) struct PushdownFilter {
     col_idx: usize,
     op: u8,
     op_eq: bool,
@@ -36,19 +36,19 @@ impl PushdownFilter {
 }
 
 #[derive(Clone)]
-struct JsonNumericFilter {
+pub(in crate::query::executor) struct JsonNumericFilter {
     key: Vec<u8>,
     op: BinaryOperator,
     flipped: bool,
     val_f64: f64,
 }
 
-struct DefaultEvalContext {
+pub(in crate::query::executor) struct DefaultEvalContext {
     now: chrono::DateTime<chrono::Utc>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum CsvBadLinePolicy {
+pub(in crate::query::executor) enum CsvBadLinePolicy {
     Error,
     Skip,
     Warn,
@@ -1315,13 +1315,12 @@ impl ApexExecutor {
     }
 
     pub(in crate::query::executor) fn rows_to_apex_result(
-        col_names: &[String],
+        _col_names: &[String],
         rows: &[Vec<Value>],
         schema: &Arc<arrow::datatypes::Schema>,
     ) -> io::Result<ApexResult> {
         use arrow::array::{
-            ArrayBuilder, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
-            UInt64Builder,
+            BooleanBuilder, Float64Builder, Int64Builder, StringBuilder, UInt64Builder,
         };
         use arrow::datatypes::DataType;
 

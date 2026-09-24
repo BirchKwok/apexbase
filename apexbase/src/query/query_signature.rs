@@ -969,16 +969,6 @@ fn extract_simple_id_in_list(sql: &str, su: &str) -> Option<Vec<u64>> {
     Some(ids)
 }
 
-/// Extract LIMIT value from uppercased SQL.
-fn extract_limit_from_upper(su: &str) -> Option<usize> {
-    let after_limit = su.rsplit("LIMIT").next()?;
-    after_limit
-        .trim()
-        .trim_end_matches(';')
-        .parse::<usize>()
-        .ok()
-}
-
 /// Extract LIMIT/OFFSET values from uppercased SQL.
 fn extract_limit_offset_from_upper(su: &str) -> Option<(usize, usize)> {
     let after_limit = su.rsplit("LIMIT").next()?;

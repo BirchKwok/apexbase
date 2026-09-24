@@ -3,6 +3,51 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.36.2](https://github.com/BirchKwok/ApexBase/releases/tag/v1.36.2)
+*2026-09-24*
+
+[Compare with v1.36.1](https://github.com/BirchKwok/ApexBase/compare/v1.36.1...v1.36.2)
+
+### Highlights
+
+v1.36.2 is a compiler-hygiene and baseline-maintenance release. The crate now
+compiles with zero warnings under every feature configuration the release
+workflow builds — core, `server`, `flight`, the default `python` set, and the
+full `python` + `server` + `flight` set that the wheels ship — which removed
+roughly 2,500 lines of unreachable code without touching any reachable path, the
+`.apex` file format, or the public Python, Rust, PostgreSQL-wire, and Flight
+entry points. It also refreshes the checked-in public performance baseline to
+the released v1.36.1 so that future comparisons are made against the current
+generation instead of the stale v1.33.0 snapshot.
+
+### Compiler Warning Cleanup
+
+- Remove every unused item the compiler reported: 51 dead functions, constants, wrapper types, struct fields and helper methods; 65 unused imports; 47 unused bindings; 10 unneeded `mut`; 9 dead assignments; and 2 unreachable `match` arms, including a shadowed `SqlExpr::InSubquery` arm that duplicated an earlier pattern
+- Delete the vestigial `update_by_id_cell_cache`: it was initialized, cleared and retained but never inserted into, so the per-client `DashMap` and its no-op maintenance calls only cost memory
+- Keep the two file-handle fields in `MappedCatalog` / `MappedSchemas` with an explicit `#[allow(dead_code)]` and a comment, because they anchor the mapped file for the mapping's lifetime
+- Gate the five helpers that only in-crate unit tests call (`cached_len`, `QueryMemoryBudget::limit`/`used`, `ScanBound::exclusive`, `PreparedCommit::txn_id`, `insert_typed_to_delta`) behind `#[cfg(test)]` instead of leaving them compiled into the shipping library
+- Make `flush_out_rg!` return the flushed row count and assign it only where the counter is read, removing the dead store the final invocation performed while keeping the row-group flush boundary identical
+- Gate the Python-only `Database` wrappers (`cached_backend`, `cache_backend`, `open_backend`, `open_insert_backend`, `create_backend`, `temp_dir`, `invalidate_query_cache`, and the FTS `wait_fts_backfill` / `has_fts_backfill` / `fts_manager` / `register_fts_manager` / `unregister_fts_manager` / `fts_backfill` / `enable_fts_config` / `read_fts_config` helpers) and the two mmap projection helpers behind `#[cfg(feature = "python")]`, and the executor's `wait_fts_backfills_for_dir` / `unregister_fts_manager` / `has_fts_backfill` / `cache_backend_pub` behind `#[cfg(feature = "python")]` (plus `test` for the two the Rust unit tests drive), so the core-only configuration the release workflow builds is warning-free too
+- Silence the remaining non-unused diagnostics: explicit `{reg:v}` formatting for the aarch64 `fcvtl`/`fcvtl2` operands, an explicit `#[pyo3(signature = (where_clause, limit=None))]` for `_query_arrow_ffi`, `'_`-annotated lock guards, upper-case const-generic parameters in the fused LUT loops, `pub(crate)` / `pub(in crate::query::executor)` on the types the corresponding helpers expose, and removal of the `[profile.release.package.apexbase-server]` override that never matched a package
+
+### Performance Baseline
+
+- Regenerate `benchmarks/latest_public_baseline.json` from the released v1.36.1 tag (commit `9d365cb`), built locally with the same toolchain and `target-cpu=native` flags, keeping the comparison on one machine and one dependency set; the previous v1.33.0 snapshot is retained under `local-perf-results/`
+
+### Validation And Performance
+
+- `cargo check --release --all-targets` reports zero warnings and zero errors for every configuration the release workflow builds: core (`--no-default-features`), `server`, `flight`, the default `python` set, and the full `python` + `server` + `flight` set
+- Release build, the complete serial Python suite (1,894 passed), and the complete Rust suites passed on this tree in both the default-feature and the core-only (`--no-default-features --release`) configuration (630 unit + 6 documentation tests each)
+- The public 1,000,000-row benchmark completed with ApexBase winning 103/103 tabular, 6/6 exact-vector, and 6/6 shared quantized-vector comparisons; the previously load-sensitive `NOT filter (age NOT BETWEEN, name NOT LIKE)` measured 2.08 ms against DuckDB's 3.03 ms
+- The same-machine canary against `origin/main` passed 64/64; the full-mode same-machine gate passed 109/109 metrics with zero regressions, together with its Q/s, quantized-index, index and parallel-scan phases
+- The two JSON-read metrics that a single-shot public run flagged as slower were re-checked by the interleaved multi-sample gate, which placed them at +8.85% and +14.29% (inside threshold) with overlapping sample ranges, confirming run-to-run file-I/O noise rather than a regression
+
+### Upgrade Notes
+
+- No `.apex` file-format change, no API change, and no migration from v1.36.1
+- Update the Rust crate and Python package version metadata to 1.36.2
+
+
 ## [v1.36.1](https://github.com/BirchKwok/ApexBase/releases/tag/v1.36.1)
 *2026-09-23*
 

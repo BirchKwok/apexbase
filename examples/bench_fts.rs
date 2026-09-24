@@ -9,7 +9,6 @@
 //!   cargo run --example bench_fts --no-default-features --release
 
 use std::collections::HashMap;
-use std::path::Path;
 use std::time::Instant;
 
 use apexbase::fts::{FtsConfig, FtsEngine};

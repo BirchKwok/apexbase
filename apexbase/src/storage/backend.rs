@@ -1982,14 +1982,14 @@ impl TableStorageBackend {
     /// Acquire global read lock for thread-safe concurrent reads.
     /// Multiple readers can hold the lock simultaneously.
     #[inline]
-    pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<()> {
+    pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
         self.storage.read_lock()
     }
 
     /// Acquire global write lock for thread-safe writes.
     /// Only one writer can hold the lock; readers are blocked while held.
     #[inline]
-    pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<()> {
+    pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
         self.storage.write_lock()
     }
 
@@ -3026,7 +3026,7 @@ impl TableStorageBackend {
         column_names: Option<&[&str]>,
     ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
         use arrow::array::{Array, ArrayRef, DictionaryArray, StringArray, UInt32Array};
-        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema, UInt32Type};
+        use arrow::datatypes::{Field, Schema, UInt32Type};
         use std::sync::Arc;
 
         let Some(names) = column_names else {
@@ -3866,7 +3866,6 @@ impl TableStorageBackend {
         let schema = self.schema.read();
         let mut fields: Vec<Field> = Vec::new();
         let mut arrays: Vec<ArrayRef> = Vec::new();
-        let expected_row_count = matching_indices.len();
 
         // Include _id column with filtered indices
         let include_id = column_names
@@ -4211,7 +4210,7 @@ impl TableStorageBackend {
         col_refs: Option<&[&str]>,
     ) -> io::Result<arrow::record_batch::RecordBatch> {
         use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
-        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+        use arrow::datatypes::{DataType as ArrowDataType, Field};
         use std::sync::Arc;
 
         if row_indices.is_empty() {
@@ -4428,7 +4427,6 @@ impl TableStorageBackend {
         &self,
         id: u64,
     ) -> io::Result<Option<arrow::record_batch::RecordBatch>> {
-        use crate::data::DataType;
         use arrow::array::{ArrayRef, BooleanArray, Float64Array, Int64Array, StringArray};
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
@@ -5882,18 +5880,6 @@ impl TableStorageBackend {
             .scan_top_k_by_length_mmap(str_col, tie_col, k, length_desc, tie_desc)
     }
 
-    /// Decode persisted rows for a projection through the mmap fast path.
-    /// Only the requested columns are staged and decoded, which keeps small
-    /// projected point/batch reads fast for both the Python binding and Rust
-    /// crate users.
-    pub fn retrieve_many_mmap_columns_projected(
-        &self,
-        ids: &[u64],
-        columns: &[String],
-    ) -> io::Result<Option<crate::storage::on_demand::MmapBatchColumns>> {
-        self.storage.retrieve_many_mmap_columns_projected(ids, columns)
-    }
-
     /// Get underlying storage for direct access
     pub fn storage(&self) -> &OnDemandStorage {
         &self.storage
@@ -6449,12 +6435,6 @@ impl TableStorageBackend {
         limit: usize,
         offset: usize,
     ) -> io::Result<Option<RecordBatch>> {
-        use crate::data::AggregateFunc;
-        use arrow::array::{DictionaryArray, Float64Array, Int64Array, StringArray, UInt32Array};
-        use arrow::datatypes::UInt32Type;
-        use std::cmp::Ordering;
-        use std::collections::BinaryHeap;
-
         // This optimization requires dictionary-encoded columns for maximum performance
         // Get filter column info
         let schema_guard = self.schema.read();
@@ -7227,7 +7207,6 @@ mod tests {
     #[test]
     fn test_column_projection_correctness() {
         use crate::storage::OnDemandStorage;
-        use arrow::array::{Int64Array, StringArray};
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_proj.apex");
@@ -7282,7 +7261,6 @@ mod tests {
     #[test]
     fn test_row_range_scan() {
         use crate::storage::OnDemandStorage;
-        use arrow::array::Int64Array;
 
         let dir = tempdir().unwrap();
         let path = dir.path().join("test_range.apex");
@@ -7880,7 +7858,7 @@ mod tests {
     fn overlay_state_separates_base_in_memory_from_pending_writes() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("overlay_state_base_in_memory.apex");
-        let mut builder = TableStorageBackend::create(&path).unwrap();
+        let builder = TableStorageBackend::create(&path).unwrap();
         builder.add_column("v", DataType::Int64).unwrap();
         builder
             .insert_rows(&[

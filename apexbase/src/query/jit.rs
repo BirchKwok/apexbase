@@ -271,7 +271,6 @@ impl ExprJIT {
         let one = builder.ins().iconst(types::I64, 1);
         let four = builder.ins().iconst(types::I64, 4);
         let eight = builder.ins().iconst(types::I64, 8);
-        let thirty_two = builder.ins().iconst(types::I64, 32);
 
         // 4-way unrolled main loop
         let loop_header = builder.create_block();

@@ -872,7 +872,7 @@ enum ParallelScanOverride {
 
 /// Holds in-flight worker tokens; returns them on drop so every exit path
 /// of the parallel path releases the budget (RAII).
-struct ParallelTokenGuard {
+pub(crate) struct ParallelTokenGuard {
     count: usize,
 }
 

@@ -1454,7 +1454,6 @@ impl ApexStorageImpl {
         // Clear all per-database caches
         self.cached_backends.clear();
         self.update_by_id_numeric_cache.clear();
-        self.update_by_id_cell_cache.clear();
         self.replace_exact_row_cache.clear();
         self.table_paths.write().clear();
         *self.tables_scanned.write() = false;

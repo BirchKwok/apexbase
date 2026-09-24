@@ -236,7 +236,7 @@ impl FtsEngine {
         let mut all_terms: AHashSet<&str> = state.base_terms()?.into_iter().collect();
         all_terms.extend(state.delta_postings.keys().map(String::as_str));
         let max_candidates = config.fuzzy_max_candidates.clamp(1, 256);
-        let mut best = RoaringTreemap::new();
+        let mut best;
         let mut threshold = config.fuzzy_threshold;
         loop {
             let mut result: Option<RoaringTreemap> = None;

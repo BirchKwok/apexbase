@@ -67,6 +67,7 @@ impl ScanBound {
         }
     }
 
+    #[cfg(test)]
     #[inline]
     pub(crate) fn exclusive(value: ScanValue) -> Self {
         Self {

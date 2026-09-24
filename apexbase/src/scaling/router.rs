@@ -6,11 +6,10 @@
 //! - Write routing based on partition key
 
 use std::collections::HashMap;
-use std::io;
 use std::sync::Arc;
 
 use super::partition::{PartitionKey, PartitionStrategy};
-use super::shard::{ShardId, ShardManager, ShardMeta};
+use super::shard::{ShardId, ShardManager};
 
 // ============================================================================
 // Routing Decision

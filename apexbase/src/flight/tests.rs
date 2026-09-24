@@ -2,7 +2,6 @@
 //! Compiled only with the `flight` feature.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use arrow::array::Int64Array;
 use arrow_flight::error::FlightError;

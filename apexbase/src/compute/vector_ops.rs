@@ -2459,8 +2459,8 @@ unsafe fn f16x8_to_f32pair(
     let lo: float32x4_t;
     let hi: float32x4_t;
     std::arch::asm!(
-        "fcvtl  {lo}.4s, {src}.4h",
-        "fcvtl2 {hi}.4s, {src}.8h",
+        "fcvtl  {lo:v}.4s, {src:v}.4h",
+        "fcvtl2 {hi:v}.4s, {src:v}.8h",
         src = in(vreg) src,
         lo  = out(vreg) lo,
         hi  = out(vreg) hi,
