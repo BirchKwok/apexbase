@@ -1492,6 +1492,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#wal-crash-recovery" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        WAL Crash Recovery
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#validation-fixes" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2901,13 +2912,29 @@
 <p><a href="https://github.com/BirchKwok/ApexBase/compare/v1.37.0...v1.37.1">Compare with v1.37.0</a></p>
 <h3 id="highlights">Highlights<a class="headerlink" href="#highlights" title="Permanent link">&para;</a></h3>
 <p>v1.37.1 is the <strong>V5 architecture preview</strong> release. It republishes everything in
-v1.37.0 together with the fixes the release workflow itself surfaced: the
-first v1.37.0 run failed on three of the new tests, all of them on Windows (and
-one of them also on the macOS Python 3.9 job), so no wheel, crate or PyPI
-artifact was published from that tag. This release carries the same V5 code and
-fixes the tests, so the same validation chain now also passes on those
-configurations. Read the <a href="#v1370">v1.37.0 notes</a> for the V5 preview description
-and the compatibility rules.</p>
+v1.37.0 together with what the release run itself surfaced: a crash-recovery
+defect that the new tests caught, and three of those tests failing on Windows
+(one of them also on the macOS Python 3.9 job). The first v1.37.0 run published
+nothing — no wheel, crate or PyPI artifact — so v1.37.1 is the release that
+carries the V5 preview. Read the <a href="#v1370">v1.37.0 notes</a> for the V5 preview
+description and the compatibility rules.</p>
+<h3 id="wal-crash-recovery">WAL Crash Recovery<a class="headerlink" href="#wal-crash-recovery" title="Permanent link">&para;</a></h3>
+<ul>
+<li>Stop panicking on a WAL record a crash left half-written:
+  <code>WalRecord::from_bytes_versioned</code> sliced the 13-byte header, the body and the
+  trailing CRC without checking that the buffer was long enough, so a truncated
+  record crashed the process (<code>range end index 9 out of range for slice of length
+  7</code> at <code>storage/incremental.rs:410</code>) instead of ending the valid prefix that
+  <code>read_all_with_offsets</code> scans. A record that cannot be parsed completely now
+  returns <code>InvalidData</code>, and a corrupt length is bounds-checked with a checked
+  add so it cannot wrap into a slice inside the buffer</li>
+<li>This was reachable from <code>SELECT COUNT(*)</code> (through <code>fast_row_count</code>) on any
+  table whose WAL ended in a partially written record: the Linux Python 3.10 job
+  hit it in <code>test_kill_during_commit_is_all_or_nothing</code>, which kills the writer
+  mid-commit on purpose. Add a Rust regression test that cuts a real record at
+  every byte offset and asserts an error rather than a panic, plus a corrupt
+  length, and that the complete record still round-trips</li>
+</ul>
 <h3 id="validation-fixes">Validation Fixes<a class="headerlink" href="#validation-fixes" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Stop asserting that the out-of-core importer's table file was <em>observed growing</em>:
@@ -2925,9 +2952,10 @@ and the compatibility rules.</p>
 <li>Give the out-of-core CSV scan assertion Windows working-set headroom: Windows
   counts shared and file-backed pages that Linux and macOS do not, so the previous
   100 MB resident-set bound was reached by measurement rather than by the
-  materializing path this test exists to catch. The bound is 250 MB on Windows and
+  materializing path this test exists to catch. The bound is 400 MB on Windows and
   stays at 100 MB elsewhere, still far below the +1397 MB the materializing path
-  added</li>
+  added; the fixture also writes its CSV in batched byte chunks now instead of one
+  encode per row, so the allocation noise the assertion sees is smaller</li>
 <li>Allow the saturated-statement timing comparison the same 10 ms the server's wait
   budget allows, because both sides are wall-clock samples from a busy machine;
   the rejection must still be shorter than the statement that held the slot</li>
@@ -2943,8 +2971,9 @@ and the compatibility rules.</p>
   <code>flight</code>), the public 1,000,000-row benchmark (102/103 tabular, 6/6 exact-vector,
   6/6 quantized-vector) and the full-mode same-machine gate (10 of 11 phases
   unmarked, with <code>CROSS JOIN COUNT</code> the long-standing jitter)</li>
-<li>No production code changed between v1.37.0 and v1.37.1: the diff is the three
-  test fixes, the benchmark-side RSS probe and the version metadata</li>
+<li>Apart from the WAL bounds checks, no production code changed between v1.37.0 and
+  v1.37.1: the rest of the diff is the test fixes, the benchmark-side RSS probe and
+  the version metadata</li>
 </ul>
 <h3 id="upgrade-notes">Upgrade Notes<a class="headerlink" href="#upgrade-notes" title="Permanent link">&para;</a></h3>
 <ul>
