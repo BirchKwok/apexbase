@@ -4,10 +4,11 @@
 
 use std::collections::HashMap;
 use std::fmt::Debug;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use parking_lot::RwLock;
+use tokio::sync::Semaphore;
 
 use async_trait::async_trait;
 use futures::stream;
@@ -42,6 +43,61 @@ use super::types::{schema_to_field_info, schema_to_field_info_binary};
 /// Client metadata key for tracking current database per connection
 const METADATA_KEY_DB: &str = "apex_current_db";
 
+/// Default number of statements that may execute at once.
+///
+/// Every query used to run *on* a tokio worker: execution concurrency was capped
+/// by the worker count and a long scan stalled that worker's share of the
+/// connection loop. Queries now run on the blocking pool under this bound, so
+/// the reactor keeps accepting, reading and encoding while they execute.
+/// `APEX_SERVER_QUERY_CONCURRENCY` overrides it; an unparsable or zero value
+/// keeps the derived default.
+pub fn default_query_concurrency() -> usize {
+    let cpus = std::thread::available_parallelism().map_or(4, |count| count.get());
+    std::env::var("APEX_SERVER_QUERY_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| cpus.saturating_mul(2).max(1))
+}
+
+/// How long a statement waits for a query slot before it is rejected.
+///
+/// `APEX_SERVER_QUERY_WAIT_MS` overrides it; zero or an unparsable value keeps
+/// the default. The bound exists because the semaphore queue is unbounded: a
+/// client must learn that the server is at capacity instead of waiting forever.
+pub fn default_query_wait() -> std::time::Duration {
+    let millis = std::env::var("APEX_SERVER_QUERY_WAIT_MS")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(30_000);
+    std::time::Duration::from_millis(millis)
+}
+
+/// A statement failure with the SQLSTATE a client acts on.
+#[derive(Debug)]
+struct QueryFailure {
+    code: &'static str,
+    message: String,
+}
+
+impl QueryFailure {
+    fn new(message: impl Into<String>) -> Self {
+        Self {
+            code: "42000",
+            message: message.into(),
+        }
+    }
+
+    /// The server is at its statement capacity; the client may retry.
+    fn capacity(message: impl Into<String>) -> Self {
+        Self {
+            code: "53300",
+            message: message.into(),
+        }
+    }
+}
+
 /// ApexBase handler for PostgreSQL wire protocol
 pub struct ApexBaseHandler {
     /// Root directory containing .apex database files and named-database subdirs
@@ -49,14 +105,54 @@ pub struct ApexBaseHandler {
     /// Schema cache: SQL template → Arc<Vec<FieldInfo>>.
     /// Avoids re-executing queries in do_describe_statement just to get column schema.
     schema_cache: RwLock<HashMap<String, (Arc<Vec<FieldInfo>>, u64)>>,
+    /// Admission control for query execution. Waiting here queues a statement
+    /// instead of occupying a reactor thread, and never blocks the connection.
+    query_slots: Arc<Semaphore>,
+    /// How long a statement may wait for a slot before it is rejected.
+    query_wait: std::time::Duration,
+    /// Configured capacity, reported even while every slot is busy.
+    query_limit: usize,
 }
 
 impl ApexBaseHandler {
     pub fn new(base_dir: PathBuf) -> Self {
+        Self::with_query_limits(base_dir, default_query_concurrency(), default_query_wait())
+    }
+
+    /// Build a handler whose queries run at most `query_concurrency` at a time.
+    pub fn with_query_concurrency(base_dir: PathBuf, query_concurrency: usize) -> Self {
+        Self::with_query_limits(base_dir, query_concurrency, default_query_wait())
+    }
+
+    /// Build a handler with explicit admission limits.
+    pub fn with_query_limits(
+        base_dir: PathBuf,
+        query_concurrency: usize,
+        query_wait: std::time::Duration,
+    ) -> Self {
+        let query_limit = query_concurrency.max(1);
         Self {
             base_dir,
             schema_cache: RwLock::new(HashMap::new()),
+            query_slots: Arc::new(Semaphore::new(query_limit)),
+            query_wait,
+            query_limit,
         }
+    }
+
+    /// How many statements this handler runs at once (the configured capacity).
+    pub fn query_concurrency(&self) -> usize {
+        self.query_limit
+    }
+
+    /// Slots that are free right now.
+    pub fn available_query_slots(&self) -> usize {
+        self.query_slots.available_permits()
+    }
+
+    /// How long a statement waits for a slot before it is rejected.
+    pub fn query_wait(&self) -> std::time::Duration {
+        self.query_wait
     }
 
     /// Look up cached schema for a SQL string.
@@ -92,19 +188,66 @@ impl ApexBaseHandler {
     }
 
     /// Execute a SQL query in the context of the given database.
-    fn execute_query_with_db(&self, sql: &str, current_db: &str) -> Result<RecordBatch, String> {
-        if let Some(batch) = pg_catalog::try_handle_catalog_query(sql, &self.base_dir) {
-            return Ok(batch);
-        }
-        let base_dir = self.effective_base_dir(current_db);
-        let default_table_path = base_dir.join("apexbase.apex");
-        let exec_result = crate::Session::new(&base_dir, &default_table_path)
-            .with_root_dir(&self.base_dir)
-            .execute(sql);
-        exec_result
+    ///
+    /// This is the synchronous core: the caller owns a query slot and runs it on
+    /// a blocking thread, so it must not touch the async runtime.
+    fn execute_query_sync(
+        base_dir: &Path,
+        database_dir: &Path,
+        sql: &str,
+    ) -> Result<RecordBatch, String> {
+        let default_table_path = database_dir.join("apexbase.apex");
+        crate::Session::new(database_dir, &default_table_path)
+            .with_root_dir(base_dir)
+            .execute(sql)
             .map_err(|e| e.to_string())?
             .to_record_batch()
             .map_err(|e| e.to_string())
+    }
+
+    /// Execute a SQL query in the context of the given database, waiting for a
+    /// query slot and running the work on the blocking pool.
+    ///
+    /// The wait is bounded: the semaphore queue is unbounded, so past
+    /// [`Self::query_wait`] the statement is rejected with `53300` instead of
+    /// queueing forever.
+    async fn run_query(
+        &self,
+        sql: &str,
+        current_db: &str,
+    ) -> Result<RecordBatch, QueryFailure> {
+        // Catalog probes are cheap metadata answers that every client polls on
+        // connect; they must never queue behind a running table scan.
+        if let Some(batch) = pg_catalog::try_handle_catalog_query(sql, &self.base_dir) {
+            return Ok(batch);
+        }
+        let base_dir = self.base_dir.clone();
+        let database_dir = self.effective_base_dir(current_db);
+        let sql = sql.to_string();
+        let permit = match tokio::time::timeout(
+            self.query_wait,
+            Arc::clone(&self.query_slots).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => {
+                return Err(QueryFailure::new(format!("query admission closed: {error}")))
+            }
+            Err(_) => {
+                return Err(QueryFailure::capacity(format!(
+                    "too many concurrent statements: all {} query slots are busy",
+                    self.query_concurrency()
+                )))
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            Self::execute_query_sync(&base_dir, &database_dir, &sql)
+        })
+        .await
+        .map_err(|error| QueryFailure::new(format!("query task failed: {error}")))?
+        .map_err(QueryFailure::new)
     }
 
     /// Try to parse a USE / \c database-switching command.
@@ -152,27 +295,52 @@ impl ApexBaseHandler {
             .unwrap_or_else(|| "default".to_string())
     }
 
-    /// Encode a RecordBatch into a Vec of encoded DataRows.
-    /// Columns are extracted once outside the row loop to avoid repeated Arc deref.
+    /// Stream encoded `DataRow`s for a batch.
+    ///
+    /// The whole `Vec<DataRow>` used to be built before the first row was sent,
+    /// so a result cost its full *encoded* size on top of the Arrow batch it came
+    /// from (text encoding of a wide result can exceed the batch itself). Rows are
+    /// now encoded one at a time as the client consumes them, which keeps only
+    /// one encoded row alive.
+    ///
+    /// The first row is still encoded eagerly: an unsupported column that cannot
+    /// produce a row fails the statement before anything is sent, exactly as
+    /// before. Columns are extracted once, outside the row loop.
     fn encode_batch_rows(
-        batch: &RecordBatch,
-        field_infos: &Arc<Vec<FieldInfo>>,
-    ) -> PgWireResult<Vec<PgWireResult<pgwire::messages::data::DataRow>>> {
+        batch: RecordBatch,
+        field_infos: Arc<Vec<FieldInfo>>,
+    ) -> PgWireResult<impl Iterator<Item = PgWireResult<pgwire::messages::data::DataRow>> + Send + 'static>
+    {
         let num_rows = batch.num_rows();
-        let num_cols = batch.num_columns();
-        let mut rows = Vec::with_capacity(num_rows);
-
         // Pre-extract all column refs once — avoids repeated batch.column() + Arc clone per row
-        let cols: Vec<&ArrayRef> = (0..num_cols).map(|i| batch.column(i)).collect();
+        let cols: Vec<ArrayRef> = (0..batch.num_columns())
+            .map(|index| batch.column(index).clone())
+            .collect();
 
-        for row_idx in 0..num_rows {
-            let mut encoder = DataRowEncoder::new(field_infos.clone());
-            for col in &cols {
-                encode_arrow_value(&mut encoder, col, row_idx)?;
-            }
-            rows.push(encoder.finish());
+        // The `?` is the eager validation: a row that cannot be encoded fails the
+        // statement before the first DataRow is sent.
+        let validated = if num_rows == 0 {
+            None
+        } else {
+            Some(Self::encode_row(&cols, &field_infos, 0)?)
+        };
+        let first = validated.map(Ok);
+        let rest = (usize::from(num_rows > 0)..num_rows)
+            .map(move |row| Self::encode_row(&cols, &field_infos, row));
+        Ok(first.into_iter().chain(rest))
+    }
+
+    /// Encode one row of already-extracted columns.
+    fn encode_row(
+        cols: &[ArrayRef],
+        field_infos: &Arc<Vec<FieldInfo>>,
+        row: usize,
+    ) -> PgWireResult<pgwire::messages::data::DataRow> {
+        let mut encoder = DataRowEncoder::new(field_infos.clone());
+        for col in cols {
+            encode_arrow_value(&mut encoder, col, row)?;
         }
-        Ok(rows)
+        encoder.finish()
     }
 
     /// Strip leading SQL comments (-- and /* */) to get the effective SQL start
@@ -318,7 +486,7 @@ impl SimpleQueryHandler for ApexBaseHandler {
                 continue;
             }
             let current_db = Self::current_db_from_metadata(client);
-            match self.execute_query_with_db(sql, &current_db) {
+            match self.run_query(sql, &current_db).await {
                 Ok(batch) => {
                     if Self::is_write_op(sql) {
                         let tag = Self::command_tag(sql, batch.num_rows());
@@ -329,7 +497,7 @@ impl SimpleQueryHandler for ApexBaseHandler {
                             Arc::new(schema_to_field_info(&schema));
                         self.cache_schema(sql, field_infos.clone());
 
-                        let rows = Self::encode_batch_rows(&batch, &field_infos)?;
+                        let rows = Self::encode_batch_rows(batch, Arc::clone(&field_infos))?;
                         let data_row_stream = stream::iter(rows);
                         responses.push(Response::Query(QueryResponse::new(
                             field_infos,
@@ -337,12 +505,12 @@ impl SimpleQueryHandler for ApexBaseHandler {
                         )));
                     }
                 }
-                Err(msg) => {
+                Err(failure) => {
                     return Err(PgWireError::UserError(Box::new(
                         pgwire::error::ErrorInfo::new(
                             "ERROR".to_string(),
-                            "42000".to_string(),
-                            msg,
+                            failure.code.to_string(),
+                            failure.message,
                         ),
                     )));
                 }
@@ -418,7 +586,7 @@ impl ExtendedQueryHandler for ApexBaseHandler {
         .unwrap_or_else(|_| sql.clone());
 
         let current_db = Self::current_db_from_metadata(client);
-        match self.execute_query_with_db(&eval_sql, &current_db) {
+        match self.run_query(&eval_sql, &current_db).await {
             Ok(batch) => {
                 let fields = schema_to_field_info(&batch.schema());
                 let fields_arc = Arc::new(fields.clone());
@@ -459,7 +627,7 @@ impl ExtendedQueryHandler for ApexBaseHandler {
         }
 
         let current_db = Self::current_db_from_metadata(client);
-        match self.execute_query_with_db(&eval_sql, &current_db) {
+        match self.run_query(&eval_sql, &current_db).await {
             Ok(batch) => {
                 let fields = schema_to_field_info(&batch.schema());
                 let fields_arc = Arc::new(fields.clone());
@@ -502,7 +670,7 @@ impl ExtendedQueryHandler for ApexBaseHandler {
         let current_db = Self::current_db_from_metadata(_client);
         // Check if client requested binary result format
         let want_binary = matches!(portal.result_column_format, Format::UnifiedBinary);
-        match self.execute_query_with_db(sql, &current_db) {
+        match self.run_query(sql, &current_db).await {
             Ok(batch) => {
                 if Self::is_write_op(sql) {
                     let tag = Self::command_tag(sql, batch.num_rows());
@@ -519,7 +687,7 @@ impl ExtendedQueryHandler for ApexBaseHandler {
                         self.cache_schema(raw_sql, field_infos.clone());
                     }
 
-                    let rows = Self::encode_batch_rows(&batch, &field_infos)?;
+                    let rows = Self::encode_batch_rows(batch, Arc::clone(&field_infos))?;
                     let data_row_stream = stream::iter(rows);
                     Ok(Response::Query(QueryResponse::new(
                         field_infos,
@@ -527,8 +695,12 @@ impl ExtendedQueryHandler for ApexBaseHandler {
                     )))
                 }
             }
-            Err(msg) => Err(PgWireError::UserError(Box::new(
-                pgwire::error::ErrorInfo::new("ERROR".to_string(), "42000".to_string(), msg),
+            Err(failure) => Err(PgWireError::UserError(Box::new(
+                pgwire::error::ErrorInfo::new(
+                    "ERROR".to_string(),
+                    failure.code.to_string(),
+                    failure.message,
+                ),
             ))),
         }
     }
@@ -807,4 +979,163 @@ fn encode_arrow_value(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn query_concurrency_is_clamped_and_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        assert_eq!(
+            ApexBaseHandler::with_query_concurrency(path.clone(), 0).query_concurrency(),
+            1,
+            "zero slots would deadlock every statement"
+        );
+        assert_eq!(
+            ApexBaseHandler::with_query_concurrency(path.clone(), 3).query_concurrency(),
+            3
+        );
+        assert!(ApexBaseHandler::new(path).query_concurrency() > 0);
+        // The reported capacity is the configured limit, not what happens to be
+        // free: an overloaded server must not tell clients "0 slots".
+        let busy = ApexBaseHandler::with_query_concurrency(dir.path().to_path_buf(), 2);
+        let held = Arc::clone(&busy.query_slots).try_acquire_owned().unwrap();
+        assert_eq!(busy.query_concurrency(), 2);
+        assert_eq!(busy.available_query_slots(), 1);
+        drop(held);
+    }
+
+    #[test]
+    fn default_query_concurrency_prefers_the_env_override() {
+        let prior = std::env::var("APEX_SERVER_QUERY_CONCURRENCY").ok();
+        std::env::set_var("APEX_SERVER_QUERY_CONCURRENCY", "3");
+        assert_eq!(default_query_concurrency(), 3);
+        std::env::set_var("APEX_SERVER_QUERY_CONCURRENCY", "0");
+        let derived = default_query_concurrency();
+        assert!(derived > 0, "a zero override must keep the derived default");
+        std::env::set_var("APEX_SERVER_QUERY_CONCURRENCY", "many");
+        assert_eq!(default_query_concurrency(), derived);
+        match prior {
+            Some(value) => std::env::set_var("APEX_SERVER_QUERY_CONCURRENCY", value),
+            None => std::env::remove_var("APEX_SERVER_QUERY_CONCURRENCY"),
+        }
+    }
+
+    /// Statements that touch data go through the blocking pool, so they must
+    /// still work end to end with a bounded number of slots.
+    #[test]
+    fn statements_run_through_the_blocking_pool() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = ApexBaseHandler::with_query_concurrency(dir.path().to_path_buf(), 2);
+        let runtime = runtime();
+        runtime
+            .block_on(handler.run_query("CREATE TABLE t (a INT)", "default"))
+            .unwrap();
+        runtime
+            .block_on(handler.run_query("INSERT INTO t (a) VALUES (1)", "default"))
+            .unwrap();
+        let batch = runtime
+            .block_on(handler.run_query("SELECT COUNT(*) FROM t", "default"))
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        assert_eq!(handler.query_concurrency(), 2, "slots are returned when done");
+    }
+
+    /// Rows are produced one at a time, so a result does not need its encoded
+    /// copy resident, and a row that cannot be encoded still fails the statement
+    /// before anything is sent.
+    #[test]
+    fn rows_are_encoded_lazily_with_a_validated_first_row() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("s", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2, 3])),
+                Arc::new(StringArray::from(vec!["x", "y", "z"])),
+            ],
+        )
+        .unwrap();
+        let fields: Arc<Vec<FieldInfo>> = Arc::new(schema_to_field_info(&batch.schema()));
+
+        let mut rows = ApexBaseHandler::encode_batch_rows(batch, fields).unwrap();
+        let mut count = 0;
+        for row in rows.by_ref() {
+            assert!(row.is_ok());
+            count += 1;
+        }
+        assert_eq!(count, 3);
+        assert!(rows.next().is_none());
+
+        // An empty result yields nothing (and must not need a first row).
+        let empty = RecordBatch::new_empty(Arc::new(Schema::new(vec![Field::new(
+            "a",
+            DataType::Int64,
+            false,
+        )])));
+        let fields: Arc<Vec<FieldInfo>> = Arc::new(schema_to_field_info(&empty.schema()));
+        assert_eq!(ApexBaseHandler::encode_batch_rows(empty, fields).unwrap().count(), 0);
+    }
+
+    /// A statement that cannot get a slot within the wait budget is rejected with
+    /// the capacity SQLSTATE instead of queueing forever, and the connection
+    /// keeps working afterwards.
+    #[test]
+    fn saturated_statements_fail_after_the_wait_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = ApexBaseHandler::with_query_limits(
+            dir.path().to_path_buf(),
+            1,
+            std::time::Duration::from_millis(50),
+        );
+        assert_eq!(handler.query_wait(), std::time::Duration::from_millis(50));
+
+        let busy = Arc::clone(&handler.query_slots).try_acquire_owned().unwrap();
+        let started = std::time::Instant::now();
+        let failure = runtime()
+            .block_on(handler.run_query("CREATE TABLE t (a INT)", "default"))
+            .expect_err("the only slot is held, so the statement must be rejected");
+        assert_eq!(failure.code, "53300", "{failure:?}");
+        assert!(failure.message.contains("query slots"), "{failure:?}");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the wait must be bounded by the configured budget"
+        );
+
+        // The slot returns and the connection recovers.
+        drop(busy);
+        runtime()
+            .block_on(handler.run_query("CREATE TABLE t (a INT)", "default"))
+            .unwrap();
+    }
+
+    /// Metadata probes answer even while every query slot is busy.
+    #[test]
+    fn catalog_probes_skip_the_admission_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let handler = ApexBaseHandler::with_query_concurrency(dir.path().to_path_buf(), 1);
+        let busy = Arc::clone(&handler.query_slots).try_acquire_owned().unwrap();
+        let batch = runtime()
+            .block_on(handler.run_query("SELECT version()", "default"))
+            .unwrap();
+        assert_eq!(batch.num_rows(), 1);
+        drop(busy);
+        assert_eq!(handler.query_concurrency(), 1);
+    }
 }

@@ -423,12 +423,46 @@ impl ApexExecutor {
                                 }
                                 Some(crate::storage::on_demand::ColumnType::Binary) => {
                                     // Auto-encode JSON-style float array string '[1.0,2.0,…]' as binary vector
-                                    Self::try_parse_vector_string(v)
-                                        .map(Value::Binary)
-                                        .unwrap_or_else(|| value.clone())
+                                    match Self::try_parse_vector_string(v) {
+                                        Some(bytes) => Value::Binary(bytes),
+                                        None if matches!(value, Value::Binary(_) | Value::Null) => {
+                                            value.clone()
+                                        }
+                                        // A literal that is neither binary nor vector-encodable
+                                        // must not quietly become an empty BLOB. The UPDATE path
+                                        // already rejects it ("Cannot assign VARCHAR to BINARY
+                                        // column 'b'"); INSERT stored NULL instead - silent data
+                                        // loss. Fail loudly here too.
+                                        None => {
+                                            return Err(err_input(format!(
+                                                "Column '{}' requires BINARY, got {}",
+                                                col_name,
+                                                value.data_type()
+                                            )))
+                                        }
+                                    }
                                 }
                                 _ => value.clone(),
                             }
+                        }
+                        // Same rule for BLOB columns, which have no vector-string form.
+                        other
+                            if matches!(
+                                col_schema_type,
+                                Some(
+                                    crate::storage::on_demand::ColumnType::Binary
+                                        | crate::storage::on_demand::ColumnType::Blob
+                                )
+                            ) && !matches!(
+                                other,
+                                Value::Binary(_) | Value::Blob(_) | Value::Null
+                            ) =>
+                        {
+                            return Err(err_input(format!(
+                                "Column '{}' requires BINARY, got {}",
+                                col_name,
+                                value.data_type()
+                            )))
                         }
                         _ => value.clone(),
                     };

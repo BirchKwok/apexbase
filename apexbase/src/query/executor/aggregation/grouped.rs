@@ -12,16 +12,19 @@ impl ApexExecutor {
         // Materialize expression-based GROUP BY columns (e.g., YEAR(date), MONTH(ts))
         let batch = Self::materialize_group_by_exprs(batch, stmt)?;
 
-        // Build group keys - strip table prefix if present (e.g., "u.tier" -> "tier")
+        // Build group keys. A qualified name is used as written when the batch exposes
+        // it: `GROUP BY u.id` over a join whose tables both have `id` used to strip the
+        // qualifier and group by the LEFT table's column (INNER and LEFT alike, even
+        // though the batch carries `u.id`). Otherwise fall back to the bare name.
         let group_cols: Vec<String> = stmt
             .group_by
             .iter()
             .map(|s| {
                 let trimmed = s.trim_matches('"');
-                if let Some(dot_pos) = trimmed.rfind('.') {
-                    trimmed[dot_pos + 1..].to_string()
-                } else {
+                if batch.column_by_name(trimmed).is_some() {
                     trimmed.to_string()
+                } else {
+                    strip_column_qualifier(trimmed).to_string()
                 }
             })
             .collect();
@@ -149,12 +152,7 @@ impl ApexExecutor {
         }
 
         fn clean_name(name: &str) -> &str {
-            let trimmed = name.trim_matches('"');
-            trimmed
-                .rsplit('.')
-                .next()
-                .unwrap_or(trimmed)
-                .trim_matches('"')
+            strip_column_qualifier(name)
         }
 
         fn numeric_value(array: &ArrayRef, row: usize) -> Option<f64> {
@@ -916,11 +914,7 @@ impl ApexExecutor {
                             .first()
                             .map(|s| {
                                 let trimmed = s.trim_matches('"');
-                                if let Some(dot_pos) = trimmed.rfind('.') {
-                                    trimmed[dot_pos + 1..].to_string()
-                                } else {
-                                    trimmed.to_string()
-                                }
+                                strip_column_qualifier(trimmed).to_string()
                             })
                             .unwrap_or_else(|| "group".to_string());
 
@@ -1026,12 +1020,7 @@ impl ApexExecutor {
                 ..
             } = col
             {
-                let actual_col = col_name.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = actual_col.rfind('.') {
-                    &actual_col[dot_pos + 1..]
-                } else {
-                    actual_col
-                };
+                let actual_col = strip_column_qualifier(col_name);
                 if actual_col != "*" {
                     agg_col_name = Some(actual_col);
                     // Check if it's an int column
@@ -1063,7 +1052,7 @@ impl ApexExecutor {
         if num_groups == 0 {
             // Return empty result
             let schema = Arc::new(Schema::new(vec![Field::new(
-                group_col_name,
+                Self::group_output_name(stmt, group_col_name),
                 ArrowDataType::Utf8,
                 false,
             )]));
@@ -1081,13 +1070,8 @@ impl ApexExecutor {
         let mut group_col_alias: Option<&str> = None;
         for col in &stmt.columns {
             if let SelectColumn::ColumnAlias { column, alias } = col {
-                let col_name = column.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                    &col_name[dot_pos + 1..]
-                } else {
-                    col_name
-                };
-                if actual_col == group_col_name {
+                let actual_col = strip_column_qualifier(column);
+                if actual_col == strip_column_qualifier(group_col_name) {
                     group_col_alias = Some(alias.as_str());
                     break;
                 }
@@ -1454,12 +1438,7 @@ impl ApexExecutor {
                 ..
             } = col
             {
-                let actual_col = col_name.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = actual_col.rfind('.') {
-                    &actual_col[dot_pos + 1..]
-                } else {
-                    actual_col
-                };
+                let actual_col = strip_column_qualifier(col_name);
                 if actual_col != "*" {
                     if let Some(arr) = batch.column_by_name(actual_col) {
                         if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
@@ -1583,11 +1562,7 @@ impl ApexExecutor {
             })
             .unwrap_or_else(|| {
                 // No alias found, use column name (stripping table prefix)
-                if let Some(dot_pos) = group_by_col.rfind('.') {
-                    group_by_col[dot_pos + 1..].to_string()
-                } else {
-                    group_by_col.to_string()
-                }
+                strip_column_qualifier(group_by_col).to_string()
             });
 
         let group_values: Vec<Option<&str>> = active_groups
@@ -1768,12 +1743,7 @@ impl ApexExecutor {
                 ..
             } = col
             {
-                let actual_col = col_name.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = actual_col.rfind('.') {
-                    &actual_col[dot_pos + 1..]
-                } else {
-                    actual_col
-                };
+                let actual_col = strip_column_qualifier(col_name);
                 if actual_col != "*" {
                     if let Some(arr) = batch.column_by_name(actual_col) {
                         if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
@@ -2039,7 +2009,11 @@ impl ApexExecutor {
                 SelectColumn::Column(name) | SelectColumn::ColumnAlias { column: name, .. } => {
                     let name = name.trim_matches('"');
                     let name = name.rsplit('.').next().unwrap_or(name);
-                    group_cols.iter().any(|group| group == name)
+                    // `group_cols` may carry a qualifier (e.g. `u.id`); compare the
+                    // bare names so a colliding key still takes this two-key lane.
+                    group_cols
+                        .iter()
+                        .any(|group| strip_column_qualifier(group) == name)
                 }
                 SelectColumn::Aggregate {
                     func: AggregateFunc::Count,
@@ -2124,11 +2098,12 @@ impl ApexExecutor {
                             | SelectColumn::ColumnAlias { column: name, .. } => {
                                 let actual = name.trim_matches('"');
                                 let actual = actual.rsplit('.').next().unwrap_or(actual);
+
                                 let output = match column {
                                     SelectColumn::ColumnAlias { alias, .. } => alias.as_str(),
                                     _ => actual,
                                 };
-                                let array = if actual == group_cols[0] {
+                                let array = if actual == strip_column_qualifier(&group_cols[0]) {
                                     result1.clone()
                                 } else {
                                     result2.clone()
@@ -2478,12 +2453,7 @@ impl ApexExecutor {
                                 ..
                             } = col
                             {
-                                let actual_col = col_name.trim_matches('"');
-                                let actual_col = if let Some(dot_pos) = actual_col.rfind('.') {
-                                    &actual_col[dot_pos + 1..]
-                                } else {
-                                    actual_col
-                                };
+                                let actual_col = strip_column_qualifier(col_name);
                                 if actual_col != "*" {
                                     if let Some(arr) = batch.column_by_name(actual_col) {
                                         if let Some(float_arr) =
@@ -2740,8 +2710,28 @@ impl ApexExecutor {
         // FAST PATH: String + Int64 2-column GROUP BY (common case: category + numeric id)
         // Uses composite key: (string_dict_id * int_range + int_value_offset) for direct array indexing
         if group_cols.len() == 2 {
-            let col1 = batch.column_by_name(&group_cols[0]);
-            let col2 = batch.column_by_name(&group_cols[1]);
+            let mut col1 = batch.column_by_name(&group_cols[0]);
+            let mut col2 = batch.column_by_name(&group_cols[1]);
+
+            // This kernel is written for (string, int): it dictionary-encodes the first
+            // key and range-encodes the second. A query written the other way round
+            // (`GROUP BY u.id, u.city`) rebinds the columns here and the emitter below
+            // restores the written order.
+            let is_string_col = |col: &Option<&ArrayRef>| {
+                col.map_or(false, |col| {
+                    col.as_any().downcast_ref::<StringArray>().is_some()
+                        || col
+                            .as_any()
+                            .downcast_ref::<arrow::array::DictionaryArray<
+                                arrow::datatypes::UInt32Type,
+                            >>()
+                            .is_some()
+                })
+            };
+            let swapped = !is_string_col(&col1) && is_string_col(&col2);
+            if swapped {
+                std::mem::swap(&mut col1, &mut col2);
+            }
 
             if let (Some(c1), Some(c2)) = (col1, col2) {
                 // Try to build dictionary for string column and get int range for int column
@@ -2875,12 +2865,7 @@ impl ApexExecutor {
                                 ..
                             } = col
                             {
-                                let actual_col = col_name.trim_matches('"');
-                                let actual_col = if let Some(dot_pos) = actual_col.rfind('.') {
-                                    &actual_col[dot_pos + 1..]
-                                } else {
-                                    actual_col
-                                };
+                                let actual_col = strip_column_qualifier(col_name);
                                 if actual_col != "*" {
                                     if let Some(arr) = batch.column_by_name(actual_col) {
                                         if let Some(float_arr) =
@@ -3005,18 +2990,36 @@ impl ApexExecutor {
                         let mut result_fields: Vec<Field> = Vec::new();
                         let mut result_arrays: Vec<ArrayRef> = Vec::new();
 
-                        result_fields.push(Field::new(
-                            Self::group_output_name(stmt, &group_cols[0]),
-                            ArrowDataType::Utf8,
-                            true,
-                        ));
-                        result_arrays.push(Arc::new(StringArray::from(result_col1)));
-                        result_fields.push(Field::new(
-                            Self::group_output_name(stmt, &group_cols[1]),
-                            ArrowDataType::Int64,
-                            true,
-                        ));
-                        result_arrays.push(Arc::new(Int64Array::from(result_col2)));
+                        if swapped {
+                            // The kernel is written for (string, int); this query wrote
+                            // (int, string), so emit both the field types and the values
+                            // in the order the query asked for.
+                            result_fields.push(Field::new(
+                                Self::group_output_name(stmt, &group_cols[0]),
+                                ArrowDataType::Int64,
+                                true,
+                            ));
+                            result_arrays.push(Arc::new(Int64Array::from(result_col2)));
+                            result_fields.push(Field::new(
+                                Self::group_output_name(stmt, &group_cols[1]),
+                                ArrowDataType::Utf8,
+                                true,
+                            ));
+                            result_arrays.push(Arc::new(StringArray::from(result_col1)));
+                        } else {
+                            result_fields.push(Field::new(
+                                Self::group_output_name(stmt, &group_cols[0]),
+                                ArrowDataType::Utf8,
+                                true,
+                            ));
+                            result_arrays.push(Arc::new(StringArray::from(result_col1)));
+                            result_fields.push(Field::new(
+                                Self::group_output_name(stmt, &group_cols[1]),
+                                ArrowDataType::Int64,
+                                true,
+                            ));
+                            result_arrays.push(Arc::new(Int64Array::from(result_col2)));
+                        }
 
                         let has_int_agg = agg_col_int.is_some();
 
@@ -3265,12 +3268,7 @@ impl ApexExecutor {
                 ..
             } = col
             {
-                let actual_col = col_name.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = actual_col.rfind('.') {
-                    &actual_col[dot_pos + 1..]
-                } else {
-                    actual_col
-                };
+                let actual_col = strip_column_qualifier(col_name);
                 if actual_col != "*" {
                     if let Some(arr) = batch.column_by_name(actual_col) {
                         if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
@@ -3298,16 +3296,24 @@ impl ApexExecutor {
                         match col_opt {
                             Some(TypedCol::Int64(arr)) => {
                                 if !arr.is_null(row_idx) {
+                                    hasher.write_u8(1);
                                     hasher.write_i64(arr.value(row_idx));
                                 } else {
                                     hasher.write_u8(0);
                                 }
                             }
                             Some(TypedCol::StringDict(_arr, indices)) => {
-                                hasher.write_u32(indices[row_idx]);
+                                // Index 0 is the reserved NULL slot.
+                                if indices[row_idx] == 0 {
+                                    hasher.write_u8(0);
+                                } else {
+                                    hasher.write_u8(1);
+                                    hasher.write_u32(indices[row_idx]);
+                                }
                             }
                             Some(TypedCol::Float64(arr)) => {
                                 if !arr.is_null(row_idx) {
+                                    hasher.write_u8(1);
                                     hasher.write_u64(arr.value(row_idx).to_bits());
                                 } else {
                                     hasher.write_u8(0);
@@ -3315,13 +3321,19 @@ impl ApexExecutor {
                             }
                             Some(TypedCol::Bool(arr)) => {
                                 if !arr.is_null(row_idx) {
+                                    hasher.write_u8(1);
                                     hasher.write_u8(arr.value(row_idx) as u8);
                                 } else {
-                                    hasher.write_u8(2);
+                                    hasher.write_u8(0);
                                 }
                             }
                             Some(TypedCol::Other(col)) => {
-                                hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
+                                if col.is_null(row_idx) {
+                                    hasher.write_u8(0);
+                                } else {
+                                    hasher.write_u8(1);
+                                    hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
+                                }
                             }
                             None => {}
                         }
@@ -3338,16 +3350,24 @@ impl ApexExecutor {
                         match col_opt {
                             Some(TypedCol::Int64(arr)) => {
                                 if !arr.is_null(row_idx) {
+                                    hasher.write_u8(1);
                                     hasher.write_i64(arr.value(row_idx));
                                 } else {
                                     hasher.write_u8(0);
                                 }
                             }
                             Some(TypedCol::StringDict(_arr, indices)) => {
-                                hasher.write_u32(indices[row_idx]);
+                                // Index 0 is the reserved NULL slot.
+                                if indices[row_idx] == 0 {
+                                    hasher.write_u8(0);
+                                } else {
+                                    hasher.write_u8(1);
+                                    hasher.write_u32(indices[row_idx]);
+                                }
                             }
                             Some(TypedCol::Float64(arr)) => {
                                 if !arr.is_null(row_idx) {
+                                    hasher.write_u8(1);
                                     hasher.write_u64(arr.value(row_idx).to_bits());
                                 } else {
                                     hasher.write_u8(0);
@@ -3355,13 +3375,19 @@ impl ApexExecutor {
                             }
                             Some(TypedCol::Bool(arr)) => {
                                 if !arr.is_null(row_idx) {
+                                    hasher.write_u8(1);
                                     hasher.write_u8(arr.value(row_idx) as u8);
                                 } else {
-                                    hasher.write_u8(2);
+                                    hasher.write_u8(0);
                                 }
                             }
                             Some(TypedCol::Other(col)) => {
-                                hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
+                                if col.is_null(row_idx) {
+                                    hasher.write_u8(0);
+                                } else {
+                                    hasher.write_u8(1);
+                                    hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
+                                }
                             }
                             None => {}
                         }
@@ -3545,18 +3571,24 @@ impl ApexExecutor {
         for col in &stmt.columns {
             match col {
                 SelectColumn::Column(name) | SelectColumn::ColumnAlias { column: name, .. } => {
-                    let col_name = name.trim_matches('"');
-                    let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                        &col_name[dot_pos + 1..]
-                    } else {
-                        col_name
-                    };
+                    let written = name.trim_matches('"');
+                    let actual_col = strip_column_qualifier(written);
                     let output_name = match col {
                         SelectColumn::ColumnAlias { alias, .. } => alias.as_str(),
                         _ => actual_col,
                     };
+                    // A join exposes the right table's colliding column under its qualified
+                    // name (`o.id`), so resolve the reference as written before falling back
+                    // to the bare name. Stripping first made `SELECT o.id` emit the left
+                    // table's `id`, which also made `GROUP BY u.id, o.id` output the left key
+                    // for both columns (the second group key silently became the first).
+                    let lookup = if batch.column_by_name(written).is_some() {
+                        written
+                    } else {
+                        actual_col
+                    };
 
-                    if let Some(src_col) = batch.column_by_name(actual_col) {
+                    if let Some(src_col) = batch.column_by_name(lookup) {
                         // Take value from first row of each group
                         let first_indices: Vec<usize> =
                             states.iter().map(|s| s.first_row).collect();
@@ -3789,6 +3821,7 @@ impl ApexExecutor {
                 match col_opt {
                     Some(TypedColumn::Int64(arr)) => {
                         if !arr.is_null(row_idx) {
+                            hasher.write_u8(1);
                             hasher.write_i64(arr.value(row_idx));
                         } else {
                             hasher.write_u8(0);
@@ -3796,6 +3829,7 @@ impl ApexExecutor {
                     }
                     Some(TypedColumn::String(arr)) => {
                         if !arr.is_null(row_idx) {
+                            hasher.write_u8(1);
                             hasher.write(arr.value(row_idx).as_bytes());
                         } else {
                             hasher.write_u8(0);
@@ -3803,6 +3837,7 @@ impl ApexExecutor {
                     }
                     Some(TypedColumn::Float64(arr)) => {
                         if !arr.is_null(row_idx) {
+                            hasher.write_u8(1);
                             hasher.write_u64(arr.value(row_idx).to_bits());
                         } else {
                             hasher.write_u8(0);
@@ -3810,20 +3845,27 @@ impl ApexExecutor {
                     }
                     Some(TypedColumn::Bool(arr)) => {
                         if !arr.is_null(row_idx) {
+                            hasher.write_u8(1);
                             hasher.write_u8(arr.value(row_idx) as u8);
                         } else {
-                            hasher.write_u8(2);
+                            hasher.write_u8(0);
                         }
                     }
                     Some(TypedColumn::StringDict(arr)) => {
                         if !arr.keys().is_null(row_idx) {
+                            hasher.write_u8(1);
                             hasher.write_u32(arr.keys().value(row_idx));
                         } else {
                             hasher.write_u8(0);
                         }
                     }
                     Some(TypedColumn::Other(col)) => {
-                        hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
+                        if col.is_null(row_idx) {
+                            hasher.write_u8(0);
+                        } else {
+                            hasher.write_u8(1);
+                            hasher.write_u64(Self::hash_array_value_fast(col, row_idx));
+                        }
                     }
                     None => {}
                 }
@@ -3877,13 +3919,7 @@ impl ApexExecutor {
         for col in &stmt.columns {
             match col {
                 SelectColumn::Column(name) => {
-                    let col_name = name.trim_matches('"');
-                    // Strip table prefix if present (e.g., "u.tier" -> "tier")
-                    let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                        &col_name[dot_pos + 1..]
-                    } else {
-                        col_name
-                    };
+                    let actual_col = strip_column_qualifier(name);
                     if let Some(src_col) = batch.column_by_name(actual_col) {
                         let (field, array) =
                             Self::take_first_from_groups(src_col, &group_indices, actual_col)?;
@@ -3892,13 +3928,7 @@ impl ApexExecutor {
                     }
                 }
                 SelectColumn::ColumnAlias { column, alias } => {
-                    let col_name = column.trim_matches('"');
-                    // Strip table prefix if present
-                    let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                        &col_name[dot_pos + 1..]
-                    } else {
-                        col_name
-                    };
+                    let actual_col = strip_column_qualifier(column);
                     if let Some(src_col) = batch.column_by_name(actual_col) {
                         let (field, array) =
                             Self::take_first_from_groups(src_col, &group_indices, alias)?;
@@ -4828,11 +4858,7 @@ impl ApexExecutor {
         // Strip table prefix from column name if present (e.g., "o.amount" -> "amount")
         let actual_column: Option<String> = column.as_ref().map(|c| {
             let trimmed = c.trim_matches('"');
-            if let Some(dot_pos) = trimmed.rfind('.') {
-                trimmed[dot_pos + 1..].to_string()
-            } else {
-                trimmed.to_string()
-            }
+            strip_column_qualifier(trimmed).to_string()
         });
 
         match func {

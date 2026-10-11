@@ -54,7 +54,7 @@ impl OnDemandStorage {
         let mut total_min: f64 = f64::INFINITY;
         let mut total_max: f64 = f64::NEG_INFINITY;
 
-        for rg_meta in &footer.row_groups {
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
             let rg_rows = rg_meta.row_count as usize;
             if rg_rows == 0 {
                 continue;
@@ -74,8 +74,16 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let decompressed = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed
+                .as_ref()
+                .map(|body| body.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
             let mut pos =
                 rg_id_section_len(rg_rows, rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN));
             let del_vec_len = (rg_rows + 7) / 8;
@@ -87,22 +95,64 @@ impl OnDemandStorage {
             pos += del_vec_len;
 
             let null_bitmap_len = (rg_rows + 7) / 8;
-            for ci in 0..col_count {
-                if pos + null_bitmap_len > body.len() {
-                    break;
-                }
-                let null_bytes = &body[pos..pos + null_bitmap_len];
-                pos += null_bitmap_len;
 
-                let ct = schema.columns[ci].1;
-                if ci == col_idx {
-                    let col_bytes = &body[pos..];
-                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                    let encoding = if encoding_version >= 1 {
-                        col_bytes[0]
-                    } else {
-                        COL_ENCODING_PLAIN
-                    };
+            // RCIX records every column's body offset, so the requested column can
+            // be addressed directly instead of walking each preceding column's null
+            // bitmap and payload. Compressed row groups carry no usable offsets —
+            // the recorded ones describe the uncompressed body — so they keep the
+            // sequential walk.
+            let rcix_offset = if compress_flag == RG_COMPRESS_NONE {
+                footer
+                    .col_offsets
+                    .get(rg_i)
+                    .and_then(|offs| offs.get(col_idx))
+                    .map(|&offset| offset as usize)
+            } else {
+                None
+            };
+
+            let (null_bytes, col_bytes): (&[u8], &[u8]) = match rcix_offset {
+                Some(col_start) if col_start + null_bitmap_len <= body.len() => (
+                    &body[col_start..col_start + null_bitmap_len],
+                    &body[col_start + null_bitmap_len..],
+                ),
+                _ => {
+                    let mut found: (&[u8], &[u8]) = (&[], &[]);
+                    let mut walk = pos;
+                    for ci in 0..col_count {
+                        if walk + null_bitmap_len > body.len() {
+                            break;
+                        }
+                        let null_bytes = &body[walk..walk + null_bitmap_len];
+                        walk += null_bitmap_len;
+                        if ci == col_idx {
+                            found = (null_bytes, &body[walk..]);
+                            break;
+                        }
+                        let ct = schema.columns[ci].1;
+                        let consumed = if encoding_version == RG_ENCODING_VERSION {
+                            skip_column_encoded(&body[walk..], ct)?
+                        } else {
+                            ColumnData::skip_bytes_typed(&body[walk..], ct)?
+                        };
+                        walk += consumed;
+                    }
+                    found
+                }
+            };
+
+            if null_bytes.is_empty() || col_bytes.is_empty() {
+                continue;
+            }
+
+            {
+                let ct = col_type;
+                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                    col_bytes[0]
+                } else {
+                    COL_ENCODING_PLAIN
+                };
 
                     if encoding == COL_ENCODING_PLAIN {
                         let data = &col_bytes[enc_offset..];
@@ -162,7 +212,7 @@ impl OnDemandStorage {
                         }
                     } else {
                         // Encoded column: fallback to full decode
-                        let (col_data, _) = if encoding_version >= 1 {
+                        let (col_data, _) = if encoding_version == RG_ENCODING_VERSION {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -216,14 +266,6 @@ impl OnDemandStorage {
                             _ => {}
                         }
                     }
-                }
-                // Skip column data to advance pos
-                let consumed = if encoding_version >= 1 {
-                    skip_column_encoded(&body[pos..], ct)?
-                } else {
-                    ColumnData::skip_bytes_typed(&body[pos..], ct)?
-                };
-                pos += consumed;
             }
         }
 

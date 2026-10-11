@@ -287,6 +287,73 @@ fn test_create_and_open() {
 }
 
 #[test]
+fn cached_group_agg_skips_saved_deletion_vectors() {
+    // Uncompressed tables aggregate through the streaming loop, compressed ones
+    // through the fallback; both have to skip the saved deletion vectors.
+    for compression in [None, Some(CompressionType::Zstd)] {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("agg_delete_vectors.apex");
+        let n = 1000i64;
+        let label = format!("{compression:?}");
+
+        {
+            let storage = OnDemandStorage::create(&path).unwrap();
+            if let Some(compression) = compression {
+                storage.set_compression(compression).unwrap();
+            }
+            storage
+                .insert_typed(
+                    HashMap::from([("user_id".to_string(), (1..=n).collect::<Vec<i64>>())]),
+                    HashMap::new(),
+                    HashMap::from([(
+                        "city".to_string(),
+                        (0..n)
+                            .map(|i| {
+                                ["Beijing", "Shanghai", "Shenzhen", "Guangzhou", "Hangzhou"]
+                                    [i as usize % 5]
+                                    .to_string()
+                            })
+                            .collect::<Vec<String>>(),
+                    )]),
+                    HashMap::new(),
+                    HashMap::new(),
+                )
+                .unwrap();
+            // Beijing's `user_id`s are 1, 6, 11, ... (every fifth row).
+            for id in (1..=n as u64).filter(|id| (id - 1) % 5 == 0) {
+                assert!(storage.delete(id), "{label}: row {id} must exist");
+            }
+            storage.save().unwrap();
+        }
+
+        // Read the aggregate back from disk: the vectors are the only record of the
+        // deletion, so an aggregate that never reads a deletion bitmap -- a
+        // `COUNT(*)`-only group-by has no columns to scan -- counts all 1000 rows.
+        let reader = OnDemandStorage::open(&path).unwrap();
+        let (labels, group_ids) = reader
+            .build_string_dict_cache("city")
+            .unwrap()
+            .expect("dictionary");
+        let aggregated = reader
+            .execute_group_agg_cached(&labels, &group_ids, &[("*", true)])
+            .unwrap()
+            .expect("aggregate");
+        let counts: HashMap<&str, i64> = aggregated
+            .iter()
+            .map(|(label, values)| (label.as_str(), values[0].1))
+            .collect();
+        assert_eq!(
+            counts.get("Beijing").copied().unwrap_or(0),
+            0,
+            "{label}: {counts:?}"
+        );
+        for city in ["Shanghai", "Shenzhen", "Guangzhou", "Hangzhou"] {
+            assert_eq!(counts.get(city).copied().unwrap_or(0), 200, "{label}: {counts:?}");
+        }
+    }
+}
+
+#[test]
 fn streaming_compact_merges_delta_and_deltastore_bounded_memory() {
     use crate::data::Value;
 
@@ -1832,17 +1899,39 @@ fn compressed_delete_uses_streaming_rewrite_not_full_load() {
             "id".to_string(),
             (1..=200).collect::<Vec<i64>>(),
         );
+        // Compressible filler: with implicit contiguous IDs the ID section is
+        // zero-length, so a single narrow integer column no longer pushes the
+        // Row Group body past COMPRESS_MIN_BODY_SIZE. A wide, all-distinct
+        // string column keeps the body above the threshold (dict encoding
+        // cannot shrink it) while zstd still compresses it (asserted below).
+        let mut string_cols = HashMap::new();
+        string_cols.insert(
+            "label".to_string(),
+            (0..200)
+                .map(|i| format!("row_number_{i:04}"))
+                .collect::<Vec<String>>(),
+        );
         storage
             .insert_typed(
                 int_cols,
                 HashMap::new(),
-                HashMap::new(),
+                string_cols,
                 HashMap::new(),
                 HashMap::new(),
             )
             .unwrap();
         storage.save().unwrap();
     }
+
+    // Precondition: this test only means something when the Row Group is really
+    // compressed, otherwise the delete takes the uncompressed in-place
+    // deletion-vector path instead of the streaming rewrite.
+    let bytes = std::fs::read(&path).unwrap();
+    assert_ne!(
+        bytes[256 + 28],
+        RG_COMPRESS_NONE,
+        "fixture Row Group must be compressed for this test to exercise the streaming rewrite"
+    );
 
     let storage = OnDemandStorage::open(&path).unwrap();
     assert!(!storage.v4_base_loaded.load(Ordering::SeqCst));
@@ -1865,6 +1954,88 @@ fn compressed_delete_uses_streaming_rewrite_not_full_load() {
         }
         other => panic!("unexpected id column: {other:?}"),
     }
+}
+
+#[test]
+fn numeric_range_inplace_delete_handles_implicit_id_row_groups() {
+    // A path carrying an `.apex_tmp` component writes the implicit ID encoding,
+    // so the Row Group body is `[deletion vector][columns...]` with no ID
+    // section. The in-place numeric-range delete must place the deletion vector
+    // at `32 + rg_id_section_len(..)`; a hard-coded `row_count * 8` offset lands
+    // inside column data (or past EOF, growing the file) and the delete never
+    // takes effect.
+    let dir = tempdir().unwrap();
+    let tmp_root = dir.path().join(".apex_tmp");
+    std::fs::create_dir_all(&tmp_root).unwrap();
+    let path = tmp_root.join("range_delete.apex");
+
+    // Wide-range values keep the target column out of the bit-packed encoding,
+    // which the in-place delete does not support.
+    let scale = 9_000_000_000_000i64;
+    let values: Vec<i64> = (0..2000).map(|i| (i - 1000) * scale).collect();
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("id".to_string(), values.clone());
+        int_cols.insert(
+            "v".to_string(),
+            (0..2000).map(|i| i % 17).collect::<Vec<i64>>(),
+        );
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    // Precondition: this fixture must really exercise the implicit encoding.
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(
+        bytes[256 + 30],
+        RG_IDS_IMPLICIT_CONTIGUOUS,
+        "temp-path Row Groups must use the implicit ID encoding"
+    );
+    let size_before = bytes.len();
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let deleted = storage
+        .delete_where_numeric_range_inplace("id", f64::NEG_INFINITY, -0.5)
+        .unwrap()
+        .expect("an uncompressed V4 row group must take the in-place delete path");
+    assert_eq!(deleted, 1000);
+    drop(storage);
+
+    // On Unix the delete only records pending state; it is applied when the
+    // table is next opened, which is where a wrong deletion-vector offset
+    // surfaces (the bytes land in column data or past the footer).
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.active_row_count(), 1000);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len() as usize,
+        size_before,
+        "the in-place delete must not grow the file"
+    );
+    // Deleted rows are tombstoned, not removed: the raw column scan still holds
+    // all 2000 physical rows, and its bytes must be untouched.
+    let result = reopened.read_columns(Some(&["id", "v"]), 0, None).unwrap();
+    match &result["id"] {
+        ColumnData::Int64(vals) => assert_eq!(vals, &values),
+        other => panic!("unexpected id column: {other:?}"),
+    }
+    match &result["v"] {
+        ColumnData::Int64(vals) => {
+            assert_eq!(vals.len(), 2000);
+            assert!(vals.iter().enumerate().all(|(i, &v)| v == (i % 17) as i64));
+        }
+        other => panic!("unexpected v column: {other:?}"),
+    }
+    let batch = reopened.to_arrow_batch(None, false).unwrap();
+    assert_eq!(batch.num_rows(), 1000);
 }
 
 #[test]
@@ -2140,6 +2311,43 @@ fn fused_reference<F: Fn(usize) -> bool>(n: usize, predicate: F) -> [i64; 4] {
         }
     }
     counts
+}
+
+#[test]
+fn fused_group_agg_declines_a_value_aggregate_without_a_lane() {
+    // A HAVING clause may inject an extra aggregate the SELECT list never
+    // asked for. When no value lane was resolved for it, the LUT scatter loop
+    // read the aggregate value through a null pointer and the process
+    // segfaulted; the kernel must decline and let the caller fall back.
+    use crate::storage::on_demand::{FusedLeaf, FusedLaneSpec, FusedPredicate};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("fused_no_lane.apex");
+    let (dict_strings, group_ids) = fused_test_setup(&path);
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let lanes = vec![FusedLaneSpec {
+        col: "age".to_string(),
+        is_int: true,
+    }];
+    let predicate = FusedPredicate::Leaf(FusedLeaf::InI64 {
+        lane: 0,
+        values: vec![0, 1, 2],
+    });
+    assert!(
+        storage
+            .execute_fused_group_agg_mmap(&dict_strings, &group_ids, &lanes, &predicate, None, 2)
+            .unwrap()
+            .is_none(),
+        "a value aggregate without a value lane must decline the fused kernel"
+    );
+    // The same mask with a resolved lane still runs.
+    assert!(
+        storage
+            .execute_fused_group_agg_mmap(&dict_strings, &group_ids, &lanes, &predicate, Some(0), 2)
+            .unwrap()
+            .is_some(),
+        "a value aggregate with a lane keeps using the kernel"
+    );
 }
 
 #[test]
@@ -3140,3 +3348,2807 @@ fn scratch_sweep_removes_only_stale_rewrite_files() {
         "the open path sweeps a directory at most once per process"
     );
 }
+
+#[test]
+fn point_read_page_cache_respects_its_byte_budget() {
+    // The pread point-read path caches one 4 KiB page per touched offset, so an
+    // unbudgeted cache grows with every distinct page a workload reads. Bound
+    // it: the underlying bytes must still be correct after eviction.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("page_cache_budget.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let rows = 20_000usize;
+        let mut int_cols = HashMap::new();
+        int_cols.insert("a".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        int_cols.insert("b".to_string(), (0..rows as i64).map(|i| i * 3).collect());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let file_bytes = std::fs::read(&path).unwrap();
+    assert!(
+        file_bytes.len() > 12 * 4096,
+        "fixture must span more pages than the test budget"
+    );
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    storage.set_page_cache_budget_bytes(4 * 4096);
+    let mut probe = [0u8; 64];
+    for page in 0..12u64 {
+        storage.read_cached_bytes(page * 4096, &mut probe).unwrap();
+        let start = (page * 4096) as usize;
+        assert_eq!(
+            &probe[..],
+            &file_bytes[start..start + 64],
+            "page {page} must be read correctly through the cache"
+        );
+        assert!(
+            storage.page_cache_len() <= 4,
+            "page cache must stay within its 4-page budget, got {}",
+            storage.page_cache_len()
+        );
+    }
+
+    // A repeated read of a cached page still returns the right bytes.
+    storage.read_cached_bytes(0, &mut probe).unwrap();
+    assert_eq!(&probe[..], &file_bytes[..64]);
+}
+
+#[test]
+fn point_read_page_cache_hits_and_invalidation() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("page_cache_hits.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("a".to_string(), (0..4000).collect::<Vec<i64>>());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let file_bytes = std::fs::read(&path).unwrap();
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(storage.page_cache_len(), 0);
+    let mut first = [0u8; 32];
+    storage.read_cached_bytes(64, &mut first).unwrap();
+    assert_eq!(storage.page_cache_len(), 1, "a miss caches exactly one page");
+    assert_eq!(&first[..], &file_bytes[64..96]);
+
+    // Same page, different slice: served from the cache, no new entry.
+    let mut second = [0u8; 32];
+    storage.read_cached_bytes(128, &mut second).unwrap();
+    assert_eq!(storage.page_cache_len(), 1);
+    assert_eq!(&second[..], &file_bytes[128..160]);
+
+    // Writes invalidate the cache (the file may have moved under it).
+    storage.invalidate_page_cache();
+    assert_eq!(storage.page_cache_len(), 0);
+}
+
+#[test]
+fn mmap_batch_overlays_delta_updates_with_and_without_id_projection() {
+    // `build_arrow_batch` needs the physical row IDs to place DeltaStore
+    // updates. Those IDs come from the `_id` column when it is projected and
+    // from the retained accumulator otherwise; both branches must overlay the
+    // update on the right row, and a scan without any overlay must stay clean.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("delta_overlay.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("value".to_string(), (0..8i64).collect::<Vec<i64>>());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    // Row 5 (the sixth physical row) gets a cell-level update through the
+    // DeltaStore, exactly like `UPDATE ... WHERE _id = 6`.
+    storage.delta_store.write().update_cell(
+        6,
+        "value",
+        crate::data::Value::Int64(900),
+    );
+
+    let expected: Vec<i64> = vec![0, 1, 2, 3, 4, 900, 6, 7];
+
+    let without_id = storage.to_arrow_batch_mmap(None, false, None, false).unwrap().unwrap();
+    let values = without_id
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert!(without_id.column_by_name("_id").is_none());
+    assert_eq!(
+        (0..values.len()).map(|i| values.value(i)).collect::<Vec<_>>(),
+        expected,
+    );
+
+    let with_id = storage.to_arrow_batch_mmap(None, true, None, false).unwrap().unwrap();
+    let values = with_id
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let ids = with_id
+        .column_by_name("_id")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(
+        (0..values.len()).map(|i| values.value(i)).collect::<Vec<_>>(),
+        expected,
+    );
+    assert_eq!(
+        (0..ids.len()).map(|i| ids.value(i)).collect::<Vec<_>>(),
+        (1..=8).collect::<Vec<i64>>(),
+    );
+}
+
+#[test]
+fn parallel_numeric_range_scan_prunes_row_groups_by_zone_map() {
+    // Clustered values give every row group a tight zone, so a range confined to
+    // one group proves the others empty. The parallel fast path (no limit, many
+    // uncompressed row groups) must prune them exactly like the sequential
+    // fallback, and must still return the right rows across group boundaries.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("numeric_zone_prune.apex");
+    let rows = 200_000usize;
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("ts".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        int_cols.insert(
+            "v".to_string(),
+            (0..rows as i64).map(|i| i % 7).collect::<Vec<i64>>(),
+        );
+        let mut float_cols = HashMap::new();
+        float_cols.insert("f".to_string(), (0..rows).map(|i| i as f64).collect());
+        storage
+            .insert_typed(
+                int_cols,
+                float_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let row_groups = storage
+        .get_or_load_footer()
+        .unwrap()
+        .expect("footer")
+        .row_groups
+        .len();
+    assert!(row_groups >= 3, "fixture needs multiple row groups");
+
+    let scan = |col: &str, low: f64, high: f64| {
+        storage
+            .scan_numeric_range_mmap(col, low, high, None)
+            .unwrap()
+            .expect("uncompressed row groups must take the range-scan path")
+    };
+
+    // Confined to one row group: only that group may contribute rows, and the
+    // pruning counter must prove the other groups were skipped rather than
+    // merely returning no matches.
+    let before = zone_pruned_row_groups();
+    let confined = scan("ts", 150_000.0, 150_009.0);
+    assert_eq!(confined, (150_000..=150_009).collect::<Vec<usize>>());
+    assert_eq!(
+        zone_pruned_row_groups() - before,
+        row_groups - 1,
+        "every row group outside the requested range must be pruned"
+    );
+
+    // Straddling a row-group boundary: both neighbours must be scanned.
+    let before = zone_pruned_row_groups();
+    let boundary = scan("ts", 65_530.0, 65_545.0);
+    assert_eq!(boundary, (65_530..=65_545).collect::<Vec<usize>>());
+    assert_eq!(
+        zone_pruned_row_groups() - before,
+        row_groups - 2
+    );
+
+    // A range wider than every zone prunes nothing and still returns every row.
+    let before = zone_pruned_row_groups();
+    let all = scan("ts", -1.0, rows as f64 + 1.0);
+    assert_eq!(all.len(), rows);
+    assert_eq!(
+        zone_pruned_row_groups() - before,
+        0
+    );
+
+    // Float zones use the float comparison path.
+    let floats = scan("f", 120_000.0, 120_004.0);
+    assert_eq!(floats, (120_000..=120_004).collect::<Vec<usize>>());
+
+    // ... and a float range strictly between two groups stays empty.
+    assert!(scan("f", rows as f64 + 10.0, rows as f64 + 20.0).is_empty());
+}
+
+#[test]
+fn column_value_at_maps_every_supported_column_kind() {
+    // One shared converter serves the compressed and uncompressed point-read
+    // fallbacks. It used to be two divergent matches, and the compressed one
+    // returned NULL for dictionary strings and booleans.
+    use crate::data::Value;
+
+    let dict = ColumnData::StringDict {
+        indices: vec![1, 2, 0],
+        dict_offsets: vec![0, 3, 6],
+        dict_data: b"abcxyz".to_vec(),
+    };
+    assert_eq!(column_value_at(&dict, 0), Value::String("abc".to_string()));
+    assert_eq!(column_value_at(&dict, 1), Value::String("xyz".to_string()));
+    assert_eq!(column_value_at(&dict, 2), Value::Null, "index 0 is the NULL slot");
+    assert_eq!(column_value_at(&dict, 3), Value::Null, "out of range");
+
+    let bools = ColumnData::Bool {
+        data: vec![0b0000_0101],
+        len: 3,
+    };
+    assert_eq!(column_value_at(&bools, 0), Value::Bool(true));
+    assert_eq!(column_value_at(&bools, 1), Value::Bool(false));
+    assert_eq!(column_value_at(&bools, 2), Value::Bool(true));
+    assert_eq!(column_value_at(&bools, 3), Value::Null);
+
+    let binary = ColumnData::Binary {
+        offsets: vec![0, 2, 5],
+        data: b"abxyz".to_vec(),
+    };
+    assert_eq!(column_value_at(&binary, 0), Value::Binary(b"ab".to_vec()));
+    assert_eq!(column_value_at(&binary, 1), Value::Binary(b"xyz".to_vec()));
+    assert_eq!(column_value_at(&binary, 2), Value::Null);
+
+    let floats = ColumnData::Float64(vec![1.5, 2.5]);
+    assert_eq!(column_value_at(&floats, 1), Value::Float64(2.5));
+    assert_eq!(column_value_at(&floats, 2), Value::Null);
+
+    // Vector columns read back as their raw row bytes, matching the Python
+    // binding's `ColumnValue::FixedList` -> bytes conversion.
+    // f32 rows: `dim` elements of four bytes each.
+    let fixed = ColumnData::FixedList {
+        data: (0..24).map(|i| i as u8).collect(),
+        dim: 3,
+    };
+    assert_eq!(
+        column_value_at(&fixed, 0),
+        Value::FixedList((0..12).collect())
+    );
+    assert_eq!(
+        column_value_at(&fixed, 1),
+        Value::FixedList((12..24).collect())
+    );
+    assert_eq!(column_value_at(&fixed, 2), Value::Null, "out of range");
+    assert_eq!(
+        column_value_at(
+            &ColumnData::FixedList {
+                data: vec![0; 4],
+                dim: 0
+            },
+            0
+        ),
+        Value::Null,
+        "an unknown dimension has no rows"
+    );
+
+    let f16 = ColumnData::Float16List {
+        data: (0..12).map(|i| i as u8).collect(),
+        dim: 2,
+    };
+    assert_eq!(
+        column_value_at(&f16, 2),
+        Value::FixedList(vec![8, 9, 10, 11])
+    );
+    assert_eq!(column_value_at(&f16, 3), Value::Null, "out of range");
+}
+
+#[test]
+fn filtered_numeric_agg_skips_aggregate_column_nulls_across_row_groups() {
+    // The fused filtered-aggregation lane reads values straight from the row
+    // group bodies. Its parallel branch (one aggregate column, several row
+    // groups) used the filter column's NULL bitmap but not the aggregate
+    // column's own, so a matching row with a NULL value still entered
+    // COUNT(col)/SUM/MIN/MAX. The sequential single-row-group branch did check
+    // it, so the defect only appeared once a table had several row groups.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("agg_nulls.apex");
+    let schema = [
+        ("a".to_string(), ColumnType::Int64),
+        ("b".to_string(), ColumnType::Int64),
+    ];
+    let rows = 300_000usize;
+    let nulls_every = 3usize;
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("a".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        int_cols.insert("b".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        let mut null_positions = HashMap::new();
+        null_positions.insert(
+            "b".to_string(),
+            (0..rows).map(|i| i % nulls_every == 0).collect::<Vec<bool>>(),
+        );
+        storage
+            .insert_typed_with_nulls_full(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                null_positions,
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let footer = storage.get_or_load_footer().unwrap().expect("footer");
+    assert!(
+        footer.row_groups.len() >= 2,
+        "the parallel branch needs several row groups, got {}",
+        footer.row_groups.len()
+    );
+
+    let stats = storage
+        .execute_filtered_numeric_agg_mmap("a", 0.0, f64::INFINITY, &["*", "b"])
+        .unwrap()
+        .expect("fused aggregation");
+    let non_null = rows - rows.div_ceil(nulls_every);
+    assert_eq!(stats[0].0, rows as i64, "COUNT(*) keeps every matching row");
+    assert_eq!(stats[1].0, non_null as i64, "COUNT(b) skips NULL cells");
+    assert_eq!(stats[1].1, (0..rows as i64).filter(|v| v % nulls_every as i64 != 0).sum::<i64>() as f64, "SUM(b)");
+    assert_eq!(stats[1].2, 1.0, "MIN(b)");
+    assert_eq!(stats[1].3, (rows - 1) as f64, "MAX(b)");
+}
+
+#[test]
+fn scan_buffer_budget_env_parsing() {
+    // The vector TopK lanes hold a whole-column buffer; `APEX_SCAN_BUFFER_MB` decides how
+    // large that may get before the lane stands down and reads a windowed batch instead
+    // (bounded RSS = the out-of-core contract). The parser is pure so the cases below do
+    // not race with other tests over the process environment.
+    use crate::storage::on_demand::parse_scan_buffer_budget;
+    const MB: usize = 1024 * 1024;
+    assert_eq!(
+        parse_scan_buffer_budget(None),
+        usize::MAX,
+        "unlimited by default: a default cap made ordinary vector TopK stand down (+1479% \
+         on Batch quantized TopK L2 (float16) in the full gate)"
+    );
+    assert_eq!(parse_scan_buffer_budget(Some("64")), 64 * MB);
+    assert_eq!(parse_scan_buffer_budget(Some(" 8 ")), 8 * MB, "whitespace tolerated");
+    assert_eq!(parse_scan_buffer_budget(Some("0")), usize::MAX, "0 = unlimited");
+    assert_eq!(
+        parse_scan_buffer_budget(Some("nonsense")),
+        usize::MAX,
+        "an unparsable value keeps the default (unlimited) rather than inventing a cap"
+    );
+    assert_eq!(
+        parse_scan_buffer_budget(Some(&usize::MAX.to_string())),
+        usize::MAX.saturating_mul(MB),
+        "huge values saturate instead of wrapping"
+    );
+}
+
+#[test]
+fn deletion_state_lets_the_cached_dictionary_be_compacted() {
+    // The cached string dictionary describes *physical* rows, so the dict-read path
+    // (`read_cached_dict_columns`) compacts its codes onto the surviving rows instead of
+    // standing down. That compaction needs exactly two numbers: the persisted physical base
+    // and a bitmap whose set bits are the deleted rows. This pins both, because losing
+    // either one silently sends every string GROUP BY back to plain strings (1M rows,
+    // numeric+string key: 9.3 -> 38.3 ms, 4.13x).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("dict_compaction_state.apex");
+    let schema = [
+        ("k".to_string(), ColumnType::Int64),
+        ("s".to_string(), ColumnType::String),
+    ];
+    let rows = 50_000usize;
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("k".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        let mut string_cols = HashMap::new();
+        string_cols.insert(
+            "s".to_string(),
+            (0..rows).map(|i| format!("c{}", i % 100)).collect::<Vec<String>>(),
+        );
+        storage
+            .insert_typed(HashMap::new(), HashMap::new(), string_cols, HashMap::new(), HashMap::new())
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert!(
+        storage.persisted_deletion_state().unwrap().is_none(),
+        "a table without deletions needs no compaction"
+    );
+
+    assert!(storage.delete(5_000));
+    assert!(storage.delete(50_000));
+    storage.save_delete_only().unwrap();
+
+    let (physical_base, bitmap) = storage
+        .persisted_deletion_state()
+        .unwrap()
+        .expect("a persisted deletion vector must expose its physical base");
+    assert_eq!(physical_base, rows, "the physical base is the pre-delete row count");
+    let deleted_bits: usize = bitmap.iter().map(|byte| byte.count_ones() as usize).sum();
+    assert_eq!(deleted_bits, 2, "exactly the two deleted ids are marked");
+    // What the dict path publishes: physical base minus the marked rows.
+    assert_eq!(physical_base - deleted_bits, rows - 2);
+    assert_eq!(storage.active_row_count() as usize, rows - 2);
+
+    // The dictionary cache itself stays physical-space, which is why compaction is needed.
+    if let Some((dict_strings, group_ids)) = storage.build_string_dict_cache("s").unwrap() {
+        assert_eq!(
+            group_ids.len(),
+            physical_base,
+            "the cached codes cover physical rows, so they must be compacted"
+        );
+        assert!(dict_strings.len() <= 4096);
+    }
+}
+
+#[test]
+fn numeric_group_by_skips_deleted_rows() {
+    // The native numeric GROUP BY lane used to stand down whenever any row group had
+    // deletions, which pushed every later grouping onto the generic path (1M rows, 100
+    // deletes: 0.86 -> 9.68 ms, 11.3x). It now skips deleted rows inside its per-row loop
+    // using the row group's deletion bitmap, so the per-group stats cover live rows only.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("numeric_group_deletes.apex");
+    let schema = [
+        ("g".to_string(), ColumnType::Int64),
+        ("v".to_string(), ColumnType::Int64),
+    ];
+    let rows = 100_000usize;
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert(
+            "g".to_string(),
+            (0..rows as i64).map(|i| i % 10).collect::<Vec<i64>>(),
+        );
+        int_cols.insert("v".to_string(), vec![1i64; rows]);
+        storage
+            .insert_typed_with_nulls_full(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let group_of = |id: i64| (id - 1) % 10;
+    let baseline = storage
+        .execute_numeric_group_agg_mmap("g", &[("v", false)], &[3], 0)
+        .unwrap()
+        .expect("native numeric GROUP BY");
+    let expected_per_group = (rows / 10) as i64;
+    for part in &baseline {
+        assert_eq!(part.stats[0].0, expected_per_group, "group {}", part.key);
+    }
+
+    // Delete three rows spread across the id space (ids 3, 5_000, 99_999).
+    for id in [3i64, 5_000, 99_999] {
+        assert!(storage.delete(id as u64));
+    }
+    storage.save_delete_only().unwrap();
+    let after = storage
+        .execute_numeric_group_agg_mmap("g", &[("v", false)], &[3], 0)
+        .unwrap()
+        .expect("native numeric GROUP BY after deletes");
+    let mut deleted_per_group: HashMap<i64, i64> = HashMap::new();
+    for id in [3i64, 5_000, 99_999] {
+        *deleted_per_group.entry(group_of(id)).or_default() += 1;
+    }
+    for part in &after {
+        let removed = deleted_per_group.get(&part.key).copied().unwrap_or(0);
+        assert_eq!(
+            part.stats[0].0,
+            expected_per_group - removed,
+            "group {} must exclude deleted rows",
+            part.key
+        );
+        assert_eq!(
+            part.stats[0].1,
+            (expected_per_group - removed) as f64,
+            "group {} sum must exclude deleted rows",
+            part.key
+        );
+    }
+    assert_eq!(after.len(), baseline.len(), "no group may disappear");
+}
+
+#[test]
+fn covering_range_count_reads_no_payload() {
+    // A range that covers a row group entirely makes COUNT(*) the row count, so the
+    // filter column need not be touched. Before this the lane evaluated the predicate
+    // row by row (~13 ms per 1M rows), while a compressed table answered it in ~1.3 ms
+    // through a batch path.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("covering_count.apex");
+    let schema = [
+        ("k".to_string(), ColumnType::Int64),
+        ("v".to_string(), ColumnType::Int64),
+    ];
+    let rows = 300_000usize;
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("k".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        int_cols.insert("v".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        storage
+            .insert_typed_with_nulls_full(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    // Covers every row group: count must be the row count, and no value column read.
+    let covered = storage
+        .execute_filtered_numeric_agg_mmap("k", 0.0, f64::INFINITY, &["*"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(covered[0].0, rows as i64, "covering COUNT(*)");
+    // A range that matches nothing is pruned by the zone map as before.
+    let empty = storage
+        .execute_filtered_numeric_agg_mmap("k", -10.0, -1.0, &["*"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(empty[0].0, 0, "non-overlapping range");
+    // Partially covering still evaluates the predicate per row and stays correct.
+    let partial = storage
+        .execute_filtered_numeric_agg_mmap("k", 100_000.0, f64::INFINITY, &["*"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(partial[0].0, (rows - 100_000) as i64, "partial COUNT(*)");
+    // Asking for a value column keeps count semantics and, because the range covers the
+    // group and the column has no NULLs, accumulates with the tight loop.
+    let with_value = storage
+        .execute_filtered_numeric_agg_mmap("k", 0.0, f64::INFINITY, &["*", "v"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(with_value[0].0, rows as i64, "COUNT(*) beside COUNT(v)");
+    assert_eq!(with_value[1].0, rows as i64, "COUNT(v)");
+    assert_eq!(
+        with_value[1].1,
+        (0..rows as i64).sum::<i64>() as f64,
+        "SUM(v) over a covering range"
+    );
+    assert_eq!(with_value[1].2, 0.0, "MIN(v) over a covering range");
+    assert_eq!(with_value[1].3, (rows - 1) as f64, "MAX(v) over a covering range");
+    // A narrow integer column may be bit-packed; the covering path decodes it in
+    // bulk (BITPACK payloads: [count][bit_width][min][packed]) instead of per row.
+    let narrow = storage
+        .execute_filtered_numeric_agg_mmap("k", 0.0, f64::INFINITY, &["*", "k"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(narrow[0].0, rows as i64, "COUNT(*) beside COUNT(k)");
+    assert_eq!(narrow[1].0, rows as i64, "COUNT(k)");
+    assert_eq!(narrow[1].1, (0..rows as i64).sum::<i64>() as f64, "SUM(k)");
+    assert_eq!(narrow[1].2, 0.0, "MIN(k)");
+    assert_eq!(narrow[1].3, (rows - 1) as f64, "MAX(k)");
+
+    // A partially covering range on a bit-packed filter column counts straight from
+    // the packed bits for count-only aggregates (the per-row decoder cost ~7.9 ms per
+    // 1M rows against ~0.4 ms here).
+    let partial_count = storage
+        .execute_filtered_numeric_agg_mmap("k", 100_000.0, f64::INFINITY, &["*"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(partial_count[0].0, (rows - 100_000) as i64, "partial COUNT(*)");
+    let between_count = storage
+        .execute_filtered_numeric_agg_mmap("k", 0.0, 999.0, &["*"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(between_count[0].0, 1_000, "BETWEEN COUNT(*)");
+
+    // A covering count stays exact (and metadata-only) after deletions: the shortcut now
+    // uses the footer's active-row count instead of requiring `deletion_count == 0`,
+    // which used to push every later covering count onto the per-row path (4x).
+    assert!(storage.delete(5_000));
+    storage.save_delete_only().unwrap();
+    let after_delete = storage
+        .execute_filtered_numeric_agg_mmap("k", 0.0, f64::INFINITY, &["*"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(
+        after_delete[0].0,
+        rows as i64 - 1,
+        "a covering COUNT(*) must exclude the deleted row"
+    );
+    // A value aggregate must also exclude it (it keeps the per-row path when the row
+    // group has deletions, so only its arithmetic matters here).
+    let values_after_delete = storage
+        .execute_filtered_numeric_agg_mmap("k", 0.0, f64::INFINITY, &["*", "v"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(
+        values_after_delete[0].0,
+        rows as i64 - 1,
+        "COUNT(*) beside a value aggregate"
+    );
+
+    // A partially covering range with both columns bit-packed streams them together,
+    // so the per-row header re-parse and bit walk disappear.
+    let partial_values = storage
+        .execute_filtered_numeric_agg_mmap("k", 100_000.0, f64::INFINITY, &["*", "v"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(partial_values[0].0, (rows - 100_000) as i64, "partial COUNT(*)");
+    assert_eq!(partial_values[1].0, (rows - 100_000) as i64, "partial COUNT(v)");
+    assert_eq!(
+        partial_values[1].1,
+        (100_000..rows as i64).sum::<i64>() as f64,
+        "partial SUM(v)"
+    );
+    assert_eq!(partial_values[1].2, 100_000.0, "partial MIN(v)");
+    assert_eq!(partial_values[1].3, (rows - 1) as f64, "partial MAX(v)");
+    let between_values = storage
+        .execute_filtered_numeric_agg_mmap("k", 0.0, 999.0, &["*", "v"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(between_values[1].0, 1_000, "BETWEEN COUNT(v)");
+    assert_eq!(between_values[1].1, (0..1_000).sum::<i64>() as f64, "BETWEEN SUM(v)");
+
+    // A partially covering range keeps the per-row path for value aggregates.
+    let partial_value = storage
+        .execute_filtered_numeric_agg_mmap("k", 100_000.0, f64::INFINITY, &["*", "v"])
+        .unwrap()
+        .expect("fused aggregation");
+    assert_eq!(partial_value[0].0, (rows - 100_000) as i64, "partial COUNT(*)");
+    assert_eq!(
+        partial_value[1].1,
+        (100_000..rows as i64).sum::<i64>() as f64,
+        "partial SUM(v)"
+    );
+}
+
+#[test]
+fn string_tail_zone_prunes_equal_length_shared_prefix_rows() {
+    // Timestamp/UUID-shaped values are all the same length and share their
+    // first eight bytes, so neither the byte-length zone nor the first-eight
+    // value zone can tell them apart. The tail zone (second eight bytes) is
+    // what makes such a column prunable.
+    use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("string_tail_zone.apex");
+    let schema = [
+        ("code".to_string(), ColumnType::String),
+        ("pad".to_string(), ColumnType::Int64),
+    ];
+    let rows = 400_000usize;
+    let codes: Vec<String> = (0..rows)
+        .map(|i| format!("2026-09-26T{i:06}"))
+        .collect();
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("pad".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        let mut string_cols = HashMap::new();
+        string_cols.insert("code".to_string(), codes.clone());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let footer = storage.get_or_load_footer().unwrap().expect("footer");
+    assert!(footer.row_groups.len() >= 3, "fixture needs multiple groups");
+    let code_idx = footer.schema.get_index("code").unwrap();
+    for rg_i in 0..footer.row_groups.len() {
+        let zones: Vec<_> = footer.zone_maps[rg_i]
+            .iter()
+            .filter(|z| z.col_idx as usize == code_idx)
+            .collect();
+        assert_eq!(zones.len(), 3);
+        // Every value is 17 bytes ("2026-09-26T" + six digits) and starts with
+        // the same eight bytes: only the tail entry varies across the group.
+        assert_eq!(zones[0].min_bits, 17);
+        assert_eq!(zones[0].max_bits, 17);
+        assert_eq!(zones[1].min_bits, zones[1].max_bits);
+        assert!(zones[1].is_string_prefix);
+        assert!(zones[2].min_bits < zones[2].max_bits, "row group {rg_i}");
+        assert!(zones[2].is_string_tail);
+    }
+
+    let scan = |value: &str| {
+        let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "code".to_string(),
+            op: ScanComparison::Eq,
+            value: ScanValue::String(value.to_string()),
+        });
+        let before = predicate_pruned_row_groups();
+        let streams = storage
+            .scan_rg_batches_ranges(Some(&["code"]), false, Some(&predicate), 1)
+            .unwrap()
+            .expect("persisted table must stream batches");
+        let mut seen = 0usize;
+        for stream in streams {
+            for batch in stream {
+                seen += batch.unwrap().num_rows();
+            }
+        }
+        (seen, predicate_pruned_row_groups() - before)
+    };
+
+    // The first and last stored values live in the first and last group.
+    let first = scan(&codes[0]);
+    let last = scan(&codes[rows - 1]);
+    assert!(first.0 > 0 && first.1 >= footer.row_groups.len() - 2);
+    assert!(last.0 > 0 && last.1 >= footer.row_groups.len() - 2);
+    assert!(
+        first.1 > footer.row_groups.len() / 2,
+        "the tail zone must prune most groups (pruned={})",
+        first.1
+    );
+    // A missing value that shares all sixteen bytes with a stored one differs
+    // only in its last byte, outside the stored window: the zones cannot prove
+    // it absent, so exactly the twin's group survives (and the predicate still
+    // returns no row for it at the SQL level).
+    let stored = &codes[rows / 2];
+    let missing = format!("{}9", &stored[..16]);
+    assert_ne!(&missing, stored);
+    let (rows_seen, pruned) = scan(&missing);
+    assert_eq!(
+        pruned,
+        footer.row_groups.len() - 1,
+        "only the sixteen-byte twin's group can survive"
+    );
+    assert!(rows_seen > 0, "the twin group is scanned, not skipped");
+
+    // A value whose tail window lies beyond every stored one prunes every group.
+    let beyond = "2026-09-26T999999";
+    let (rows_seen, pruned) = scan(beyond);
+    assert_eq!(rows_seen, 0, "no group can hold it");
+    assert_eq!(pruned, footer.row_groups.len());
+
+    // Ordering comparisons must not use the tail entry: a range whose bounds
+    // sit between stored tails still matches every stored value.
+    let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+        column: "code".to_string(),
+        op: ScanComparison::Gt,
+        value: ScanValue::String("2026-09-26T000000".to_string()),
+    });
+    let before = predicate_pruned_row_groups();
+    let streams = storage
+        .scan_rg_batches_ranges(Some(&["code"]), false, Some(&predicate), 1)
+        .unwrap()
+        .expect("persisted table must stream batches");
+    let mut seen = 0usize;
+    for stream in streams {
+        for batch in stream {
+            seen += batch.unwrap().num_rows();
+        }
+    }
+    assert_eq!(seen, rows, "an ordering comparison skips no group");
+    assert_eq!(
+        predicate_pruned_row_groups() - before,
+        0,
+        "the tail zone must not prune an ordering comparison"
+    );
+}
+
+#[test]
+fn string_value_zones_prune_rows_whose_length_zone_cannot() {
+    // A fixed-width string column gives the byte-length zone nothing to prune:
+    // every value is eight bytes, so only the lexicographic value range can
+    // skip row groups. This is the case the value zone exists for.
+    use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("string_value_zone.apex");
+    let schema = [
+        ("code".to_string(), ColumnType::String),
+        ("pad".to_string(), ColumnType::Int64),
+    ];
+    let rows = 400_000usize;
+    let bucket = 131_072usize;
+    let codes: Vec<String> = (0..rows)
+        .map(|i| format!("k{:07}", i / bucket))
+        .collect();
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("pad".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        let mut string_cols = HashMap::new();
+        string_cols.insert("code".to_string(), codes.clone());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let footer = storage.get_or_load_footer().unwrap().expect("footer");
+    assert!(footer.row_groups.len() >= 3, "fixture needs multiple groups");
+    let code_idx = footer.schema.get_index("code").unwrap();
+    for rg_i in 0..footer.row_groups.len() {
+        let entries: Vec<_> = footer.zone_maps[rg_i]
+            .iter()
+            .filter(|z| z.col_idx as usize == code_idx)
+            .collect();
+        // The first eight bytes already separate the buckets, and every value is
+        // exactly eight bytes, so the tail window is a constant all-zero range:
+        // the writer omits it (it would repeat what the value zone says while
+        // costing footer bytes and a reader check on every scan).
+        assert_eq!(entries.len(), 2, "length zone + value zone");
+        // Uniform width: the length zone spans exactly one value.
+        assert_eq!(entries[0].min_bits, 8);
+        assert_eq!(entries[0].max_bits, 8);
+        assert!(!entries[0].is_string_prefix && !entries[0].is_string_tail);
+        // Uniform bucket: the value zone spans exactly one prefix key.
+        assert_eq!(entries[1].min_bits, entries[1].max_bits);
+        assert!(entries[1].is_string_prefix);
+        assert!(!entries[1].is_string_tail);
+    }
+
+    let scan = |value: &str| {
+        let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "code".to_string(),
+            op: ScanComparison::Eq,
+            value: ScanValue::String(value.to_string()),
+        });
+        let before = predicate_pruned_row_groups();
+        let streams = storage
+            .scan_rg_batches_ranges(Some(&["code"]), false, Some(&predicate), 1)
+            .unwrap()
+            .expect("persisted table must stream batches");
+        let mut seen = 0usize;
+        for stream in streams {
+            for batch in stream {
+                seen += batch.unwrap().num_rows();
+            }
+        }
+        (seen, predicate_pruned_row_groups() - before)
+    };
+
+    let probe = crate::storage::on_demand::string_prefix_key(b"k0000001");
+    let matching_groups = footer
+        .row_groups
+        .iter()
+        .enumerate()
+        .filter(|(rg_i, _)| {
+            footer.zone_maps[*rg_i].iter().any(|z| {
+                z.is_string_prefix
+                    && z.col_idx as usize == code_idx
+                    && z.min_bits == probe
+                    && z.max_bits == probe
+            })
+        })
+        .count();
+    assert!(matching_groups > 0 && matching_groups < footer.row_groups.len());
+    let (rows_seen, pruned) = scan("k0000001");
+    assert_eq!(rows_seen, bucket);
+    assert_eq!(pruned, footer.row_groups.len() - matching_groups);
+}
+
+#[test]
+fn string_zone_maps_prune_row_groups_by_value() {
+    // String zone maps used to store byte lengths, which no predicate could
+    // use. They now store the lexicographic value range, so a clustered string
+    // column can skip row groups for `=`, `IN` and range predicates.
+    use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("string_zone.apex");
+    let schema = [
+        ("name".to_string(), ColumnType::String),
+        ("pad".to_string(), ColumnType::Int64),
+    ];
+    let rows = 400_000usize;
+    // 131_072-row buckets make every adaptive row group uniformly in one
+    // lexical bucket (see `compute_adaptive_row_group_size`).
+    let bucket = 131_072usize;
+    // The distinguishing part must fall inside the eight-byte prefix the zone
+    // stores; values that share their first eight bytes can never be told
+    // apart by it (that is the conservative case, covered by a unit test).
+    let names: Vec<String> = (0..rows)
+        .map(|i| format!("b{:07}-row{i}", i / bucket))
+        .collect();
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("pad".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        let mut string_cols = HashMap::new();
+        string_cols.insert("name".to_string(), names.clone());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let footer = storage.get_or_load_footer().unwrap().expect("footer");
+    assert!(footer.row_groups.len() >= 3, "fixture needs multiple groups");
+    let name_idx = footer.schema.get_index("name").unwrap();
+    for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+        let entries: Vec<_> = footer.zone_maps[rg_i]
+            .iter()
+            .filter(|z| z.col_idx as usize == name_idx)
+            .collect();
+        assert_eq!(
+            entries.len(),
+            3,
+            "a string column carries the byte-length zone, the value zone and the tail zone"
+        );
+        let length_zone = entries[0];
+        let value_zone = entries[1];
+        let tail_zone = entries[2];
+        // The length entry comes first so readers that predate the value-range
+        // flags keep resolving the column's zone with the legacy meaning.
+        assert!(!length_zone.is_string_prefix, "length zone must come first");
+        assert!(!length_zone.is_string_tail);
+        assert!(value_zone.is_string_prefix, "value semantics must be declared");
+        assert!(!value_zone.is_string_tail);
+        assert!(tail_zone.is_string_tail, "tail semantics must be declared");
+        assert!(!tail_zone.is_string_prefix);
+        for zone in [length_zone, value_zone, tail_zone] {
+            assert!(!zone.is_float);
+        }
+        // Values are "b{bucket:07}-row{index}": the byte length varies with the
+        // row index inside the group but never drops below the fixed prefix.
+        assert!(
+            (13..=18).contains(&length_zone.min_bits),
+            "row group {rg_i} rows={} length zone=({}, {})",
+            rg_meta.row_count,
+            length_zone.min_bits,
+            length_zone.max_bits
+        );
+        assert!(length_zone.max_bits >= length_zone.min_bits);
+        // Each group lies inside one 131_072-row bucket, so the eight-byte
+        // prefix (and therefore the value zone) is constant.
+        assert_eq!(value_zone.min_bits, value_zone.max_bits, "row group {rg_i}");
+        assert!(rg_meta.row_count > 0);
+    }
+
+    let scan = |value: &str, op: ScanComparison| {
+        let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "name".to_string(),
+            op,
+            value: ScanValue::String(value.to_string()),
+        });
+        let before = predicate_pruned_row_groups();
+        let streams = storage
+            .scan_rg_batches_ranges(Some(&["name"]), false, Some(&predicate), 1)
+            .unwrap()
+            .expect("persisted table must stream batches");
+        let mut seen = 0usize;
+        for stream in streams {
+            for batch in stream {
+                seen += batch.unwrap().num_rows();
+            }
+        }
+        (seen, predicate_pruned_row_groups() - before)
+    };
+
+    // The bucket value exists only in the row groups that carry its bucket
+    // prefix; the tail range then narrows that set to the group(s) whose second
+    // eight bytes can hold the value.
+    let probe = crate::storage::on_demand::string_prefix_key(b"b0000001-row");
+    let matching_groups = footer
+        .row_groups
+        .iter()
+        .enumerate()
+        .filter(|(rg_i, _)| {
+            footer.zone_maps[*rg_i]
+                .iter()
+                .any(|z| z.is_string_prefix && z.col_idx as usize == name_idx
+                    && z.min_bits == probe
+                    && z.max_bits == probe)
+        })
+        .count();
+    assert!(matching_groups > 0 && matching_groups < footer.row_groups.len());
+    let existing = format!("b0000001-row{}", bucket);
+    let probe_tail = crate::storage::on_demand::string_tail_key(existing.as_bytes());
+    let exact_groups: Vec<&_> = footer
+        .row_groups
+        .iter()
+        .enumerate()
+        .filter(|(rg_i, _)| {
+            let zones: Vec<_> = footer.zone_maps[*rg_i]
+                .iter()
+                .filter(|z| z.col_idx as usize == name_idx)
+                .collect();
+            zones.iter().all(|z| {
+                if z.is_string_tail {
+                    probe_tail >= z.min_bits && probe_tail <= z.max_bits
+                } else if z.is_string_prefix {
+                    probe >= z.min_bits && probe <= z.max_bits
+                } else {
+                    (existing.len() as i64) >= z.min_bits
+                        && (existing.len() as i64) <= z.max_bits
+                }
+            })
+        })
+        .map(|(_, meta)| meta)
+        .collect();
+    assert_eq!(exact_groups.len(), 1, "the tail zone isolates the owning group");
+    assert!(
+        matching_groups > exact_groups.len(),
+        "the tail zone must prune beyond the shared prefix"
+    );
+    let expected_rows: usize = exact_groups.iter().map(|m| m.row_count as usize).sum();
+    let (rows_seen, pruned) = scan(&existing, ScanComparison::Eq);
+    assert_eq!(rows_seen, expected_rows, "only the owning group may survive");
+    assert_eq!(pruned, footer.row_groups.len() - exact_groups.len());
+
+    // A value outside every bucket prunes every group.
+    let (rows_seen, _) = scan("zzz", ScanComparison::Eq);
+    assert_eq!(rows_seen, 0);
+
+    // The byte-length zone is decisive on its own: a probe whose length no
+    // group can hold proves every group empty even when its eight-byte prefix
+    // matches a bucket.
+    let too_long = format!("b0000001-row{}x", rows);
+    let (rows_seen, pruned) = scan(&too_long, ScanComparison::Eq);
+    assert_eq!(rows_seen, 0);
+    assert_eq!(pruned, footer.row_groups.len());
+}
+
+#[test]
+fn legacy_length_string_zones_never_prune_by_order() {
+    // Files written before the value-prefix flag store byte lengths in the
+    // string zone. Those numbers must never be compared against string values
+    // for an ordering comparison, and equality may only prune when the length is
+    // provably absent from the range.
+    use crate::storage::on_demand::{OnDemandSchema, RgColumnZoneMap, RowGroupMeta, V4Footer};
+    use crate::storage::{ScanComparison, ScanPredicate, ScanValue};
+
+    let mut schema = OnDemandSchema::new();
+    schema.add_column("name", ColumnType::String);
+    let footer = V4Footer {
+        schema,
+        row_groups: vec![RowGroupMeta {
+            offset: 0,
+            data_size: 0,
+            row_count: 8,
+            min_id: 1,
+            max_id: 8,
+            deletion_count: 0,
+        }],
+        zone_maps: vec![vec![RgColumnZoneMap {
+            col_idx: 0,
+            min_bits: 3,
+            max_bits: 7,
+            has_nulls: false,
+            is_float: false,
+            is_string_prefix: false,
+            is_string_tail: false,
+        }]],
+        col_offsets: Vec::new(),
+    };
+    let disjoint = |op: ScanComparison, value: &str| {
+        let predicate = ScanPredicate::Compare {
+            column: "name".to_string(),
+            op,
+            value: ScanValue::String(value.to_string()),
+        };
+        zone_map_rg_disjoint_for_test(
+            0,
+            &footer,
+            &crate::storage::ScanPredicateExpr::Predicate(predicate),
+        )
+    };
+    // Lengths 1 and 12 fall outside the stored [3, 7] byte-length range, so no
+    // value of that length can be present.
+    for value in ["a", "zzzzzzzzzzzz"] {
+        assert!(disjoint(ScanComparison::Eq, value), "length proves {value:?} absent");
+    }
+    // A length inside the range proves nothing about the value.
+    for value in ["abc", "abcd", "abcdefg"] {
+        assert!(!disjoint(ScanComparison::Eq, value), "must not prune {value:?}");
+    }
+    // Lengths say nothing about lexicographic order.
+    for op in [
+        ScanComparison::Lt,
+        ScanComparison::Le,
+        ScanComparison::Gt,
+        ScanComparison::Ge,
+        ScanComparison::NotEq,
+    ] {
+        for value in ["a", "zzzzzzzzzzzz", "abc"] {
+            assert!(
+                !disjoint(op, value),
+                "length-semantics zones must not prune for {op:?} {value:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn bool_zone_maps_prune_row_groups_in_the_batch_stream() {
+    // Bool columns used to carry no zone map at all, so `WHERE flag = true`
+    // scanned every row group. The writer now records the observed bit range
+    // (false < true) and the batch stream prunes a group whose range cannot
+    // contain the requested value.
+    use crate::storage::{ScanComparison, ScanPredicate, ScanPredicateExpr, ScanValue};
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("bool_zone.apex");
+    let schema = [
+        ("flag".to_string(), ColumnType::Bool),
+        ("pad".to_string(), ColumnType::Int64),
+    ];
+    let rows = 400_000usize;
+    // Runs of 131_072 rows: that is the largest adaptive row-group size, and
+    // the smaller choices (65_536 / 32_768) divide it, so every row group is
+    // uniformly true or uniformly false whichever size is picked.
+    let run = 131_072usize;
+    let flags: Vec<bool> = (0..rows).map(|i| (i / run) % 2 == 0).collect();
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("pad".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        let mut bool_cols = HashMap::new();
+        bool_cols.insert("flag".to_string(), flags.clone());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                bool_cols,
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let footer = storage.get_or_load_footer().unwrap().expect("footer");
+    assert!(
+        footer.row_groups.len() >= 3,
+        "fixture needs multiple row groups"
+    );
+    let flag_idx = footer.schema.get_index("flag").unwrap();
+
+    // Every row group must carry a Bool zone, and the fixture must make those
+    // zones uniform so pruning is provable from the file itself.
+    let mut all_true_rows = 0usize;
+    let mut all_false_rows = 0usize;
+    let mut all_true_groups = 0usize;
+    let mut all_false_groups = 0usize;
+    for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+        let zone = footer.zone_maps[rg_i]
+            .iter()
+            .find(|z| z.col_idx as usize == flag_idx)
+            .map(|z| (z.min_bits, z.max_bits, z.is_float))
+            .expect("every row group must carry a zone map for the Bool column");
+        assert_eq!(zone.2, false, "a Bool zone is never a float zone");
+        match zone {
+            (1, 1, _) => {
+                all_true_rows += rg_meta.row_count as usize;
+                all_true_groups += 1;
+            }
+            (0, 0, _) => {
+                all_false_rows += rg_meta.row_count as usize;
+                all_false_groups += 1;
+            }
+            other => panic!("row group {rg_i} is not uniform: {other:?}"),
+        }
+    }
+
+    let scan_rows = |value: bool| {
+        let predicate = ScanPredicateExpr::Predicate(ScanPredicate::Compare {
+            column: "flag".to_string(),
+            op: ScanComparison::Eq,
+            value: ScanValue::Bool(value),
+        });
+        let before = predicate_pruned_row_groups();
+        let streams = storage
+            .scan_rg_batches_ranges(Some(&["flag"]), false, Some(&predicate), 1)
+            .unwrap()
+            .expect("persisted table must stream batches");
+        let mut seen = 0usize;
+        for stream in streams {
+            for batch in stream {
+                seen += batch.unwrap().num_rows();
+            }
+        }
+        (seen, predicate_pruned_row_groups() - before)
+    };
+
+    let (true_rows, true_pruned) = scan_rows(true);
+    assert_eq!(true_rows, all_true_rows);
+    assert_eq!(true_pruned, all_false_groups);
+
+    let (false_rows, false_pruned) = scan_rows(false);
+    assert_eq!(false_rows, all_false_rows);
+    assert_eq!(false_pruned, all_true_groups);
+    assert!(all_false_groups > 0 && all_true_groups > 0);
+}
+
+#[test]
+fn projection_without_id_still_applies_a_preexisting_delta() {
+    // The overlay locates rows by ID, so a scan that starts with a pending
+    // delta must collect them even when `_id` is not projected.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("skip_ids_delta.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("value".to_string(), (0..8i64).collect::<Vec<i64>>());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    storage
+        .delta_store
+        .write()
+        .update_cell(6, "value", crate::data::Value::Int64(900));
+
+    let batch = storage
+        .to_arrow_batch_mmap(Some(&["value"]), false, None, false)
+        .unwrap()
+        .unwrap();
+    let values = batch
+        .column_by_name("value")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    assert_eq!(
+        (0..values.len()).map(|i| values.value(i)).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3, 4, 900, 6, 7],
+    );
+}
+
+#[test]
+fn unsupported_format_version_is_rejected() {
+    // Every V4 code path is gated on an exact version match, so an unknown
+    // version must fail at parse time instead of falling into legacy reads.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("future_version.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("v".to_string(), (0..16i64).collect::<Vec<i64>>());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    let mut header = [0u8; HEADER_SIZE];
+    header.copy_from_slice(&bytes[..HEADER_SIZE]);
+    assert!(OnDemandHeader::from_bytes(&header).is_ok(), "current files must parse");
+
+    // Patch the on-disk version to one this build has never seen.
+    bytes[8..12].copy_from_slice(&99u32.to_le_bytes());
+    std::fs::write(&path, &bytes).unwrap();
+    let mut patched = [0u8; HEADER_SIZE];
+    patched.copy_from_slice(&bytes[..HEADER_SIZE]);
+    let error = OnDemandHeader::from_bytes(&patched).expect_err("version 99 must be rejected");
+    let message = error.to_string();
+    assert!(message.contains("unsupported"), "{message}");
+    assert!(message.contains("99"), "{message}");
+
+    // Opening the file surfaces the same refusal rather than reading legacy.
+    assert!(
+        OnDemandStorage::open(&path).is_err(),
+        "opening a newer-version file must fail"
+    );
+}
+
+#[test]
+fn newer_row_group_encoding_version_is_rejected() {
+    // Column-body rules are versioned per Row Group; a newer revision must be
+    // refused, not interpreted with this build's rules.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("future_rg_encoding.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("v".to_string(), (0..2000i64).collect::<Vec<i64>>());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let mut bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes[HEADER_SIZE + 29], RG_ENCODING_VERSION);
+    bytes[HEADER_SIZE + 29] = RG_ENCODING_VERSION + 1;
+    std::fs::write(&path, &bytes).unwrap();
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let error = storage
+        .to_arrow_batch(None, false)
+        .expect_err("a newer Row Group encoding must be refused");
+    let message = error.to_string();
+    assert!(message.contains("encoding version"), "{message}");
+}
+
+#[test]
+fn width_fidelity_stores_float32_at_four_bytes_and_round_trips() {
+    // A Float32 column is declared at 4 bytes; storing it at 8 bytes doubles
+    // its I/O for no precision the declaration asked for. The encoding is
+    // opt-in because builds predating it cannot read the narrow payload.
+    let dir = tempdir().unwrap();
+    let narrow_path = dir.path().join("narrow.apex");
+    let wide_path = dir.path().join("wide.apex");
+    let schema = [("v".to_string(), ColumnType::Float32)];
+    let values: Vec<f64> = (0..4096).map(|i| i as f64 * 0.5).collect();
+
+    let narrow_size = {
+        let mut storage =
+            OnDemandStorage::create_with_schema_and_durability(
+                &narrow_path,
+                crate::storage::DurabilityLevel::Fast,
+                &schema,
+            )
+            .unwrap();
+        assert!(
+            storage.set_width_fidelity(true).unwrap(),
+            "an empty table accepts the opt-in"
+        );
+        let mut float_cols = HashMap::new();
+        float_cols.insert("v".to_string(), values.clone());
+        storage
+            .insert_typed(
+                HashMap::new(),
+                float_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+        std::fs::metadata(&narrow_path).unwrap().len()
+    };
+
+    let wide_size = {
+        let storage =
+            OnDemandStorage::create_with_schema_and_durability(
+                &wide_path,
+                crate::storage::DurabilityLevel::Fast,
+                &schema,
+            )
+            .unwrap();
+        assert!(
+            storage.set_width_fidelity(false).unwrap(),
+            "opting out keeps the V4-compatible full-width layout"
+        );
+        let mut float_cols = HashMap::new();
+        float_cols.insert("v".to_string(), values.clone());
+        let storage = storage;
+        storage
+            .insert_typed(
+                HashMap::new(),
+                float_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+        std::fs::metadata(&wide_path).unwrap().len()
+    };
+
+    // The narrow file must shed the whole 4-bytes-per-value difference.
+    let saved = wide_size.saturating_sub(narrow_size);
+    assert_eq!(
+        saved,
+        values.len() as u64 * 4,
+        "wide {wide_size} vs narrow {narrow_size} must differ by 4 bytes/value"
+    );
+
+    let bytes = std::fs::read(&narrow_path).unwrap();
+    assert_eq!(
+        u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+        FORMAT_VERSION_V5,
+        "a narrow Float32 payload is a V5 file"
+    );
+    assert_eq!(
+        u32::from_le_bytes(
+            std::fs::read(&wide_path).unwrap()[8..12].try_into().unwrap()
+        ),
+        FORMAT_VERSION_V4,
+        "the opt-out keeps the V4 layout (and V4 file version)"
+    );
+
+    // Values come back at f32 precision, widened exactly.
+    let storage = OnDemandStorage::open(&narrow_path).unwrap();
+    assert!(storage.width_fidelity(), "the flag persists in the header");
+    let result = storage.read_columns(Some(&["v"]), 0, None).unwrap();
+    match &result["v"] {
+        ColumnData::Float64(read) => {
+            assert_eq!(read.len(), values.len());
+            for (index, value) in read.iter().enumerate() {
+                assert_eq!(*value, (values[index] as f32) as f64);
+            }
+        }
+        other => panic!("unexpected column: {other:?}"),
+    }
+
+    // The default path stores the same values at full width.
+    let wide = OnDemandStorage::open(&wide_path).unwrap();
+    assert!(!wide.width_fidelity());
+    let result = wide.read_columns(Some(&["v"]), 0, None).unwrap();
+    match &result["v"] {
+        ColumnData::Float64(read) => assert_eq!(read, &values),
+        other => panic!("unexpected column: {other:?}"),
+    }
+}
+
+#[test]
+fn width_fidelity_falls_back_when_a_value_exceeds_float32() {
+    // `1e39` does not fit in f32; narrowing it would silently become an
+    // infinity, so the writer keeps the full-width form for that row group.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("narrow_overflow.apex");
+    let schema = [("v".to_string(), ColumnType::Float32)];
+    let values = vec![1.0, 2.0, 1e39, 4.0];
+
+    let mut storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Fast,
+        &schema,
+    )
+    .unwrap();
+    assert!(storage.set_width_fidelity(true).unwrap());
+    let mut float_cols = HashMap::new();
+    float_cols.insert("v".to_string(), values.clone());
+    storage
+        .insert_typed(
+            HashMap::new(),
+            float_cols,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save().unwrap();
+    drop(storage);
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let result = storage.read_columns(Some(&["v"]), 0, None).unwrap();
+    match &result["v"] {
+        ColumnData::Float64(read) => assert_eq!(read, &values),
+        other => panic!("unexpected column: {other:?}"),
+    }
+}
+
+#[test]
+fn width_fidelity_indexed_extraction_reads_every_projected_column() {
+    // `extract_rows_by_indices_to_arrow` decodes matching columns at index in
+    // its parallel lane. A narrow Float32 payload has no 8-byte stride, so an
+    // encoding missing from that lane silently produced an all-NULL column:
+    // every filter over it then matched nothing and the query returned empty.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("narrow_extract.apex");
+    let schema = [
+        ("score".to_string(), ColumnType::Float32),
+        ("age".to_string(), ColumnType::Int64),
+        ("city".to_string(), ColumnType::String),
+    ];
+    let rows = 4096usize;
+    let scores: Vec<f64> = (0..rows).map(|i| (i % 97) as f64 * 0.5).collect();
+    let ages: Vec<i64> = (0..rows).map(|i| (i % 13) as i64).collect();
+    let cities: Vec<String> = (0..rows).map(|i| ["n", "s", "e"][i % 3].to_string()).collect();
+
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        assert!(storage.set_width_fidelity(true).unwrap());
+        let mut int_cols = HashMap::new();
+        int_cols.insert("age".to_string(), ages.clone());
+        let mut float_cols = HashMap::new();
+        float_cols.insert("score".to_string(), scores.clone());
+        let mut string_cols = HashMap::new();
+        string_cols.insert("city".to_string(), cities.clone());
+        storage
+            .insert_typed(
+                int_cols,
+                float_cols,
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    // More than 500 selected rows and more than one projected column is what
+    // makes the extraction take the parallel lane.
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let indices: Vec<usize> = (0..rows).step_by(4).collect();
+    assert!(indices.len() > 500);
+    let batch = storage
+        .extract_rows_by_indices_to_arrow(&indices, Some(&["score", "age"]))
+        .unwrap()
+        .expect("indexed extraction must serve two numeric columns");
+
+    assert_eq!(batch.num_rows(), indices.len());
+    assert_eq!(batch.num_columns(), 2);
+    let score_array = batch
+        .column_by_name("score")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Float64Array>()
+        .unwrap();
+    let age_array = batch
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    for (out_idx, &row) in indices.iter().enumerate() {
+        assert_eq!(
+            score_array.value(out_idx),
+            (scores[row] as f32) as f64,
+            "narrow Float32 value at row {row} must survive indexed extraction"
+        );
+        assert_eq!(age_array.value(out_idx), ages[row]);
+        assert!(
+            !arrow::array::Array::is_null(score_array, out_idx),
+            "no value may be dropped"
+        );
+    }
+}
+
+#[test]
+fn width_fidelity_point_lookup_keeps_the_rcix_fast_lane() {
+    // `retrieve_rcix` decodes one cell per column from the footer's column
+    // offsets. An encoding it does not know made it report "no such row", so a
+    // `_id = X` query on a table with a narrow Float32 column dropped out of
+    // the O(1) point-lookup lane into a full scan (measured 0.003 ms -> 0.12 ms
+    // on a 200k-row table). The value must come back and the lane must survive.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("narrow_point.apex");
+    let schema = [
+        ("score".to_string(), ColumnType::Float32),
+        ("age".to_string(), ColumnType::Int64),
+    ];
+    let rows = 512usize;
+    let scores: Vec<f64> = (0..rows).map(|i| i as f64 * 0.5).collect();
+    let ages: Vec<i64> = (0..rows).map(|i| (i % 13) as i64).collect();
+
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        assert!(storage.set_width_fidelity(true).unwrap());
+        let mut int_cols = HashMap::new();
+        int_cols.insert("age".to_string(), ages.clone());
+        let mut float_cols = HashMap::new();
+        float_cols.insert("score".to_string(), scores.clone());
+        storage
+            .insert_typed(
+                int_cols,
+                float_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let id = 7u64;
+    let expected_score = (scores[(id - 1) as usize] as f32) as f64;
+
+    let row = storage
+        .retrieve_rcix(id)
+        .unwrap()
+        .expect("the RCIX point lane must serve a narrow Float32 column");
+    let score = row
+        .iter()
+        .find(|(name, _)| name == "score")
+        .map(|(_, value)| value.clone())
+        .expect("score column present");
+    assert_eq!(score, crate::data::Value::Float64(expected_score));
+    let age = row
+        .iter()
+        .find(|(name, _)| name == "age")
+        .map(|(_, value)| value.clone())
+        .expect("age column present");
+    assert_eq!(age, crate::data::Value::Int64(ages[(id - 1) as usize]));
+
+    // The projected variant and the fallback cell reader must agree.
+    let projected = storage
+        .retrieve_rcix_projected(id, &["age", "score", "_id"])
+        .unwrap()
+        .expect("projected point lane must serve a narrow Float32 column");
+    let projected_score = projected
+        .iter()
+        .find(|(name, _)| name == "score")
+        .map(|(_, value)| value.clone())
+        .expect("score column present");
+    assert_eq!(projected_score, crate::data::Value::Float64(expected_score));
+
+    let values = storage
+        .read_row_by_id_values(id)
+        .unwrap()
+        .expect("cell reader must find the row");
+    let read_score = values
+        .iter()
+        .find(|(name, _)| name == "score")
+        .map(|(_, value)| value.clone())
+        .expect("score column present");
+    assert_eq!(read_score, crate::data::Value::Float64(expected_score));
+}
+
+#[test]
+fn indexed_extraction_decodes_rle_columns_at_index() {
+    // RLE Int64 used to have no at-index decoder in the parallel lane, so the
+    // lane declined (correct, but a serial fallback). It now decodes the run
+    // list at index; the values must stay exact either way.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rle_extract.apex");
+    let schema = [
+        ("wide".to_string(), ColumnType::Int64),
+        ("tag".to_string(), ColumnType::Int64),
+    ];
+    let rows = 4096usize;
+    // Two long runs of 60-bit-separated values: RLE beats bit-packing here.
+    let wide: Vec<i64> = (0..rows)
+        .map(|i| if i < rows / 2 { 0 } else { 1i64 << 60 })
+        .collect();
+    let tag: Vec<i64> = (0..rows).map(|i| (i % 7) as i64).collect();
+
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("wide".to_string(), wide.clone());
+        int_cols.insert("tag".to_string(), tag.clone());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.contains(&COL_ENCODING_RLE),
+        "fixture must physically store the RLE encoding"
+    );
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let indices: Vec<usize> = (0..rows).step_by(4).collect();
+    let batch = storage
+        .extract_rows_by_indices_to_arrow(&indices, Some(&["wide", "tag"]))
+        .unwrap()
+        .expect("indexed extraction must serve two Int64 columns");
+    let wide_array = batch
+        .column_by_name("wide")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    let tag_array = batch
+        .column_by_name("tag")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    for (out_idx, &row) in indices.iter().enumerate() {
+        assert_eq!(wide_array.value(out_idx), wide[row]);
+        assert_eq!(tag_array.value(out_idx), tag[row]);
+        assert!(!arrow::array::Array::is_null(wide_array, out_idx));
+    }
+}
+
+#[test]
+fn indexed_extraction_decodes_rle_bool_columns_at_index() {
+    // A clustered Bool column is RLE_BOOL-encoded (long runs). The parallel
+    // lane had no branch for it: before the round-14 guard the column came back
+    // all-NULL, and with the guard the whole lane declined. It now decodes.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rle_bool_extract.apex");
+    let schema = [
+        ("flag".to_string(), ColumnType::Bool),
+        ("age".to_string(), ColumnType::Int64),
+    ];
+    let rows = 4096usize;
+    let flags: Vec<bool> = (0..rows).map(|i| i < rows / 2).collect();
+    let ages: Vec<i64> = (0..rows).map(|i| (i % 13) as i64).collect();
+
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("age".to_string(), ages.clone());
+        let mut bool_cols = HashMap::new();
+        bool_cols.insert("flag".to_string(), flags.clone());
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                bool_cols,
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(
+        bytes.contains(&COL_ENCODING_RLE_BOOL),
+        "fixture must physically store the RLE_BOOL encoding"
+    );
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let indices: Vec<usize> = (0..rows).step_by(4).collect();
+    let batch = storage
+        .extract_rows_by_indices_to_arrow(&indices, Some(&["flag", "age"]))
+        .unwrap()
+        .expect("indexed extraction must serve a Bool and an Int64 column");
+    let flag_array = batch
+        .column_by_name("flag")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::BooleanArray>()
+        .unwrap();
+    let age_array = batch
+        .column_by_name("age")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .unwrap();
+    for (out_idx, &row) in indices.iter().enumerate() {
+        assert_eq!(flag_array.value(out_idx), flags[row], "flag at row {row}");
+        assert_eq!(age_array.value(out_idx), ages[row]);
+    }
+}
+
+#[test]
+fn width_fidelity_requires_an_empty_table() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("narrow_late.apex");
+    let schema = [("v".to_string(), ColumnType::Float32)];
+    let mut storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Fast,
+        &schema,
+    )
+    .unwrap();
+    let mut float_cols = HashMap::new();
+    float_cols.insert("v".to_string(), vec![1.0, 2.0]);
+    storage
+        .insert_typed(
+            HashMap::new(),
+            float_cols,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    assert!(
+        !storage.set_width_fidelity(true).unwrap(),
+        "the flag cannot change once rows exist"
+    );
+}
+
+#[test]
+fn width_fidelity_env_switch_applies_to_new_tables() {
+    // The deployment switch is read when a table is created and persisted in
+    // the header, so reopening keeps the encoding.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("env_narrow.apex");
+    let schema = [("v".to_string(), ColumnType::Float32)];
+    {
+        std::env::set_var("APEX_WIDTH_FIDELITY", "1");
+        let mut storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        assert!(
+            storage.width_fidelity(),
+            "APEX_WIDTH_FIDELITY=1 must opt a new table in"
+        );
+        let mut float_cols = HashMap::new();
+        float_cols.insert("v".to_string(), vec![1.0, 2.0, 3.0, 4.0]);
+        storage
+            .insert_typed(
+                HashMap::new(),
+                float_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+        std::env::remove_var("APEX_WIDTH_FIDELITY");
+    }
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert!(
+        reopened.width_fidelity(),
+        "the opt-in must survive a reopen through the header flag"
+    );
+}
+
+/// The V4 compat append in `StorageEngine::write_typed` assigns ids from the
+/// backend's `next_id` instead of the allocator, so it has to reserve them
+/// against the table's shared row-id mark itself.
+///
+/// The branch only runs for a legacy V4 file (`footer_offset > 0`), which is why
+/// the fixture is built with `save_v4()` rather than by writing a table through
+/// the current default layout.
+#[test]
+fn v4_compat_append_reserves_ids_against_the_shared_mark() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("legacy_v4.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        storage
+            .insert_typed(
+                HashMap::from([("a".to_string(), vec![1_i64, 2, 3, 4, 5])]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save_v4().unwrap();
+        assert!(
+            storage.header.read().footer_offset > 0,
+            "the fixture must be a legacy V4 file so the compat append branch runs"
+        );
+    }
+
+    // Another process already owns the ids from 100 on.
+    let claimed = crate::storage::epoch::reserve_row_ids(&path, 100, 1);
+    assert!(claimed >= 100, "{claimed}");
+
+    let ids = crate::Database::write_typed(
+        &path,
+        HashMap::from([("a".to_string(), vec![6_i64])]),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        crate::storage::DurabilityLevel::Safe,
+    )
+    .unwrap();
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert!(
+        ids[0] > claimed,
+        "a V4 compat append must stay above the ids another process reserved: {ids:?} vs {claimed}"
+    );
+}
+
+/// A BITPACK point read must cover the whole value window.
+///
+/// `retrieve_rcix` (and its projected twin) used to read a fixed three-byte
+/// window, so any value whose bits straddle more than 24 bits silently lost its
+/// high bits. With a 50k-row base of `0..49_999` the appended rows push the row
+/// group's bit width to 22, and `4_000_001` came back as `67_841` through the
+/// point lane while the scan (which decodes the full stream) was correct.
+#[test]
+fn wide_bitpack_point_reads_keep_their_high_bits() {
+    use crate::data::Value;
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("wide_bitpack.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    let base: Vec<i64> = (0..50_000).collect();
+    storage
+        .insert_typed(
+            HashMap::from([("a".to_string(), base)]),
+            HashMap::new(),
+            HashMap::from([("s".to_string(), vec!["v".to_string(); 50_000])]),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save_v4().unwrap();
+
+    let appended: Vec<HashMap<String, ColumnValue>> = (0..3)
+        .map(|offset| {
+            HashMap::from([
+                ("a".to_string(), ColumnValue::Int64(4_000_000 + offset)),
+                ("s".to_string(), ColumnValue::String("x".to_string())),
+            ])
+        })
+        .collect();
+    let ids = storage.insert_rows(&appended).unwrap();
+    storage.save().unwrap();
+    assert_eq!(ids.len(), 3, "{ids:?}");
+
+    for (offset, id) in ids.iter().enumerate() {
+        let expected = 4_000_000 + offset as i64;
+        let point = storage.retrieve_rcix(*id).unwrap().expect("row must exist");
+        let value = point
+            .iter()
+            .find(|(name, _)| name == "a")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(value, Value::Int64(expected), "retrieve_rcix id={id}");
+
+        let projected = storage
+            .retrieve_rcix_projected(*id, &["a"])
+            .unwrap()
+            .expect("projected row must exist");
+        let projected_value = projected
+            .iter()
+            .find(|(name, _)| name == "a")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(projected_value, Value::Int64(expected), "projected id={id}");
+
+        // The values lane agrees with the point lane and with the expected value.
+        let values = storage.read_row_by_id_values(*id).unwrap().expect("row");
+        let values_value = values
+            .iter()
+            .find(|(name, _)| name == "a")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(values_value, Value::Int64(expected), "values lane id={id}");
+    }
+}
+
+/// A compressed row group is decompressed once, not once per point read.
+///
+/// Compressed groups carry no RCIX, so the point-read fallback decodes the whole
+/// group; without a cache every read paid that cost again (a zstd point read
+/// measured ~1.43 ms against 0.014 ms on the plain twin).
+#[test]
+fn compressed_point_reads_reuse_the_decompressed_row_group() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("compressed_point.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    assert!(storage
+        .set_compression(CompressionType::Zstd)
+        .unwrap_or(false));
+    let rows = 40_000usize;
+    storage
+        .insert_typed(
+            HashMap::from([
+                ("a".to_string(), (0..rows as i64).collect::<Vec<i64>>()),
+                ("b".to_string(), (0..rows as i64).map(|v| v * 3).collect()),
+            ]),
+            HashMap::new(),
+            HashMap::from([(
+                "s".to_string(),
+                (0..rows).map(|i| format!("v{}", i % 50)).collect::<Vec<String>>(),
+            )]),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save_v4().unwrap();
+    drop(storage);
+
+    // A fresh instance has no in-memory mirror, so the reads take the compressed
+    // fallback this cache exists for (the writer instance would answer from its
+    // own buffer).
+    let storage = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(storage.row_count() as usize, rows);
+    assert_eq!(storage.decompressed_rg_cache.read().len(), 0);
+
+    for id in [1u64, 2, 3, 4] {
+        let row = storage
+            .read_row_by_id_values(id)
+            .unwrap()
+            .expect("row must exist");
+        let value = row
+            .iter()
+            .find(|(name, _)| name == "a")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(value, crate::data::Value::Int64(id as i64 - 1), "id={id}");
+        // The other encodings in the same group take their own targeted arms.
+        let b = row
+            .iter()
+            .find(|(name, _)| name == "b")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(b, crate::data::Value::Int64((id as i64 - 1) * 3), "id={id}");
+        let s = row
+            .iter()
+            .find(|(name, _)| name == "s")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert_eq!(
+            s,
+            crate::data::Value::String(format!("v{}", (id as usize - 1) % 50)),
+            "id={id}"
+        );
+    }
+    // All four ids live in the first row group: one decompressed body is cached.
+    assert_eq!(
+        storage.decompressed_rg_cache.read().len(),
+        1,
+        "the second and later reads must reuse the cached body"
+    );
+    // The cache is dropped together with the page cache on any table change.
+    storage.invalidate_page_cache();
+    assert_eq!(
+        storage.decompressed_rg_cache.read().len(),
+        0,
+        "invalidation must drop decompressed bodies"
+    );
+}
+
+/// A compressed row group has no RCIX, so every touch decodes the whole group.
+/// The write path therefore caps the group size for compressed tables while the
+/// plain layout keeps the larger adaptive groups, where RCIX already gives O(1)
+/// column access. This pins both halves: the cap and its absence.
+#[test]
+fn compressed_tables_use_capped_row_groups_and_plain_tables_do_not() {
+    let dir = tempdir().unwrap();
+    let rows = (OnDemandStorage::COMPRESSED_ROW_GROUP_SIZE as usize) * 2 + 100;
+
+    let build = |name: &str, compression: Option<CompressionType>| {
+        let path = dir.path().join(name);
+        let storage = OnDemandStorage::create(&path).unwrap();
+        if let Some(compression) = compression {
+            assert!(storage.set_compression(compression).unwrap_or(false));
+        }
+        storage
+            .insert_typed(
+                HashMap::from([("a".to_string(), (0..rows as i64).collect::<Vec<i64>>())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save_v4().unwrap();
+        let header = storage.header.read();
+        let (row_group_size, row_group_count) = (header.row_group_size, header.row_group_count);
+        drop(header);
+        drop(storage);
+        (path, row_group_size, row_group_count)
+    };
+
+    let chunk = OnDemandStorage::COMPRESSED_ROW_GROUP_SIZE as usize;
+    let (zstd_path, zstd_size, zstd_groups) = build("capped_zstd.apex", Some(CompressionType::Zstd));
+    assert_eq!(zstd_size, OnDemandStorage::COMPRESSED_ROW_GROUP_SIZE);
+    assert_eq!(zstd_groups as usize, (rows + chunk - 1) / chunk);
+
+    let (plain_path, plain_size, plain_groups) = build("capped_plain.apex", None);
+    assert_eq!(
+        plain_size, DEFAULT_ROW_GROUP_SIZE,
+        "the plain layout keeps the large adaptive group; RCIX already gives it O(1) column access"
+    );
+    assert_eq!(plain_groups, 1);
+
+    // The cap is a layout choice, not a data one: both files read back whole.
+    for (label, path) in [("zstd", zstd_path), ("plain", plain_path)] {
+        let storage = OnDemandStorage::open(&path).unwrap();
+        assert_eq!(storage.row_count() as usize, rows);
+        let columns = storage.read_columns(Some(&["a"]), 0, None).unwrap();
+        match &columns["a"] {
+            ColumnData::Int64(values) => {
+                assert_eq!(values.len(), rows, "{label}");
+                assert_eq!(values[0], 0, "{label}");
+                assert_eq!(values[rows - 1], rows as i64 - 1, "{label}");
+            }
+            other => panic!("unexpected {label} column: {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn find_row_group_for_id_follows_the_sorted_id_directory() {
+    let group = |row_count: u32, min_id: u64, max_id: u64| RowGroupMeta {
+        offset: 0,
+        data_size: 0,
+        row_count,
+        min_id,
+        max_id,
+        deletion_count: 0,
+    };
+    // Ranges left by appends and by a rewrite that dropped the deleted rows
+    // (the second range ends at 149 while the next starts at 200).
+    let groups = vec![group(100, 0, 99), group(50, 100, 149), group(10, 200, 209)];
+    assert_eq!(find_row_group_for_id(&groups, 0), Some(0));
+    assert_eq!(find_row_group_for_id(&groups, 99), Some(0));
+    assert_eq!(find_row_group_for_id(&groups, 100), Some(1));
+    assert_eq!(find_row_group_for_id(&groups, 149), Some(1));
+    // Inside the hole: no group covers the id.
+    assert_eq!(find_row_group_for_id(&groups, 150), None);
+    assert_eq!(find_row_group_for_id(&groups, 199), None);
+    assert_eq!(find_row_group_for_id(&groups, 200), Some(2));
+    assert_eq!(find_row_group_for_id(&groups, 209), Some(2));
+    assert_eq!(find_row_group_for_id(&groups, 210), None);
+    // The empty bootstrap row group of an empty table matches nothing.
+    let empty = vec![group(0, 0, 0)];
+    assert_eq!(find_row_group_for_id(&empty, 0), None);
+    assert_eq!(find_row_group_for_id(&groups[..0], 0), None);
+}
+
+#[test]
+fn apply_pending_deletes_ignores_a_short_entry() {
+    // The deferred-delete entry starts with "APXP" + four u64 + rg_count (a
+    // 40-byte fixed header). The old guard accepted anything >= 24 bytes and
+    // then read `buf[28..36]`, so a 29-byte entry panicked a reader thread
+    // ("range end index 36 out of range for slice of length 29") instead of
+    // being ignored.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("short.apex");
+    std::fs::write(&path, b"base").unwrap();
+    for len in [0usize, 3, 4, 24, 29, 33, 36, 39] {
+        let mut buf = vec![0u8; len];
+        if len >= 4 {
+            buf[0..4].copy_from_slice(b"APXP");
+        }
+        super::global_pending_deletes()
+            .write()
+            .unwrap()
+            .get_or_insert_with(std::collections::HashMap::new)
+            .insert(path.clone(), buf);
+        super::apply_pending_deletes(&path).unwrap();
+    }
+    super::global_pending_deletes()
+        .write()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .remove(&path);
+}
+
+#[test]
+fn positions_for_ids_requires_dense_undeleted_row_groups() {
+    // The FTS row selection resolves candidate positions from the row-group
+    // directory instead of reading the whole `_id` column. That shortcut is only
+    // exact while the persisted ids are dense and undeleted, so anything else
+    // must report "unknown" and let the caller walk the column.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("positions.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    let ints: Vec<i64> = (0..300).collect();
+    storage
+        .insert_typed(
+            HashMap::from([("a".to_string(), ints)]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save_v4().unwrap();
+
+    // Dense rows: `id - min_id` is the local index (`_id`s start at 1). An id no
+    // group covers is skipped, exactly like the id reader skips a deleted row.
+    assert_eq!(
+        storage.positions_for_ids(&[1, 8, 300, 5_000]).unwrap(),
+        Some(vec![0, 7, 299])
+    );
+
+    // A persisted deletion marks its row group, so the mapping is no longer
+    // provable and the caller has to read the column.
+    storage.delete(5);
+    storage.save_v4().unwrap();
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.positions_for_ids(&[0]).unwrap(), None);
+}
+
+#[test]
+fn compressed_point_lane_reports_the_decline_to_its_callers() {
+    // `retrieve_rcix` only serves uncompressed row groups. It used to report the
+    // same `None` for "row absent" and "lane unavailable", so the Arrow point
+    // readers concluded absence and the SQL fast path fell back to a full scan.
+    // The lane now exposes the distinction; the decoding reader answers the row.
+    let dir = tempdir().unwrap();
+    let rows = 4_000usize;
+    let ints: Vec<i64> = (0..rows as i64).collect();
+    let strings: Vec<String> = (0..rows).map(|i| format!("v{}", i % 50)).collect();
+
+    let build = |name: &str, compression: Option<CompressionType>| {
+        let path = dir.path().join(name);
+        let storage = OnDemandStorage::create(&path).unwrap();
+        if let Some(compression) = compression {
+            assert!(storage.set_compression(compression).unwrap_or(false));
+        }
+        storage
+            .insert_typed(
+                HashMap::from([("a".to_string(), ints.clone())]),
+                HashMap::new(),
+                HashMap::from([("s".to_string(), strings.clone())]),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save_v4().unwrap();
+        drop(storage);
+        OnDemandStorage::open(&path).unwrap()
+    };
+
+    let plain = build("plain_lane.apex", None);
+    let zstd = build("zstd_lane.apex", Some(CompressionType::Zstd));
+    let id = 1_234u64;
+
+    // Uncompressed: the lean lane serves the row and reports itself available.
+    assert!(plain.point_read_lane_available(id).unwrap());
+    assert!(plain.retrieve_rcix(id).unwrap().is_some());
+
+    // Compressed: the lean lane declines, and the caller is told so.
+    assert!(
+        !zstd.point_read_lane_available(id).unwrap(),
+        "a compressed row group must report the lean lane as unavailable"
+    );
+    assert!(
+        zstd.retrieve_rcix(id).unwrap().is_none(),
+        "the lean lane declines compressed row groups"
+    );
+    let row = zstd
+        .read_row_by_id_values(id)
+        .unwrap()
+        .expect("the decoding lane must still answer the row");
+    let value = |name: &str| {
+        row.iter()
+            .find(|(column, _)| column == name)
+            .map(|(_, value)| value.clone())
+            .unwrap()
+    };
+    assert_eq!(value("a"), crate::data::Value::Int64(id as i64 - 1));
+    assert_eq!(
+        value("s"),
+        crate::data::Value::String(format!("v{}", (id as usize - 1) % 50))
+    );
+
+    // An id past the last group is an absent row, not an unavailable lane, so
+    // both readers may answer `None` without consulting the decoder.
+    let missing = rows as u64 + 5;
+    assert!(plain.point_read_lane_available(missing).unwrap());
+    assert!(zstd.point_read_lane_available(missing).unwrap());
+    assert!(plain.read_row_by_id_values(missing).unwrap().is_none());
+    assert!(zstd.read_row_by_id_values(missing).unwrap().is_none());
+}
+
+/// The writer records the per-column directory (RCIX) *before* compressing a row
+/// group, so a compressed group carries one too, and the directory addresses the
+/// decompressed body. The decoding lane can therefore jump straight to the
+/// requested columns, and a projection can avoid decoding the rest entirely,
+/// instead of walking the body in column order.
+/// `_id IN (...)` on a compressed table must be answered by the storage batch
+/// lane. That lane carries the same column directory a plain group does (the
+/// write path records it before compressing) and already decompresses the body,
+/// but it declined every compressed group up front, so the whole statement fell
+/// through to the SQL executor.
+#[test]
+fn compressed_batch_point_reads_use_the_decompressed_body() {
+    let dir = tempdir().unwrap();
+    let rows = (OnDemandStorage::COMPRESSED_ROW_GROUP_SIZE as usize) * 2 + 777;
+
+    let build = |name: &str, compression: Option<CompressionType>| {
+        let path = dir.path().join(name);
+        let storage = OnDemandStorage::create(&path).unwrap();
+        if let Some(compression) = compression {
+            assert!(storage.set_compression(compression).unwrap_or(false));
+        }
+        storage
+            .insert_typed(
+                HashMap::from([
+                    ("a".to_string(), (0..rows as i64).collect::<Vec<i64>>()),
+                    (
+                        "b".to_string(),
+                        (0..rows as i64).map(|value| value * 5).collect::<Vec<i64>>(),
+                    ),
+                ]),
+                HashMap::from([(
+                    "f".to_string(),
+                    (0..rows).map(|value| value as f64 * 0.5).collect::<Vec<f64>>(),
+                )]),
+                HashMap::from([(
+                    "s".to_string(),
+                    (0..rows).map(|value| format!("v{}", value % 32)).collect::<Vec<String>>(),
+                )]),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save_v4().unwrap();
+        drop(storage);
+        OnDemandStorage::open(&path).unwrap()
+    };
+
+    let plain = build("batch_plain.apex", None);
+    let zstd = build("batch_zstd.apex", Some(CompressionType::Zstd));
+    let lz4 = build("batch_lz4.apex", Some(CompressionType::Lz4));
+
+    // Spread across row groups, including a group boundary and the last row.
+    let ids: Vec<u64> = vec![1, 2, 4_096, 4_097, 4_098, 5_000, rows as u64 - 1, rows as u64];
+
+    let read = |storage: &OnDemandStorage, ids: &[u64]| {
+        storage
+            .retrieve_many_mmap_columns(ids)
+            .unwrap()
+            .expect("the batch lane must answer rather than decline")
+    };
+    // The projected batch lane is only reachable from the Python bindings, so the
+    // method itself is compiled under `python`; this test must build in the
+    // core-only configuration too, which is why only these assertions are gated.
+    #[cfg(feature = "python")]
+    let projected = |storage: &OnDemandStorage, ids: &[u64]| {
+        storage
+            .retrieve_many_mmap_columns_projected(ids, &["b".to_string(), "s".to_string()])
+            .unwrap()
+            .expect("the projected batch lane must answer rather than decline")
+    };
+
+    let baseline = read(&plain, &ids);
+    assert_eq!(baseline.row_count, ids.len());
+    for (label, storage) in [("zstd", &zstd), ("lz4", &lz4)] {
+        let batch = read(storage, &ids);
+        assert_eq!(batch.row_count, ids.len(), "{label}");
+        assert_eq!(
+            batch.columns.len(),
+            baseline.columns.len(),
+            "{label}: column count"
+        );
+        for ((name, got), (_, want)) in batch.columns.iter().zip(baseline.columns.iter()) {
+            match (got, want) {
+                (MmapBatchColumn::I64(got), MmapBatchColumn::I64(want)) => {
+                    assert_eq!(got, want, "{label}: column {name}")
+                }
+                (MmapBatchColumn::F64(got), MmapBatchColumn::F64(want)) => {
+                    assert_eq!(got, want, "{label}: column {name}")
+                }
+                (MmapBatchColumn::Str(got), MmapBatchColumn::Str(want)) => {
+                    assert_eq!(got, want, "{label}: column {name}")
+                }
+                _ => panic!("unexpected column shapes for {label}: column {name}"),
+            }
+        }
+
+        // The projected form returns `_id` plus exactly the named columns.
+        #[cfg(feature = "python")]
+        {
+            let narrow = projected(storage, &ids);
+            assert_eq!(narrow.row_count, ids.len(), "{label}");
+            let names: Vec<&str> =
+                narrow.columns.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(names, vec!["_id", "b", "s"], "{label}");
+        }
+    }
+
+    // An id that does not exist is skipped, and the lane still answers: it is a
+    // result, not a decline that would push the statement back to the executor.
+    let missing = vec![1u64, rows as u64 + 11];
+    let partial = read(&zstd, &missing);
+    assert_eq!(partial.row_count, 1);
+    #[cfg(feature = "python")]
+    assert_eq!(projected(&zstd, &missing).row_count, 1);
+
+    // A deleted row must not come back through the batch lane either.
+    let removed = 5_000u64;
+    assert!(zstd.delete(removed));
+    zstd.save_v4().unwrap();
+    let after_delete = read(&zstd, &[removed - 1, removed, removed + 1]);
+    assert_eq!(after_delete.row_count, 2);
+}
+
+#[test]
+fn compressed_point_reads_use_the_column_directory_and_honor_a_projection() {
+    let dir = tempdir().unwrap();
+    // More rows than `COMPRESSED_ROW_GROUP_SIZE` so the table spans several
+    // compressed groups and a point read lands in the middle one.
+    let rows = (OnDemandStorage::COMPRESSED_ROW_GROUP_SIZE as usize) * 2 + 512;
+
+    let build = |name: &str, compression: Option<CompressionType>| {
+        let path = dir.path().join(name);
+        let storage = OnDemandStorage::create(&path).unwrap();
+        if let Some(compression) = compression {
+            assert!(storage.set_compression(compression).unwrap_or(false));
+        }
+        storage
+            .insert_typed(
+                HashMap::from([
+                    ("a".to_string(), (0..rows as i64).collect::<Vec<i64>>()),
+                    (
+                        "b".to_string(),
+                        (0..rows as i64).map(|value| value * 7).collect::<Vec<i64>>(),
+                    ),
+                ]),
+                HashMap::from([(
+                    "f".to_string(),
+                    (0..rows).map(|value| value as f64 * 0.25).collect::<Vec<f64>>(),
+                )]),
+                HashMap::from([(
+                    "s".to_string(),
+                    (0..rows).map(|value| format!("v{}", value % 50)).collect::<Vec<String>>(),
+                )]),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save_v4().unwrap();
+        drop(storage);
+        OnDemandStorage::open(&path).unwrap()
+    };
+
+    let plain = build("directory_plain.apex", None);
+    let zstd = build("directory_zstd.apex", Some(CompressionType::Zstd));
+    // The fixture must actually be compressed, or the test proves nothing.
+    let footer = zstd.get_or_load_footer().unwrap().unwrap();
+    assert!(footer.row_groups.len() >= 2, "expected several compressed groups");
+    for group in &footer.row_groups {
+        let mut header = [0u8; 32];
+        zstd.read_cached_bytes(group.offset, &mut header).unwrap();
+        assert_ne!(header[28], RG_COMPRESS_NONE, "a group was left uncompressed");
+    }
+    assert!(
+        footer.col_offsets.iter().all(|offsets| offsets.len() >= 4),
+        "every compressed group must carry its column directory"
+    );
+    drop(footer);
+
+    let value = |row: &[(String, crate::data::Value)], name: &str| {
+        row.iter()
+            .find(|(column, _)| column == name)
+            .map(|(_, value)| value.clone())
+            .expect("column present")
+    };
+
+    for id in [1u64, 4_096, 4_097, rows as u64 / 2, rows as u64] {
+        let before = compressed_directory_point_reads();
+        let zstd_row = zstd.read_row_by_id_values(id).unwrap().expect("row present");
+        assert!(
+            compressed_directory_point_reads() > before,
+            "a compressed point read must be served from the column directory"
+        );
+        let plain_row = plain.read_row_by_id_values(id).unwrap().expect("row present");
+        for name in ["_id", "a", "b", "f", "s"] {
+            assert_eq!(value(&zstd_row, name), value(&plain_row, name), "id {id} column {name}");
+        }
+        let index = id as i64 - 1;
+        assert_eq!(value(&zstd_row, "a"), crate::data::Value::Int64(index));
+        assert_eq!(value(&zstd_row, "b"), crate::data::Value::Int64(index * 7));
+        assert_eq!(value(&zstd_row, "f"), crate::data::Value::Float64(index as f64 * 0.25));
+        assert_eq!(
+            value(&zstd_row, "s"),
+            crate::data::Value::String(format!("v{}", (id as usize - 1) % 50))
+        );
+
+        // A projection returns `_id` plus exactly the named columns, and the
+        // values are the ones the unprojected read reported.
+        let projected = zstd
+            .read_row_by_id_values_projected(id, Some(&["b", "s"]))
+            .unwrap()
+            .expect("row present");
+        let names: Vec<&str> = projected.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["_id", "b", "s"], "id {id}");
+        assert_eq!(value(&projected, "b"), value(&zstd_row, "b"));
+        assert_eq!(value(&projected, "s"), value(&zstd_row, "s"));
+
+        let id_only = zstd
+            .read_row_by_id_values_projected(id, Some(&["_id"]))
+            .unwrap()
+            .expect("row present");
+        assert_eq!(id_only.len(), 1, "id {id}");
+        assert_eq!(id_only[0].0, "_id");
+    }
+
+    // An unknown column name simply selects nothing; `_id` still answers.
+    let unknown = zstd
+        .read_row_by_id_values_projected(7, Some(&["nope"]))
+        .unwrap()
+        .expect("row present");
+    assert_eq!(unknown.len(), 1);
+    assert_eq!(unknown[0].0, "_id");
+
+    // Reading past the last group is an absent row for both the full and the
+    // projected form, and an unusable lane must not turn it into an error.
+    let missing = rows as u64 + 3;
+    assert!(zstd.read_row_by_id_values(missing).unwrap().is_none());
+    assert!(zstd
+        .read_row_by_id_values_projected(missing, Some(&["b"]))
+        .unwrap()
+        .is_none());
+}
+
+/// Deleting and updating rows through the overlay must not let the directory
+/// lane answer with a stale body: the directory describes the base file, so the
+/// narrow projection has to keep agreeing with the full read across writes.
+#[test]
+fn compressed_directory_point_reads_stay_correct_across_delete_and_update() {
+    let dir = tempdir().unwrap();
+    let rows = (OnDemandStorage::COMPRESSED_ROW_GROUP_SIZE as usize) + 256;
+    let path = dir.path().join("directory_mutate.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    assert!(storage.set_compression(CompressionType::Zstd).unwrap_or(false));
+    storage
+        .insert_typed(
+            HashMap::from([
+                ("a".to_string(), (0..rows as i64).collect::<Vec<i64>>()),
+                (
+                    "b".to_string(),
+                    (0..rows as i64).map(|value| value * 3).collect::<Vec<i64>>(),
+                ),
+            ]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save_v4().unwrap();
+
+    let deleted = 4_321u64;
+    assert!(storage.delete(deleted));
+    // Persist the deletion vector into the base file: the directory lane reads
+    // the base bytes, so the delete has to reach them to be observable.
+    storage.save_v4().unwrap();
+
+    let after_delete = storage.read_row_by_id_values(deleted).unwrap();
+    assert!(
+        after_delete.is_none(),
+        "a deleted row must not be resurrected by the directory lane"
+    );
+    assert!(storage
+        .read_row_by_id_values_projected(deleted, Some(&["b"]))
+        .unwrap()
+        .is_none());
+
+    let value = |row: &[(String, crate::data::Value)], name: &str| {
+        row.iter()
+            .find(|(column, _)| column == name)
+            .map(|(_, value)| value.clone())
+            .expect("column present")
+    };
+    let survivor = storage.read_row_by_id_values(3).unwrap().expect("row present");
+    let projected = storage
+        .read_row_by_id_values_projected(3, Some(&["b"]))
+        .unwrap()
+        .expect("row present");
+    assert_eq!(value(&projected, "b"), value(&survivor, "b"));
+
+    // An appended row must read back the same through both forms too: the base
+    // file's directory does not describe rows the append added.
+    storage
+        .insert_typed(
+            HashMap::from([("a".to_string(), vec![rows as i64 + 1])]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save_v4().unwrap();
+    let appended = rows as u64 + 1;
+    let full = storage.read_row_by_id_values(appended).unwrap().expect("row present");
+    let narrow = storage
+        .read_row_by_id_values_projected(appended, Some(&["a"]))
+        .unwrap()
+        .expect("row present");
+    assert_eq!(value(&full, "a"), crate::data::Value::Int64(rows as i64 + 1));
+    assert_eq!(value(&narrow, "a"), value(&full, "a"));
+}
+
+#[test]
+fn row_group_id_directory_stays_sorted_across_delete_and_append() {
+    // `find_row_group_for_id` binary-searches `min_id`, which is only sound while
+    // the published row groups stay ordered by id. Appends extend the id
+    // sequence and the rewrite paths walk the active rows in order; this test
+    // pins that invariant — and with it that every live id stays reachable
+    // through the point lanes — across a deletion plus an incremental append.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("rg_directory.apex");
+    let rows = 150_000usize; // several 131,072-row groups for one int64 column
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        storage
+            .insert_typed(
+                HashMap::from([("a".to_string(), (0..rows as i64).collect::<Vec<i64>>())]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+    {
+        let storage = OnDemandStorage::open(&path).unwrap();
+        assert!(storage.delete(5_000));
+        assert!(storage.delete(70_000));
+        storage.save_delete_only().unwrap();
+        storage
+            .insert_typed(
+                HashMap::from([(
+                    "a".to_string(),
+                    (rows as i64..rows as i64 + 2_000).collect::<Vec<i64>>(),
+                )]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let footer = storage.get_or_load_footer().unwrap().expect("footer");
+    assert!(
+        footer.row_groups.len() >= 2,
+        "the fixture must span several row groups"
+    );
+    assert!(
+        footer
+            .row_groups
+            .windows(2)
+            .all(|pair| pair[0].min_id <= pair[1].min_id),
+        "the id directory must stay sorted for the binary search to be sound"
+    );
+    for id in [1u64, 5_001, 70_001, rows as u64, rows as u64 + 1, rows as u64 + 1_999] {
+        let expected_group = footer
+            .row_groups
+            .iter()
+            .position(|rg| rg.min_id <= id && id <= rg.max_id && rg.row_count > 0)
+            .unwrap_or_else(|| panic!("some group must cover live id {id}"));
+        assert_eq!(
+            find_row_group_for_id(&footer.row_groups, id),
+            Some(expected_group),
+            "id={id}"
+        );
+        assert!(
+            storage.read_row_by_id_values(id).unwrap().is_some(),
+            "the point lane must still find live id {id}"
+        );
+    }
+    for id in [5_000u64, 70_000] {
+        assert!(
+            storage.read_row_by_id_values(id).unwrap().is_none(),
+            "deleted id {id} must stay absent"
+        );
+    }
+}
+
+
+
+
+

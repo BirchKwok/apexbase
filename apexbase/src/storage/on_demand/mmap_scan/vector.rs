@@ -142,6 +142,61 @@ impl OnDemandStorage {
         // data is already present — skip the 512MB mmap→heap copy entirely.
         // Invalidated by invalidate_page_cache() on every write.
         let needed = total_active * query_dim;
+        let row_bytes = query_dim * 4;
+        let budget = self.scan_buffer_budget_bytes();
+        let window_rows = if budget == usize::MAX || row_bytes == 0 {
+            total_active
+        } else {
+            (budget / row_bytes).max(1).min(total_active)
+        };
+        if window_rows < total_active {
+            // Windowed scoring (OOC-6) for the binary/fixed-list lane: this lane declines pending
+            // deltas above, so a window is a plain contiguous byte range per row group, and the
+            // score call is the same as the f32 lane.
+            let mut scratch: Vec<f32> = vec![0.0; window_rows.saturating_mul(query_dim)];
+            let mut best: Vec<(usize, f32)> = Vec::with_capacity(k.min(total_active));
+            let mut start = 0usize;
+            while start < total_active {
+                let rows = window_rows.min(total_active - start);
+                let mut written = 0usize;
+                let mut active_base = 0usize;
+                for desc in rg_descs.iter() {
+                    let Some(d) = desc else { continue };
+                    let rg_end = active_base + d.count;
+                    if rg_end <= start || active_base >= start + rows {
+                        active_base = rg_end;
+                        continue;
+                    }
+                    let from = start.max(active_base) - active_base;
+                    let take = (start + rows).min(rg_end) - start.max(active_base);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            mmap.as_ptr().add(d.data_start + from * row_bytes),
+                            (scratch.as_mut_ptr() as *mut u8).add(written * row_bytes),
+                            take * row_bytes,
+                        );
+                    }
+                    written += take;
+                    active_base = rg_end;
+                }
+                if written != rows {
+                    return Ok(None);
+                }
+                let partial =
+                    topk_heap_on_floats(&scratch[..rows * query_dim], rows, query_dim, computer, k);
+                for (index, distance) in partial {
+                    best.push((start + index, distance));
+                }
+                best.sort_by(|left, right| {
+                    left.1
+                        .partial_cmp(&right.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                best.truncate(k);
+                start += rows;
+            }
+            return Ok(Some(best));
+        }
         let file_size = mmap.len() as u64;
         let mut buf_guard = self.scan_buf.lock().unwrap();
         let cached_size = self
@@ -250,6 +305,8 @@ impl OnDemandStorage {
             count: usize,
             float_abs: usize,
             byte_len: usize,
+            /// Absolute offset of this row group's deletion bitmap, when it has one.
+            del_abs: Option<usize>,
         }
         let mut rg_descs: Vec<Option<RgDesc>> = Vec::with_capacity(footer.row_groups.len());
         let mut total_active: usize = 0;
@@ -285,9 +342,12 @@ impl OnDemandStorage {
                 0
             };
 
+            let has_deletions = rg_meta.deletion_count > 0;
             if compress_flag != RG_COMPRESS_NONE
                 || encoding_ver < 1
-                || rg_meta.deletion_count > 0
+                // Every branch below (f32, f16, quantized) now compacts live rows using
+                // the row group's deletion bitmap, so deletions no longer force the lane
+                // to stand down and fall back to whole-column Arrow materialization.
                 || co_idx >= footer.col_offsets.len()
                 || col_idx >= footer.col_offsets[co_idx].len()
             {
@@ -332,10 +392,30 @@ impl OnDemandStorage {
                 return Ok(None);
             }
 
+            let del_abs = if has_deletions {
+                // Body layout: [id section][deletion bitmap][per-column null bitmap +
+                // data]. `col_offsets` already accounts for both leading sections; the
+                // bitmap itself starts right after the id section.
+                let id_encoding = mmap
+                    .get(rg_meta.offset as usize + 30)
+                    .copied()
+                    .unwrap_or(crate::storage::on_demand::RG_IDS_PLAIN);
+                let del_start = rg_body_abs
+                    + crate::storage::on_demand::rg_id_section_len(rg_rows, id_encoding);
+                let del_len = null_bitmap_len_fn(rg_rows);
+                if del_start + del_len > mmap.len() || count != rg_rows {
+                    return Ok(None);
+                }
+                Some(del_start)
+            } else {
+                None
+            };
+
             rg_descs.push(Some(RgDesc {
                 count,
                 float_abs,
                 byte_len,
+                del_abs,
             }));
             co_idx += 1;
         }
@@ -359,10 +439,54 @@ impl OnDemandStorage {
                 }
             }
             let row_width = codec.row_width(query_dim)?;
-            let mut encoded = Vec::with_capacity(total_active.saturating_mul(row_width));
+            let needed_bytes = total_active.saturating_mul(row_width);
+            let mut encoded: Vec<u8> = Vec::with_capacity(needed_bytes);
+            // Fill through a raw pointer: per-row `extend_from_slice` adds capacity and
+            // bounds bookkeeping that dominated the small-row codecs (int8 at dim 32 kept
+            // a 3.2x gap that way, versus 1.7-1.9x for the wider ones).
+            unsafe {
+                encoded.set_len(needed_bytes);
+            }
+            let dst = encoded.as_mut_ptr();
+            let mut written = 0usize;
             for desc in &rg_descs {
                 let Some(desc) = desc else { continue };
-                encoded.extend_from_slice(&mmap[desc.float_abs..desc.float_abs + desc.byte_len]);
+                match desc.del_abs {
+                    None => {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                mmap.as_ptr().add(desc.float_abs),
+                                dst.add(written),
+                                desc.byte_len,
+                            );
+                        }
+                        written += desc.byte_len;
+                    }
+                    Some(del_abs) => {
+                        // Quantized columns carried the same penalty as f32/f16 (a single
+                        // DELETE used to send the lane home: turboquant4 0.36 -> 12.87 ms,
+                        // 35.8x). Copy only live rows, which keeps the encoded buffer at
+                        // `active_rows * row_width` - exactly what the scorer derives rows
+                        // from - so the returned indices stay in the active row space.
+                        for row in 0..desc.count {
+                            if (mmap[del_abs + row / 8] >> (row % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    mmap.as_ptr().add(desc.float_abs + row * row_width),
+                                    dst.add(written),
+                                    row_width,
+                                );
+                            }
+                            written += row_width;
+                        }
+                    }
+                }
+            }
+            // Same safety net as the f32/f16 paths: never score a partial buffer.
+            if written != needed_bytes {
+                return Ok(None);
             }
             return crate::compute::vector_quantization::topk_encoded_rows(
                 &encoded, query_dim, codec, computer, k,
@@ -375,6 +499,106 @@ impl OnDemandStorage {
         // ── PASS 2 (f16): cache raw f16 bytes, decode per-element during topk ─
         if is_f16 {
             let f16_needed = total_active * query_dim * 2;
+            let f16_row_bytes = query_dim * 2;
+            let budget = self.scan_buffer_budget_bytes();
+            let window_rows = if budget == usize::MAX || f16_row_bytes == 0 {
+                total_active
+            } else {
+                (budget / f16_row_bytes).max(1).min(total_active)
+            };
+            if window_rows < total_active {
+                // Windowed scoring (OOC-6) for the f16 lane: same active-row semantics and the
+                // same top-k as the whole-column scan, but RSS stays inside one window.
+                let live_per_rg: Vec<usize> = rg_descs
+                    .iter()
+                    .map(|desc| match desc {
+                        None => 0,
+                        Some(d) => match d.del_abs {
+                            None => d.count,
+                            Some(del_abs) => (0..d.count)
+                                .filter(|row| (mmap[del_abs + row / 8] >> (row % 8)) & 1 == 0)
+                                .count(),
+                        },
+                    })
+                    .collect();
+
+                let mut scratch: Vec<u8> = vec![0u8; window_rows.saturating_mul(f16_row_bytes)];
+                let mut best: Vec<(usize, f32)> = Vec::with_capacity(k.min(total_active));
+                let mut start = 0usize;
+                while start < total_active {
+                    let rows = window_rows.min(total_active - start);
+                    let mut written = 0usize;
+                    let mut active_base = 0usize;
+                    for (desc, live) in rg_descs.iter().zip(live_per_rg.iter()) {
+                        let Some(d) = desc else { continue };
+                        let rg_start = active_base;
+                        let rg_end = active_base + live;
+                        active_base = rg_end;
+                        if rg_end <= start || rg_start >= start + rows {
+                            continue;
+                        }
+                        let from = start.max(rg_start) - rg_start;
+                        let take = (start + rows).min(rg_end) - start.max(rg_start);
+                        match d.del_abs {
+                            None => unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    mmap.as_ptr().add(d.float_abs + from * f16_row_bytes),
+                                    scratch.as_mut_ptr().add(written * f16_row_bytes),
+                                    take * f16_row_bytes,
+                                );
+                            },
+                            Some(del_abs) => {
+                                let mut live_index = 0usize;
+                                let mut copied = 0usize;
+                                for row in 0..d.count {
+                                    if (mmap[del_abs + row / 8] >> (row % 8)) & 1 == 1 {
+                                        continue;
+                                    }
+                                    if live_index >= from {
+                                        unsafe {
+                                            std::ptr::copy_nonoverlapping(
+                                                mmap.as_ptr()
+                                                    .add(d.float_abs + row * f16_row_bytes),
+                                                scratch
+                                                    .as_mut_ptr()
+                                                    .add((written + copied) * f16_row_bytes),
+                                                f16_row_bytes,
+                                            );
+                                        }
+                                        copied += 1;
+                                        if copied >= take {
+                                            break;
+                                        }
+                                    }
+                                    live_index += 1;
+                                }
+                            }
+                        }
+                        written += take;
+                    }
+                    if written != rows {
+                        return Ok(None);
+                    }
+                    let partial = crate::compute::vector_ops::topk_heap_on_f16_bytes(
+                        &scratch[..rows * f16_row_bytes],
+                        rows,
+                        query_dim,
+                        computer,
+                        k,
+                    );
+                    for (index, distance) in partial {
+                        best.push((start + index, distance));
+                    }
+                    best.sort_by(|left, right| {
+                        left.1
+                            .partial_cmp(&right.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    best.truncate(k);
+                    start += rows;
+                }
+                return Ok(Some(best));
+            }
             let mut f16_guard = self.scan_buf_f16.lock().unwrap();
             let f16_cached = self
                 .scan_buf_f16_file_size
@@ -395,16 +619,44 @@ impl OnDemandStorage {
                 }
                 let f16_ptr = f16_guard.as_mut_ptr();
                 let mut filled = 0usize;
+                let f16_row_bytes = query_dim * 2;
                 for desc in rg_descs.iter() {
                     let Some(d) = desc else { continue };
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            mmap.as_ptr().add(d.float_abs),
-                            f16_ptr.add(filled),
-                            d.byte_len,
-                        );
+                    match d.del_abs {
+                        None => {
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    mmap.as_ptr().add(d.float_abs),
+                                    f16_ptr.add(filled),
+                                    d.byte_len,
+                                );
+                            }
+                            filled += d.byte_len;
+                        }
+                        Some(del_abs) => {
+                            // Same compaction as the f32 path: one DELETE used to send the f16
+                            // lane home entirely (the column is half the size, so the Arrow
+                            // fallback looked even worse: 0.50 -> 13.32 ms). Copy only live rows
+                            // so the scored indices stay in the active row space.
+                            for row in 0..d.count {
+                                if (mmap[del_abs + row / 8] >> (row % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                unsafe {
+                                    std::ptr::copy_nonoverlapping(
+                                        mmap.as_ptr().add(d.float_abs + row * f16_row_bytes),
+                                        f16_ptr.add(filled),
+                                        f16_row_bytes,
+                                    );
+                                }
+                                filled += f16_row_bytes;
+                            }
+                        }
                     }
-                    filled += d.byte_len;
+                }
+                // Same safety net as the f32 path: never score a partial buffer.
+                if filled != f16_needed {
+                    return Ok(None);
                 }
                 let mut cg = self.scan_buf_f16_col.lock().unwrap();
                 cg.clear();
@@ -431,6 +683,109 @@ impl OnDemandStorage {
 
         // ── PASS 2 (f32): fill scan_buf and run ONE topk scan ────────────────
         let needed = total_active * query_dim;
+        let row_bytes = query_dim * 4;
+        let budget = self.scan_buffer_budget_bytes();
+        let window_rows = if budget == usize::MAX || row_bytes == 0 {
+            total_active
+        } else {
+            (budget / row_bytes).max(1).min(total_active)
+        };
+
+        if window_rows < total_active {
+            // Windowed scoring (OOC-6): score the column one bounded window at a time and merge
+            // each window's top-k into the running best, instead of either pinning the whole
+            // column or standing down and losing the zero-copy lane. Deleted rows are skipped
+            // exactly as in the whole-column fill, so the returned indices stay in active row
+            // space and the result is identical to the uncapped lane.
+            let live_per_rg: Vec<usize> = rg_descs
+                .iter()
+                .map(|desc| match desc {
+                    None => 0,
+                    Some(d) => match d.del_abs {
+                        None => d.count,
+                        Some(del_abs) => (0..d.count)
+                            .filter(|row| (mmap[del_abs + row / 8] >> (row % 8)) & 1 == 0)
+                            .count(),
+                    },
+                })
+                .collect();
+
+            let mut scratch: Vec<f32> = vec![0.0; window_rows.saturating_mul(query_dim)];
+            let mut best: Vec<(usize, f32)> = Vec::with_capacity(k.min(total_active));
+            let mut start = 0usize;
+            while start < total_active {
+                let rows = window_rows.min(total_active - start);
+                let mut written = 0usize;
+                let mut active_base = 0usize;
+                for (desc, live) in rg_descs.iter().zip(live_per_rg.iter()) {
+                    let Some(d) = desc else { continue };
+                    let rg_start = active_base;
+                    let rg_end = active_base + live;
+                    active_base = rg_end;
+                    if rg_end <= start || rg_start >= start + rows {
+                        continue;
+                    }
+                    let from = start.max(rg_start) - rg_start;
+                    let take = (start + rows).min(rg_end) - start.max(rg_start);
+                    match d.del_abs {
+                        None => unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                mmap.as_ptr().add(d.float_abs + from * row_bytes),
+                                (scratch.as_mut_ptr() as *mut u8).add(written * row_bytes),
+                                take * row_bytes,
+                            );
+                        },
+                        Some(del_abs) => {
+                            let mut live_index = 0usize;
+                            let mut copied = 0usize;
+                            for row in 0..d.count {
+                                if (mmap[del_abs + row / 8] >> (row % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                if live_index >= from {
+                                    unsafe {
+                                        std::ptr::copy_nonoverlapping(
+                                            mmap.as_ptr().add(d.float_abs + row * row_bytes),
+                                            (scratch.as_mut_ptr() as *mut u8)
+                                                .add((written + copied) * row_bytes),
+                                            row_bytes,
+                                        );
+                                    }
+                                    copied += 1;
+                                    if copied >= take {
+                                        break;
+                                    }
+                                }
+                                live_index += 1;
+                            }
+                        }
+                    }
+                    written += take;
+                }
+                // Safety net: never score a partially filled window.
+                if written != rows {
+                    return Ok(None);
+                }
+                let partial = crate::compute::vector_ops::topk_heap_on_floats(
+                    &scratch[..rows * query_dim],
+                    rows,
+                    query_dim,
+                    computer,
+                    k,
+                );
+                for (index, distance) in partial {
+                    best.push((start + index, distance));
+                }
+                best.sort_by(|left, right| {
+                    left.1
+                        .partial_cmp(&right.1)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                best.truncate(k);
+                start += rows;
+            }
+            return Ok(Some(best));
+        }
         let mut buf_guard = self.scan_buf.lock().unwrap();
         let cached_size = self
             .scan_buf_file_size
@@ -452,14 +807,43 @@ impl OnDemandStorage {
             let mut filled_floats = 0usize;
             for desc in rg_descs.iter() {
                 let Some(d) = desc else { continue };
-                unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        mmap.as_ptr().add(d.float_abs),
-                        (buf_ptr as *mut u8).add(filled_floats * 4),
-                        d.byte_len,
-                    );
+                let row_bytes = query_dim * 4;
+                match d.del_abs {
+                    None => {
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                mmap.as_ptr().add(d.float_abs),
+                                (buf_ptr as *mut u8).add(filled_floats * 4),
+                                d.byte_len,
+                            );
+                        }
+                        filled_floats += d.count * query_dim;
+                    }
+                    Some(del_abs) => {
+                        // A single DELETE used to send this lane home entirely (it assumed
+                        // contiguously mapped rows), costing ~10x on every later TopK. Copy
+                        // only the live rows: the score pass then returns indices that are
+                        // already in the active row space the caller reads with.
+                        for row in 0..d.count {
+                            if (mmap[del_abs + row / 8] >> (row % 8)) & 1 == 1 {
+                                continue;
+                            }
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    mmap.as_ptr().add(d.float_abs + row * row_bytes),
+                                    (buf_ptr as *mut u8).add(filled_floats * 4),
+                                    row_bytes,
+                                );
+                            }
+                            filled_floats += query_dim;
+                        }
+                    }
                 }
-                filled_floats += d.count * query_dim;
+            }
+            // Safety net: the buffer was sized from `active_rows()`. If compaction
+            // disagrees with that count, decline rather than score a partial buffer.
+            if filled_floats != needed {
+                return Ok(None);
             }
             let mut cg = self.scan_buf_col.lock().unwrap();
             cg.clear();
@@ -663,7 +1047,75 @@ impl OnDemandStorage {
 
         // ── PASS 2 (f16 batch): cache raw f16 bytes, decode per-row during topk
         if is_f16_batch {
+        // A whole-column buffer is only worth pinning while it fits the budget: on a
+        // larger column decline here so the caller reads a windowed batch instead
+        // (identical results, bounded RSS).
             let f16_needed = total_active * query_dim * 2;
+            let f16_row_bytes = query_dim * 2;
+            let budget = self.scan_buffer_budget_bytes();
+            let window_rows = if budget == usize::MAX || f16_row_bytes == 0 {
+                total_active
+            } else {
+                (budget / f16_row_bytes).max(1).min(total_active)
+            };
+            if window_rows < total_active {
+                // Windowed batch scoring (OOC-6): score one bounded window at a time and merge
+                // each query's top-k, so a capped buffer keeps this lane instead of standing
+                // down. This lane declines pending deltas above, so windows are plain byte
+                // ranges of live rows.
+                let mut scratch: Vec<u8> = vec![0u8; window_rows.saturating_mul(f16_row_bytes)];
+                let mut best: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_queries];
+                let mut start = 0usize;
+                while start < total_active {
+                    let rows = window_rows.min(total_active - start);
+                    let mut written = 0usize;
+                    let mut active_base = 0usize;
+                    for desc in rg_descs.iter() {
+                        let Some(d) = desc else { continue };
+                        let rg_end = active_base + d.count;
+                        if rg_end <= start || active_base >= start + rows {
+                            active_base = rg_end;
+                            continue;
+                        }
+                        let from = start.max(active_base) - active_base;
+                        let take = (start + rows).min(rg_end) - start.max(active_base);
+                        unsafe {
+                            std::ptr::copy_nonoverlapping(
+                                mmap.as_ptr().add(d.float_abs + from * f16_row_bytes),
+                                scratch.as_mut_ptr().add(written * f16_row_bytes),
+                                take * f16_row_bytes,
+                            );
+                        }
+                        written += take;
+                        active_base = rg_end;
+                    }
+                    if written != rows {
+                        return Ok(None);
+                    }
+                    let partial = crate::compute::vector_ops::batch_topk_on_f16_bytes(
+                        &scratch[..rows * f16_row_bytes],
+                        rows,
+                        query_dim,
+                        queries,
+                        n_queries,
+                        k,
+                        metric,
+                    );
+                    for (query_index, items) in partial.into_iter().enumerate() {
+                        for (index, distance) in items {
+                            best[query_index].push((start + index, distance));
+                        }
+                        best[query_index].sort_by(|left, right| {
+                            left.1
+                                .partial_cmp(&right.1)
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        });
+                        best[query_index].truncate(k);
+                    }
+                    start += rows;
+                }
+                return Ok(Some(best));
+            }
             let mut f16_guard = self.scan_buf_f16.lock().unwrap();
             let f16_cached = self
                 .scan_buf_f16_file_size
@@ -720,7 +1172,72 @@ impl OnDemandStorage {
         }
 
         // ── PASS 2 (f32 batch): fill scan_buf once, run all N queries ────────
+        // A whole-column buffer is only worth pinning while it fits the budget: on a
+        // larger column decline here so the caller reads a windowed batch instead
+        // (identical results, bounded RSS).
         let needed = total_active * query_dim;
+        let row_bytes = query_dim * 4;
+        let budget = self.scan_buffer_budget_bytes();
+        let window_rows = if budget == usize::MAX || row_bytes == 0 {
+            total_active
+        } else {
+            (budget / row_bytes).max(1).min(total_active)
+        };
+        if window_rows < total_active {
+            // Windowed batch scoring (OOC-6) for f32, mirroring the f16 batch lane.
+            let mut scratch: Vec<f32> = vec![0.0; window_rows.saturating_mul(query_dim)];
+            let mut best: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_queries];
+            let mut start = 0usize;
+            while start < total_active {
+                let rows = window_rows.min(total_active - start);
+                let mut written = 0usize;
+                let mut active_base = 0usize;
+                for desc in rg_descs.iter() {
+                    let Some(d) = desc else { continue };
+                    let rg_end = active_base + d.count;
+                    if rg_end <= start || active_base >= start + rows {
+                        active_base = rg_end;
+                        continue;
+                    }
+                    let from = start.max(active_base) - active_base;
+                    let take = (start + rows).min(rg_end) - start.max(active_base);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            mmap.as_ptr().add(d.float_abs + from * row_bytes),
+                            (scratch.as_mut_ptr() as *mut u8).add(written * row_bytes),
+                            take * row_bytes,
+                        );
+                    }
+                    written += take;
+                    active_base = rg_end;
+                }
+                if written != rows {
+                    return Ok(None);
+                }
+                let partial = crate::compute::vector_ops::batch_topk_on_floats(
+                    &scratch[..rows * query_dim],
+                    rows,
+                    query_dim,
+                    queries,
+                    n_queries,
+                    k,
+                    metric,
+                );
+                for (query_index, items) in partial.into_iter().enumerate() {
+                    for (index, distance) in items {
+                        best[query_index].push((start + index, distance));
+                    }
+                    best[query_index].sort_by(|left, right| {
+                        left.1
+                            .partial_cmp(&right.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    best[query_index].truncate(k);
+                }
+                start += rows;
+            }
+            return Ok(Some(best));
+        }
         let mut buf_guard = self.scan_buf.lock().unwrap();
         let cached_size = self
             .scan_buf_file_size
@@ -913,6 +1430,70 @@ impl OnDemandStorage {
 
         // ── PASS 2: fill scan_buf once, run all N queries in parallel ───────
         let needed = total_active * query_dim;
+        let row_bytes = query_dim * 4;
+        let budget = self.scan_buffer_budget_bytes();
+        let window_rows = if budget == usize::MAX || row_bytes == 0 {
+            total_active
+        } else {
+            (budget / row_bytes).max(1).min(total_active)
+        };
+        if window_rows < total_active {
+            // Windowed batch scoring (OOC-6) for the binary lane, mirroring the f32 batch lane:
+            // this lane declines deleted/compressed row groups above, so a window is a plain
+            // contiguous byte range per row group.
+            let mut scratch: Vec<f32> = vec![0.0; window_rows.saturating_mul(query_dim)];
+            let mut best: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_queries];
+            let mut start = 0usize;
+            while start < total_active {
+                let rows = window_rows.min(total_active - start);
+                let mut written = 0usize;
+                let mut active_base = 0usize;
+                for desc in rg_descs.iter() {
+                    let Some(d) = desc else { continue };
+                    let rg_end = active_base + d.count;
+                    if rg_end <= start || active_base >= start + rows {
+                        active_base = rg_end;
+                        continue;
+                    }
+                    let from = start.max(active_base) - active_base;
+                    let take = (start + rows).min(rg_end) - start.max(active_base);
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            mmap.as_ptr().add(d.data_start + from * row_bytes),
+                            (scratch.as_mut_ptr() as *mut u8).add(written * row_bytes),
+                            take * row_bytes,
+                        );
+                    }
+                    written += take;
+                    active_base = rg_end;
+                }
+                if written != rows {
+                    return Ok(None);
+                }
+                let partial = crate::compute::vector_ops::batch_topk_on_floats(
+                    &scratch[..rows * query_dim],
+                    rows,
+                    query_dim,
+                    queries,
+                    n_queries,
+                    k,
+                    metric,
+                );
+                for (query_index, items) in partial.into_iter().enumerate() {
+                    for (index, distance) in items {
+                        best[query_index].push((start + index, distance));
+                    }
+                    best[query_index].sort_by(|left, right| {
+                        left.1
+                            .partial_cmp(&right.1)
+                            .unwrap_or(std::cmp::Ordering::Equal)
+                    });
+                    best[query_index].truncate(k);
+                }
+                start += rows;
+            }
+            return Ok(Some(best));
+        }
         let file_size = mmap.len() as u64;
         let mut buf_guard = self.scan_buf.lock().unwrap();
         let cached_size = self

@@ -12,6 +12,24 @@ The on-disk format is the V4 row-group columnar format (`.apex`). Legacy V3
 files were dropped in v1.10.0 and are rejected on open; the `APEXV3` magic is
 retained in the header for compatibility with readers that check it.
 
+### Format versions and compatibility
+
+A file declares its format version in the header (byte 8). `4` is the V4
+row-group layout; `5` adds V5-only column encodings — currently a `Float32`
+column stored at its declared four bytes per value (`FLAG_NARROW_FLOAT32` in
+the header flags, `COL_ENCODING_PLAIN_F32` per column). A table that uses a
+V5-only encoding declares version `5`.
+
+Compatibility is one-way by design:
+
+- **V5 builds read V4 files** (and V4 data written by V5, e.g. with
+  `APEX_WIDTH_FIDELITY=0`, which keeps the V4 layout and the version-4
+  declaration).
+- **V4 builds must not read V5 files.** Older builds do not know the new
+  encodings and would misread values instead of failing, so do not point a
+  pre-V5 build at a version-5 file. Use `APEX_WIDTH_FIDELITY=0` when a file has
+  to be handed to an older build.
+
 This document defines the architecture and engineering guidelines for future
 development.
 
@@ -88,7 +106,8 @@ Supporting subsystems (not shown above, all under `apexbase/src/storage/`):
 
 | Module | Role |
 |--------|------|
-| `epoch.rs` | Generation counters; caches are only trusted when `epoch + mtime` match |
+| `epoch.rs` | Generation counters; caches are only trusted when `epoch + mtime` match. The per-table sidecar (`<table>.apex.lock`, the same file the cross-process write lock uses) holds two `u64` slots: the published generation and the shared row-id high-water mark |
+| `cross_process_lock.rs` | The single `<table>.apex.lock` flock rule for every write path, re-entrant per thread |
 | `mvcc/` | Snapshot / version store / GC used by transactions |
 | `index/` | B-Tree and hash secondary indexes (`IndexManager`); persistent postings are marked stale before committed table changes and refused in planning/execution until `REINDEX` rebuilds them (marker: `<table>.index.stale`) |
 | `delta/` | DeltaStore: update log + delete bitmap, merge logic |
@@ -484,6 +503,12 @@ reads.
 - **Epochs**: every cache entry records the table epoch at insertion time;
   readers re-check `epoch + mtime` before trusting a cached backend. All
   storage mutations take a `logical_write` epoch guard.
+- **Row ids across processes**: every writer derives its next id from the base
+  file it read, so two processes would hand out the same `_id`. Write entry
+  points reserve a range against the sidecar's shared high-water mark instead
+  (`epoch::reserve_row_ids`); ids may be skipped, never repeated, and the
+  single-process sequence stays contiguous because the reservation minimum is
+  that same next id.
 - **MVCC**: transaction reads use `Snapshot` / `SnapshotManager`; row versions
   live in a `VersionStore` and are reclaimed by the `GarbageCollector`.
 - **Locks**: table file locks (advisory) serialize write paths; the catalog

@@ -3081,6 +3081,42 @@ fn test_right_join() {
 }
 
 #[test]
+fn test_join_null_keys_never_match() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    exec_multi("CREATE TABLE ln (k INT)", base).unwrap();
+    exec_multi("CREATE TABLE rn (k INT, tag TEXT)", base).unwrap();
+    exec_multi("INSERT INTO ln (k) VALUES (NULL), (0), (2)", base).unwrap();
+    exec_multi(
+        "INSERT INTO rn (k, tag) VALUES (0, 'zero'), (2, 'two'), (NULL, 'nulltag')",
+        base,
+    )
+    .unwrap();
+
+    // NULL = NULL is unknown. A NULL key used to be read as 0, so it joined a real
+    // zero key (inner) or matched the other side's NULL row.
+    let inner = exec_multi("SELECT * FROM ln JOIN rn ON ln.k = rn.k", base).unwrap();
+    assert_eq!(inner.to_record_batch().unwrap().num_rows(), 2);
+
+    let left = exec_multi("SELECT * FROM ln LEFT JOIN rn ON ln.k = rn.k", base).unwrap();
+    assert_eq!(left.to_record_batch().unwrap().num_rows(), 3);
+
+    let full = exec_multi("SELECT * FROM ln FULL JOIN rn ON ln.k = rn.k", base).unwrap();
+    assert_eq!(full.to_record_batch().unwrap().num_rows(), 4);
+
+    // An expression ON clause takes the same route (it used to be a nested loop).
+    let expr = exec_multi(
+        "SELECT * FROM ln LEFT JOIN rn ON ln.k + 1000000 = rn.k",
+        base,
+    )
+    .unwrap();
+    assert_eq!(expr.to_record_batch().unwrap().num_rows(), 3);
+
+    let expr_inner = exec_multi("SELECT * FROM ln JOIN rn ON ln.k + 2 = rn.k", base).unwrap();
+    assert_eq!(expr_inner.to_record_batch().unwrap().num_rows(), 1);
+}
+
+#[test]
 fn test_right_join_qualified_key_projection() {
     let dir = tempdir().unwrap();
     let base = dir.path();
@@ -3429,6 +3465,8 @@ fn test_zone_map_pruning_logic() {
         max_bits: 100,
         has_nulls: false,
         is_float: false,
+        is_string_prefix: false,
+        is_string_tail: false,
     };
     // Value 50 is in range [10,100]
     assert!(zm.may_contain_int("=", 50));
@@ -3613,6 +3651,65 @@ fn assert_batches_logically_equal(a: &RecordBatch, b: &RecordBatch, sql: &str) {
 }
 
 #[test]
+#[test]
+fn null_comparisons_and_in_lists_are_unknown_not_errors() {
+    use crate::query::sql_parser::SqlStatement;
+    use arrow::array::{BooleanArray, Int64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    // One NULL string cell, so the mask's null_count tells UNKNOWN from FALSE.
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("k", DataType::Int64, true),
+            Field::new("s", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3])),
+            Arc::new(StringArray::from(vec![Some("a"), None, Some("c")])),
+        ],
+    )
+    .unwrap();
+
+    let mask_for = |sql: &str| -> BooleanArray {
+        let stmt = match SqlParser::parse(sql).unwrap() {
+            SqlStatement::Select(stmt) => stmt,
+            other => panic!("expected SELECT, got {other:?}"),
+        };
+        ApexExecutor::evaluate_predicate(&batch, stmt.where_clause.as_ref().unwrap()).unwrap()
+    };
+
+    // `s = NULL` is UNKNOWN for every row: it must be all-NULL rather than
+    // all-false, otherwise NOT would invert UNKNOWN into TRUE.
+    let mask = mask_for("SELECT k FROM t WHERE s = NULL");
+    assert_eq!(mask.len(), 3);
+    assert_eq!(mask.null_count(), 3);
+    assert_eq!(mask.true_count(), 0);
+
+    let negated = mask_for("SELECT k FROM t WHERE NOT (s = NULL)");
+    assert_eq!(negated.null_count(), 3, "NOT UNKNOWN must stay UNKNOWN");
+    assert_eq!(negated.true_count(), 0);
+
+    // UNKNOWN OR TRUE is TRUE.
+    let either = mask_for("SELECT k FROM t WHERE s = NULL OR k >= 2");
+    assert_eq!(either.true_count(), 2);
+
+    // A NULL member of an IN list leaves the misses UNKNOWN.
+    let in_list = mask_for("SELECT k FROM t WHERE s IN ('a', NULL)");
+    assert_eq!(in_list.true_count(), 1);
+    assert_eq!(in_list.null_count(), 2);
+    let not_in = mask_for("SELECT k FROM t WHERE s NOT IN ('a', NULL)");
+    assert_eq!(not_in.true_count(), 0);
+
+    // Lists without NULL keep their original meaning, and a numeric column with a
+    // NULL member takes the other code path.
+    assert_eq!(mask_for("SELECT k FROM t WHERE s IN ('a')").true_count(), 1);
+    let numeric = mask_for("SELECT k FROM t WHERE k IN (2, NULL)");
+    assert_eq!(numeric.true_count(), 1);
+    assert_eq!(numeric.null_count(), 2);
+    assert_eq!(mask_for("SELECT k FROM t WHERE k NOT IN (2, NULL)").true_count(), 0);
+}
+
 fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
     use crate::query::sql_parser::SqlStatement;
 
@@ -3640,6 +3737,26 @@ fn batch_group_pipeline_executes_gated_shapes_and_falls_back_outside_gate() {
         assert!(
             result.is_some(),
             "gated shape must be served by the batch pipeline"
+        );
+
+        // A predicate that prunes every row group leaves the key lanes unbuilt; the
+        // pipeline must decline instead of finishing a shape it cannot describe
+        // (this used to panic in `BatchGroupAggregator::finish`).
+        let empty_sql = "SELECT city, COUNT(*) AS n FROM default \
+                         WHERE score < 0 GROUP BY city HAVING COUNT(*) > 0";
+        let empty_stmt = parse(empty_sql);
+        let empty_predicate =
+            ApexExecutor::build_scan_predicate(empty_stmt.where_clause.as_ref().unwrap()).unwrap();
+        assert!(
+            ApexExecutor::try_batch_group_pipeline(
+                &backend,
+                &empty_stmt,
+                &empty_predicate,
+                &path.to_string_lossy()
+            )
+            .unwrap()
+            .is_none(),
+            "a fully pruned scan must fall back to the single-batch path"
         );
 
         // Outside the gate: three group keys fall back to the single-batch path.
@@ -4517,9 +4634,11 @@ fn explain_analyze_reports_metadata_and_point_lookup_paths() {
     let plan = explain_analyze_plan(&path, "EXPLAIN ANALYZE SELECT COUNT(*) FROM default");
     assert_eq!(actual_path(&plan), "count_star_metadata");
 
-    // Columnar scan with LIMIT runs through the generic executor route.
+    // A projected read with LIMIT and nothing else to evaluate is bounded: it
+    // reads only the rows the page needs instead of materializing the table and
+    // slicing (a non-zero OFFSET used to cost a full table read).
     let plan = explain_analyze_plan(&path, "EXPLAIN ANALYZE SELECT city FROM default LIMIT 3");
-    assert_eq!(actual_path(&plan), "generic_executor");
+    assert_eq!(actual_path(&plan), "bounded_projection");
 
     // O(1) point lookup on _id.
     let plan = explain_analyze_plan(
@@ -4850,6 +4969,7 @@ fn parsed_select(sql: &str) -> crate::query::SelectStatement {
     }
 }
 
+
 #[test]
 fn plan_feedback_persists_to_sidecar_and_reloads() {
     let dir = tempdir().unwrap();
@@ -4964,6 +5084,634 @@ fn join_cte_fixture(base: &Path) {
         base,
     )
     .unwrap();
+}
+
+#[test]
+fn right_join_with_an_on_predicate_keeps_qualified_names() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // An extra ON predicate sends the RIGHT JOIN down the swapped outer path, which
+    // dropped the original right table's join key - `SELECT u.id` reported a missing
+    // projected column. Every user row survives; user 1 matches two orders.
+    let result = ApexExecutor::execute(
+        "SELECT u.id FROM orders o RIGHT JOIN users u ON o.user_id = u.id AND u.city = 'a'",
+        &default_path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let mut got: Vec<i64> = (0..batch.num_rows()).map(|i| ids.value(i)).collect();
+    got.sort();
+    assert_eq!(got, vec![1, 1, 2, 3, 9], "u.id must come from the preserved side");
+}
+
+#[test]
+fn right_join_exposes_the_left_tables_qualified_columns() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // Both tables expose `id`. A RIGHT JOIN is executed as a swapped LEFT JOIN, which
+    // named the left table's colliding columns `id_right`, so `o.id` was unresolvable.
+    let result = ApexExecutor::execute(
+        "SELECT o.id AS oid, u.id AS uid FROM orders o RIGHT JOIN users u \
+         ON o.user_id = u.id",
+        &default_path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let order_ids = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let user_ids = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let mut got: Vec<(Option<i64>, i64)> = (0..batch.num_rows())
+        .map(|i| {
+            (
+                if order_ids.is_null(i) { None } else { Some(order_ids.value(i)) },
+                user_ids.value(i),
+            )
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![
+            (None, 9),
+            (Some(1), 1),
+            (Some(2), 2),
+            (Some(3), 1),
+            (Some(4), 3),
+            (Some(5), 2),
+        ],
+        "the left key must carry the left table's ids"
+    );
+}
+
+#[test]
+fn insert_rejects_a_text_literal_for_a_binary_column() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    exec_multi("CREATE TABLE default (id INT)", base).unwrap();
+    exec_multi("CREATE TABLE blobs (k INT, b BINARY)", base).unwrap();
+    exec_multi("INSERT INTO blobs (k, b) VALUES (1, NULL)", base).unwrap();
+
+    // A VARCHAR literal cannot be represented in a binary column: the UPDATE path
+    // already rejects it, and INSERT used to store NULL instead (silent data loss).
+    let err = match exec_multi("INSERT INTO blobs (k, b) VALUES (2, 'plain text')", base) {
+        Ok(_) => panic!("a text literal for a BINARY column must be rejected"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("BINARY"),
+        "unexpected error: {err}"
+    );
+    assert_eq!(count_rows(base), 1, "the rejected row must not be written");
+}
+
+fn count_rows(base: &Path) -> i64 {
+    let default_path = base.join("default.apex");
+    let result = ApexExecutor::execute("SELECT COUNT(*) FROM blobs", &default_path).unwrap();
+    result
+        .to_record_batch()
+        .unwrap()
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0)
+}
+
+#[test]
+fn a_string_in_list_count_uses_the_storage_set_count() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    exec_multi("CREATE TABLE default (id INT)", base).unwrap();
+    exec_multi("CREATE TABLE tags (s TEXT, v INT)", base).unwrap();
+    exec_multi(
+        "INSERT INTO tags (s, v) VALUES ('a', 1), ('b', 2), ('a', 3), ('c', 4), ('b', 5)",
+        base,
+    )
+    .unwrap();
+
+    // The lane requires every element to be a non-empty string literal, so a NOT IN or a
+    // numeric list keeps the ordinary path (asserted below).
+    let result = ApexExecutor::execute(
+        "SELECT COUNT(*) FROM tags WHERE s IN ('a', 'b')",
+        &default_path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let count = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 4);
+
+    let not_in = ApexExecutor::execute(
+        "SELECT COUNT(*) FROM tags WHERE s NOT IN ('a')",
+        &default_path,
+    )
+    .unwrap();
+    let not_in_count = not_in
+        .to_record_batch()
+        .unwrap()
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(not_in_count, 3, "NOT IN must keep the ordinary path and stay correct");
+}
+
+#[test]
+fn an_unfiltered_count_join_counts_key_multiplicities() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+    // A right side with duplicate keys exercises the histogram fan-out.
+    exec_multi("CREATE TABLE dup (id INT, k INT)", base).unwrap();
+    exec_multi(
+        "INSERT INTO dup (id, k) VALUES (1, 1), (2, 1), (3, 2), (4, 9)",
+        base,
+    )
+    .unwrap();
+
+    // orders: user_id 1,2,1,3,2 -> dim contributes 1,1,1,1,1; dup: k=1 twice, k=2 once.
+    let result = ApexExecutor::execute(
+        "SELECT COUNT(*) FROM orders o JOIN dup d ON o.user_id = d.k",
+        &default_path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let counts = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    // user_id 1 appears twice and d.k = 1 twice (4), plus user_id 2 twice against the
+    // single d.k = 2 row (2).
+    assert_eq!(counts.value(0), 6, "key multiplicities must multiply");
+
+    // Outer joins take the same histogram now: an unmatched orders row still contributes
+    // one null-extended row, and the preserved side of a RIGHT join is the probe side.
+    let left_count = ApexExecutor::execute(
+        "SELECT COUNT(*) FROM orders o LEFT JOIN dup d ON o.user_id = d.k",
+        &default_path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap()
+    .column(0)
+    .as_any()
+    .downcast_ref::<Int64Array>()
+    .unwrap()
+    .value(0);
+    // user_id 1 twice against k=1 twice (4), user_id 2 twice against k=2 once (2),
+    // user_id 3 unmatched (1).
+    assert_eq!(left_count, 7, "LEFT JOIN keeps unmatched probe rows");
+
+    let right_count = ApexExecutor::execute(
+        "SELECT COUNT(*) FROM orders o RIGHT JOIN dup d ON o.user_id = d.k",
+        &default_path,
+    )
+    .unwrap()
+    .to_record_batch()
+    .unwrap()
+    .column(0)
+    .as_any()
+    .downcast_ref::<Int64Array>()
+    .unwrap()
+    .value(0);
+    // dup has k=1 twice (2 orders each -> 4), k=2 once (2 orders -> 2), k=9 unmatched (1).
+    assert_eq!(right_count, 7, "RIGHT JOIN keeps unmatched dup rows");
+
+    let filtered = ApexExecutor::execute(
+        "SELECT COUNT(*) FROM orders o JOIN dup d ON o.user_id = d.k WHERE o.id >= 100",
+        &default_path,
+    )
+    .unwrap();
+    let filtered_counts = filtered
+        .to_record_batch()
+        .unwrap()
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(filtered_counts, 0, "the row-group prune must keep the count at zero");
+}
+
+#[test]
+fn a_two_key_group_by_with_colliding_bare_names_keeps_both_keys() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // Both tables expose `id`, so the join carries the right one as `users.id`. The
+    // emitter stripped the qualifier before looking the column up, which resolved
+    // `u.id` to the left table's `id` and emitted the first group key twice.
+    let result = ApexExecutor::execute(
+        "SELECT o.id, u.id, COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id \
+         GROUP BY o.id, u.id ORDER BY o.id",
+        &default_path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let left = batch.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+    let right = batch.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+    let expected: Vec<(i64, i64)> = vec![(1, 1), (2, 2), (3, 1), (4, 3), (5, 2)];
+    let got: Vec<(i64, i64)> = (0..batch.num_rows())
+        .map(|i| (left.value(i), right.value(i)))
+        .collect();
+    assert_eq!(got, expected, "each row must keep its own table's id");
+}
+
+#[test]
+fn a_two_key_group_by_with_an_int_first_keeps_both_keys() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // The two-key kernel is written for (string, int); written the other way round the
+    // query fell through and emitted the left table's ids. Both orders must now agree.
+    let result = ApexExecutor::execute(
+        "SELECT u.id, u.city, COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id \
+         GROUP BY u.id, u.city",
+        &default_path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let ids = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let cities = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows: Vec<(i64, String, i64)> = (0..batch.num_rows())
+        .map(|i| (ids.value(i), cities.value(i).to_string(), counts.value(i)))
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            (1, "a".to_string(), 2),
+            (2, "b".to_string(), 2),
+            (3, "c".to_string(), 1),
+        ]
+    );
+}
+
+#[test]
+fn a_two_key_group_by_with_a_string_first_keeps_both_keys() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // users: id 1..3 -> city a, b, c and id 9 -> x; orders has five rows over 1..3.
+    // The two-key lane matched the SELECT names against qualified group keys and fell
+    // through to a path that emitted wrong first-key values.
+    let result = ApexExecutor::execute(
+        "SELECT u.city, u.id, COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id \
+         GROUP BY u.city, u.id",
+        &default_path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let cities = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .unwrap();
+    let ids = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows: Vec<(String, i64, i64)> = (0..batch.num_rows())
+        .map(|i| {
+            (
+                cities.value(i).to_string(),
+                ids.value(i),
+                counts.value(i),
+            )
+        })
+        .collect();
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("a".to_string(), 1, 2),
+            ("b".to_string(), 2, 2),
+            ("c".to_string(), 3, 1),
+        ]
+    );
+}
+
+#[test]
+fn a_local_filter_prunes_a_string_keyed_count_join() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // The probe-key IN scan used to be Int64-only, so a string-keyed count join read
+    // both sides in full even when a local filter had narrowed one of them. users.city
+    // is the key here: ids 1..3 map to a, b, c and id 9 to x, all distinct, so the
+    // join is 1:1 and two probe rows yield two matches.
+    let result = ApexExecutor::execute(
+        "SELECT COUNT(*) FROM users a JOIN users b ON a.city = b.city WHERE a.id < 3",
+        &default_path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    let count = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap()
+        .value(0);
+    assert_eq!(count, 2);
+}
+
+#[test]
+fn group_by_on_a_colliding_qualified_name_groups_the_right_column() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // Both tables have an `id`; stripping the qualifier made `GROUP BY u.id` group by
+    // the left table's ids (10,20,30 instead of 1,2,3).
+    let result = ApexExecutor::execute(
+        "SELECT u.id, COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id \
+         GROUP BY u.id",
+        &default_path,
+    )
+    .unwrap();
+    let batch = result.to_record_batch().unwrap();
+    assert_eq!(batch.num_rows(), 3);
+    let keys = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let counts = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .unwrap();
+    let mut rows: Vec<(i64, i64)> = (0..keys.len())
+        .map(|i| (keys.value(i), counts.value(i)))
+        .collect();
+    rows.sort_unstable();
+    assert_eq!(rows, vec![(1, 2), (2, 2), (3, 1)]);
+}
+
+#[test]
+fn qualified_references_pick_their_own_table_when_names_collide() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // Both tables have an `id`. The projection resolves a reference as written and
+    // only then falls back to the bare column, so an INNER join that never kept a
+    // `u.id` column silently returned the left table's ids.
+    let cells = |sql: &str| -> Vec<i64> {
+        let result = ApexExecutor::execute(sql, &default_path).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        assert_eq!(batch.num_rows(), 1, "{sql}");
+        (0..batch.num_columns())
+            .map(|i| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect()
+    };
+
+    // orders.id sums to 15 over the five matched rows; users.id sums to 9.
+    assert_eq!(
+        cells(
+            "SELECT SUM(u.id), SUM(o.id) FROM orders o JOIN users u ON o.user_id = u.id"
+        ),
+        vec![9, 15]
+    );
+    assert_eq!(
+        cells(
+            "SELECT SUM(u.id), SUM(o.id) FROM orders o LEFT JOIN users u \
+             ON o.user_id = u.id"
+        ),
+        vec![9, 15]
+    );
+    // The RIGHT JOIN also keeps the unmatched user 9, so the right key sums to 18.
+    assert_eq!(
+        cells(
+            "SELECT SUM(u.id) FROM orders o RIGHT JOIN users u ON o.user_id = u.id"
+        ),
+        vec![18]
+    );
+}
+
+#[test]
+fn aggregate_over_join_keys_resolves_qualified_references() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // The RIGHT-JOIN swap keeps the key it consumed only under its qualified name, so
+    // `SUM(o.user_id)` / `SUM(u.id)` used to fail with "Column: user_id"/"Column: id".
+    // users has an unmatched id 9, which is the null-extended row here.
+    let cells = |sql: &str| -> Vec<i64> {
+        let result = ApexExecutor::execute(sql, &default_path).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        assert_eq!(batch.num_rows(), 1, "{sql}");
+        (0..batch.num_columns())
+            .map(|i| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .unwrap()
+                    .value(0)
+            })
+            .collect()
+    };
+
+    assert_eq!(
+        cells(
+            "SELECT COUNT(o.user_id), COUNT(u.id), SUM(o.user_id), SUM(u.id) \
+             FROM orders o RIGHT JOIN users u ON o.user_id = u.id"
+        ),
+        vec![5, 6, 9, 18]
+    );
+    assert_eq!(
+        cells(
+            "SELECT MIN(o.user_id), MIN(u.id), MAX(o.user_id), MAX(u.id) \
+             FROM orders o RIGHT JOIN users u ON o.user_id = u.id"
+        ),
+        vec![1, 1, 3, 9]
+    );
+    // The left key survives an ordinary LEFT JOIN.
+    assert_eq!(
+        cells(
+            "SELECT COUNT(o.user_id), SUM(o.user_id), MIN(o.user_id) \
+             FROM orders o LEFT JOIN users u ON o.user_id = u.id"
+        ),
+        vec![5, 9, 1]
+    );
+}
+
+#[test]
+fn join_on_key_order_does_not_change_the_result() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    let default_path = base.join("default.apex");
+    join_cte_fixture(base);
+
+    // SQL lets either table's key be written first in the ON clause. Reading the
+    // operands positionally made `ON o.user_id = u.id` fail with
+    // "Left join key 'user_id' not found" for INNER, LEFT and RIGHT alike.
+    let count = |sql: &str| -> i64 {
+        let result = ApexExecutor::execute(sql, &default_path).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    // orders has five rows over users 1..3; users also has an unmatched id 9, so the
+    // RIGHT JOIN (users preserved) counts the five matches plus one null extension.
+    for (join_type, expected) in [("JOIN", 5i64), ("LEFT JOIN", 5), ("RIGHT JOIN", 6)] {
+        let forward = count(&format!(
+            "SELECT COUNT(*) FROM orders o {join_type} users u ON o.user_id = u.id"
+        ));
+        let reversed = count(&format!(
+            "SELECT COUNT(*) FROM orders o {join_type} users u ON u.id = o.user_id"
+        ));
+        assert_eq!(forward, expected, "{join_type} forward");
+        assert_eq!(reversed, expected, "{join_type} reversed");
+    }
+}
+
+#[test]
+fn filtered_count_join_counts_only_rows_the_where_keeps() {
+    let dir = tempdir().unwrap();
+    let base = dir.path();
+    join_cte_fixture(base);
+
+    // Each case is the count lane with a WHERE conjunct that touches one side (or
+    // both). The lane may prune a side's read through the zone maps, so the counted
+    // rows -- including key multiplicities -- must match the plain join exactly.
+    let default_path = base.join("default.apex");
+    let count = |sql: &str| -> i64 {
+        let result = ApexExecutor::execute(sql, &default_path).unwrap();
+        let batch = result.to_record_batch().unwrap();
+        assert_eq!(batch.num_rows(), 1, "{sql}");
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+
+    // orders has 5 rows, all with a matching users row.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id"),
+        5
+    );
+    // Two orders belong to user 1.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id                WHERE o.user_id = 1"),
+        2
+    );
+    // A filter on the other side: users.city 'a' is user 1.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id                WHERE u.city = 'a'"),
+        2
+    );
+    // Three orders are >= 30, and the city filter keeps users 1 and 2.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id                WHERE o.amount >= 30"),
+        3
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id                WHERE o.amount >= 30 AND u.city IN ('a', 'b')"),
+        2
+    );
+    // A predicate that keeps nothing yields zero, not a stale count.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id                WHERE o.user_id = 99"),
+        0
+    );
+    // Either side can carry the filter: the build side is pruned by the probe's keys
+    // and vice versa.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id \
+               WHERE o.amount >= 30 AND u.id < 3"),
+        2
+    );
+    // A null-rejecting WHERE predicate on the nullable side drops the null-extended
+    // rows, so the outer join must count exactly like the inner one. users has an
+    // unmatched row (id 9) and orders has no amount >= 100, so both directions have
+    // null-extended candidates that the WHERE has to remove.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o LEFT JOIN users u ON o.user_id = u.id \
+               WHERE u.id < 3"),
+        4
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o RIGHT JOIN users u ON o.user_id = u.id \
+               WHERE o.amount >= 30"),
+        3
+    );
+    // Without such a predicate the unmatched probes survive.
+    assert_eq!(
+        count("SELECT COUNT(*) FROM orders o LEFT JOIN users u ON o.user_id = u.id"),
+        5
+    );
+    assert_eq!(
+        count("SELECT COUNT(*) FROM users u LEFT JOIN orders o ON u.id = o.user_id"),
+        6
+    );
+
+    // The filtered shapes still take the count fast path.
+    let plan = explain_analyze_plan(
+        &base.join("default.apex"),
+        "EXPLAIN ANALYZE SELECT COUNT(*) FROM orders o JOIN users u ON o.user_id = u.id \
+         WHERE o.amount >= 30",
+    );
+    assert_eq!(actual_path(&plan), "join_count_fast_path");
 }
 
 #[test]
@@ -5086,6 +5834,162 @@ fn result_shape(result: &Option<ApexResult>) -> String {
         Some(ApexResult::Empty(schema)) => format!("Empty({} cols)", schema.fields().len()),
         Some(ApexResult::Scalar(value)) => format!("Scalar({value})"),
     }
+}
+
+/// A secondary index covers the persisted row groups only, so the index route
+/// must stand down while an overlay is visible: otherwise the lookup (and the
+/// covering index-only scan, which never touches the table) silently drops every
+/// appended row.
+#[test]
+fn index_route_stands_down_while_an_overlay_is_visible() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    create_index_spec_range_fixture(&path);
+    let (base_dir, _) = base_dir_and_table(&path);
+    let backend = get_cached_backend(&path).unwrap();
+
+    let sql = "SELECT * FROM default WHERE city = 't1'";
+    let select = match SqlParser::parse(sql).unwrap() {
+        SqlStatement::Select(select) => select,
+        _ => panic!("expected SELECT"),
+    };
+    let where_clause = select.where_clause.as_ref().unwrap();
+    let plan = planned_select(&path, sql);
+
+    let clean = ApexExecutor::try_index_accelerated_read(
+        &backend,
+        &select,
+        where_clause,
+        plan.execution.as_ref(),
+        &base_dir,
+        &path,
+    )
+    .unwrap();
+    assert!(
+        clean.is_some(),
+        "a clean persisted view must keep the index route, got {}",
+        result_shape(&clean)
+    );
+
+    // One buffered appended row makes the index cover only part of the visible
+    // set, both through the plan-carried spec and the legacy path.
+    backend
+        .insert_rows(&[HashMap::from([
+            ("city".to_string(), Value::String("t1".to_string())),
+            ("score".to_string(), Value::Float64(1.0)),
+        ])])
+        .unwrap();
+    assert!(backend.requires_merged_read());
+    for spec in [plan.execution.as_ref(), None] {
+        let overlay = ApexExecutor::try_index_accelerated_read(
+            &backend,
+            &select,
+            where_clause,
+            spec,
+            &base_dir,
+            &path,
+        )
+        .unwrap();
+        assert!(
+            overlay.is_none(),
+            "an overlay must stand the index route down, got {}",
+            result_shape(&overlay)
+        );
+    }
+
+    // The scan fallback still sees the appended row next to the base rows.
+    let batch = ApexExecutor::execute("SELECT * FROM default WHERE city = 't1'", &path)
+        .unwrap()
+        .to_record_batch()
+        .unwrap();
+    let base_rows = (1..1_000).filter(|i| i % 2 == 1 && i % 7 == 1).count();
+    assert_eq!(batch.num_rows(), base_rows + 1, "appended row must be visible");
+}
+
+/// The typed/columnar write paths publish rows without going through
+/// `Database::write`, and used to skip index maintenance entirely: an indexed
+/// equality then missed the row while a scan saw it.
+#[test]
+fn typed_writes_maintain_secondary_indexes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    create_index_spec_range_fixture(&path);
+
+    crate::Database::write_typed(
+        &path,
+        HashMap::new(),
+        HashMap::from([("score".to_string(), vec![1.5_f64])]),
+        HashMap::from([("city".to_string(), vec!["brand_new".to_string()])]),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        HashMap::new(),
+        crate::storage::DurabilityLevel::Safe,
+    )
+    .unwrap();
+    // The bindings invalidate the cached backend after a write; do the same here.
+    crate::query::executor::invalidate_storage_cache(&path);
+
+    let count = |sql: &str| {
+        ApexExecutor::execute(sql, &path)
+            .unwrap()
+            .to_record_batch()
+            .unwrap()
+            .num_rows()
+    };
+    assert_eq!(
+        count("SELECT * FROM default WHERE city = 'brand_new'"),
+        1,
+        "the typed write must publish its index posting"
+    );
+    // A second typed write keeps both previous and new postings exact.
+    crate::Database::write_typed_columns(
+        &path,
+        HashMap::from([
+            (
+                "city".to_string(),
+                crate::storage::on_demand::ColumnData::String {
+                    offsets: vec![0, 10],
+                    data: b"brand_new2".to_vec(),
+                },
+            ),
+            (
+                "score".to_string(),
+                crate::storage::on_demand::ColumnData::Float64(vec![2.5]),
+            ),
+        ]),
+        HashMap::new(),
+        crate::storage::DurabilityLevel::Safe,
+    )
+    .unwrap();
+    crate::query::executor::invalidate_storage_cache(&path);
+    assert_eq!(count("SELECT * FROM default WHERE city = 'brand_new2'"), 1);
+    assert_eq!(count("SELECT * FROM default WHERE city = 'brand_new'"), 1);
+}
+
+/// REINDEX rebuilt on top of whatever postings an unloaded index instance
+/// happened to load: every row was posted a second time and an indexed lookup
+/// returned duplicates until the next REINDEX. The fixture is deliberately not
+/// read through the index before the rebuild.
+#[test]
+fn reindex_after_an_incremental_insert_does_not_duplicate_postings() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("default.apex");
+    create_index_spec_range_fixture(&path);
+
+    ApexExecutor::execute(
+        "INSERT INTO default (city, score) VALUES ('brand_new', 1.0)",
+        &path,
+    )
+    .unwrap();
+    ApexExecutor::execute("REINDEX default", &path).unwrap();
+
+    let rows = ApexExecutor::execute("SELECT * FROM default WHERE city = 'brand_new'", &path)
+        .unwrap()
+        .to_record_batch()
+        .unwrap()
+        .num_rows();
+    assert_eq!(rows, 1, "REINDEX must not duplicate postings");
 }
 
 fn assert_index_results_equal(
@@ -5258,6 +6162,24 @@ fn stale_index_execution_spec_falls_back_to_scan() {
 // ============================================================================
 // S1: per-query aggregation memory budget
 // ============================================================================
+
+#[test]
+fn query_memory_charge_reserves_and_releases_like_raii() {
+    // ORDER BY and hash-JOIN state are charged through this guard now, so its release-on-drop
+    // is what keeps one query's sort from leaking a charge into the next (out-of-core OOC-3).
+    let budget = std::sync::Arc::new(QueryMemoryBudget::new(100));
+    let _guard =
+        crate::query::executor::memory::install_query_memory_budget(Some(budget.clone()));
+    {
+        let charge = crate::query::executor::memory::QueryMemoryCharge::new(80).unwrap();
+        assert_eq!(charge.bytes(), 80);
+        assert_eq!(budget.used(), 80);
+        assert!(crate::query::executor::memory::QueryMemoryCharge::new(30).is_err());
+        assert_eq!(budget.used(), 80, "a rejected charge must not move the counter");
+    }
+    assert_eq!(budget.used(), 0, "the charge must be released on drop");
+    assert!(crate::query::executor::memory::QueryMemoryCharge::new(100).is_ok());
+}
 
 #[test]
 fn query_memory_budget_tracks_and_limits_reservations() {
@@ -5731,4 +6653,566 @@ fn memory_index_stale_marker_stays_in_process() {
     // Clearing an already-clear marker must stay idempotent.
     clear_indexes_stale(path).unwrap();
     assert!(!indexes_stale(path));
+}
+
+#[test]
+fn scan_capacity_resolution_honours_configuration() {
+    use super::resolve_scan_capacity;
+
+    // Historical default: one core left to the caller and the OS, capped at 8.
+    assert_eq!(resolve_scan_capacity(10, None), 8);
+    assert_eq!(resolve_scan_capacity(4, None), 3);
+    assert_eq!(resolve_scan_capacity(2, None), 1);
+    assert_eq!(resolve_scan_capacity(1, None), 0);
+
+    // A deployment override wins, including above the default cap.
+    assert_eq!(resolve_scan_capacity(10, Some("6")), 6);
+    assert_eq!(resolve_scan_capacity(10, Some(" 4 ")), 4);
+    assert_eq!(resolve_scan_capacity(2, Some("16")), 16);
+
+    // Missing, malformed, and below-two values keep the default: a budget of
+    // 0 or 1 would silently disable the parallel path instead of tuning it.
+    for value in ["", " ", "0", "1", "abc", "-3", "2.5", "999999999999999999999"] {
+        assert_eq!(
+            resolve_scan_capacity(10, Some(value)),
+            8,
+            "value {value:?} must keep the default budget"
+        );
+    }
+}
+
+#[test]
+fn scan_capacity_env_override_is_read_per_call() {
+    let _guard = BATCH_SCAN_ENV_LOCK.lock().unwrap();
+    let ncpu = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(2);
+    let default = ncpu.saturating_sub(1).min(8);
+
+    std::env::remove_var("APEX_SCAN_THREADS");
+    assert_eq!(super::parallel_scan_capacity(), default);
+    std::env::set_var("APEX_SCAN_THREADS", "3");
+    assert_eq!(super::parallel_scan_capacity(), 3);
+    std::env::set_var("APEX_SCAN_THREADS", "nonsense");
+    assert_eq!(super::parallel_scan_capacity(), default);
+    std::env::remove_var("APEX_SCAN_THREADS");
+}
+
+#[test]
+fn point_lookup_applies_a_pending_delta_without_scanning_the_table() {
+    // A pending DeltaStore update used to send `WHERE _id = X` through the full
+    // scan path. The base row is still addressable by id, so the overlay is now
+    // applied to that one row (appended delta rows keep the merged scan).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("overlay_point.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Fast,
+        &[
+            ("value".to_string(), crate::storage::ColumnType::Int64),
+            ("label".to_string(), crate::storage::ColumnType::String),
+        ],
+    )
+    .unwrap();
+    storage
+        .insert_rows(&[
+            HashMap::from([
+                (
+                    "value".to_string(),
+                    crate::storage::ColumnValue::Int64(1),
+                ),
+                (
+                    "label".to_string(),
+                    crate::storage::ColumnValue::String("one".to_string()),
+                ),
+            ]),
+            HashMap::from([
+                (
+                    "value".to_string(),
+                    crate::storage::ColumnValue::Int64(2),
+                ),
+                (
+                    "label".to_string(),
+                    crate::storage::ColumnValue::String("two".to_string()),
+                ),
+            ]),
+        ])
+        .unwrap();
+    storage.save_full().unwrap();
+    drop(storage);
+
+    let session = crate::Session::new(dir.path(), &path);
+    let columns = |sql: &str| -> Vec<String> {
+        session
+            .execute(sql)
+            .unwrap()
+            .to_record_batch()
+            .unwrap()
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect()
+    };
+    // Shape with no overlay at all, for comparison with the overlay path.
+    let clean_columns = columns("SELECT * FROM overlay_point WHERE _id = 2");
+
+    session
+        .execute("UPDATE overlay_point SET value = 9 WHERE _id = 1")
+        .unwrap();
+
+    let read_value = |sql: &str| -> Vec<i64> {
+        let batch = session.execute(sql).unwrap().to_record_batch().unwrap();
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    };
+
+    // `SELECT *` keeps the same shape whether or not an overlay is pending.
+    let overlay_columns = columns("SELECT * FROM overlay_point WHERE _id = 1");
+    assert_eq!(
+        overlay_columns, clean_columns,
+        "an overlay must not change the projected columns of SELECT *"
+    );
+    assert!(
+        overlay_columns.contains(&"_id".to_string()),
+        "SELECT * must keep _id: {overlay_columns:?} vs clean {clean_columns:?}"
+    );
+
+    // The updated row reflects the overlay on the point path.
+    assert_eq!(read_value("SELECT value FROM overlay_point WHERE _id = 1"), vec![9]);
+    // Other rows are untouched by the overlay.
+    assert_eq!(read_value("SELECT value FROM overlay_point WHERE _id = 2"), vec![2]);
+
+    // A delta delete removes the row from the same fast path.
+    session
+        .execute("DELETE FROM overlay_point WHERE _id = 2")
+        .unwrap();
+    assert!(read_value("SELECT value FROM overlay_point WHERE _id = 2").is_empty());
+    assert_eq!(read_value("SELECT value FROM overlay_point WHERE _id = 1"), vec![9]);
+}
+
+#[test]
+fn fts_conjunct_bitmap_only_splits_a_top_level_and() {
+    // V5 §6.4 item 15: only a top-level `AND` conjunct may restrict the scan.
+    // Under `OR`/`NOT` the bitmap is not a superset of the result, so the shape
+    // must be rejected and the caller must scan.
+    let fts = |values: &[u64]| SqlExpr::FtsResolved {
+        doc_ids: Arc::new(values.iter().copied().collect::<roaring::RoaringTreemap>()),
+    };
+    let eq = |value: i64| SqlExpr::BinaryOp {
+        left: Box::new(SqlExpr::Column("k".to_string())),
+        op: BinaryOperator::Eq,
+        right: Box::new(SqlExpr::Literal(crate::data::Value::Int64(value))),
+    };
+    let binary = |left: SqlExpr, op: BinaryOperator, right: SqlExpr| SqlExpr::BinaryOp {
+        left: Box::new(left),
+        op,
+        right: Box::new(right),
+    };
+
+    for expression in [
+        binary(fts(&[1, 2]), BinaryOperator::And, eq(7)),
+        binary(eq(7), BinaryOperator::And, fts(&[3])),
+        SqlExpr::Paren(Box::new(binary(
+            fts(&[4, 5, 6]),
+            BinaryOperator::And,
+            eq(1),
+        ))),
+    ] {
+        assert!(
+            ApexExecutor::fts_conjunct_bitmap(&expression).is_some(),
+            "a MATCH under a top-level AND must be usable as a row selection"
+        );
+    }
+    assert_eq!(
+        ApexExecutor::fts_conjunct_bitmap(&binary(
+            fts(&[1, 2]),
+            BinaryOperator::And,
+            eq(7)
+        ))
+        .unwrap()
+        .len(),
+        2
+    );
+
+    assert!(ApexExecutor::fts_conjunct_bitmap(&binary(
+        fts(&[1]),
+        BinaryOperator::Or,
+        eq(2)
+    ))
+    .is_none());
+    assert!(ApexExecutor::fts_conjunct_bitmap(&SqlExpr::UnaryOp {
+        op: crate::query::sql_parser::UnaryOperator::Not,
+        expr: Box::new(fts(&[1])),
+    })
+    .is_none());
+    assert!(ApexExecutor::fts_conjunct_bitmap(&eq(3)).is_none());
+}
+
+#[test]
+fn order_by_distance_spec_resolves_both_spellings_and_rejects_the_rest() {
+    // V5 §6.4 item 16: only `ORDER BY <distance>(col, [literal])` (or its
+    // `SELECT <expr> AS alias ... ORDER BY alias` spelling) may take the fused
+    // TopK lane. Everything else must keep the general path.
+    let spec = |sql: &str| {
+        let SqlStatement::Select(stmt) = SqlParser::parse(sql).unwrap() else {
+            panic!("not a select: {sql}");
+        };
+        ApexExecutor::order_by_distance_spec(&stmt)
+    };
+
+    let (column, query, metric) = spec(
+        "SELECT doc FROM t ORDER BY cosine_distance(emb, [0.5, 0.25]) LIMIT 5",
+    )
+    .expect("expression form must resolve");
+    assert_eq!(column, "emb");
+    assert_eq!(query, vec![0.5f32, 0.25]);
+    assert_eq!(metric, crate::query::vector_ops::DistanceMetric::CosineDistance);
+
+    let (column, query, metric) = spec(
+        "SELECT doc, array_distance(emb, [1.0, 2.0]) AS dist FROM t ORDER BY dist LIMIT 5",
+    )
+    .expect("alias form must resolve");
+    assert_eq!(column, "emb");
+    assert_eq!(query, vec![1.0f32, 2.0]);
+    assert_eq!(metric, crate::query::vector_ops::DistanceMetric::L2);
+
+    // A string literal query vector is accepted as well.
+    assert!(spec(
+        "SELECT doc FROM t ORDER BY l1_distance(emb, '[1.0,2.0]') LIMIT 5"
+    )
+    .is_some());
+
+    for rejected in [
+        // Descending order asks for the opposite end of the heap.
+        "SELECT doc FROM t ORDER BY cosine_distance(emb, [1.0, 2.0]) DESC LIMIT 5",
+        // More than one ordering term has to be honoured together.
+        "SELECT doc FROM t ORDER BY cosine_distance(emb, [1.0, 2.0]), doc LIMIT 5",
+        // Not a distance function.
+        "SELECT doc FROM t ORDER BY abs(doc) LIMIT 5",
+        // A non-column first argument.
+        "SELECT doc FROM t ORDER BY cosine_distance(doc + 1, [1.0, 2.0]) LIMIT 5",
+        // The query vector is not a literal.
+        "SELECT doc FROM t ORDER BY cosine_distance(emb, doc) LIMIT 5",
+    ] {
+        assert!(spec(rejected).is_none(), "{rejected}");
+    }
+
+    for name in [
+        "cosine_distance",
+        "array_distance",
+        "l2_squared_distance",
+        "cosine_similarity",
+        "inner_product",
+        "negative_inner_product",
+        "l1_distance",
+        "linf_distance",
+    ] {
+        assert!(
+            ApexExecutor::distance_metric_for_name(name).is_some(),
+            "{name}"
+        );
+    }
+    assert!(ApexExecutor::distance_metric_for_name("lower").is_none());
+}
+
+#[test]
+fn order_by_expression_keeps_an_unprojected_predicate_column() {
+    // A storage-level fast path stages only the post-filter columns while the
+    // shared tail evaluates the WHERE again, so `SELECT doc FROM t WHERE k < 2
+    // ORDER BY <expression>` used to fail with "Column 'k' not found" whenever
+    // `k` was neither projected nor an ordering key. The executor now re-reads
+    // the relation and re-evaluates the predicate instead of reporting the
+    // absent column.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("pruned_where.apex");
+    {
+        let session = crate::Session::new(dir.path(), &path);
+        session
+            .execute("CREATE TABLE t (doc BIGINT, k BIGINT)")
+            .unwrap();
+        for value in 0..20i64 {
+            session
+                .execute(&format!(
+                    "INSERT INTO t (doc, k) VALUES ({value}, {})",
+                    value % 3
+                ))
+                .unwrap();
+        }
+    }
+
+    let session = crate::Session::new(dir.path(), &path);
+    let docs = |sql: &str| -> Vec<i64> {
+        session
+            .execute(sql)
+            .unwrap()
+            .to_record_batch()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    };
+
+    // The pruned read and the read that also projects `k` must agree.
+    for (pruned, projected) in [
+        (
+            "SELECT doc FROM t WHERE k < 2 ORDER BY abs(doc) LIMIT 5",
+            "SELECT doc, k FROM t WHERE k < 2 ORDER BY abs(doc) LIMIT 5",
+        ),
+        (
+            "SELECT doc FROM t WHERE k BETWEEN 0 AND 1 ORDER BY abs(doc) DESC LIMIT 5",
+            "SELECT doc, k FROM t WHERE k BETWEEN 0 AND 1 ORDER BY abs(doc) DESC LIMIT 5",
+        ),
+        (
+            "SELECT doc FROM t WHERE k < 2 ORDER BY abs(doc) LIMIT 4 OFFSET 2",
+            "SELECT doc, k FROM t WHERE k < 2 ORDER BY abs(doc) LIMIT 4 OFFSET 2",
+        ),
+    ] {
+        let expected = docs(projected);
+        assert!(!expected.is_empty(), "{projected}");
+        assert_eq!(docs(pruned), expected, "{pruned}");
+    }
+
+    // When the predicate column is projected the batch already has it, so the
+    // scan must stay on the normal path rather than re-reading the relation.
+    let projected_only = docs("SELECT doc, k FROM t WHERE k < 2 ORDER BY abs(doc) LIMIT 5");
+    assert_eq!(projected_only.len(), 5);
+}
+
+
+#[test]
+fn filtered_string_agg_decodes_bitpack_columns() {
+    // The fused `WHERE <string> = …` aggregation lane read the aggregate
+    // column's payload without its encoding tag (the tag is one byte after the
+    // null bitmap) and handed that to `read_column_encoded`, which dispatches on
+    // `bytes[0]`. A BITPACK int column therefore decoded a garbage length and
+    // failed with "Int64 column data truncated" while the same column in a
+    // non-aggregate projection read fine.
+    use arrow::array::{Int64Array, StringArray};
+    use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use std::sync::Arc;
+
+    let dir = tempdir().unwrap();
+    let db = crate::ApexDB::open(dir.path()).unwrap();
+    let table = db
+        .create_table_with_schema(
+            "default",
+            &[
+                ("doc".to_string(), crate::storage::ColumnType::Int64),
+                ("age".to_string(), crate::storage::ColumnType::Int64),
+                ("city".to_string(), crate::storage::ColumnType::String),
+            ],
+        )
+        .unwrap();
+    let n = 40i64;
+    let ages: Vec<Option<i64>> = (0..n)
+        .map(|i| if i % 4 == 0 { None } else { Some(i % 7) })
+        .collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("doc", ArrowDataType::Int64, true),
+            Field::new("age", ArrowDataType::Int64, true),
+            Field::new("city", ArrowDataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from((0..n).collect::<Vec<_>>())),
+            Arc::new(Int64Array::from(ages.clone())),
+            Arc::new(StringArray::from(
+                (0..n)
+                    .map(|i| if i % 2 == 0 { "Beijing" } else { "Shanghai" })
+                    .collect::<Vec<_>>(),
+            )),
+        ],
+    )
+    .unwrap();
+    table.insert_arrow(&batch).unwrap();
+    table.flush().unwrap();
+    drop(table);
+
+    let beijing: Vec<i64> = ages
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % 2 == 0)
+        .filter_map(|(_, age)| *age)
+        .collect();
+    let count = beijing.len() as i64;
+    let sum: i64 = beijing.iter().sum();
+    let min = *beijing.iter().min().unwrap();
+    let max = *beijing.iter().max().unwrap();
+
+    let path = dir.path().join("default.apex");
+    let scalar = |sql: &str, alias: &str| -> i64 {
+        let batch = ApexExecutor::execute(sql, &path)
+            .unwrap()
+            .to_record_batch()
+            .unwrap();
+        batch
+            .column_by_name(alias)
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .value(0)
+    };
+    assert_eq!(
+        scalar(
+            "SELECT COUNT(age) AS c FROM default WHERE city = 'Beijing'",
+            "c"
+        ),
+        count
+    );
+    assert_eq!(
+        scalar(
+            "SELECT SUM(age) AS s FROM default WHERE city = 'Beijing'",
+            "s"
+        ),
+        sum
+    );
+    assert_eq!(
+        scalar(
+            "SELECT MIN(age) AS m FROM default WHERE city = 'Beijing'",
+            "m"
+        ),
+        min
+    );
+    assert_eq!(
+        scalar(
+            "SELECT MAX(age) AS m FROM default WHERE city = 'Beijing'",
+            "m"
+        ),
+        max
+    );
+    assert_eq!(
+        scalar(
+            "SELECT COUNT(age) AS c FROM default WHERE city <> 'Beijing'",
+            "c"
+        ),
+        ages.iter().enumerate().filter(|(i, _)| i % 2 == 1).filter_map(|(_, a)| *a).count() as i64
+    );
+}
+
+#[test]
+fn strip_column_qualifier_keeps_expression_names() {
+    use super::pipeline::strip_column_qualifier as clean;
+
+    // Plain references (with or without a qualifier) keep their meaning.
+    assert_eq!(clean("tier"), "tier");
+    assert_eq!(clean("u.tier"), "tier");
+    assert_eq!(clean("db.t.col"), "col");
+    assert_eq!(clean("\"u.tier\""), "tier");
+    // An expression's rendered name keeps its decimal points: cutting at the
+    // last `.` used to yield `5)`, no column matched, and GROUP BY silently
+    // collapsed to a single group.
+    assert_eq!(clean("ABS(score - 1.5)"), "ABS(score - 1.5)");
+    assert_eq!(
+        clean("COSINE_DISTANCE(EMB, [0.5, 0.25])"),
+        "COSINE_DISTANCE(EMB, [0.5, 0.25])"
+    );
+    assert_eq!(clean("score / 2.5"), "score / 2.5");
+}
+
+#[test]
+fn filtered_distance_lane_scores_only_the_predicate_rows() {
+    // `WHERE <selective range> ORDER BY <distance>(col, [q]) LIMIT k` resolves
+    // the predicate to candidate row ids and scores just those rows. The
+    // predicate must stay a minority (the gate keeps a full scan cheaper when
+    // it does not) and must be a shape the candidate extractors understand; a
+    // disjunction, a majority predicate or a dirty view all fall back to the
+    // general path with the same answer.
+    use arrow::array::{FixedSizeListArray, Float32Array, Int64Array};
+    use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use std::sync::Arc;
+
+    const ROWS: i64 = 40;
+    const DIM: i32 = 4;
+    let dir = tempdir().unwrap();
+    let db = crate::ApexDB::open(dir.path()).unwrap();
+    let table = db
+        .create_table_with_schema(
+            "default",
+            &[
+                ("doc".to_string(), crate::storage::ColumnType::Int64),
+                ("emb".to_string(), crate::storage::ColumnType::FixedList),
+            ],
+        )
+        .unwrap();
+
+    // Row `i` moves along the first axis, so the cosine ranking of the query
+    // `[1, 1, 0, 0]` is exactly `doc` 0, 1, 2, ... and the expected top-3 is
+    // known without a second implementation.
+    let mut flat: Vec<f32> = Vec::with_capacity(ROWS as usize * DIM as usize);
+    for doc in 0..ROWS {
+        flat.extend_from_slice(&[doc as f32 + 1.0, 1.0, 0.0, 0.0]);
+    }
+    let item = Arc::new(Field::new("item", ArrowDataType::Float32, true));
+    let list = FixedSizeListArray::new(
+        item.clone(),
+        DIM,
+        Arc::new(Float32Array::from(flat)),
+        None,
+    );
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("doc", ArrowDataType::Int64, true),
+        Field::new("emb", ArrowDataType::FixedSizeList(item, DIM), true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from((0..ROWS).collect::<Vec<_>>())),
+            Arc::new(list),
+        ],
+    )
+    .unwrap();
+    table.insert_arrow(&batch).unwrap();
+    table.flush().unwrap();
+
+    let path = dir.path().join("default.apex");
+    let query = "cosine_distance(emb, [1.0, 1.0, 0.0, 0.0])";
+    let lane_sql = format!("SELECT doc FROM default WHERE doc < 5 ORDER BY {query} LIMIT 3");
+    let plan = explain_analyze_plan(&path, &format!("EXPLAIN ANALYZE {lane_sql}"));
+    assert_eq!(actual_path(&plan), "filtered_distance_topk");
+
+    let docs = |sql: &str| -> Vec<i64> {
+        ApexExecutor::execute(sql, &path)
+            .unwrap()
+            .to_record_batch()
+            .unwrap()
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    };
+    assert_eq!(docs(&lane_sql), vec![0, 1, 2]);
+
+    // A disjunction cannot drive the candidate extractors, and a predicate that
+    // keeps every row is not worth an indexed read: both must use the general
+    // path and agree with the lane.
+    for (label, general_sql) in [
+        (
+            "disjunction",
+            format!("SELECT doc FROM default WHERE doc < 5 OR doc > 1000 ORDER BY {query} LIMIT 3"),
+        ),
+        (
+            "majority",
+            format!("SELECT doc FROM default WHERE doc >= 0 ORDER BY {query} LIMIT 3"),
+        ),
+    ] {
+        let plan = explain_analyze_plan(&path, &format!("EXPLAIN ANALYZE {general_sql}"));
+        assert_ne!(
+            actual_path(&plan),
+            "filtered_distance_topk",
+            "{label} must not take the lane"
+        );
+        assert_eq!(docs(&general_sql), vec![0, 1, 2], "{label}");
+    }
 }

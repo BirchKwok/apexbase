@@ -1,6 +1,23 @@
 use super::*;
 
 impl ApexExecutor {
+
+    /// Resolve an aggregate's column reference against the batch.
+    ///
+    /// A join may expose a key only under its qualified name -- the RIGHT-JOIN swap
+    /// keeps a qualified copy of the key it consumed -- so try the reference as written
+    /// before falling back to the bare column. Looking up only the bare name made
+    /// `SELECT MIN(a.k) FROM t a RIGHT JOIN t b ON a.k = b.k` fail with "Column: k",
+    /// and in a self-join it also collapsed `a.k` and `b.k` onto the same column.
+    fn aggregate_column<'a>(
+        batch: &'a RecordBatch,
+        column: &str,
+    ) -> Option<&'a arrow::array::ArrayRef> {
+        let written = column.trim_matches('"');
+        batch
+            .column_by_name(written)
+            .or_else(|| batch.column_by_name(written.rsplit('.').next().unwrap_or(written)))
+    }
     pub(in crate::query::executor) fn execute_aggregation(
         batch: &RecordBatch,
         stmt: &SelectStatement,
@@ -85,11 +102,9 @@ impl ApexExecutor {
                     {
                         batch.num_rows() as i64
                     } else {
-                        let clean_name = col_name.trim_matches('"');
-                        let clean_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
-                        if let Some(array) = batch.column_by_name(clean_name) {
+                        if let Some(array) = Self::aggregate_column(batch, col_name) {
                             if distinct {
-                                Self::count_distinct(array)
+                                Self::count_distinct(array)?
                             } else {
                                 (array.len() - array.null_count()) as i64
                             }
@@ -110,10 +125,9 @@ impl ApexExecutor {
                     .as_ref()
                     .ok_or_else(|| err_input("SUM requires column"))?;
                 let clean_name = col_name.trim_matches('"');
-                let clean_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
-                let array = batch
-                    .column_by_name(clean_name)
-                    .ok_or_else(|| err_not_found(format!("Column: {}", clean_name)))?;
+                let bare_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
+                let array = Self::aggregate_column(batch, col_name)
+                    .ok_or_else(|| err_not_found(format!("Column: {}", bare_name)))?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // SIMD-optimized sum for non-null arrays
@@ -152,10 +166,9 @@ impl ApexExecutor {
                     .as_ref()
                     .ok_or_else(|| err_input("AVG requires column"))?;
                 let clean_name = col_name.trim_matches('"');
-                let clean_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
-                let array = batch
-                    .column_by_name(clean_name)
-                    .ok_or_else(|| err_not_found(format!("Column: {}", clean_name)))?;
+                let bare_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
+                let array = Self::aggregate_column(batch, col_name)
+                    .ok_or_else(|| err_not_found(format!("Column: {}", bare_name)))?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // SIMD-optimized AVG for non-null arrays
@@ -209,10 +222,9 @@ impl ApexExecutor {
                     .as_ref()
                     .ok_or_else(|| err_input(format!("{} requires column", fn_name)))?;
                 let clean_name = col_name.trim_matches('"');
-                let clean_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
-                let array = batch
-                    .column_by_name(clean_name)
-                    .ok_or_else(|| err_not_found(format!("Column: {}", clean_name)))?;
+                let bare_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
+                let array = Self::aggregate_column(batch, col_name)
+                    .ok_or_else(|| err_not_found(format!("Column: {}", bare_name)))?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     let val = if is_min {

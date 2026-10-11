@@ -670,10 +670,17 @@ impl BatchGroupAggregator {
                         .iter()
                         .position(|group| group == clean)
                         .ok_or_else(|| err_input("SELECT column is not a GROUP BY key"))?;
+                    // Never unwrap here: a lane that was never built means no group
+                    // was accumulated, and panicking turned an empty result into an
+                    // aborted query.
                     let lane = if slot == 0 {
-                        self.key1.as_ref().unwrap()
+                        self.key1
+                            .as_ref()
+                            .ok_or_else(|| err_input("group key lane unavailable"))?
                     } else {
-                        self.key2.as_ref().unwrap()
+                        self.key2
+                            .as_ref()
+                            .ok_or_else(|| err_input("group key lane unavailable"))?
                     };
                     let ids = if slot == 0 { &id1s } else { &id2s };
                     let (arrow_dt, array): (ArrowDataType, ArrayRef) =
@@ -847,12 +854,45 @@ static PARALLEL_SCAN_TOKENS: std::sync::OnceLock<std::sync::atomic::AtomicUsize>
     std::sync::OnceLock::new();
 
 /// In-flight worker budget capacity: min(hardware_concurrency - 1, 8).
+/// Resolve the in-flight parallel-scan worker budget.
+///
+/// The historical default leaves one core to the caller and the OS and caps the
+/// budget at eight workers, so one query cannot monopolise a large machine.
+/// Deployments can override it with `APEX_SCAN_THREADS` (>= 2) to budget the
+/// storage layer's parallelism against the rest of the process; malformed,
+/// missing, and below-two values keep the default, because a budget of 0 or 1
+/// would silently disable the parallel path.
+fn resolve_scan_capacity(ncpu: usize, configured: Option<&str>) -> usize {
+    let default = ncpu.saturating_sub(1).min(8);
+    match configured.and_then(|text| text.trim().parse::<usize>().ok()) {
+        Some(requested) if requested >= 2 => requested,
+        _ => default,
+    }
+}
+
+/// Process-wide pool shared by every parallel batch fold.
+///
+/// The fold used to build (and drop) a pool per query, so each parallel scan
+/// paid a fresh set of thread spawns and the scheduler had to place brand-new
+/// threads. One shared pool serves all parallel folds: its size is the
+/// process-wide worker budget, so global concurrency stays bounded no matter
+/// how many queries run, while rayon's work stealing spreads the active ranges
+/// across whatever threads are free.
+static PARALLEL_SCAN_POOL: once_cell::sync::Lazy<Option<rayon::ThreadPool>> =
+    once_cell::sync::Lazy::new(|| {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(parallel_scan_capacity().max(1))
+            .thread_name(|index| format!("apex-scan-{index}"))
+            .build()
+            .ok()
+    });
+
 fn parallel_scan_capacity() -> usize {
-    std::thread::available_parallelism()
+    let ncpu = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(2)
-        .saturating_sub(1)
-        .min(8)
+        .unwrap_or(2);
+    let configured = std::env::var("APEX_SCAN_THREADS").ok();
+    resolve_scan_capacity(ncpu, configured.as_deref())
 }
 
 fn parallel_scan_tokens() -> &'static std::sync::atomic::AtomicUsize {
@@ -987,7 +1027,12 @@ impl ApexExecutor {
         let (agg, batch_count, parallel_threads) = match granted {
             Some(threads) => {
                 let _token_guard = ParallelTokenGuard { count: threads };
-                let Some(mut ranges) = backend.scan_batches_ranges(&request, threads)? else {
+                // Two ranges per granted worker: the extra split is what makes
+                // the tail stealable when a worker is descheduled (the shared
+                // pool still caps how many run at once).
+                let Some(mut ranges) =
+                    backend.scan_batches_ranges(&request, threads.saturating_mul(2))?
+                else {
                     return Ok(None);
                 };
                 if ranges.len() >= 2 {
@@ -1000,6 +1045,7 @@ impl ApexExecutor {
                         effective_stmt,
                         cancel,
                         budget.as_deref(),
+                        threads,
                     )?
                     else {
                         return Ok(None);
@@ -1028,6 +1074,15 @@ impl ApexExecutor {
             }
         };
         let mut agg = agg;
+
+        // A scan that produced no morsel -- every row group pruned by the pushed-down
+        // predicate -- leaves the key lanes unbuilt, and `finish` cannot name the group
+        // column without them. Decline here so the single-batch path answers the query
+        // (it returns the empty result) instead of describing the shape with a lane
+        // that was never created.
+        if agg.key1.is_none() && agg.key2.is_none() {
+            return Ok(None);
+        }
 
         let mut result = ApexResult::Data(agg.finish(effective_stmt)?);
 
@@ -1262,82 +1317,113 @@ impl ApexExecutor {
         Some(())
     }
 
-    /// Fused parallel scan+fold (R5.11 B phase): each worker owns one
-    /// contiguous row-group range as an independent stream over the same
-    /// stable read view and folds its morsels into a partial group state;
-    /// partials merge in range order (deterministic, re-interning key
-    /// values through the merged lanes). The per-query dedicated pool
-    /// keeps the scan fold off the rayon global pool, which the vector
-    /// kernels own (§14.8.3); the pool is dropped at the end of the
-    /// query, so no background threads survive it.
+    /// Fold one row-group range into an independent partial group state.
+    /// Cancellation is checked at batch boundaries (one atomic load per row
+    /// group), never per row (R4).
+    fn fold_range(
+        stmt: &SelectStatement,
+        cancel: &Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+        budget: Option<&QueryMemoryBudget>,
+        mut stream: crate::storage::BatchMorselStream<'_>,
+    ) -> ParallelFusedOutcome {
+        let mut agg = match BatchGroupAggregator::new(stmt) {
+            Some(agg) => agg,
+            None => return ParallelFusedOutcome::FallBack,
+        };
+        let mut charged = agg.state_bytes();
+        let mut batch_count: u64 = 0;
+        for outcome in &mut stream {
+            if cancel
+                .as_ref()
+                .is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire))
+            {
+                release_state(budget, charged);
+                return ParallelFusedOutcome::Cancelled;
+            }
+            match outcome {
+                Ok(crate::storage::BatchMorselOutcome::Morsel(morsel)) => {
+                    batch_count += 1;
+                    if agg.consume_morsel(&morsel).is_none() {
+                        release_state(budget, charged);
+                        return ParallelFusedOutcome::FallBack;
+                    }
+                    let current = agg.state_bytes();
+                    if let Err(error) = charge_state(budget, current - charged) {
+                        release_state(budget, charged);
+                        return ParallelFusedOutcome::Err(error);
+                    }
+                    charged = current;
+                }
+                Ok(crate::storage::BatchMorselOutcome::Unsupported) => {
+                    release_state(budget, charged);
+                    return ParallelFusedOutcome::FallBack;
+                }
+                Err(error) => {
+                    release_state(budget, charged);
+                    return ParallelFusedOutcome::Err(error);
+                }
+            }
+        }
+        ParallelFusedOutcome::Folded(agg, batch_count)
+    }
+
+    /// Fused parallel scan+fold (R5.11 B phase): the query's row-group ranges
+    /// are handed out dynamically to `workers` tasks over one stable read view,
+    /// and each range folds its morsels into an independent partial group state.
+    /// Partials merge in *range order* (deterministic, re-interning key values
+    /// through the merged lanes), which is why the outcomes are stored by range
+    /// index rather than in completion order.
+    ///
+    /// Dynamic hand-out rather than one pre-assigned range per worker: a worker
+    /// that is descheduled for a moment no longer holds up the whole query,
+    /// because its remaining ranges are picked up by whichever worker finishes
+    /// first. The worker count is unchanged, so a query still uses at most the
+    /// worker budget it was granted; the process-wide pool bounds how many
+    /// threads every query together may use.
     fn parallel_fused_scan_fold(
         ranges: Vec<crate::storage::BatchMorselStream>,
         stmt: &SelectStatement,
         cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
         budget: Option<&QueryMemoryBudget>,
+        workers: usize,
     ) -> io::Result<Option<(BatchGroupAggregator, u64)>> {
         use rayon::prelude::*;
+        use std::sync::Mutex;
 
-        let worker_count = ranges.len();
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(worker_count)
-            .build()
-            .map_err(|error| {
-                std::io::Error::new(std::io::ErrorKind::Other, error.to_string())
-            })?;
-        // Each worker scans+folds its range into a partial state;
-        // collect keeps range order for the deterministic merge. Every
-        // partial charges the query budget as it grows, so the peak across
-        // all live partials (which is where parallel state amplifies) is
-        // bounded, not just the merged result.
-        let partials: Vec<ParallelFusedOutcome> = pool.install(|| {
-            ranges
-                .into_par_iter()
-                .map(|mut stream| {
-                    let mut agg = match BatchGroupAggregator::new(stmt) {
-                        Some(agg) => agg,
-                        None => return ParallelFusedOutcome::FallBack,
-                    };
-                    let mut charged = agg.state_bytes();
-                    let mut batch_count: u64 = 0;
-                    for outcome in &mut stream {
-                        // Cancellation is checked at batch boundaries (one
-                        // atomic load per row group), never per row (R4).
-                        if cancel
-                            .as_ref()
-                            .is_some_and(|token| token.load(std::sync::atomic::Ordering::Acquire))
-                        {
-                            release_state(budget, charged);
-                            return ParallelFusedOutcome::Cancelled;
-                        }
-                        match outcome {
-                            Ok(crate::storage::BatchMorselOutcome::Morsel(morsel)) => {
-                                batch_count += 1;
-                                if agg.consume_morsel(&morsel).is_none() {
-                                    release_state(budget, charged);
-                                    return ParallelFusedOutcome::FallBack;
-                                }
-                                let current = agg.state_bytes();
-                                if let Err(error) = charge_state(budget, current - charged) {
-                                    release_state(budget, charged);
-                                    return ParallelFusedOutcome::Err(error);
-                                }
-                                charged = current;
-                            }
-                            Ok(crate::storage::BatchMorselOutcome::Unsupported) => {
-                                release_state(budget, charged);
-                                return ParallelFusedOutcome::FallBack;
-                            }
-                            Err(error) => {
-                                release_state(budget, charged);
-                                return ParallelFusedOutcome::Err(error);
-                            }
-                        }
-                    }
-                    ParallelFusedOutcome::Folded(agg, batch_count)
-                })
-                .collect()
-        });
+        let range_count = ranges.len();
+        let worker_count = workers.clamp(1, range_count.max(1));
+        let queue: Mutex<Vec<(usize, crate::storage::BatchMorselStream)>> =
+            Mutex::new(ranges.into_iter().enumerate().collect());
+        let outcomes: Mutex<Vec<Option<ParallelFusedOutcome>>> =
+            Mutex::new((0..range_count).map(|_| None).collect());
+
+        let run = || {
+            (0..worker_count).into_par_iter().for_each(|_| loop {
+                let next = {
+                    let mut queue = queue.lock().unwrap_or_else(|error| error.into_inner());
+                    queue.pop()
+                };
+                let Some((index, stream)) = next else {
+                    break;
+                };
+                let outcome = Self::fold_range(stmt, &cancel, budget, stream);
+                let mut outcomes = outcomes.lock().unwrap_or_else(|error| error.into_inner());
+                outcomes[index] = Some(outcome);
+            });
+        };
+        match PARALLEL_SCAN_POOL.as_ref() {
+            Some(pool) => pool.install(run),
+            None => run(),
+        }
+
+        let partials: Vec<ParallelFusedOutcome> = outcomes
+            .into_inner()
+            .unwrap_or_else(|error| error.into_inner())
+            .into_iter()
+            // A range that produced no outcome cannot be merged safely, so the
+            // query falls back to the single-batch path.
+            .map(|outcome| outcome.unwrap_or(ParallelFusedOutcome::FallBack))
+            .collect();
         // Charges held by partial folds that have not been merged yet.
         let mut unmerged: usize = partials
             .iter()

@@ -322,3 +322,74 @@ def _run_threads(worker, count=4):
         thread.start()
     for thread in threads:
         thread.join()
+
+
+def test_over_budget_order_by_reports_clear_error(tmp_path, monkeypatch):
+    """ORDER BY state is budgeted too: a huge sort must fail loudly, not grow unbounded."""
+    client = ApexClient(str(tmp_path / "order"), drop_if_exists=True)
+    client.create_table("t", schema={"k": "int64", "s": "string"})
+    client.use_table("t")
+    rows = 200_000
+    client.store({"k": list(range(rows)), "s": [f"v{i % 1000}" for i in range(rows)]})
+    client.flush()
+    try:
+        monkeypatch.setenv(LIMIT_ENV, "1")
+        with pytest.raises(Exception) as error:
+            client.execute("SELECT * FROM t ORDER BY k DESC").to_dict()
+        assert "query memory budget exceeded" in str(error.value)
+
+        # A bounded sort (LIMIT) stays on the top-k lane and must still work.
+        limited = client.execute("SELECT * FROM t ORDER BY k DESC LIMIT 10").to_dict()
+        assert len(limited) == 10
+    finally:
+        client.close()
+
+
+def test_over_budget_materialising_join_reports_clear_error(tmp_path, monkeypatch):
+    """The hash-join build side is budgeted: a materialising join over a big build fails."""
+    client = ApexClient(str(tmp_path / "join"), drop_if_exists=True)
+    for name in ("a", "b"):
+        client.create_table(name, schema={"k": "int64", "v": "string"})
+    rows = 200_000
+    client.use_table("a")
+    client.store({"k": list(range(rows)), "v": [f"x{i % 100}" for i in range(rows)]})
+    client.flush()
+    client.use_table("b")
+    client.store({"k": list(range(rows)), "v": [f"y{i % 100}" for i in range(rows)]})
+    client.flush()
+    try:
+        monkeypatch.setenv(LIMIT_ENV, "1")
+        with pytest.raises(Exception) as error:
+            client.execute("SELECT a.v, b.v FROM a JOIN b ON a.k = b.k").to_dict()
+        assert "query memory budget exceeded" in str(error.value)
+    finally:
+        client.close()
+
+
+def test_numeric_group_by_cannot_bypass_the_budget(tmp_path, monkeypatch):
+    """The mmap numeric GROUP BY lane must not silently ignore APEX_QUERY_MEMORY_MB.
+
+    Regression evidence: 5,000,000 groups used to succeed under a 1 MB budget while peaking at
+    ~1.3 GB RSS, because the storage-layer lane (`agg_wal.rs`) never charged its state. It must
+    now complete inside the budget or report the budget explicitly.
+    """
+    client = ApexClient(str(tmp_path / "numeric_group"), drop_if_exists=True)
+    client.create_table("t", schema={"k": "int64", "v": "float64"})
+    client.use_table("t")
+    rows = 400_000
+    client.store({"k": list(range(rows)), "v": [float(i % 100) for i in range(rows)]})
+    client.flush()
+    try:
+        monkeypatch.setenv(LIMIT_ENV, "1")
+        with pytest.raises(Exception) as error:
+            client.execute("SELECT k, COUNT(*) AS n FROM t GROUP BY k").to_dict()
+        assert "query memory budget exceeded" in str(error.value)
+
+        # Without the budget constraint the very same query must be exact.
+        monkeypatch.delenv(LIMIT_ENV, raising=False)
+        result = client.execute("SELECT k, COUNT(*) AS n FROM t GROUP BY k").to_dict()
+        assert len(result) == rows
+        assert sum(int(row["n"]) for row in result) == rows
+    finally:
+        client.close()
+

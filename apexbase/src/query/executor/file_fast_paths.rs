@@ -541,7 +541,18 @@ impl ApexExecutor {
         // Keep this path for one or more actual numeric columns, including a
         // mixed COUNT(*) + MAX/SUM/AVG/MIN query.
         if aggregate_columns.is_empty() {
-            return Ok(None);
+            // A pure `COUNT(*)` filtered by numeric predicates is fully supported: the kernel
+            // scans the predicate columns and reports how many rows matched. Declining here
+            // sent the query to the whole-file reader, which pinned the entire CSV in memory
+            // (20M rows / 643 MB: +1397 MB RSS under a 256 MB cap).
+            if predicates.is_empty() {
+                return Ok(None);
+            }
+            for (column, _, _) in &predicates {
+                if !aggregate_columns.contains(column) {
+                    aggregate_columns.push(column.clone());
+                }
+            }
         }
 
         let Some((row_count, stats)) =

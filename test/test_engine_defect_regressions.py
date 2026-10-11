@@ -604,3 +604,378 @@ class TestWindowFramesAndLimits:
             rows = partitioned_client.execute(self._top3_sql(cmp_op)).to_dict()
             assert len(rows) == 6, f"{cmp_op} should return 3 rows per region"
             assert sorted(r["rn"] for r in rows) == sorted([1, 2, 3] * 2)
+
+
+class TestOrderByTopKNullOrdering:
+    """The mmap top-K lane must not rank NULLs as a placeholder value.
+
+    Defect: ``scan_top_k_indices_mmap`` decided whether to skip NULL rows from
+    the persisted zone-map ``has_nulls`` flag, which every zone-map writer
+    stores as ``false``. The lane therefore ranked each NULL as its stored
+    placeholder (0). ``SELECT * FROM t ORDER BY v LIMIT 3`` on
+    ``[NULL, NULL, NULL, 5, 6, 7, 8, 9, 10, 11]`` returned the three NULL rows
+    (ascending) and dropped them entirely (descending), instead of following the
+    documented ``NULLS FIRST``/``NULLS LAST`` default — NULLs sort last when
+    ascending and first when descending.
+
+    The lane now reads the row group's real null bitmap and declines the scan
+    (falling back to the general path) when the sort column holds any NULL.
+    """
+
+    @staticmethod
+    def _table(client, values, dtype="int64"):
+        """A file-backed table whose base row groups carry zone maps."""
+        client.execute(f"CREATE TABLE t (v {dtype}, tag TEXT)")
+        client.use_table("t")
+        client.store({"v": values, "tag": [f"r{i}" for i in range(len(values))]})
+        client.flush()
+        return client
+
+    @staticmethod
+    def _ordered(client, sql):
+        return [row["v"] for row in client.execute(sql).to_dict()]
+
+    VALUES = [None, None, None, 5, 6, 7, 8, 9, 10, 11]
+
+    def test_ascending_returns_smallest_real_values(self, tmp_client):
+        # Was: [None, None, None] because each NULL ranked as 0.
+        self._table(tmp_client, self.VALUES)
+        assert self._ordered(tmp_client, "SELECT * FROM t ORDER BY v LIMIT 3") == [5, 6, 7]
+
+    def test_descending_returns_nulls_first(self, tmp_client):
+        # Was: [11, 10, 9] because each NULL ranked as the smallest value.
+        self._table(tmp_client, self.VALUES)
+        rows = self._ordered(tmp_client, "SELECT * FROM t ORDER BY v DESC LIMIT 3")
+        assert rows == [None, None, None]
+
+    def test_full_ordering_matches_ascending_then_nulls(self, tmp_client):
+        self._table(tmp_client, self.VALUES)
+        rows = self._ordered(tmp_client, "SELECT * FROM t ORDER BY v LIMIT 20")
+        assert rows == [5, 6, 7, 8, 9, 10, 11, None, None, None]
+
+    def test_explicit_nulls_first_and_last(self, tmp_client):
+        self._table(tmp_client, self.VALUES)
+        assert self._ordered(
+            tmp_client, "SELECT * FROM t ORDER BY v ASC NULLS FIRST LIMIT 3"
+        ) == [None, None, None]
+        assert self._ordered(
+            tmp_client, "SELECT * FROM t ORDER BY v DESC NULLS LAST LIMIT 3"
+        ) == [11, 10, 9]
+
+    def test_float_column_takes_the_same_guard(self, tmp_client):
+        self._table(tmp_client, [None, None, 1.5, 2.5, 3.5], dtype="float64")
+        assert self._ordered(
+            tmp_client, "SELECT * FROM t ORDER BY v LIMIT 2"
+        ) == [1.5, 2.5]
+
+    def test_multi_row_group_table_with_nulls_in_later_group(self, tmp_client):
+        # 70k rows crosses the 65,536-row row-group boundary, so the NULLs land
+        # in a later group than the first candidates: the lane has to decline the
+        # whole request rather than return a partially wrong heap.
+        values = [float(i) for i in range(70_000)] + [None, None]
+        self._table(tmp_client, values, dtype="float64")
+        rows = self._ordered(tmp_client, "SELECT * FROM t ORDER BY v LIMIT 3")
+        assert rows == [0.0, 1.0, 2.0]
+
+    def test_null_free_column_keeps_the_fast_path_result(self, tmp_client):
+        # The guard must not disturb null-free columns.
+        self._table(tmp_client, [9, 3, 7, 1, 5])
+        assert self._ordered(tmp_client, "SELECT * FROM t ORDER BY v LIMIT 3") == [1, 3, 5]
+        assert self._ordered(tmp_client, "SELECT * FROM t ORDER BY v DESC LIMIT 2") == [9, 7]
+
+
+class TestGroupByOrderByNullOrdering:
+    """GROUP BY ... ORDER BY ... LIMIT must place NULL groups like a plain sort.
+
+    Defect: the grouped path's small-k single-key fast paths scored a NULL group
+    key as the extreme value (``i64::MIN``/``f64::NEG_INFINITY``), and the
+    grouped comparator derived NULL placement from the sort direction instead of
+    the requested ``NULLS FIRST``/``NULLS LAST``. A descending sort therefore
+    returned the NULL group last, and an explicit ``NULLS FIRST`` on an ascending
+    sort was ignored.
+    """
+
+    @staticmethod
+    def _grouped(client):
+        client.execute("CREATE TABLE t (g INT, v INT)")
+        client.use_table("t")
+        rows = [{"g": 1, "v": None}, {"g": 1, "v": None}, {"g": 1, "v": 5},
+                {"g": 1, "v": 6}, {"g": 1, "v": 7}, {"g": 1, "v": 8},
+                {"g": 2, "v": 9}, {"g": 2, "v": 10}]
+        for row in rows:
+            client.store(row)
+        client.flush()
+
+    @staticmethod
+    def _keys(client, order_clause):
+        rows = client.execute(
+            f"SELECT v, COUNT(*) AS c FROM t GROUP BY v ORDER BY {order_clause} LIMIT 3"
+        ).to_dict()
+        return [row["v"] for row in rows]
+
+    def test_descending_puts_the_null_group_first(self, tmp_client):
+        self._grouped(tmp_client)
+        assert self._keys(tmp_client, "v DESC") == [None, 10, 9]
+
+    def test_ascending_puts_the_null_group_last(self, tmp_client):
+        self._grouped(tmp_client)
+        assert self._keys(tmp_client, "v") == [5, 6, 7]
+
+    def test_explicit_nulls_first_is_honoured(self, tmp_client):
+        self._grouped(tmp_client)
+        assert self._keys(tmp_client, "v ASC NULLS FIRST") == [None, 5, 6]
+
+    def test_explicit_nulls_last_on_descending_is_honoured(self, tmp_client):
+        self._grouped(tmp_client)
+        assert self._keys(tmp_client, "v DESC NULLS LAST") == [10, 9, 8]
+
+
+class TestNarrowColumnIndexedExtraction:
+    """A Float32 column stored at V5 width must survive every read lane.
+
+    The indexed extraction lane (candidate rows -> projected columns) decodes
+    each column at index. Float32 values are four bytes wide there, so a column
+    read through an 8-byte stride produced an all-NULL result: any filter over
+    that column then matched nothing and the query returned zero rows. The
+    shapes below need two projected numeric columns and more than 500 candidate
+    rows, which is what selects that lane.
+    """
+
+    # More than 500 candidate rows plus two projected numeric columns is what
+    # selects the indexed extraction lane this class guards.
+    ROWS = 2400
+
+    @staticmethod
+    def _f32(value):
+        import struct
+
+        return struct.unpack("f", struct.pack("f", value))[0]
+
+    def _store(self, client):
+        cities = ["North", "South", "East", "West"]
+        rows = [
+            {
+                "city": cities[i % 4],
+                "age": i % 13,
+                "score": self._f32((i % 11) * 0.5),
+            }
+            for i in range(self.ROWS)
+        ]
+        client.create_table("narrow", {"city": "string", "age": "int", "score": "float"})
+        client.use_table("narrow")
+        client.store(rows)
+        client.flush()
+        return rows
+
+    def _reference(self, rows, predicate):
+        groups = {}
+        for row in rows:
+            if not predicate(row):
+                continue
+            total, count, minimum = groups.setdefault(row["city"], [0.0, 0, row["age"]])
+            groups[row["city"]] = [total + row["score"], count + 1, min(minimum, row["age"])]
+        return groups
+
+    def test_two_numeric_aggregates_over_a_filtered_narrow_column(self, tmp_client):
+        rows = self._store(tmp_client)
+
+        def predicate(row):
+            return (
+                row["city"] in ("North", "South") or row["age"] in (3, 7, 11)
+            ) and row["score"] >= 1.0
+
+        groups = self._reference(rows, predicate)
+        assert len(groups) == 4
+
+        query = (
+            "SELECT city, SUM(score) AS total, MIN(age) AS youngest FROM narrow "
+            "WHERE (city IN ('North', 'South') OR age IN (3, 7, 11)) AND score >= 1.0 "
+            "GROUP BY city ORDER BY city"
+        )
+        actual = {
+            row["city"]: (round(row["total"], 5), row["youngest"])
+            for row in tmp_client.execute(query).to_dict()
+        }
+        expected = {
+            city: (round(total, 5), youngest)
+            for city, (total, _count, youngest) in groups.items()
+        }
+        assert actual == expected
+
+    def test_second_aggregate_column_is_never_dropped(self, tmp_client):
+        # The same lane with SUM over the second numeric column: both projected
+        # columns must carry real values, not nulls.
+        rows = self._store(tmp_client)
+        query = (
+            "SELECT city, SUM(score) AS total, SUM(age) AS age_total FROM narrow "
+            "WHERE (city IN ('North', 'South') OR age IN (3, 7, 11)) AND score >= 1.0 "
+            "GROUP BY city ORDER BY city"
+        )
+        actual = {
+            row["city"]: (round(row["total"], 5), row["age_total"])
+            for row in tmp_client.execute(query).to_dict()
+        }
+
+        def predicate(row):
+            return (
+                row["city"] in ("North", "South") or row["age"] in (3, 7, 11)
+            ) and row["score"] >= 1.0
+
+        expected = {}
+        for row in rows:
+            if not predicate(row):
+                continue
+            total, age_total = expected.setdefault(row["city"], [0.0, 0])
+            expected[row["city"]] = [total + row["score"], age_total + row["age"]]
+        expected = {city: (round(total, 5), age) for city, (total, age) in expected.items()}
+        assert actual == expected
+
+    def test_having_over_a_second_aggregate_matches_the_reference(self, tmp_client):
+        rows = self._store(tmp_client)
+        query = (
+            "SELECT city, COUNT(*) AS n, SUM(score) AS total FROM narrow "
+            "WHERE (city IN ('North', 'South') OR age IN (3, 7, 11)) AND score >= 1.0 "
+            "GROUP BY city HAVING COUNT(*) > 5 AND MIN(age) >= 0 ORDER BY city"
+        )
+        actual = [
+            (row["city"], row["n"], round(row["total"], 5))
+            for row in tmp_client.execute(query).to_dict()
+        ]
+
+        def predicate(row):
+            return (
+                row["city"] in ("North", "South") or row["age"] in (3, 7, 11)
+            ) and row["score"] >= 1.0
+
+        expected = []
+        for city, (total, count, youngest) in sorted(
+            self._reference(rows, predicate).items()
+        ):
+            if count > 5 and youngest >= 0:
+                expected.append((city, count, round(total, 5)))
+        assert actual == expected
+        assert expected
+
+
+class TestHavingAggregateWithoutAValueLane:
+    """A HAVING-only value aggregate must never reach the fused kernel bare.
+
+    The fused group-by resolves at most one *value lane* (the column a
+    SUM/AVG/MIN/MAX reads). A HAVING clause can inject an aggregate the SELECT
+    list never asked for, leaving that lane unresolved while the aggregate mask
+    still requested a value. The lookup-table scatter loop then copied the
+    aggregate value from a null pointer: the three shapes below crashed the
+    interpreter (SIGSEGV) instead of returning rows. They must now match a
+    plain-Python reference.
+    """
+
+    ROWS = 1200
+
+    def _store(self, client):
+        cities = ["North", "South", "East", "West", "Center"]
+        rows = [
+            {"city": cities[i % 5], "age": i % 13, "score": (i % 9) * 0.5}
+            for i in range(self.ROWS)
+        ]
+        client.create_table("lane", {"city": "string", "age": "int", "score": "float"})
+        client.use_table("lane")
+        client.store(rows)
+        client.flush()
+        return rows
+
+    @staticmethod
+    def _matches(row):
+        return (
+            row["city"] in ("North", "South") or row["age"] in (3, 7, 11)
+        ) and row["score"] >= 1.0
+
+    def _reference(self, rows):
+        groups = {}
+        for row in rows:
+            if not self._matches(row):
+                continue
+            count, youngest, oldest = groups.setdefault(
+                row["city"], [0, row["age"], row["age"]]
+            )
+            groups[row["city"]] = [
+                count + 1,
+                min(youngest, row["age"]),
+                max(oldest, row["age"]),
+            ]
+        return groups
+
+    def _assert_shape(self, client, rows, having, keep):
+        query = (
+            "SELECT city, COUNT(*) AS n FROM lane "
+            "WHERE (city IN ('North', 'South') OR age IN (3, 7, 11)) AND score >= 1.0 "
+            f"GROUP BY city HAVING {having} ORDER BY city"
+        )
+        actual = [(row["city"], row["n"]) for row in client.execute(query).to_dict()]
+        expected = sorted(
+            (city, count)
+            for city, (count, youngest, oldest) in self._reference(rows).items()
+            if keep(count, youngest, oldest)
+        )
+        assert expected, "the fixture must keep at least one group"
+        assert actual == expected
+
+    def test_having_min_over_an_unprojected_column(self, tmp_client):
+        rows = self._store(tmp_client)
+        self._assert_shape(
+            tmp_client,
+            rows,
+            "COUNT(*) > 5 AND MIN(age) >= 0",
+            lambda count, youngest, oldest: count > 5 and youngest >= 0,
+        )
+
+    def test_having_max_over_an_unprojected_column(self, tmp_client):
+        rows = self._store(tmp_client)
+        self._assert_shape(
+            tmp_client,
+            rows,
+            "MAX(age) >= 0",
+            lambda count, youngest, oldest: oldest >= 0,
+        )
+
+    def test_having_min_only(self, tmp_client):
+        rows = self._store(tmp_client)
+        self._assert_shape(
+            tmp_client,
+            rows,
+            "MIN(age) >= 0",
+            lambda count, youngest, oldest: youngest >= 0,
+        )
+
+
+class TestColumnarMaterializationKeepsRichTypes:
+    """The Python columnar fast path must not silently drop rich column types.
+
+    `to_dict()` on a projected scan used to report `None` for every column whose
+    Arrow type had no branch in the pylist converter: timestamps, dates, and
+    vector columns. The converter now refuses such types so the caller takes the
+    Arrow path, which decodes them.
+    """
+
+    def test_timestamp_and_date_projection_returns_values(self, tmp_client):
+        import datetime
+
+        tmp_client.create_table(
+            "events", {"ts": "timestamp", "d": "date", "v": "int64"}
+        )
+        tmp_client.use_table("events")
+        tmp_client.store(
+            {
+                "ts": [1_700_000_000_000_000, 1_700_000_001_000_000],
+                "d": [19_000, 19_001],
+                "v": [1, 2],
+            }
+        )
+        tmp_client.flush()
+
+        rows = tmp_client.execute("SELECT ts, d, v FROM events").to_dict()
+        assert isinstance(rows[0]["ts"], datetime.datetime)
+        assert isinstance(rows[0]["d"], datetime.date)
+        assert rows[0]["v"] == 1
+        # A projection of just the rich column keeps it too.
+        projected = tmp_client.execute("SELECT ts FROM events").to_dict()
+        assert all(isinstance(row["ts"], datetime.datetime) for row in projected)

@@ -340,22 +340,38 @@ impl ApexExecutor {
         batch: &RecordBatch,
         order_by: &[crate::query::OrderByClause],
     ) -> io::Result<RecordBatch> {
+        // ORDER BY materialises a sort key per row plus the permutation indices. Charge that
+        // footprint to the query budget: GROUP BY state was already budgeted, while ORDER BY
+        // (and JOIN/DISTINCT) could grow without any limit at all (out-of-core item OOC-3).
+        // Admission control now, spilling later (OOC-4).
+        let order_state_bytes = {
+            let mut bytes = batch.num_rows().saturating_mul(std::mem::size_of::<usize>() * 2);
+            for order in order_by {
+                let name = Self::resolve_order_col_name(batch, &order.column);
+                if let Some(column) = batch.column_by_name(&name) {
+                    bytes = bytes.saturating_add(column.get_array_memory_size());
+                }
+            }
+            bytes
+        };
+        let _order_state_charge =
+            crate::query::executor::memory::QueryMemoryCharge::new(order_state_bytes)?;
         use arrow::compute::SortColumn;
 
         // Pre-evaluate expression ORDER BY columns (e.g. ORDER BY array_distance(...))
         let batch_cow = if order_by.iter().any(|o| {
-            o.expr.is_some() && {
-                let cn = o.column.trim_matches('"');
-                let cn = cn.rfind('.').map_or(cn, |p| &cn[p + 1..]);
-                batch.column_by_name(cn).is_none()
-            }
+            o.expr.is_some()
+                && batch
+                    .column_by_name(Self::resolve_order_col_name(batch, &o.column))
+                    .is_none()
         }) {
             let mut extra: Vec<(String, arrow::array::ArrayRef)> = Vec::new();
             for o in order_by {
                 if let Some(ref expr) = o.expr {
-                    let cn = o.column.trim_matches('"');
-                    let cn = cn.rfind('.').map_or(cn, |p| &cn[p + 1..]);
-                    if batch.column_by_name(cn).is_none() {
+                    if batch
+                        .column_by_name(Self::resolve_order_col_name(batch, &o.column))
+                        .is_none()
+                    {
                         let arr = Self::evaluate_expr_to_array(batch, expr)?;
                         extra.push((o.column.clone(), arr));
                     }
@@ -392,13 +408,9 @@ impl ApexExecutor {
         let sort_columns: Vec<SortColumn> = order_by
             .iter()
             .filter_map(|clause| {
-                let col_name = clause.column.trim_matches('"');
-                // Strip table prefix if present (e.g., "u.tier" -> "tier")
-                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                    &col_name[dot_pos + 1..]
-                } else {
-                    col_name
-                };
+                // Only a plain-identifier prefix is a table qualifier; an
+                // expression name may contain float literals.
+                let actual_col = Self::resolve_order_col_name(batch, &clause.column);
                 batch.column_by_name(actual_col).map(|col| SortColumn {
                     values: col.clone(),
                     options: Some(SortOptions {
@@ -455,12 +467,7 @@ impl ApexExecutor {
         use rayon::prelude::*;
 
         let clause = &order_by[0];
-        let col_name = clause.column.trim_matches('"');
-        let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-            &col_name[dot_pos + 1..]
-        } else {
-            col_name
-        };
+        let actual_col = Self::resolve_order_col_name(batch, &clause.column);
 
         let col = batch.column_by_name(actual_col).ok_or_else(|| {
             io::Error::new(
@@ -562,12 +569,7 @@ impl ApexExecutor {
         let sort_columns: Vec<_> = order_by
             .iter()
             .filter_map(|clause| {
-                let col_name = clause.column.trim_matches('"');
-                let actual_col = if let Some(dot_pos) = col_name.rfind('.') {
-                    &col_name[dot_pos + 1..]
-                } else {
-                    col_name
-                };
+                let actual_col = Self::resolve_order_col_name(batch, &clause.column);
                 batch.column_by_name(actual_col).map(|col| SortColumn {
                     values: col.clone(),
                     options: Some(SortOptions {
@@ -633,12 +635,31 @@ impl ApexExecutor {
 
     /// Strip a table qualifier (e.g. `t.col` -> `col`) and quotes from an ORDER BY column name.
     pub(crate) fn clean_order_col(col: &str) -> &str {
-        let c = col.trim_matches('"');
-        if let Some(p) = c.rfind('.') {
-            &c[p + 1..]
-        } else {
-            c
+        strip_column_qualifier(col)
+    }
+
+    /// Resolve an ORDER BY name against a batch, preferring an exact match.
+    ///
+    /// A clause may carry a table qualifier (`u.tier`), but an *expression*
+    /// clause's name can contain a decimal point (`abs(score - 2.5)`,
+    /// `cosine_distance(emb, [0.5, 0.25])`). Cutting at the last `.` — what
+    /// `clean_order_col` does — turns such a name into a suffix that no column
+    /// carries, and the sort then silently keeps the scan order. Only a
+    /// plain-identifier prefix is a real qualifier.
+    pub(crate) fn resolve_order_col_name<'a>(batch: &RecordBatch, col: &'a str) -> &'a str {
+        let trimmed = col.trim_matches('"');
+        if batch.column_by_name(trimmed).is_some() {
+            return trimmed;
         }
+        if let Some((prefix, bare)) = trimmed.rsplit_once('.') {
+            if !prefix.is_empty()
+                && prefix.chars().all(|c| c.is_alphanumeric() || c == '_')
+                && batch.column_by_name(bare).is_some()
+            {
+                return bare;
+            }
+        }
+        trimmed
     }
 
     /// Bucket-based top-K for `ORDER BY <low-cardinality numeric> ASC, <string> ASC`.
@@ -757,18 +778,18 @@ impl ApexExecutor {
         // Pre-evaluate any expression-based ORDER BY columns not yet in the batch.
         // e.g. ORDER BY array_distance(vec, [1,2,3]) — expression not in SELECT output yet.
         let batch = if order_by.iter().any(|o| {
-            o.expr.is_some() && {
-                let cn = o.column.trim_matches('"');
-                let cn = cn.rfind('.').map_or(cn, |p| &cn[p + 1..]);
-                batch.column_by_name(cn).is_none()
-            }
+            o.expr.is_some()
+                && batch
+                    .column_by_name(Self::resolve_order_col_name(batch, &o.column))
+                    .is_none()
         }) {
             let mut new_cols: Vec<(String, arrow::array::ArrayRef)> = Vec::new();
             for o in order_by {
                 if let Some(ref expr) = o.expr {
-                    let cn = o.column.trim_matches('"');
-                    let cn = cn.rfind('.').map_or(cn, |p| &cn[p + 1..]);
-                    if batch.column_by_name(cn).is_none() {
+                    if batch
+                        .column_by_name(Self::resolve_order_col_name(batch, &o.column))
+                        .is_none()
+                    {
                         let arr = Self::evaluate_expr_to_array(batch, expr)?;
                         new_cols.push((o.column.clone(), arr));
                     }
@@ -814,39 +835,27 @@ impl ApexExecutor {
 
         // Pre-downcast sort columns for fast comparison (avoid repeated dynamic dispatch)
         enum TypedSortCol<'a> {
-            Int64(&'a Int64Array, bool), // (array, descending)
-            Float64(&'a Float64Array, bool),
-            String(&'a StringArray, bool),
-            Other(&'a ArrayRef, bool),
+            // (array, descending, nulls_first)
+            Int64(&'a Int64Array, bool, bool),
+            Float64(&'a Float64Array, bool, bool),
+            String(&'a StringArray, bool, bool),
+            Other(&'a ArrayRef, bool, bool),
         }
 
         let typed_sort_cols: Vec<TypedSortCol> = order_by
             .iter()
             .filter_map(|clause| {
-                let col_name = clause.column.trim_matches('"');
-                // Try exact name first; only strip table prefix if the prefix part is a
-                // simple identifier (no parens/brackets) — avoids mis-splitting float literals.
-                let actual_col = if batch.column_by_name(col_name).is_some() {
-                    col_name
-                } else if let Some(dot_pos) = col_name.rfind('.') {
-                    let prefix = &col_name[..dot_pos];
-                    if prefix.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                        &col_name[dot_pos + 1..]
-                    } else {
-                        col_name
-                    }
-                } else {
-                    col_name
-                };
+                let actual_col = Self::resolve_order_col_name(batch, &clause.column);
                 batch.column_by_name(actual_col).map(|col| {
+                    let nulls_first = clause.nulls_first.unwrap_or(clause.descending);
                     if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                        TypedSortCol::Int64(arr, clause.descending)
+                        TypedSortCol::Int64(arr, clause.descending, nulls_first)
                     } else if let Some(arr) = col.as_any().downcast_ref::<Float64Array>() {
-                        TypedSortCol::Float64(arr, clause.descending)
+                        TypedSortCol::Float64(arr, clause.descending, nulls_first)
                     } else if let Some(arr) = col.as_any().downcast_ref::<StringArray>() {
-                        TypedSortCol::String(arr, clause.descending)
+                        TypedSortCol::String(arr, clause.descending, nulls_first)
                     } else {
-                        TypedSortCol::Other(col, clause.descending)
+                        TypedSortCol::Other(col, clause.descending, nulls_first)
                     }
                 })
             })
@@ -897,31 +906,31 @@ impl ApexExecutor {
             }
         }
 
+        // Both optimizations below compare raw key values, so a NULL can only be
+        // ranked as an arbitrary extreme. That contradicts the documented default
+        // (`nulls_first == descending`, i.e. NULLs last ascending and first
+        // descending), so a sort key that actually holds NULLs takes the
+        // NULL-aware comparator path instead.
+        let sort_has_nulls = typed_sort_cols.iter().any(|col| match col {
+            TypedSortCol::Int64(arr, _, _) => arr.null_count() > 0,
+            TypedSortCol::Float64(arr, _, _) => arr.null_count() > 0,
+            TypedSortCol::String(arr, _, _) => arr.null_count() > 0,
+            TypedSortCol::Other(arr, _, _) => arr.null_count() > 0,
+        });
+
         // Arrow lexsort with limit: radix-based top-k selection is far faster
         // than a generic heap comparator for large inputs, and its null
         // ordering (nulls_first == descending, i.e. nulls last ascending)
         // matches the manual comparator below.
         let all_typed = typed_sort_cols.iter().all(|col| {
-            !matches!(col, TypedSortCol::Other(_, _))
+            !matches!(col, TypedSortCol::Other(_, _, _))
         });
-        if all_typed {
+        if all_typed && !sort_has_nulls {
             use arrow::compute::SortColumn;
             let sort_columns: Vec<SortColumn> = order_by
                 .iter()
                 .filter_map(|clause| {
-                    let col_name = clause.column.trim_matches('"');
-                    let actual_col = if batch.column_by_name(col_name).is_some() {
-                        col_name
-                    } else if let Some(dot_pos) = col_name.rfind('.') {
-                        let prefix = &col_name[..dot_pos];
-                        if prefix.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                            &col_name[dot_pos + 1..]
-                        } else {
-                            col_name
-                        }
-                    } else {
-                        col_name
-                    };
+                    let actual_col = Self::resolve_order_col_name(batch, &clause.column);
                     batch.column_by_name(actual_col).map(|col| SortColumn {
                         values: col.clone(),
                         options: Some(SortOptions {
@@ -951,68 +960,89 @@ impl ApexExecutor {
         let compare_rows = |a: usize, b: usize| -> Ordering {
             for col in &typed_sort_cols {
                 let ord = match col {
-                    TypedSortCol::Int64(arr, desc) => {
+                    TypedSortCol::Int64(arr, desc, nulls_first) => {
                         let a_null = arr.is_null(a);
                         let b_null = arr.is_null(b);
-                        let ord = if a_null && b_null {
-                            Ordering::Equal
-                        } else if a_null {
-                            Ordering::Greater
-                        } else if b_null {
-                            Ordering::Less
+                        if a_null || b_null {
+                            // NULL placement is independent of the value direction.
+                            if a_null && b_null {
+                                Ordering::Equal
+                            } else if a_null == *nulls_first {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            }
                         } else {
-                            arr.value(a).cmp(&arr.value(b))
-                        };
-                        if *desc {
-                            ord.reverse()
-                        } else {
-                            ord
+                            let ord = arr.value(a).cmp(&arr.value(b));
+                            if *desc {
+                                ord.reverse()
+                            } else {
+                                ord
+                            }
                         }
                     }
-                    TypedSortCol::Float64(arr, desc) => {
+                    TypedSortCol::Float64(arr, desc, nulls_first) => {
                         let a_null = arr.is_null(a);
                         let b_null = arr.is_null(b);
-                        let ord = if a_null && b_null {
-                            Ordering::Equal
-                        } else if a_null {
-                            Ordering::Greater
-                        } else if b_null {
-                            Ordering::Less
+                        if a_null || b_null {
+                            // NULL placement is independent of the value direction.
+                            if a_null && b_null {
+                                Ordering::Equal
+                            } else if a_null == *nulls_first {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            }
                         } else {
-                            arr.value(a)
+                            let ord = arr.value(a)
                                 .partial_cmp(&arr.value(b))
-                                .unwrap_or(Ordering::Equal)
-                        };
-                        if *desc {
-                            ord.reverse()
-                        } else {
-                            ord
+                                .unwrap_or(Ordering::Equal);
+                            if *desc {
+                                ord.reverse()
+                            } else {
+                                ord
+                            }
                         }
                     }
-                    TypedSortCol::String(arr, desc) => {
+                    TypedSortCol::String(arr, desc, nulls_first) => {
                         let a_null = arr.is_null(a);
                         let b_null = arr.is_null(b);
-                        let ord = if a_null && b_null {
-                            Ordering::Equal
-                        } else if a_null {
-                            Ordering::Greater
-                        } else if b_null {
-                            Ordering::Less
+                        if a_null || b_null {
+                            // NULL placement is independent of the value direction.
+                            if a_null && b_null {
+                                Ordering::Equal
+                            } else if a_null == *nulls_first {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            }
                         } else {
-                            arr.value(a).cmp(arr.value(b))
-                        };
-                        if *desc {
-                            ord.reverse()
-                        } else {
-                            ord
+                            let ord = arr.value(a).cmp(arr.value(b));
+                            if *desc {
+                                ord.reverse()
+                            } else {
+                                ord
+                            }
                         }
                     }
-                    TypedSortCol::Other(arr, desc) => {
-                        let ord = Self::compare_array_values(arr, a, b);
-                        if *desc {
-                            ord.reverse()
+                    TypedSortCol::Other(arr, desc, nulls_first) => {
+                        let a_null = arr.is_null(a);
+                        let b_null = arr.is_null(b);
+                        if a_null || b_null {
+                            if a_null && b_null {
+                                Ordering::Equal
+                            } else if a_null == *nulls_first {
+                                Ordering::Less
+                            } else {
+                                Ordering::Greater
+                            }
                         } else {
-                            ord
+                            let ord = Self::compare_array_values(arr, a, b);
+                            if *desc {
+                                ord.reverse()
+                            } else {
+                                ord
+                            }
                         }
                     }
                 };
@@ -1025,12 +1055,12 @@ impl ApexExecutor {
 
         // OPTIMIZATION: For small k, use heap-based top-k (O(n log k))
         // For larger k, use partial sort (O(n + k log k))
-        let indices: Vec<usize> = if k <= 100 {
+        let indices: Vec<usize> = if k <= 100 && !sort_has_nulls {
             // Simple approach: store (score, index) where score is computed once
             // For numeric DESC sorting, we can use the value directly as score
             if typed_sort_cols.len() == 1 {
                 match &typed_sort_cols[0] {
-                    TypedSortCol::Float64(arr, true) => {
+                    TypedSortCol::Float64(arr, true, _) => {
                         // DESC sort on float - use value as score, keep k largest
                         let mut top_k: Vec<(i64, usize)> = Vec::with_capacity(k);
                         for i in 0..num_rows {
@@ -1056,7 +1086,7 @@ impl ApexExecutor {
                         }
                         top_k.iter().map(|(_, i)| *i).collect()
                     }
-                    TypedSortCol::Int64(arr, true) => {
+                    TypedSortCol::Int64(arr, true, _) => {
                         // DESC sort on int - use value as score, keep k largest
                         let mut top_k: Vec<(i64, usize)> = Vec::with_capacity(k);
                         for i in 0..num_rows {
@@ -1985,6 +2015,12 @@ impl ApexExecutor {
                             Some(s) => s,
                             None => return Ok(None),
                         };
+                        // NAN marks a column whose min/max the deletion-vector
+                        // correction could not recover (a deleted row held the
+                        // extreme value): scan it instead of reporting a wrong one.
+                        if s.2.is_nan() {
+                            return Ok(None);
+                        }
                         fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
                         if s.0 == 0 {
                             arrays.push(Arc::new(Float64Array::from(vec![None as Option<f64>])));
@@ -2005,6 +2041,9 @@ impl ApexExecutor {
                             Some(s) => s,
                             None => return Ok(None),
                         };
+                        if s.3.is_nan() {
+                            return Ok(None);
+                        }
                         fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
                         if s.0 == 0 {
                             arrays.push(Arc::new(Float64Array::from(vec![None as Option<f64>])));
@@ -2029,5 +2068,25 @@ impl ApexExecutor {
         let schema = Arc::new(Schema::new(fields));
         let batch = RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))?;
         Ok(Some(ApexResult::Data(batch)))
+    }
+}
+
+
+/// Strip a table qualifier (e.g. `t.col` -> `col`) and quotes from a name.
+///
+/// Only a `qualifier.bare` pair of plain identifiers is a qualifier. An
+/// expression's rendered name keeps its decimal points (`ABS(score - 1.5)`,
+/// `cosine_distance(emb, [0.5, 0.25])`), so cutting at the last `.` — what this
+/// used to do — yields a suffix that names no column, and the caller then
+/// silently drops the group key or the sort column.
+pub(super) fn strip_column_qualifier(name: &str) -> &str {
+    let plain = |part: &str| {
+        !part.is_empty() && part.chars().all(|c| c.is_alphanumeric() || c == '_')
+    };
+    let trimmed = name.trim_matches('"');
+    match trimmed.rsplit_once('.') {
+        // `u.tier` / `db.t.col` are qualifiers; `ABS(score - 1.5)` is not.
+        Some((prefix, bare)) if prefix.split('.').all(plain) && plain(bare) => bare,
+        _ => trimmed,
     }
 }

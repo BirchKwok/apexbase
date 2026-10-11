@@ -111,7 +111,7 @@ impl OnDemandStorage {
             }
             let compress_flag = rg_bytes[28];
             let encoding_version = rg_bytes[29];
-            if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
                 return Ok(None); // fallback for compressed RGs
             }
 

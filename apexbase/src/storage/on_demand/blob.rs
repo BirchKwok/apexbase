@@ -148,8 +148,16 @@ impl OnDemandStorage {
             RG_COMPRESS_NONE
         };
         let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
-        let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-        let body = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+        let decompressed = self.decompressed_rg_body(
+            rg_meta.offset,
+            rg_meta.offset + rg_meta.data_size,
+            compress_flag,
+            &rg_bytes[32..],
+        )?;
+        let body = decompressed
+            .as_ref()
+            .map(|buf| buf.as_slice())
+            .unwrap_or(&rg_bytes[32..]);
 
         let mut pos = rg_id_section_len(
             rg_rows,
@@ -174,7 +182,7 @@ impl OnDemandStorage {
             }
 
             let col_type = footer.schema.columns[idx].1;
-            let consumed = if encoding_version >= 1 {
+            let consumed = if encoding_version == RG_ENCODING_VERSION {
                 skip_column_encoded(&body[pos..], col_type)?
             } else {
                 ColumnData::skip_bytes_typed(&body[pos..], col_type)?

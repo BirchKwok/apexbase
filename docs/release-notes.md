@@ -3,6 +3,251 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.37.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.37.0)
+*2026-10-11*
+
+[Compare with v1.36.2](https://github.com/BirchKwok/ApexBase/compare/v1.36.2...v1.37.0)
+
+> **V5 architecture preview.** v1.37.0 is the first release of the **V5 storage
+> and execution architecture**, published as a **preview**: the new layout, the
+> new read lanes and the new write-exclusion rules are complete and validated on
+> this tree, but the format is still allowed to change before V5 is declared
+> stable. Read [V5 Preview Status](#v5-preview-status) before pointing existing
+> data or older builds at it.
+
+### Highlights
+
+v1.37.0 is the largest change since the V4 row-group format landed. The storage
+layer moves to **V5**: a file may declare format version `5` and carry V5-only
+column encodings, tables reserve `_id` ranges against a shared on-disk
+high-water mark so several processes can write one table without handing out the
+same row id, and every public write path now takes the same cross-process
+`flock`. The read side grows the lanes that the V4 profile showed were missing:
+row-group row directories give single-row point reads direct column decoding, an
+executor index lane serves planner-selected equality and range lookups
+(covering-case scans never touch the table), full-text `MATCH()` selections
+materialize only the rows they hit, and `ORDER BY <distance>(col, literal)
+LIMIT k` runs as a bounded TopK over the requested columns only. On top of that
+the release finishes the out-of-core work: file-backed query paths stream
+instead of materializing, aggregation and join operators are admitted against a
+query memory budget, and the same-machine gate now measures peak RSS as well as
+latency. Grouped aggregation, join and vector semantics also pick up a batch of
+silent-wrong-answer fixes — see the correctness sections below.
+
+The V5 preview keeps **V4 compatibility in one direction**: this build reads V4
+files, and V4 data written by this build (for example with
+`APEX_WIDTH_FIDELITY=0`) stays byte-compatible, but a pre-V5 build must not open
+a version-5 file.
+
+### V5 Preview Status
+
+- **What is stable.** The V5 write path (width fidelity, cross-process write
+  exclusion and row-id reservation), the format-version declaration, and every
+  new read lane are implemented, covered by tests on both the Rust and Python
+  sides, and pass the complete validation chain recorded under
+  [Validation And Performance](#validation-and-performance)
+- **What is still open.** The `.apex` format version is declared per file and can
+  gain further V5-only encodings in later releases; a file written today may
+  therefore not be readable by a *future* V5 build that changes an encoding, and
+  older (V4-era) builds cannot read a version-5 file at all. Point releases
+  before V5 is declared stable may still adjust the encoding set
+- **Opting out.** Set `APEX_WIDTH_FIDELITY=0` (or call the width-fidelity API)
+  to keep writing the V4 layout and the version-4 declaration; V5-only features
+  then stay disabled and the file remains readable by older builds
+- **Reading the declaration.** The format version is the byte at offset 8 of the
+  `.apex` header; `4` is the V4 row-group layout and `5` marks a table that uses
+  a V5-only column encoding
+- **No migration step.** Opening an existing V4 file works as before; a table
+  only starts declaring version `5` once a write uses a V5-only encoding
+
+### V5 Storage Format And Dual-Writer Safety
+
+- Add the `Float32` width-fidelity encoding: a `Float32` column is stored at its
+  declared four bytes per value (`FLAG_NARROW_FLOAT32` in the header flags plus
+  `COL_ENCODING_PLAIN_F32` per column) instead of being promoted to eight bytes,
+  and the table then declares format version `5`. Measured on the `wf` gate
+  phase: **−12.5% bytes on disk**, **−32% first-touch page faults** on a
+  `Float32` projection, and **−36%** on a range filter, with point reads and full
+  scans unchanged
+- Reject unknown format versions explicitly: opening a file whose header version
+  is above the supported maximum now fails with
+  `unsupported ApexBase format version N (this build supports up to 5)` instead
+  of decoding unknown encodings
+- Route **every** write path through one `<table>.apex.lock` `flock`
+  (`storage/cross_process_lock.rs`): the single-row (`store_one`) and columnar
+  (`store_columnar`) fast paths previously published through
+  `Database::write_typed*`, which took only the in-process lock, so two processes
+  writing one table could each read the same base and let the last publish drop
+  the other's rows. The guard is re-entrant per thread and keeps the historical
+  30-second contention budget with 100 µs → 5 ms backoff
+- Reserve `_id` ranges against the shared high-water mark in the table sidecar
+  (`epoch::reserve_row_ids`): ids may be skipped but never repeated, and the
+  single-process sequence stays contiguous because the reservation minimum is
+  that same next id
+- Keep the per-table sidecar (`<table>.apex.lock`) authoritative for both the
+  published generation and the row-id high-water mark, and document the naming
+  rule as the single one that the SQL path, the Python bindings and the epoch
+  tracker share
+
+### Read Lanes
+
+- **Row-group row directories (RCIX) for point reads**: `retrieve_rcix` /
+  `retrieve_rcix_projected` (through `read_row_by_id_to_arrow` and the Python
+  bindings' `try_pk_read`) binary-search the row-group directory for the id and
+  decode only the requested columns, deriving `_id` instead of reading the ID
+  column. Compressed row groups carry the same per-column directory because the
+  write path records column offsets before compression, so an id that falls in a
+  compressed or older-encoded row group is served by the decode lane against the
+  cached decompressed body, using the same `decode_point_column_value`
+- **Point reads no longer fall off the fast lane**: `point_read_lane_available(id)`
+  is now the single decision point separating "row does not exist" from "lane
+  unavailable" (`retrieve_rcix*` returns `None` for both), including in the
+  bindings' `try_pk_read`. A persistent table that had taken one `UPDATE` used to
+  turn `_id = X` into a full table scan (**0.002 ms → 61.8 ms**, a 1470× cliff in
+  the earlier profile); the fixed path returns **0.042 ms**, and compressed
+  tables no longer re-parse and re-plan the statement on every lookup
+- **Executor index lane**: `ApexExecutor::try_index_accelerated_read` serves
+  planner-selected `OltpIndexLookup` single-column and composite equality and
+  range predicates, and a covering lookup runs `try_index_only_scan` without
+  reading the table at all. It yields to the scan lane whenever
+  `indexes_stale(path)` or `backend.requires_merged_read()` holds, because
+  persistent postings only describe persisted row groups and would silently drop
+  overlay rows
+- **Full-text row-selection pushdown**: a `WHERE` whose top-level `AND` contains
+  one `MATCH()` now materializes only the matching rows
+  (`try_fts_row_selection`). Without a deletion vector the resolved `_id` bitmap
+  is mapped to physical positions (row-group directory `positions_for_ids`, else
+  a scan of the `_id` column) and only the required columns are read, so vector
+  and blob columns come back whole; with a deletion vector the path falls back to
+  the id-based scalar reader. `OR`/`NOT` forms and non-clean overlays keep the
+  existing lane
+- **Distance TopK fusion**: `ORDER BY <distance>(col, [literal]) [ASC] LIMIT k`
+  (including `SELECT <expr> AS alias … ORDER BY alias`) runs as a bounded TopK
+  instead of a full sort. A clean, uncompressed table scores zero-copy over mmap
+  (`order_by_distance_topk_direct`); a selective predicate first resolves
+  candidate positions (`filtered_distance_topk`); everything else keeps the
+  allocation-free SIMD distance plus bounded heap path folded inline. All three
+  read only the columns the statement needs, and `MATCH()` forms are served by
+  the FTS lane first
+- **Staged-read correctness rules** are documented in `READ_PATH_CAPABILITIES.md`:
+  the shared tail re-evaluates `WHERE`, so `read_matching_rows_for_tail` must
+  keep predicate columns while early-return callers use the pruned
+  `read_matching_rows_adaptive`; candidate positions are physical, so lanes that
+  use them require a clean view with `active_row_count() == base_row_count()`;
+  and the two `None` meanings of a point read must go through
+  `point_read_lane_available`
+
+### Query Execution And Correctness
+
+- **Visible row space**: reads compose the visible rows as
+  `[persisted base][.delta rows][buffered tail]` through
+  `OnDemandStorage::visible_read_segments()`, and every lane keys off it. Earlier
+  code that assumed the write buffer was the whole table could silently drop base
+  rows after `spill_pending_v4_rows_to_delta()`; the first-value cache, string
+  and index lanes now refuse the shapes they cannot serve
+- **Grouped aggregation**: restore the deleted-row lane, keep `HAVING`-injected
+  value aggregates on real pointers (a fused grouping kernel used to write
+  through a null pointer and crash with `SIGSEGV`), keep NULL and `0`/`0.0` in
+  separate groups (the `u64` identity hash merged them), group by expression
+  columns and by join keys, and stop the two-key `GROUP BY u.id, o.id` form from
+  emitting the first key twice — the emitter now prefers qualified names and
+  matches at most one group key per projected column
+- **Joins**: keep right-table non-key columns reachable after a swapped RIGHT
+  JOIN with and without an appended `ON` predicate (`SELECT o.id`, `SELECT u.id`
+  now return the correct side, previously an error or a silently wrong column);
+  give counting joins a direct-index histogram so a 1M-row unfiltered count join
+  drops from ~128 ms to ~15 ms and the join family's spread narrows from 150× to
+  about 1.1–15×; and fix outer-join counting (unmatched preserved rows count 1,
+  NULL keys never match)
+- **Expression column names**: never strip a qualifier by splitting on the last
+  `.`, which cut into floating-point literals and made `ORDER BY abs(score - 2.5)
+  DESC` silently keep scan order and `GROUP BY ABS(score - 1.5)` collapse to a
+  single group; use exact-name resolution first and the identifier-aware
+  `strip_column_qualifier` otherwise
+- **Encoded columns**: keep the one-byte encoding tag in the slice handed to
+  `read_column_encoded`, whose dispatch reads `bytes[0]` — a caller that skipped
+  the null bitmap and the tag read `count=216172782113783808` from a BITPACK
+  column and reported truncation
+- **Python writes**: reject out-of-range integers and unsupported Python objects
+  with an explicit error instead of silently storing `NULL` or an empty string,
+  and route all-scalar write batches (`INSERT`/`UPDATE`/`DELETE`/DDL/`COPY`)
+  through the scalar result path so the first write of a session no longer pays
+  the one-time `import pyarrow` cost (measured 43–51 ms, 33 ms of it the C
+  extensions) before answering in 0.2–2.2 ms
+
+### Out-Of-Core And Memory Budgets
+
+- Stream file-backed query paths instead of materializing them: peak RSS for the
+  out-of-core import shape falls from **1435 MB to 106 MB** and the incremental
+  footprint from **+1397 MB to +39 MB**
+- Admit sorting and materializing joins against the query memory budget, and make
+  the storage-layer numeric grouping path report a clear error instead of
+  succeeding silently on 5,000,000 groups; peak RSS for that shape drops from
+  **1307.3 MB to 271.8 MB**
+- Window all six out-of-core vector lanes (single and batch `f32`/`f16` plus the
+  two binary encodings); a 1 MB budget yields 4.785 ms (single `f32`), 2.970 ms
+  (single `f16`), 7.555 ms (batch `f16`) and 11.319 ms (batch `f32`) with results
+  bit-identical to the unbounded run
+- Cap the scan buffer only when asked: `APEX_SCAN_BUFFER_MB` bounds a
+  whole-column scan buffer (default unlimited), and combine it with the existing
+  dictionary cap to keep large scans bounded
+- Add measured peak RSS to the gate (`--memory`, 103 RSS deltas) so a footprint
+  regression fails the release check the same way a latency regression does
+
+### Validation And Performance
+
+- Release build, the complete serial Python suite (**2342 passed, 0 failed,
+  0 skipped**), and the complete Rust suites pass on this tree: **731 unit +
+  6 documentation tests** with the default features and again in the core-only
+  (`--no-default-features`) configuration, **737 + 6** with `server` and
+  **735 + 6** with `flight`
+- Fix a release-blocking compile error in the core-only configuration: the
+  compressed-batch test called the Python-only projected batch lane, so
+  `cargo test --no-default-features --release` failed with two errors and would
+  have blocked the `rust-test` job and therefore every wheel build. The test now
+  gates only the projected-lane assertions, and the core-only suite builds and
+  passes
+- The public 1,000,000-row benchmark completed with ApexBase winning **102/103**
+  tabular, **6/6** exact-vector and **6/6** shared quantized-vector comparisons,
+  with no functional gap; the one tabular loss is
+  `NOT filter (age NOT BETWEEN, name NOT LIKE)` at 3.49 ms against DuckDB's
+  3.19 ms (1.1×), the load-sensitive file-I/O shape that a single public run also
+  flagged in v1.36.2 and that the interleaved gate has repeatedly placed inside
+  threshold
+- Refresh `benchmarks/latest_public_baseline.json` from this release's full
+  1,000,000-row run (the report is kept at
+  `benchmarks/results/v1.37.0-public.json`) so public comparisons are made
+  against the V5 generation instead of the v1.36.1 snapshot
+- The full-mode same-machine gate against `origin/main` (v1.36.2) passes
+  **10 of 11 phases** with a single marked metric — `CROSS JOIN COUNT`, the
+  long-standing jitter of a path that has no join key, was reproduced negative by
+  isolated A/B runs, and shares no code with this release's changes; it is
+  reported here rather than described as a pass
+- The remaining full-mode phases all pass: `htap` 10/10, `hybrid` 12/12, `qps`
+  12/12, `quant` 8/8, `wf` 20/20, `wide` 30/30, `idx` 4/4, `par` 4/4, `zs` 4/4
+  and `pgwire` 7/7
+- Quantized recall stays above its per-codec floors (float16 1.000, bfloat16
+  1.000, int8 0.975, uint8 0.985) and the vector lanes are checked to return
+  exactly the brute-force top-k row sets
+
+### Upgrade Notes
+
+- **V5 preview**: this is a preview of the V5 architecture. Read
+  [V5 Preview Status](#v5-preview-status) first if the data must stay readable by
+  older builds
+- **Format compatibility is one-way.** This build reads V4 files. V4-era builds
+  must not open a version-5 file: they do not know the new encodings and would
+  misread values instead of failing. Set `APEX_WIDTH_FIDELITY=0` to keep writing
+  the V4 layout and the version-4 declaration when a file has to be handed to an
+  older build
+- **No API change and no migration step** from v1.36.2; existing V4 tables open
+  unchanged and only start declaring version `5` once a write uses a V5-only
+  encoding
+- Concurrency gain: several processes may now write one table through any public
+  write path, with `_id` ranges reserved from the shared high-water mark
+- Update the Rust crate and Python package version metadata to 1.37.0
+
+
 ## [v1.36.2](https://github.com/BirchKwok/ApexBase/releases/tag/v1.36.2)
 *2026-09-24*
 

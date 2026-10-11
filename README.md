@@ -139,6 +139,17 @@ streaming overlay reads, and a per-query aggregation memory budget on top of it.
 See [Scan & Physical Execution](https://birchkwok.github.io/apexbase/latest/SCAN_EXECUTION_ARCHITECTURE/)
 and [Resource Ownership](https://birchkwok.github.io/apexbase/latest/RESOURCE_OWNERSHIP/).
 
+v1.37.0 is the **V5 architecture preview**. Files may declare format version `5`
+and carry V5-only column encodings, `_id` ranges are reserved against a shared
+on-disk high-water mark so several processes can write one table, and new read
+lanes cover direct point reads, executor index lookups, full-text row-selection
+pushdown, and distance TopK. V5 builds read V4 files; to keep a file readable by
+a pre-V5 build, set `APEX_WIDTH_FIDELITY=0` to write the V4 layout. The format
+may still gain encodings before V5 is declared stable, so treat it as a preview
+and see the [release notes](https://birchkwok.github.io/apexbase/latest/release-notes/)
+and [Storage Architecture](https://birchkwok.github.io/apexbase/latest/STORAGE_ARCHITECTURE/)
+for the compatibility rules.
+
 ## Documentation
 
 **Start here:** <https://birchkwok.github.io/apexbase/>

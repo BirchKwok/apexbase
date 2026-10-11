@@ -1514,14 +1514,32 @@ impl ApexExecutor {
     // ========== Index Maintenance Helpers ==========
 
     pub fn notify_indexes_after_write(storage_path: &Path, inserted_ids: &[u64]) {
+        if let Err(_error) = Self::notify_indexes_after_write_inner(storage_path, inserted_ids) {
+            // The rows are already durable; refusing to publish untrusted postings
+            // keeps later reads on the authoritative scan until REINDEX.
+            flag_indexes_stale_after_failure(storage_path);
+        }
+    }
+
+    /// Maintain the secondary indexes of the rows `inserted_ids` published.
+    ///
+    /// Only the appended window of the visible table is read back: a per-row store
+    /// must stay O(appended rows), not O(table). When that window does not contain
+    /// exactly the published IDs — a durability level that keeps the rows in the
+    /// engine's memory layer, a concurrent delete — the postings would silently
+    /// miss rows, so this fails and the caller flags the indexes stale instead.
+    fn notify_indexes_after_write_inner(
+        storage_path: &Path,
+        inserted_ids: &[u64],
+    ) -> io::Result<()> {
         if inserted_ids.is_empty() {
-            return;
+            return Ok(());
         }
         let (base_dir, table_name) = base_dir_and_table(storage_path);
         let idx_mgr_arc = get_index_manager(&base_dir, &table_name);
         let mut idx_mgr = idx_mgr_arc.lock();
         if idx_mgr.list_indexes().is_empty() {
-            return;
+            return Ok(());
         }
 
         let indexed_cols: Vec<String> = idx_mgr
@@ -1533,41 +1551,46 @@ impl ApexExecutor {
         col_names.extend(indexed_cols.iter().cloned());
         col_names.sort();
         col_names.dedup();
+        let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
 
-        // Open a read backend to get inserted row data
-        if let Ok(backend) = TableStorageBackend::open(storage_path) {
-            let col_refs: Vec<&str> = col_names.iter().map(|s| s.as_str()).collect();
-            if let Ok(batch) = backend.read_columns_to_arrow(Some(&col_refs), 0, None) {
-                let id_col = batch.column_by_name("_id");
-                let id_set: std::collections::HashSet<u64> = inserted_ids.iter().copied().collect();
-                for row in 0..batch.num_rows() {
-                    let row_id = if let Some(col) = id_col {
-                        if let Some(arr) = col.as_any().downcast_ref::<UInt64Array>() {
-                            arr.value(row)
-                        } else if let Some(arr) = col.as_any().downcast_ref::<Int64Array>() {
-                            arr.value(row) as u64
-                        } else {
-                            continue;
-                        }
-                    } else {
-                        continue;
-                    };
-
-                    if !id_set.contains(&row_id) {
-                        continue;
-                    }
-
-                    let mut col_vals = std::collections::HashMap::new();
-                    for col_name in &indexed_cols {
-                        if let Some(col) = batch.column_by_name(col_name) {
-                            col_vals.insert(col_name.clone(), Self::arrow_value_at_col(col, row));
-                        }
-                    }
-                    let _ = idx_mgr.on_insert(row_id, &col_vals);
-                }
-                let _ = idx_mgr.save();
+        let backend = TableStorageBackend::open(storage_path)?;
+        let total = backend.row_count() as usize;
+        let start = total.saturating_sub(inserted_ids.len());
+        let batch = backend.read_columns_to_arrow(Some(&col_refs), start, None)?;
+        let Some(id_col) = batch.column_by_name("_id") else {
+            return Err(err_data("_id column not found"));
+        };
+        let id_set: std::collections::HashSet<u64> = inserted_ids.iter().copied().collect();
+        let mut indexed = 0usize;
+        for row in 0..batch.num_rows() {
+            let row_id = if let Some(arr) = id_col.as_any().downcast_ref::<UInt64Array>() {
+                arr.value(row)
+            } else if let Some(arr) = id_col.as_any().downcast_ref::<Int64Array>() {
+                arr.value(row) as u64
+            } else {
+                return Err(err_data("_id column must be UInt64 or Int64"));
+            };
+            if !id_set.contains(&row_id) {
+                continue;
             }
+            indexed += 1;
+
+            let mut col_vals = std::collections::HashMap::new();
+            for col_name in &indexed_cols {
+                if let Some(col) = batch.column_by_name(col_name) {
+                    col_vals.insert(col_name.clone(), Self::arrow_value_at_col(col, row));
+                }
+            }
+            idx_mgr.on_insert(row_id, &col_vals)?;
         }
+        if indexed != inserted_ids.len() {
+            return Err(err_data(format!(
+                "index maintenance found {indexed} of {} appended rows",
+                inserted_ids.len()
+            )));
+        }
+        idx_mgr.save()?;
+        Ok(())
     }
 
     pub fn notify_indexes_after_delete(
@@ -2131,8 +2154,11 @@ impl ApexExecutor {
             return Ok(ApexResult::Scalar(0));
         }
 
-        // Clear all index data
-        idx_mgr.rebuild_all();
+        // Clear all index data. The stale marker goes up first: while the
+        // postings are being replaced, reads must stay on the authoritative scan
+        // (a failure midway leaves the marker behind and the next REINDEX heals).
+        crate::query::executor::mark_indexes_stale(&table_path, crate::storage::DurabilityLevel::Max)?;
+        idx_mgr.rebuild_all()?;
 
         // Re-read table data and rebuild
         let storage = if crate::storage::is_memory_path(&table_path) {

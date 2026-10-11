@@ -5,6 +5,7 @@ impl ApexExecutor {
         storage_path: &Path,
         where_clause: Option<&SqlExpr>,
     ) -> io::Result<ApexResult> {
+        let __t = std::time::Instant::now();
         if !crate::storage::is_memory_path(storage_path) {
             crate::storage::table_catalog::ensure_table_file(
                 storage_path,

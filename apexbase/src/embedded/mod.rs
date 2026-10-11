@@ -2310,6 +2310,43 @@ mod tests {
     /// the row is then read back through the point API, `retrieve_many` and SQL,
     /// before and after a flush and a reopen.
     #[test]
+    fn test_vector_dimension_mismatch_is_rejected_on_every_route() {
+        // A fixed-size vector column has one dimension. Appending a row with a
+        // different one used to be accepted and misaligned the fixed stride,
+        // which made every following read of that column return NULL.
+        let (_dir, db) = temp_db();
+        let table = db
+            .create_table_with_schema("dim", &[("emb".to_string(), ColumnType::FixedList)])
+            .unwrap();
+
+        let mut one = Row::new();
+        one.insert("emb".to_string(), Value::FixedList(vec![0u8; 4]));
+        table.insert(one).unwrap();
+
+        let mut two = Row::new();
+        two.insert("emb".to_string(), Value::FixedList(vec![0u8; 8]));
+        let error = table
+            .insert(two)
+            .expect_err("a 2-dimension row must not join a 1-dimension column");
+        assert!(
+            error.to_string().contains("1-dimension"),
+            "unexpected error: {error}"
+        );
+
+        // Batch inserts are validated before anything is written.
+        let mut batch_row = Row::new();
+        batch_row.insert("emb".to_string(), Value::FixedList(vec![0u8; 12]));
+        assert!(table.insert_batch(&[batch_row]).is_err());
+        assert_eq!(table.count().unwrap(), 1);
+
+        // The surviving row still decodes.
+        let row = table.retrieve(1).unwrap().expect("row 1 survives");
+        assert!(matches!(
+            row.get("emb"),
+            Some(Value::FixedList(bytes)) if bytes.len() == 4
+        ));
+    }
+
     fn test_every_column_type_through_every_write_route() {
         let dir = TempDir::new().unwrap();
         let routes: [(&str, i64); 4] = [

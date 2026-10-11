@@ -302,3 +302,135 @@ def test_guard_evidence_keeps_incompatible_report_status(local_guard, tmp_path):
     report = json.loads((tmp_path / "run-manifest.json").read_text())
     assert report["comparisons"] == {"comparison": 2}
     assert report["status"] == "error" and report["exit_code"] == 2
+
+
+def test_local_guard_width_fidelity_uses_the_width_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json", width_only=True
+    )
+
+    assert Path(command[0]).name == "bench_width_fidelity.py"
+    assert command[1:7] == (
+        "--rows", "200000", "--warmup", "2", "--iterations", "7",
+    )
+    assert command[-2:] == ("--output", "report.json")
+    # The phase is its own script: no canary profile flag may leak into it.
+    assert "--qps-only" not in command
+    assert "--index-only" not in command
+    assert "--skip-quantized-vector" not in command
+
+
+def test_local_guard_full_mode_runs_every_dedicated_phase(local_guard):
+    source = Path(local_guard.__file__).read_text(encoding="utf-8")
+
+    # Every dedicated base/current phase of --mode full must stay wired: the
+    # guard's coverage is the union of these interleaved comparisons.
+    for phase in ("qps", "quant", "idx", "par", "wf", "zs", "htap", "wide", "hybrid", "pgwire"):
+        assert f"collect_{phase} = make_collect(" in source
+        assert f'"{phase}-comparison"' in source
+    assert "width_only=True" in source
+    assert "string_zones_only=True" in source
+    assert "htap_only=True" in source
+    assert "wide_only=True" in source
+    assert "hybrid_only=True" in source
+    assert "pgwire_only=True" in source
+
+
+def test_local_guard_pgwire_phase_uses_the_concurrency_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json", pgwire_only=True
+    )
+
+    assert Path(command[0]).name == "bench_pg_wire_concurrency.py"
+    assert command[1:7] == (
+        "--rows", "200000", "--warmup", "2", "--iterations", "7",
+    )
+    assert command[-2:] == ("--output", "report.json")
+    # The phase starts its own server and asserts its own counts: no canary
+    # profile flag may leak into it.
+    assert "--qps-only" not in command
+    assert "--quant-only" not in command
+    assert "--index-only" not in command
+    assert "--skip-quantized-vector" not in command
+
+
+def test_local_guard_htap_phase_uses_the_overlay_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json", htap_only=True
+    )
+
+    assert Path(command[0]).name == "bench_htap_overlay.py"
+    assert command[1:7] == (
+        "--rows", "200000", "--warmup", "2", "--iterations", "7",
+    )
+    assert command[-2:] == ("--output", "report.json")
+    assert "--qps-only" not in command
+    assert "--index-only" not in command
+    assert "--skip-quantized-vector" not in command
+
+
+def test_local_guard_hybrid_phase_uses_the_retrieval_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json", hybrid_only=True
+    )
+
+    assert Path(command[0]).name == "bench_hybrid_retrieval.py"
+    assert command[1:7] == (
+        "--rows", "50000", "--warmup", "2", "--iterations", "7",
+    )
+    assert command[-2:] == ("--output", "report.json")
+    assert "--skip-quantized-vector" not in command
+    assert "--qps-only" not in command
+
+
+def test_local_guard_wide_phase_uses_the_wide_table_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json", wide_only=True
+    )
+
+    assert Path(command[0]).name == "bench_wide_table.py"
+    assert command[1:7] == (
+        "--rows", "200000", "--warmup", "2", "--iterations", "7",
+    )
+    assert command[-2:] == ("--output", "report.json")
+    # The phase builds and asserts its own fixtures: no canary profile flag may
+    # leak into it.
+    assert "--qps-only" not in command
+    assert "--index-only" not in command
+    assert "--skip-quantized-vector" not in command
+
+
+def test_local_guard_string_zone_phase_uses_the_zone_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json", string_zones_only=True
+    )
+
+    assert Path(command[0]).name == "bench_string_zone_shapes.py"
+    assert command[1:7] == (
+        "--rows", "200000", "--warmup", "2", "--iterations", "7",
+    )
+    assert command[-2:] == ("--output", "report.json")
+    # The phase is its own script: no canary/profile flag may leak into it.
+    assert "--qps-only" not in command
+    assert "--index-only" not in command
+    assert "--skip-quantized-vector" not in command
+
+def test_local_guard_tracks_rss_on_the_public_benchmark(local_guard):
+    """The perf stage must pass --memory so RSS deltas land in the report.
+
+    A timing-only gate cannot see an out-of-core regression: scanning a 20M-row CSV once
+    added +1397 MB RSS while staying inside every timing threshold.
+    """
+    public = local_guard.benchmark_arguments("full", None, None, None, "report.json")
+    assert "--memory" in public
+    assert public[-2:] == ("--output", "report.json")
+
+    canary = local_guard.benchmark_arguments("canary", None, None, None, "report.json")
+    assert Path(canary[0]).name == "bench_perf_canary.py"
+    assert "--memory" not in canary
+
+
+def test_public_benchmark_persists_the_rss_deltas():
+    """`--memory` results must be written into the report, not only printed."""
+    source = (ROOT / "benchmarks" / "bench_vs_sqlite_duckdb.py").read_text()
+    assert '"apexbase_rss_delta_mb": mem_results' in source

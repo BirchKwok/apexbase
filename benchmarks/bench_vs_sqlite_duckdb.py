@@ -1326,6 +1326,16 @@ class SQLiteBench:
             "ON b.city = m.city AND m.pop > 15000000"
         )
 
+    def bench_left_join_expression_on(self):
+        # An ON clause that is not a plain column equality used to fall back to a
+        # nested loop, so this shape cost O(left x right): 404 ms at 100k x 1k rows
+        # against 1.3 ms once the expression is evaluated into a key column and
+        # hash joined. It matches nothing, which is the expensive case.
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b LEFT JOIN meta m "
+            "ON b.age + 1000000 = m.pop"
+        )
+
     def bench_full_outer_join_bounded(self):
         return self._query_all(
             "SELECT b.city, m.pop FROM bench b FULL OUTER JOIN meta m ON b.city = m.city "
@@ -2082,6 +2092,16 @@ class DuckDBBench:
         return self._scalar(
             "SELECT COUNT(*) AS c FROM bench b LEFT JOIN meta m "
             "ON b.city = m.city AND m.pop > 15000000"
+        )
+
+    def bench_left_join_expression_on(self):
+        # An ON clause that is not a plain column equality used to fall back to a
+        # nested loop, so this shape cost O(left x right): 404 ms at 100k x 1k rows
+        # against 1.3 ms once the expression is evaluated into a key column and
+        # hash joined. It matches nothing, which is the expensive case.
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM bench b LEFT JOIN meta m "
+            "ON b.age + 1000000 = m.pop"
         )
 
     def bench_full_outer_join_bounded(self):
@@ -3361,6 +3381,16 @@ class ApexBaseBench:
             "ON b.city = m.city AND m.pop > 15000000"
         )
 
+    def bench_left_join_expression_on(self):
+        # An ON clause that is not a plain column equality used to fall back to a
+        # nested loop, so this shape cost O(left x right): 404 ms at 100k x 1k rows
+        # against 1.3 ms once the expression is evaluated into a key column and
+        # hash joined. It matches nothing, which is the expensive case.
+        return self._scalar(
+            "SELECT COUNT(*) AS c FROM default b LEFT JOIN meta m "
+            "ON b.age + 1000000 = m.pop"
+        )
+
     def bench_full_outer_join_bounded(self):
         return self._query_all(
             "SELECT b.city, m.pop FROM default b FULL OUTER JOIN meta m ON b.city = m.city "
@@ -3678,6 +3708,7 @@ BENCHMARKS = [
     ("JOIN GROUP BY ORDER LIMIT",        "bench_join_group_order_limit",    False, False, False, None),
     ("LEFT JOIN COUNT",                  "bench_left_join_count",           False, False, False, None),
     ("LEFT JOIN extra ON predicate",     "bench_left_join_extra_on",        False, False, False, None),
+    ("LEFT JOIN expression ON (no match)", "bench_left_join_expression_on",  False, False, False, None),
     ("FULL OUTER JOIN (bounded)",        "bench_full_outer_join_bounded",   False, False, False, None),
     ("CROSS JOIN COUNT",                 "bench_comma_cross_join",          False, False, False, None),
     ("UNION ALL (ordered)",              "bench_union_all",                 False, False, False, None),
@@ -5510,14 +5541,21 @@ QPS_QUERIES_DUCKDB = [
 ]
 
 def run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=1.0, min_iterations=50,
-                       existing_engines=None):
+                       existing_engines=None, thread_counts=None):
     """Measure OLAP/read Q/s for single-threaded and concurrent scenarios.
     
     Args:
         min_duration: Minimum test duration in seconds for accurate timing
         min_iterations: Minimum number of query batches to run
         existing_engines: dict of {name: bench} to reuse, avoids re-inserting data
+        thread_counts: concurrency levels to measure. Defaults to (n_threads,), so a
+            caller that passes only n_threads keeps its historical output.
     """
+    resolved_thread_counts = (
+        (n_threads,) if thread_counts is None else tuple(thread_counts)
+    )
+    if not resolved_thread_counts or any(count < 1 for count in resolved_thread_counts):
+        raise ValueError("thread_counts must be a non-empty sequence of positive integers")
     results = {}
     if existing_engines is not None:
         # The main benchmark run leaves the Apex dataset table in a
@@ -5614,90 +5652,94 @@ def run_qps_benchmark(tmpdir, data, n_threads=4, min_duration=1.0, min_iteration
         except Exception as e:
             print(f"  {name}: Error - {e}")
 
-    # 2. Concurrent Q/s (multiple threads) — reuse qps_engines, no re-insert
-    print(f"\n--- OLAP Q/s (threads={n_threads}) ---")
+    # 2. Concurrent Q/s (multiple threads) — reuse qps_engines, no re-insert.
+    #    The scaling curve (1/2/4/8 by default) makes a concurrency change
+    #    visible as a curve rather than a single point.
+    for threads in resolved_thread_counts:
+        print(f"\n--- OLAP Q/s (threads={threads}) ---")
 
-    for name, bench, queries in qps_engines:
-        try:
-            # For each thread, we need a separate connection for SQLite/DuckDB
-            # ApexBase handles concurrency internally
-            if hasattr(bench, 'client'):
-                # ApexBase: shared client
-                # Reuse the per-engine calibration from the single-threaded test.
-                conc_iterations = max(min_iterations, single_iterations.get(name, min_iterations))
-                def concurrent_worker_apex(its=conc_iterations):
-                    for _ in range(its):
-                        for q in queries:
-                            bench.execute_materialized_query(q)
-                
-                gc.collect()
-                t0 = time.perf_counter()
-                with ThreadPoolExecutor(max_workers=n_threads) as executor:
-                    list(executor.map(lambda _: concurrent_worker_apex(), range(n_threads)))
-                elapsed = time.perf_counter() - t0
-                total_queries = n_threads * conc_iterations * len(queries)
-                qps = total_queries / elapsed if elapsed > 0.001 else 0
-                
-            elif hasattr(bench, 'conn'):
-                # SQLite/DuckDB: create connection per thread
-                db_path = bench.db_path
-                is_duckdb = 'duckdb' in str(type(bench.conn)).lower()
-
-                conc_iterations = max(min_iterations, single_iterations.get(name, min_iterations))
-                def concurrent_worker_sql(db_path, is_duckdb, queries, its=conc_iterations):
-                    # Each thread creates its own connection
-                    try:
-                        if is_duckdb:
-                            import duckdb
-                            conn = duckdb.connect(db_path)
-                        else:
-                            import sqlite3
-                            conn = sqlite3.connect(db_path, timeout=30)
+        for name, bench, queries in qps_engines:
+            try:
+                # For each thread, we need a separate connection for SQLite/DuckDB
+                # ApexBase handles concurrency internally
+                if hasattr(bench, 'client'):
+                    # ApexBase: shared client
+                    # Reuse the per-engine calibration from the single-threaded test.
+                    conc_iterations = max(min_iterations, single_iterations.get(name, min_iterations))
+                    def concurrent_worker_apex(its=conc_iterations):
                         for _ in range(its):
                             for q in queries:
-                                cur = conn.execute(q)
-                                _ = rows_to_dicts([d[0] for d in (cur.description or [])], cur.fetchall())
-                        conn.close()
-                    except Exception:
-                        pass
+                                bench.execute_materialized_query(q)
                 
-                gc.collect()
-                t0 = time.perf_counter()
-                with ThreadPoolExecutor(max_workers=n_threads) as executor:
-                    list(executor.map(
-                        lambda _: concurrent_worker_sql(db_path, is_duckdb, queries),
-                        range(n_threads)
-                    ))
-                elapsed = time.perf_counter() - t0
-                total_queries = n_threads * conc_iterations * len(queries)
-                qps = total_queries / elapsed if elapsed > 0.001 else 0
-            else:
-                qps = 0
-                total_queries = 0
-                elapsed = 0
+                    gc.collect()
+                    t0 = time.perf_counter()
+                    with ThreadPoolExecutor(max_workers=threads) as executor:
+                        list(executor.map(lambda _: concurrent_worker_apex(), range(threads)))
+                    elapsed = time.perf_counter() - t0
+                    total_queries = threads * conc_iterations * len(queries)
+                    qps = total_queries / elapsed if elapsed > 0.001 else 0
+                
+                elif hasattr(bench, 'conn'):
+                    # SQLite/DuckDB: create connection per thread
+                    db_path = bench.db_path
+                    is_duckdb = 'duckdb' in str(type(bench.conn)).lower()
 
-            results[f'{name}_concurrent_{n_threads}'] = qps
-            if elapsed > 0.001:
-                print(f"  {name}: {qps:.1f} Q/s ({total_queries} queries in {elapsed:.3f}s)")
-            else:
-                print(f"  {name}: Error - test time too short ({elapsed:.6f}s)")
-        except Exception as e:
-            print(f"  {name}: Error - {e}")
+                    conc_iterations = max(min_iterations, single_iterations.get(name, min_iterations))
+                    def concurrent_worker_sql(db_path, is_duckdb, queries, its=conc_iterations):
+                        # Each thread creates its own connection
+                        try:
+                            if is_duckdb:
+                                import duckdb
+                                conn = duckdb.connect(db_path)
+                            else:
+                                import sqlite3
+                                conn = sqlite3.connect(db_path, timeout=30)
+                            for _ in range(its):
+                                for q in queries:
+                                    cur = conn.execute(q)
+                                    _ = rows_to_dicts([d[0] for d in (cur.description or [])], cur.fetchall())
+                            conn.close()
+                        except Exception:
+                            pass
+                
+                    gc.collect()
+                    t0 = time.perf_counter()
+                    with ThreadPoolExecutor(max_workers=threads) as executor:
+                        list(executor.map(
+                            lambda _: concurrent_worker_sql(db_path, is_duckdb, queries),
+                            range(threads)
+                        ))
+                    elapsed = time.perf_counter() - t0
+                    total_queries = threads * conc_iterations * len(queries)
+                    qps = total_queries / elapsed if elapsed > 0.001 else 0
+                else:
+                    qps = 0
+                    total_queries = 0
+                    elapsed = 0
+
+                results[f'{name}_concurrent_{threads}'] = qps
+                if elapsed > 0.001:
+                    print(f"  {name}: {qps:.1f} Q/s ({total_queries} queries in {elapsed:.3f}s)")
+                else:
+                    print(f"  {name}: Error - test time too short ({elapsed:.6f}s)")
+            except Exception as e:
+                print(f"  {name}: Error - {e}")
+
 
     # Print Q/s Summary
     print("\n--- OLAP Q/s Summary ---")
     apex_single = results.get("ApexBase_single", 0)
     sqlite_single = results.get("SQLite_single", 0)
     duckdb_single = results.get("DuckDB_single", 0)
-    apex_concurrent = results.get("ApexBase_concurrent_4", 0)
-    sqlite_concurrent = results.get("SQLite_concurrent_4", 0)
-    duckdb_concurrent = results.get("DuckDB_concurrent_4", 0)
     print(f"  ApexBase (single-threaded): {apex_single:.1f} Q/s")
     print(f"  SQLite (single-threaded): {sqlite_single:.1f} Q/s")
     print(f"  DuckDB (single-threaded): {duckdb_single:.1f} Q/s")
-    print(f"  ApexBase (4-thread concurrent): {apex_concurrent:.1f} Q/s")
-    print(f"  SQLite (4-thread concurrent): {sqlite_concurrent:.1f} Q/s")
-    print(f"  DuckDB (4-thread concurrent): {duckdb_concurrent:.1f} Q/s")
+    for threads in resolved_thread_counts:
+        for label in ("ApexBase", "SQLite", "DuckDB"):
+            value = results.get(f"{label}_concurrent_{threads}")
+            if value is None:
+                continue
+            print(f"  {label} ({threads}-thread concurrent): {value:.1f} Q/s")
 
     return results
 
@@ -6185,6 +6227,10 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
             "apexbase_transaction_diagnostics": apex_txn_diagnostics,
             "apexbase_buffered_oltp": buffered_oltp_results,
             "apexbase_memtable_oltp": memtable_oltp_results,
+            # Per-case RSS deltas (populated when `--memory` is on; the perf guard always passes
+            # it). Timing-only gates cannot see an out-of-core regression: scanning a 20M-row
+            # CSV once added +1397 MB RSS while staying fast enough to pass every threshold.
+            "apexbase_rss_delta_mb": mem_results,
         }
         with open(args.output, "w") as f:
             json.dump(output, f, indent=2)

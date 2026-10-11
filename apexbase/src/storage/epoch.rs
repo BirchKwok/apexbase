@@ -15,7 +15,12 @@ use dashmap::DashMap;
 use memmap2::{MmapMut, MmapOptions};
 use once_cell::sync::Lazy;
 
-const SHARED_EPOCH_BYTES: u64 = std::mem::size_of::<AtomicU64>() as u64;
+/// The sidecar holds two `AtomicU64` slots: the table epoch and the shared
+/// row-id high-water mark. Older builds map only the first slot, so widening the
+/// file stays compatible.
+const SHARED_SLOT_BYTES: u64 = std::mem::size_of::<AtomicU64>() as u64;
+const SHARED_SLOTS: u64 = 2;
+const SHARED_EPOCH_BYTES: u64 = SHARED_SLOT_BYTES * SHARED_SLOTS;
 
 struct SharedEpoch {
     mapping: MmapMut,
@@ -63,10 +68,45 @@ impl SharedEpoch {
     fn bump(&self) -> u64 {
         self.atomic().fetch_add(1, Ordering::AcqRel) + 1
     }
+
+    #[inline]
+    fn row_id_slot(&self) -> &AtomicU64 {
+        // SAFETY: see `atomic`; the second slot is inside the same mapping.
+        unsafe {
+            &*self
+                .mapping
+                .as_ptr()
+                .add(SHARED_SLOT_BYTES as usize)
+                .cast::<AtomicU64>()
+        }
+    }
+
+    /// Reserve `count` row ids, returning the first one.
+    ///
+    /// `minimum` is the caller's own next id; the mark is raised to it first so a
+    /// table written before this sidecar existed (or by an older build) keeps
+    /// handing out ids above its current maximum.
+    fn reserve_row_ids(&self, minimum: u64, count: u64) -> u64 {
+        let slot = self.row_id_slot();
+        loop {
+            let current = slot.load(Ordering::Acquire);
+            let base = current.max(minimum);
+            let next = base.saturating_add(count);
+            if slot
+                .compare_exchange(current, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return base;
+            }
+        }
+    }
 }
 
 struct TableEpoch {
+    /// Published table generation.
     local: AtomicU64,
+    /// Row-id cursor for tables without a sidecar (in-memory / unbacked).
+    id_local: AtomicU64,
     shared: Option<SharedEpoch>,
 }
 
@@ -76,6 +116,7 @@ impl TableEpoch {
         let initial = shared.as_ref().map_or(0, SharedEpoch::current);
         Self {
             local: AtomicU64::new(initial),
+            id_local: AtomicU64::new(0),
             shared,
         }
     }
@@ -95,6 +136,21 @@ impl TableEpoch {
         );
         self.local.store(epoch, Ordering::Release);
         epoch
+    }
+
+    /// Reserve row ids from the shared mark; falls back to a local counter for
+    /// tables that have no sidecar. `minimum` is the caller's own next id.
+    #[inline]
+    fn reserve_row_ids(&self, minimum: u64, count: u64) -> u64 {
+        match self.shared.as_ref() {
+            Some(shared) => shared.reserve_row_ids(minimum, count),
+            None => {
+                let base = self.id_local.load(Ordering::Acquire).max(minimum);
+                self.id_local
+                    .store(base.saturating_add(count), Ordering::Release);
+                base
+            }
+        }
     }
 }
 
@@ -183,6 +239,26 @@ pub fn global_current() -> u64 {
     GLOBAL_EPOCH.load(Ordering::Acquire)
 }
 
+/// Return the first of `count` row ids this process owns for one table.
+///
+/// The ids come from the shared high-water mark in the table's sidecar, so two
+/// processes writing the same table hand out disjoint ranges even though each
+/// derived its own next id from the base file. Ids may be skipped (a reservation
+/// that is not fully used), never repeated.
+#[inline]
+pub fn reserve_row_ids(table_path: &Path, minimum: u64, count: u64) -> u64 {
+    if count == 0 {
+        return minimum;
+    }
+    if let Some(entry) = TABLE_EPOCHS.get(table_path) {
+        return entry.reserve_row_ids(minimum, count);
+    }
+    TABLE_EPOCHS
+        .entry(table_path.to_path_buf())
+        .or_insert_with(|| TableEpoch::open(table_path))
+        .reserve_row_ids(minimum, count)
+}
+
 /// Advance the epoch once after a logical write has committed.
 #[inline]
 pub fn bump(table_path: &Path) -> u64 {
@@ -268,11 +344,73 @@ mod tests {
 
         assert_eq!(first.bump(), before + 1);
         assert_eq!(second.current(), before + 1);
+        // Two slots: the generation and the shared row-id high-water mark.
         assert_eq!(
             std::fs::metadata(path.with_extension("apex.lock"))
                 .unwrap()
                 .len(),
-            8
+            SHARED_EPOCH_BYTES
         );
+    }
+
+
+    use super::*;
+
+    #[test]
+    fn reserved_ranges_never_repeat_and_respect_the_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("t.apex");
+        // Seed well below the caller's current next id: the mark must jump to it.
+        let first = reserve_row_ids(&table, 100, 5);
+        assert!(first >= 100, "{first}");
+        let second = reserve_row_ids(&table, first, 3);
+        assert!(second >= first + 5, "{second}");
+        let third = reserve_row_ids(&table, 0, 2);
+        assert_eq!(third, second + 3);
+    }
+
+    #[test]
+    fn concurrent_reservations_are_disjoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("t.apex");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(4));
+        let mut handles = Vec::new();
+        for _ in 0..4 {
+            let table = table.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            handles.push(std::thread::spawn(move || {
+                barrier.wait();
+                let mut owned = Vec::new();
+                for _ in 0..50 {
+                    let base = reserve_row_ids(&table, 1, 3);
+                    owned.extend(base..base + 3);
+                }
+                owned
+            }));
+        }
+        let mut all: Vec<u64> = handles
+            .into_iter()
+            .flat_map(|handle| handle.join().unwrap())
+            .collect();
+        let total = all.len();
+        all.sort_unstable();
+        all.dedup();
+        assert_eq!(all.len(), total, "reserved ids must be unique");
+        assert_eq!(all.first().copied(), Some(1));
+    }
+
+    #[test]
+    fn reservations_survive_a_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let table = dir.path().join("t.apex");
+        let base = reserve_row_ids(&table, 1, 4);
+        epoch_tests_forget(&table);
+        let next = reserve_row_ids(&table, 1, 4);
+        assert!(next >= base + 4, "{next} vs {base}");
+    }
+
+    /// Drop the process-local cache so the next call re-maps the sidecar.
+    fn epoch_tests_forget(table_path: &Path) {
+        TABLE_EPOCHS.remove(table_path);
     }
 }

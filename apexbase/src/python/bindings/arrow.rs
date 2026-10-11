@@ -3,6 +3,26 @@
 use super::*;
 use arrow::array::Array;
 
+/// Arrow types `arrow_col_to_pylist` converts faithfully.
+///
+/// A type outside this set has no branch in that converter and would silently
+/// become NULL; the caller must take the Arrow path instead.
+pub(super) fn pylist_representable(dtype: &arrow::datatypes::DataType) -> bool {
+    use arrow::datatypes::DataType as ArrowDT;
+    matches!(
+        dtype,
+        ArrowDT::Int64
+            | ArrowDT::Int32
+            | ArrowDT::UInt64
+            | ArrowDT::Float64
+            | ArrowDT::Utf8
+            | ArrowDT::Boolean
+            | ArrowDT::Binary
+            | ArrowDT::LargeBinary
+            | ArrowDT::Dictionary(_, _)
+    )
+}
+
 #[pymethods]
 impl ApexStorageImpl {
     fn _execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {

@@ -38,6 +38,36 @@ impl ApexExecutor {
         }
     }
 
+    /// Helper to extract a string IN list: `col IN ('a', 'b', ...)` (non-negated only).
+    ///
+    /// Returns `None` unless every element is a non-empty string literal, so a list that
+    /// mixes types keeps the ordinary path.
+    fn extract_string_in_list(expr: &SqlExpr) -> Option<(String, Vec<String>)> {
+        match expr {
+            SqlExpr::In {
+                column,
+                values,
+                negated: false,
+            } => {
+                let clean = column.trim_matches('"');
+                let name = clean.rsplit('.').next().unwrap_or(clean).to_string();
+                let mut out: Vec<String> = Vec::with_capacity(values.len());
+                for value in values {
+                    match value {
+                        Value::String(text) if !text.is_empty() => out.push(text.clone()),
+                        _ => return None,
+                    }
+                }
+                if out.is_empty() {
+                    None
+                } else {
+                    Some((name, out))
+                }
+            }
+            _ => None,
+        }
+    }
+
     #[inline]
     fn column_is_string(backend: &TableStorageBackend, column: &str) -> bool {
         matches!(
@@ -222,27 +252,23 @@ impl ApexExecutor {
                     }
                     _ => return None,
                 };
-                // Return next/prev representable f64 for strict inequalities so that
-                // scan_numeric_range_mmap (which uses inclusive bounds) is exact.
+                // Next/prev representable f64 for strict inequalities so the inclusive
+                // range bounds stay exact. `next_down_f64(0.0)` is the negative side of
+                // zero; computing `from_bits(0) + 1` instead yields the smallest
+                // *positive* value, which silently made `k < 0` match `k = 0`.
                 let (low, high) = match effective_op {
                     BinaryOperator::Gt => {
-                        // col > N: smallest representable value strictly above N
-                        let next = if val >= 0.0 {
-                            f64::from_bits(val.to_bits() + 1)
-                        } else {
-                            f64::from_bits(val.to_bits() - 1)
-                        };
-                        (next, f64::INFINITY)
+                        (
+                            crate::query::query_signature::next_up_f64(val),
+                            f64::INFINITY,
+                        )
                     }
                     BinaryOperator::Ge => (val, f64::INFINITY),
                     BinaryOperator::Lt => {
-                        // col < N: largest representable value strictly below N
-                        let prev = if val > 0.0 {
-                            f64::from_bits(val.to_bits() - 1)
-                        } else {
-                            f64::from_bits(val.to_bits() + 1)
-                        };
-                        (f64::NEG_INFINITY, prev)
+                        (
+                            f64::NEG_INFINITY,
+                            crate::query::query_signature::next_down_f64(val),
+                        )
                     }
                     BinaryOperator::Le => (f64::NEG_INFINITY, val),
                     BinaryOperator::Eq => (val, val), // exact match as degenerate range [N, N]

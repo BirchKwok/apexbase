@@ -11,13 +11,12 @@ use crate::storage::on_demand::{ColumnValue, SchemaStableValue};
 use crate::storage::{DurabilityLevel, TableStorageBackend};
 use arrow::record_batch::RecordBatch;
 use dashmap::DashMap;
-use fs2::FileExt;
 use parking_lot::RwLock;
 use pyo3::exceptions::{PyIOError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList, PyTuple};
 use std::collections::HashMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -136,6 +135,53 @@ fn parse_agg_select(sql: &str) -> Option<Vec<(String, Option<String>, Option<Str
 }
 
 /// Convert Python value to Value
+/// Build the "integer out of range" error for an integral value.
+///
+/// Used when an integral value cannot be represented by an ApexBase INT64
+/// column. The message names the offending value so the failure is actionable.
+fn out_of_range_integer_error(obj: &Bound<'_, PyAny>) -> PyErr {
+    let value = obj
+        .str()
+        .and_then(|text| text.extract::<String>())
+        .unwrap_or_else(|_| "<integer>".to_string());
+    PyValueError::new_err(format!(
+        "integer {value} is out of range for an ApexBase INT64 column \
+         (supported range is {}..={}); store it as a string, or pass an explicit \
+         float when a lossy numeric value is acceptable",
+        i64::MIN,
+        i64::MAX
+    ))
+}
+
+/// True when `obj` is an integral scalar (Python `int`, NumPy integer, `bool`).
+///
+/// `__index__` is implemented by integral types only, so floats, `Decimal`,
+/// `Fraction` and arbitrary objects are left to their existing conversions.
+#[inline]
+fn is_integral_scalar(obj: &Bound<'_, PyAny>) -> bool {
+    obj.call_method0("__index__")
+        .map(|index| index.is_instance_of::<pyo3::types::PyInt>())
+        .unwrap_or(false)
+}
+
+/// Reject an element that is an integer outside the `i64` range.
+///
+/// The scalar conversion helpers call this only after an `i64` conversion has
+/// already failed, so any integral value reaching them is out of range. The
+/// columnar assembly loops instead meet every element here first, so an integer
+/// that *does* fit must be accepted. A Python float short-circuits on a free
+/// type check, which keeps the columnar float path cheap.
+#[inline]
+fn reject_out_of_range_integer_element(item: &Bound<'_, PyAny>) -> PyResult<()> {
+    if item.is_instance_of::<pyo3::types::PyFloat>() || item.extract::<i64>().is_ok() {
+        return Ok(());
+    }
+    if is_integral_scalar(item) {
+        return Err(out_of_range_integer_error(item));
+    }
+    Ok(())
+}
+
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     use pyo3::types::PyBytes;
 
@@ -147,11 +193,35 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::Bool(b));
     }
 
+    // A Python float is not an integer, so give it a clean fast path: trying
+    // the integer conversion first raises and clears a `TypeError` for every
+    // float that is written.
+    if obj.is_instance_of::<pyo3::types::PyFloat>() {
+        if let Ok(f) = obj.extract::<f64>() {
+            return Ok(Value::Float64(f));
+        }
+    }
+
     if let Ok(i) = obj.extract::<i64>() {
         return Ok(Value::Int64(i));
     }
 
+    // A Python `int` that does not fit i64 must never be demoted to `f64`
+    // (which rounds it) nor fall through to `NULL`. Without this, a value such
+    // as `2**64 - 1` reached the integer column as SQL `NULL` and disappeared
+    // with no error. `PyLong_Check` is a free type check, and it also covers
+    // integers so large that not even `f64` can hold them.
+    if obj.is_instance_of::<pyo3::types::PyInt>() {
+        return Err(out_of_range_integer_error(obj));
+    }
+
     if let Ok(f) = obj.extract::<f64>() {
+        // NumPy integer scalars are not `PyInt` instances, so the free check
+        // above misses them; `__index__` catches them here without touching
+        // floats, `Decimal`, `Fraction` or plain objects.
+        if is_integral_scalar(obj) {
+            return Err(out_of_range_integer_error(obj));
+        }
         return Ok(Value::Float64(f));
     }
 
@@ -213,7 +283,23 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
         return Ok(Value::Binary(bytes));
     }
 
-    Ok(Value::Null)
+    // Anything left is an object this writer cannot represent. It used to fall through to
+    // `Value::Null`, so `store({"s": [SomeWeirdObject()]})` reported success and stored a
+    // NULL - silent data loss. Refuse loudly instead; `None` is still the explicit way to
+    // write NULL.
+    Err(unsupported_value_error(obj))
+}
+
+fn unsupported_value_error(obj: &Bound<'_, PyAny>) -> PyErr {
+    let type_name = obj
+        .get_type()
+        .name()
+        .map(|name| name.to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    PyValueError::new_err(format!(
+        "unsupported Python value of type '{type_name}' for an ApexBase column; \
+         convert it explicitly or pass None to store NULL"
+    ))
 }
 
 fn py_to_column_value(obj: &Bound<'_, PyAny>) -> PyResult<ColumnValue> {
@@ -225,10 +311,23 @@ fn py_to_column_value(obj: &Bound<'_, PyAny>) -> PyResult<ColumnValue> {
     if let Ok(b) = obj.extract::<bool>() {
         return Ok(ColumnValue::Bool(b));
     }
+    // Same clean float fast path as `py_to_value`; see the comment there.
+    if obj.is_instance_of::<pyo3::types::PyFloat>() {
+        if let Ok(f) = obj.extract::<f64>() {
+            return Ok(ColumnValue::Float64(f));
+        }
+    }
     if let Ok(i) = obj.extract::<i64>() {
         return Ok(ColumnValue::Int64(i));
     }
+    // Same out-of-range integer guard as `py_to_value`; see the comment there.
+    if obj.is_instance_of::<pyo3::types::PyInt>() {
+        return Err(out_of_range_integer_error(obj));
+    }
     if let Ok(f) = obj.extract::<f64>() {
+        if is_integral_scalar(obj) {
+            return Err(out_of_range_integer_error(obj));
+        }
         return Ok(ColumnValue::Float64(f));
     }
     if obj.is_instance_of::<PyBytes>() {
@@ -265,7 +364,8 @@ fn py_to_column_value(obj: &Bound<'_, PyAny>) -> PyResult<ColumnValue> {
             return Ok(ColumnValue::FixedList(bytes));
         }
     }
-    Ok(ColumnValue::Null)
+    // See `py_to_value`: an unrepresentable object must not become a silent NULL.
+    Err(unsupported_value_error(obj))
 }
 
 fn dict_to_column_values(dict: &Bound<'_, PyDict>) -> PyResult<HashMap<String, ColumnValue>> {
@@ -311,7 +411,7 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
         Value::UInt8(i) => Ok((*i as i64).into_py(py)),
         Value::UInt16(i) => Ok((*i as i64).into_py(py)),
         Value::UInt32(i) => Ok((*i as i64).into_py(py)),
-        Value::UInt64(i) => Ok((*i as i64).into_py(py)),
+        Value::UInt64(i) => Ok(i.into_py(py)),
         Value::Float32(f) => Ok((*f as f64).into_py(py)),
         Value::Float64(f) => Ok(f.into_py(py)),
         Value::String(s) => Ok(s.into_py(py)),
@@ -732,76 +832,42 @@ impl ApexStorageImpl {
         )
     }
 
-    /// Get the lock file path for a table
-    #[inline]
-    fn get_lock_path(table_path: &Path) -> PathBuf {
-        table_path.with_extension("apex.lock")
-    }
-
-    /// Acquire a lock on the table (shared for read, exclusive for write).
-    /// Uses retry with exponential backoff (100µs → 200µs → ... → 50ms max total wait).
-    /// This avoids spurious "Database is locked" errors under concurrent load.
-    fn acquire_lock(table_path: &Path, exclusive: bool) -> io::Result<Option<File>> {
-        // Process-local memory databases have no on-disk file to coordinate;
-        // the in-process locks are sufficient and no lock sidecar may be created.
-        if crate::storage::is_memory_path(table_path) {
-            return Ok(None);
-        }
-        let lock_path = Self::get_lock_path(table_path);
-        let lock_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-
-        let max_wait = std::time::Duration::from_secs(30);
-        let mut backoff = std::time::Duration::from_micros(100);
-        let start = std::time::Instant::now();
-
-        loop {
-            let result: io::Result<()> = if exclusive {
-                lock_file.try_lock_exclusive()
-            } else {
-                lock_file
-                    .try_lock_shared()
-                    .map_err(|e| io::Error::new(io::ErrorKind::WouldBlock, e.to_string()))
-            };
-
-            match result {
-                Ok(()) => return Ok(Some(lock_file)),
-                Err(_) if start.elapsed() < max_wait => {
-                    std::thread::sleep(backoff);
-                    backoff = (backoff * 2).min(std::time::Duration::from_millis(5));
-                }
-                Err(e) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        format!(
-                            "Database is locked (waited {}ms): {}",
-                            start.elapsed().as_millis(),
-                            e
-                        ),
-                    ));
-                }
-            }
-        }
+    /// Acquire the table's cross-process lock (shared for read, exclusive for
+    /// write).
+    ///
+    /// Delegates to `storage::cross_process_lock`, which owns the single naming
+    /// rule (`<table>.apex.lock`) and the re-entrancy state shared with the
+    /// executor and the storage write paths, so a nested acquisition on the same
+    /// thread cannot deadlock against itself.
+    fn acquire_lock(
+        table_path: &Path,
+        exclusive: bool,
+    ) -> io::Result<Option<crate::storage::cross_process_lock::LockGuard>> {
+        let guard = if exclusive {
+            crate::storage::cross_process_lock::lock_write(table_path)?
+        } else {
+            crate::storage::cross_process_lock::lock_read(table_path)?
+        };
+        Ok(Some(guard))
     }
 
     #[inline]
-    fn acquire_read_lock(table_path: &Path) -> io::Result<Option<File>> {
+    fn acquire_read_lock(
+        table_path: &Path,
+    ) -> io::Result<Option<crate::storage::cross_process_lock::LockGuard>> {
         Self::acquire_lock(table_path, false)
     }
 
     #[inline]
-    fn acquire_write_lock(table_path: &Path) -> io::Result<Option<File>> {
+    fn acquire_write_lock(
+        table_path: &Path,
+    ) -> io::Result<Option<crate::storage::cross_process_lock::LockGuard>> {
         Self::acquire_lock(table_path, true)
     }
 
-    /// Release a lock (unlock and drop the file handle)
+    /// Release a lock (dropping the guard releases the flock).
     #[inline]
-    fn release_lock(lock_file: File) {
-        let _ = lock_file.unlock();
+    fn release_lock(lock_file: crate::storage::cross_process_lock::LockGuard) {
         drop(lock_file);
     }
 
@@ -1312,13 +1378,46 @@ impl ApexStorageImpl {
     /// cannot see those buffered rows — `store({...})` followed by `store([...])`
     /// silently dropped the single row. Publishing the writer before another route
     /// touches the table keeps the routes in order.
+    /// Publish a backend's buffered rows without rewriting a stale base.
+    ///
+    /// The backend's `save()` rewrites the base file from its
+    /// snapshot, so it is only correct while the file still matches that snapshot
+    /// (`persisted_row_count`). When another process committed in the meantime,
+    /// saving would drop its rows; the buffered rows are then published through
+    /// the id-preserving append sidecar, which readers merge on top of the
+    /// current base. A buffer whose boundary cannot be proven is reported instead
+    /// of silently overwriting the other writer.
+    fn publish_buffered_rows(backend: &TableStorageBackend) -> io::Result<()> {
+        let belief = backend.storage.persisted_row_count();
+        if let Some(on_disk) = backend.storage.on_disk_header_row_count()? {
+            if on_disk != belief {
+                let buffered = backend.storage.rows_buffered_since_snapshot();
+                if buffered > 0
+                    && backend
+                        .storage
+                        .spill_pending_v4_rows_to_delta_from(
+                            backend.storage.buffered_row_count() - buffered,
+                        )?
+                {
+                    return Ok(());
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "another writer changed this table while rows were buffered \
+                     (reload the table and retry)",
+                ));
+            }
+        }
+        backend.save()
+    }
+
     fn persist_schema_stable_memtable(
         &self,
         py: Python<'_>,
         table_path: &Path,
         table_name: &str,
     ) -> PyResult<()> {
-        let backend = {
+        let pending = {
             let guard = self.schema_stable_memtable_writer.read();
             match guard.as_ref() {
                 Some(writer)
@@ -1329,7 +1428,7 @@ impl ApexStorageImpl {
                 _ => None,
             }
         };
-        let Some(backend) = backend else {
+        let Some(backend) = pending else {
             return Ok(());
         };
         *self.schema_stable_memtable_writer.write() = None;
@@ -1339,10 +1438,11 @@ impl ApexStorageImpl {
             // deletion state first: this save rewrites the header and footer from
             // the backend's buffers, and a deletion still deferred in process
             // memory would leave the two describing different row counts.
+            let _cross_process = crate::storage::cross_process_lock::lock_write(table_path)?;
             let _write_guard = crate::storage::table_save_lock::write_lock(table_path);
             let _ = crate::storage::on_demand::apply_pending_deletes(table_path);
-            backend
-                .save()
+
+            Self::publish_buffered_rows(&backend)
                 .map_err(|e| PyIOError::new_err(format!("Failed to flush buffered row: {}", e)))
         })
     }
@@ -1370,7 +1470,13 @@ impl ApexStorageImpl {
             return Ok(());
         }
 
+        let table_path = table_path.to_path_buf();
         py.allow_threads(|| -> PyResult<()> {
+            // The append sidecar is part of this table's committed state, so its
+            // publish takes the same cross-process lock as every other writer.
+            let _cross_process =
+                crate::storage::cross_process_lock::lock_write(&table_path)
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?;
             for backend in backends {
                 backend
                     .save_delta_store()
@@ -1634,6 +1740,16 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
     use arrow::array::*;
     use arrow::datatypes::DataType as ArrowDT;
     use pyo3::types::PyList;
+
+    // A type this converter has no branch for used to fall through to the
+    // generic path and become NULL. Refuse it instead: every caller treats the
+    // error as "use the Arrow path", which decodes the column correctly.
+    if !arrow_bridge::pylist_representable(arr.data_type()) {
+        return Err(pyo3::exceptions::PyTypeError::new_err(format!(
+            "pylist materialization cannot represent {} columns",
+            arr.data_type()
+        )));
+    }
 
     let n = arr.len();
     match arr.data_type() {

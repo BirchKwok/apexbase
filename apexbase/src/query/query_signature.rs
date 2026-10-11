@@ -1143,7 +1143,7 @@ fn parse_numeric_comparison_clause(clause: &str) -> Option<(String, f64, f64)> {
 }
 
 #[inline]
-fn next_up_f64(value: f64) -> f64 {
+pub(crate) fn next_up_f64(value: f64) -> f64 {
     if value.is_nan() || value == f64::INFINITY {
         return value;
     }
@@ -1159,7 +1159,7 @@ fn next_up_f64(value: f64) -> f64 {
 }
 
 #[inline]
-fn next_down_f64(value: f64) -> f64 {
+pub(crate) fn next_down_f64(value: f64) -> f64 {
     if value.is_nan() || value == f64::NEG_INFINITY {
         return value;
     }
@@ -1320,6 +1320,44 @@ fn is_ident_byte(b: u8) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The strict-inequality epsilon bounds, which every scanned range relies on.
+    #[test]
+    fn strict_inequality_bounds_step_to_the_right_side_of_every_value() {
+        // Zero: the step below must be negative, the step above positive. Deriving
+        // them from the bit pattern without special-casing zero yields +4.9e-324 for
+        // both, which made `col < 0` match 0.
+        assert!(next_down_f64(0.0) < 0.0);
+        assert_eq!(next_down_f64(0.0), -f64::from_bits(1));
+        assert!(next_up_f64(0.0) > 0.0);
+        assert_eq!(next_up_f64(0.0), f64::from_bits(1));
+        assert!(next_down_f64(-0.0) < 0.0);
+        assert!(next_up_f64(-0.0) > 0.0);
+
+        // Both directions, both signs: the step is always strict and immediately
+        // adjacent, so an integer row that equals the literal can never slip in.
+        for value in [-1.0e9, -1000.0, -1.5, -0.25, 0.0, 0.25, 1.5, 1000.0, 1.0e9] {
+            let down = next_down_f64(value);
+            let up = next_up_f64(value);
+            assert!(down < value, "{down} !< {value}");
+            assert!(up > value, "{up} !> {value}");
+            assert_eq!(next_up_f64(down), value);
+            assert_eq!(next_down_f64(up), value);
+        }
+
+        // The integer scans consume the bound as `floor(high)`; no integer that
+        // reaches them may satisfy `col < N`, including at and below zero.
+        for literal in [-2.0f64, -1.0, 0.0, 1.0, 2.0] {
+            let high = next_down_f64(literal).floor() as i64;
+            assert!(high < literal as i64, "{literal}: high {high} is not below");
+        }
+
+        // Non-finite inputs pass through untouched.
+        assert_eq!(next_down_f64(f64::NEG_INFINITY), f64::NEG_INFINITY);
+        assert_eq!(next_up_f64(f64::INFINITY), f64::INFINITY);
+        assert!(next_down_f64(f64::NAN).is_nan());
+        assert!(next_up_f64(f64::NAN).is_nan());
+    }
 
     #[test]
     fn test_count_star() {

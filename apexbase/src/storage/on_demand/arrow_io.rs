@@ -255,16 +255,21 @@ impl OnDemandStorage {
                 Some(ColumnData::String { offsets, data }) => {
                     // OPTIMIZATION: build StringArray from &str refs (no per-element String alloc)
                     let count = offsets.len().saturating_sub(1);
+                    let is_null = |i: usize| -> bool {
+                        if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                            let ob = i / 8;
+                            let obit = i % 8;
+                            return ob < nulls[col_idx].len()
+                                && (nulls[col_idx][ob] >> obit) & 1 == 1;
+                        }
+                        false
+                    };
                     if let Some(ref indices) = active_indices {
                         let strings: Vec<Option<&str>> = indices.iter().map(|&i| {
                             if i < count {
                                 // Check null
-                                if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
-                                    let ob = i / 8;
-                                    let obit = i % 8;
-                                    if ob < nulls[col_idx].len() && (nulls[col_idx][ob] >> obit) & 1 == 1 {
-                                        return None;
-                                    }
+                                if is_null(i) {
+                                    return None;
                                 }
                                 let start = offsets[i] as usize;
                                 let end = offsets[i + 1] as usize;
@@ -507,6 +512,74 @@ impl OnDemandStorage {
                         std::str::from_utf8(&dict_data[start..end]).ok()
                     };
 
+                    // The group-by reader asks for dictionary encoding. Decoding a dictionary
+                    // column to plain strings here costs a decode plus (later) a re-hash of every
+                    // value in the executor: 1M rows with a numeric+string key took 9.3 ms clean
+                    // and 38.3 ms after a single DELETE, because the deletion vector bypasses the
+                    // cached-dictionary path and lands on this arm. Emitting the keys directly
+                    // keeps the dictionary alive across deletions.
+                    if dict_encode_strings {
+                        use arrow::array::{DictionaryArray, UInt32Array};
+                        use arrow::datatypes::UInt32Type;
+
+                        let dict_count = dict_offsets.len().saturating_sub(1);
+                        let values = StringArray::from(
+                            (0..dict_count)
+                                .map(|i| {
+                                    let start = dict_offsets[i] as usize;
+                                    let end = dict_offsets[i + 1] as usize;
+                                    if end <= dict_data.len() {
+                                        std::str::from_utf8(&dict_data[start..end]).ok()
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .collect::<Vec<Option<&str>>>(),
+                        );
+                        let key_at = |row_idx: usize| -> Option<u32> {
+                            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                                let ob = row_idx / 8;
+                                let obit = row_idx % 8;
+                                if ob < nulls[col_idx].len()
+                                    && (nulls[col_idx][ob] >> obit) & 1 == 1
+                                {
+                                    return None;
+                                }
+                            }
+                            let raw_idx = indices.get(row_idx).copied().unwrap_or(0);
+                            if raw_idx == 0 {
+                                return None;
+                            }
+                            let dict_idx = raw_idx - 1;
+                            if (dict_idx as usize) >= dict_count {
+                                return None;
+                            }
+                            Some(dict_idx)
+                        };
+                        let keys: Vec<Option<u32>> = if let Some(ref active) = active_indices {
+                            active.iter().map(|&i| key_at(i)).collect()
+                        } else {
+                            (0..active_count).map(key_at).collect()
+                        };
+                        let dict_array = DictionaryArray::<UInt32Type>::try_new(
+                            UInt32Array::from(keys),
+                            Arc::new(values),
+                        )
+                        .map_err(|e| err_data(e.to_string()))?;
+                        let arr_ref: ArrayRef = Arc::new(dict_array);
+                        return Ok((
+                            Field::new(
+                                col_name,
+                                ArrowDataType::Dictionary(
+                                    Box::new(ArrowDataType::UInt32),
+                                    Box::new(ArrowDataType::Utf8),
+                                ),
+                                true,
+                            ),
+                            arr_ref,
+                        ));
+                    }
+
                     let strings: Vec<Option<&str>> = if let Some(ref indices) = active_indices {
                         indices.iter().map(|&i| value_at(i)).collect()
                     } else {
@@ -647,6 +720,74 @@ impl OnDemandStorage {
         let arrow_schema = Arc::new(Schema::new(fields));
         RecordBatch::try_new(arrow_schema, arrays)
             .map_err(|e| err_data(e.to_string()))
+    }
+
+    /// True when the buffers hold appended rows and nothing else.
+    ///
+    /// `v4_base_loaded` tells a tail-only write buffer apart from one that also
+    /// mirrors the loaded base; the pending-row batch builder indexes its null
+    /// bitmaps in whichever space `ids` holds, so only the tail-only case is
+    /// safe to slice out and fold into a fused scan.
+    #[inline]
+    pub(crate) fn pending_tail_available(&self) -> bool {
+        let pending = self.pending_v4_in_memory_rows();
+        // The buffers must hold the appended rows and nothing else: the pending
+        // batch builder indexes the null bitmaps in that same space, and folding
+        // a batch that also carries the loaded base would copy the whole base on
+        // every scan.
+        pending > 0
+            && self.ids.read().len() == pending
+            && !self.v4_base_loaded.load(Ordering::SeqCst)
+            && !self.base_rows_deleted()
+    }
+
+    /// Any base-row deletion: buffered, persisted in the footer, or deferred in
+    /// the process-wide pending map (the Unix delete fast path).
+    ///
+    /// A deletion invalidates the assumption that the persisted row groups are
+    /// unchanged, and the in-place delete path rebuilds the buffered state, so
+    /// fused lanes must stand down while one is present.
+    pub(crate) fn base_rows_deleted(&self) -> bool {
+        if self.deleted.read().iter().any(|byte| *byte != 0) {
+            return true;
+        }
+        if let Some(footer) = self.v4_footer.read().as_ref() {
+            if footer
+                .row_groups
+                .iter()
+                .any(|group| group.deletion_count > 0)
+            {
+                return true;
+            }
+        }
+        global_pending_deletes()
+            .read()
+            .map(|map| {
+                map.as_ref()
+                    .is_some_and(|map| map.contains_key(&self.path))
+            })
+            .unwrap_or(false)
+    }
+
+    /// Arrow batch of the buffered appended rows, or `None` when there are none.
+    ///
+    /// Fused lanes scan the persisted row groups, so an overlay of buffered
+    /// appends has to be folded from this batch. The buffers may also mirror the
+    /// loaded base; the tail is then the last `pending` rows of that view, which
+    /// Arrow slices without copying.
+    pub(crate) fn pending_tail_to_arrow(
+        &self,
+        column_names: &[&str],
+    ) -> io::Result<Option<RecordBatch>> {
+        let pending = self.pending_v4_in_memory_rows();
+        if pending == 0 {
+            return Ok(None);
+        }
+        let batch = self.pending_v4_to_arrow_batch(Some(column_names), false)?;
+        if batch.num_rows() <= pending {
+            return Ok(Some(batch));
+        }
+        Ok(Some(batch.slice(batch.num_rows() - pending, pending)))
     }
 
     /// Build an Arrow batch from only the V4 in-memory append area.
@@ -1396,21 +1537,32 @@ impl OnDemandStorage {
         start_row: usize,
         row_count: Option<usize>,
     ) -> io::Result<HashMap<String, ColumnData>> {
-        // The row-group scan and `read_ids` both emit the physical base rows
-        // (all persisted rows, deletion vectors not applied), so the base/delta
-        // boundary must use that same physical count. `header.row_count` counts
-        // active rows and would otherwise drop tail rows and shift the delta.
-        let base_rows = match self.persisted_physical_base_row_count()? {
-            Some(physical) => physical,
-            None => self.header.read().row_count as usize,
-        };
-        let header = self.header.read();
-        let schema = self.schema.read();
+        let header_rows = self.header.read().row_count as usize;
         let column_index = self.column_index.read();
+        // LOCK-FREE: use cached_footer_offset for V4 detection
+        let v4_mode =
+            column_index.is_empty() && self.cached_footer_offset.load(Ordering::Relaxed) > 0;
+        drop(column_index);
 
-        let delta_rows = self.delta_row_count();
-        let total_rows = base_rows + delta_rows;
-        
+        // The row-group scan, `read_ids` and the delta reader all emit the physical
+        // base rows (deletion vectors not applied), so the segment boundaries must
+        // come from the segments themselves: `header.row_count` counts active rows
+        // and would drop tail rows and shift the delta.
+        let segments = if v4_mode {
+            self.visible_read_segments()?
+        } else {
+            ReadSegments {
+                base_rows: header_rows,
+                delta_rows: self.delta_row_count(),
+                pending_rows: 0,
+                buffer_base_rows: 0,
+            }
+        };
+        let base_rows = segments.base_rows;
+        let delta_rows = segments.delta_rows;
+        let total_rows = segments.total_rows();
+
+        let schema = self.schema.read();
         let actual_start = start_row.min(total_rows);
         let actual_count = row_count
             .map(|c| c.min(total_rows - actual_start))
@@ -1451,18 +1603,19 @@ impl OnDemandStorage {
             0
         };
         
-        // V4 fast path: read from in-memory columns (no mmap column index)
-        // LOCK-FREE: use cached_footer_offset for V4 detection
-        let v4_mode = column_index.is_empty() && self.cached_footer_offset.load(Ordering::Relaxed) > 0;
-        drop(column_index);
         drop(schema);
-        drop(header);
-        
+
         let mut result = HashMap::new();
-        
-        if v4_mode && base_count > 0 && self.has_v4_in_memory_data() {
+
+        // The buffer holds the base only when its columns mirror it; a tail-only
+        // append buffer starts at the first appended row, and slicing it as the
+        // base would hide every persisted row.
+        let base_from_buffer = v4_mode
+            && base_count > 0
+            && segments.buffer_base_rows >= base_start + base_count;
+
+        if base_from_buffer {
             // Use in-memory columns if available (write buffer path)
-            
             let schema = self.schema.read();
             let columns = self.columns.read();
             for &col_idx in &col_indices {
@@ -1626,6 +1779,39 @@ impl OnDemandStorage {
             }
         }
         
+        // Buffered rows appended after the persisted base (and after any delta
+        // rows) close the visible window. They exist only in the write buffer, so
+        // neither the row-group scan nor the delta reader above can reach them.
+        let pending_segment_start = base_rows + delta_rows;
+        let window_end = actual_start + actual_count;
+        if segments.pending_rows > 0 && window_end > pending_segment_start {
+            let pending_window_start = actual_start.max(pending_segment_start);
+            let pending_len = window_end - pending_window_start;
+            let buffer_start = segments.buffer_base_rows + pending_window_start - pending_segment_start;
+            let buffer_end = buffer_start + pending_len;
+            let schema = self.schema.read();
+            let columns = self.columns.read();
+            for &col_idx in &col_indices {
+                let (col_name, col_type) = &schema.columns[col_idx];
+                let slice = if col_idx < columns.len() && columns[col_idx].len() >= buffer_end {
+                    columns[col_idx].slice_range(buffer_start, buffer_end)
+                } else {
+                    Self::create_default_column(*col_type, pending_len)
+                };
+                if let Some(base_col) = result.get_mut(col_name) {
+                    base_col.append(&slice);
+                } else {
+                    // No earlier row of this column was read: pad up to the window.
+                    let mut padded = Self::create_default_column(
+                        *col_type,
+                        pending_window_start - actual_start,
+                    );
+                    padded.append(&slice);
+                    result.insert(col_name.clone(), padded);
+                }
+            }
+        }
+
         Ok(result)
     }
 
@@ -1651,141 +1837,236 @@ impl OnDemandStorage {
     /// Returns a Vec<bool> where true means the value is NULL
     /// Reads from file via mmap if not loaded in memory
     pub fn get_null_mask(&self, col_name: &str, start_row: usize, row_count: usize) -> Vec<bool> {
-        // Only use in-memory nulls if available — mmap path handles nulls separately
         let schema = self.schema.read();
         let mut result = vec![false; row_count];
-        
-        if let Some(col_idx) = schema.get_index(col_name) {
-            // First check in-memory nulls
-            let nulls = self.nulls.read();
-            if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
-                let null_bitmap = &nulls[col_idx];
-                for i in 0..row_count {
-                    let row_idx = start_row + i;
-                    let byte_idx = row_idx / 8;
-                    let bit_idx = row_idx % 8;
-                    if byte_idx < null_bitmap.len() {
-                        result[i] = (null_bitmap[byte_idx] & (1 << bit_idx)) != 0;
+
+        let Some(col_idx) = schema.get_index(col_name) else {
+            return result;
+        };
+        drop(schema);
+
+        // V4 composes `[persisted base][delta file][buffered pending]`. The
+        // buffered bitmap holds the buffer's own rows — the base prefix for a
+        // loaded base, the pending tail otherwise — so each segment takes its NULL
+        // bits from the store that actually holds it. The delta sidecar has no
+        // NULL section at all (`spill_pending_v4_rows_to_delta` refuses NULL rows).
+        if self.is_v4_format() {
+            let Ok(segments) = self.visible_read_segments() else {
+                return result;
+            };
+            let window_end = start_row + row_count;
+
+            // Base segment. A buffer that mirrors the base carries its NULL bits;
+            // a tail-only buffer starts after the base and an empty bitmap has to
+            // fall through to the row groups anyway (schema evolution marks the
+            // rows of a column a row group predates as NULL).
+            let base_end = window_end.min(segments.base_rows);
+            if start_row < base_end {
+                let base_len = base_end - start_row;
+                let mut buffered = false;
+                if segments.buffer_base_rows >= base_end {
+                    let nulls = self.nulls.read();
+                    if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                        fill_null_mask(&nulls[col_idx], start_row, &mut result[..base_len]);
+                        buffered = true;
                     }
                 }
-            } else {
-                drop(nulls);
-                // V4 mmap path: read null bitmap from RG data
-                let header = self.header.read();
-                if header.footer_offset > 0 {
-                    drop(header);
-                    drop(schema);
-                    if let Ok(Some(footer)) = self.get_or_load_footer() {
-                        let f_schema = &footer.schema;
-                        let f_col_count = f_schema.column_count();
-                        if let Some(file_guard) = self.file.try_read() {
-                            if let Some(file) = file_guard.as_ref() {
-                                let mut mmap_guard = self.mmap_cache.write();
-                                if let Ok(mmap_ref) = mmap_guard.get_or_create(file) {
-                                    let mut global_row = 0usize;
-                                    for rg_meta in &footer.row_groups {
-                                        let rg_rows = rg_meta.row_count as usize;
-                                        let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
-                                        if rg_end > mmap_ref.len() { break; }
-                                        let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
-                                        // Check compression flag at RG header byte 28, encoding version at byte 29
-                                        let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
-                                        let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
-                                        let decompressed_buf: Option<Vec<u8>> = match decompress_rg_body(compress_flag, &rg_bytes[32..]) {
-                                            Ok(v) => v,
-                                            Err(_) => break,
-                                        };
-                                        let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
-                                        let mut pos = rg_id_section_len(
-                                            rg_rows,
-                                            rg_bytes
-                                                .get(30)
-                                                .copied()
-                                                .unwrap_or(RG_IDS_PLAIN),
-                                        );
-                                        let del_vec_len = (rg_rows + 7) / 8;
-                                        pos += del_vec_len; // skip deletion vector
-                                        let null_bitmap_len = (rg_rows + 7) / 8;
-                                        // Navigate to the right column's null bitmap
-                                        let mut column_in_rg = false;
-                                        for ci in 0..f_col_count {
-                                            if pos + null_bitmap_len > body.len() { break; }
-                                            let null_bytes = &body[pos..pos + null_bitmap_len];
-                                            pos += null_bitmap_len;
-                                            if ci == col_idx {
-                                                column_in_rg = true;
-                                                // Extract null bits for rows in range
-                                                for ri in 0..rg_rows {
-                                                    let global_ri = global_row + ri;
-                                                    if global_ri >= start_row && global_ri < start_row + row_count {
-                                                        let out_i = global_ri - start_row;
-                                                        let b = ri / 8; let bit = ri % 8;
-                                                        if b < null_bytes.len() && (null_bytes[b] >> bit) & 1 != 0 {
-                                                            result[out_i] = true;
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            // Skip column data (encoding-aware)
-                                            let ct = f_schema.columns[ci].1;
-                                            let consumed = if encoding_version >= 1 {
-                                                skip_column_encoded(&body[pos..], ct)
-                                            } else {
-                                                ColumnData::skip_bytes_typed(&body[pos..], ct)
-                                            };
-                                            if let Ok(c) = consumed {
-                                                pos += c;
-                                            } else { break; }
-                                        }
-                                        if !column_in_rg {
-                                            // Schema evolution: this Row Group was written
-                                            // before the column existed, so it stores neither
-                                            // a value nor a null bit for it. Without this the
-                                            // mask stayed "not null" and the reader published
-                                            // the empty/zero padding as a real value — and
-                                            // only when a delta row forced this reader
-                                            // instead of the null-aware Arrow path.
-                                            for ri in 0..rg_rows {
-                                                let global_ri = global_row + ri;
-                                                if global_ri >= start_row && global_ri < start_row + row_count {
-                                                    result[global_ri - start_row] = true;
-                                                }
-                                            }
-                                        }
-                                        global_row += rg_rows;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    return result;
+                if !buffered {
+                    let rg = self.rg_null_mask(col_idx, start_row, base_len);
+                    result[..base_len].copy_from_slice(&rg);
                 }
-                drop(header);
-                // V3: Read null bitmap from file via column index
-                let column_index = self.column_index.read();
-                if col_idx < column_index.len() {
-                    let index_entry = &column_index[col_idx];
-                    let null_len = index_entry.null_length as usize;
-                    if null_len > 0 {
-                        if let Some(file) = self.file.read().as_ref() {
-                            let mut mmap_cache = self.mmap_cache.write();
-                            let mut null_bitmap = vec![0u8; null_len];
-                            if mmap_cache.read_at(file, &mut null_bitmap, index_entry.null_offset).is_ok() {
-                                for i in 0..row_count {
-                                    let row_idx = start_row + i;
-                                    let byte_idx = row_idx / 8;
-                                    let bit_idx = row_idx % 8;
-                                    if byte_idx < null_bitmap.len() {
-                                        result[i] = (null_bitmap[byte_idx] & (1 << bit_idx)) != 0;
-                                    }
-                                }
-                            }
-                        }
+            }
+
+            // Pending segment: buffered rows after the persisted base and delta.
+            let pending_start = segments.base_rows + segments.delta_rows;
+            if window_end > pending_start && segments.pending_rows > 0 {
+                let row_start = start_row.max(pending_start);
+                let out_start = row_start - start_row;
+                let len = window_end - row_start;
+                let nulls = self.nulls.read();
+                if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+                    let buffer_start = segments.buffer_base_rows + row_start - pending_start;
+                    fill_null_mask(
+                        &nulls[col_idx],
+                        buffer_start,
+                        &mut result[out_start..out_start + len],
+                    );
+                }
+            }
+            return result;
+        }
+
+        // In-memory tables (and V3 files without a footer) keep their NULL bits in
+        // the buffers, else in the column index.
+        let nulls = self.nulls.read();
+        if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
+            fill_null_mask(&nulls[col_idx], start_row, &mut result);
+            return result;
+        }
+        drop(nulls);
+        let column_index = self.column_index.read();
+        if col_idx < column_index.len() {
+            let index_entry = &column_index[col_idx];
+            let null_len = index_entry.null_length as usize;
+            if null_len > 0 {
+                if let Some(file) = self.file.read().as_ref() {
+                    let mut mmap_cache = self.mmap_cache.write();
+                    let mut null_bitmap = vec![0u8; null_len];
+                    if mmap_cache.read_at(file, &mut null_bitmap, index_entry.null_offset).is_ok() {
+                        fill_null_mask(&null_bitmap, start_row, &mut result);
                     }
                 }
             }
         }
         result
+    }
+
+    /// NULL bits of the persisted base rows `[start_row, start_row + row_count)`,
+    /// read straight from the row-group NULL bitmaps. Row groups written before a
+    /// column existed store neither a value nor a null bit for it, so their rows
+    /// are NULL for that column.
+    fn rg_null_mask(&self, col_idx: usize, start_row: usize, row_count: usize) -> Vec<bool> {
+        let mut result = vec![false; row_count];
+        let Some(footer) = self.get_or_load_footer().ok().flatten() else {
+            return result;
+        };
+        let f_schema = &footer.schema;
+        let f_col_count = f_schema.column_count();
+        let Some(file_guard) = self.file.try_read() else {
+            return result;
+        };
+        let Some(file) = file_guard.as_ref() else {
+            return result;
+        };
+        let mut mmap_guard = self.mmap_cache.write();
+        let Ok(mmap_ref) = mmap_guard.get_or_create(file) else {
+            return result;
+        };
+        let mut global_row = 0usize;
+        for rg_meta in &footer.row_groups {
+            let rg_rows = rg_meta.row_count as usize;
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() { break; }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            // Check compression flag at RG header byte 28, encoding version at byte 29
+            let compress_flag = if rg_bytes.len() >= 32 { rg_bytes[28] } else { RG_COMPRESS_NONE };
+            let encoding_version = if rg_bytes.len() >= 32 { rg_bytes[29] } else { 0 };
+            let decompressed_buf = match self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            ) {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let body: &[u8] = decompressed_buf
+                .as_ref()
+                .map(|buf| buf.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
+            let mut pos = rg_id_section_len(
+                rg_rows,
+                rg_bytes
+                    .get(30)
+                    .copied()
+                    .unwrap_or(RG_IDS_PLAIN),
+            );
+            let del_vec_len = (rg_rows + 7) / 8;
+            pos += del_vec_len; // skip deletion vector
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            // Navigate to the right column's null bitmap
+            let mut column_in_rg = false;
+            for ci in 0..f_col_count {
+                if pos + null_bitmap_len > body.len() { break; }
+                let null_bytes = &body[pos..pos + null_bitmap_len];
+                pos += null_bitmap_len;
+                if ci == col_idx {
+                    column_in_rg = true;
+                    // Extract null bits for rows in range
+                    for ri in 0..rg_rows {
+                        let global_ri = global_row + ri;
+                        if global_ri >= start_row && global_ri < start_row + row_count {
+                            let out_i = global_ri - start_row;
+                            let b = ri / 8; let bit = ri % 8;
+                            if b < null_bytes.len() && (null_bytes[b] >> bit) & 1 != 0 {
+                                result[out_i] = true;
+                            }
+                        }
+                    }
+                }
+                // Skip column data (encoding-aware)
+                let ct = f_schema.columns[ci].1;
+                let consumed = if encoding_version == RG_ENCODING_VERSION {
+                    skip_column_encoded(&body[pos..], ct)
+                } else {
+                    ColumnData::skip_bytes_typed(&body[pos..], ct)
+                };
+                if let Ok(c) = consumed {
+                    pos += c;
+                } else { break; }
+            }
+            if !column_in_rg {
+                // Schema evolution: this Row Group was written before the column
+                // existed. Without this the mask stayed "not null" and the reader
+                // published the empty/zero padding as a real value — and only when
+                // a delta row forced this reader instead of the null-aware Arrow path.
+                for ri in 0..rg_rows {
+                    let global_ri = global_row + ri;
+                    if global_ri >= start_row && global_ri < start_row + row_count {
+                        result[global_ri - start_row] = true;
+                    }
+                }
+            }
+            global_row += rg_rows;
+        }
+        result
+    }
+
+    /// Scatter the requested columns of the composed visible row space.
+    ///
+    /// The caller supplies the already-computed matching row indices (in that
+    /// same visible space), so both filtered readers share the read/scatter half.
+    fn read_columns_filtered_visible(
+        &self,
+        column_names: Option<&[&str]>,
+        matching_indices: &[usize],
+    ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
+        if matching_indices.is_empty() {
+            return Ok((HashMap::new(), Vec::new()));
+        }
+        // Both buffer-only filtered readers skip deleted rows; the composed space
+        // has to do the same: the persisted vector covers the base rows, and the
+        // write buffer keeps its own bitmap for the rows it holds.
+        let segments = self.visible_read_segments()?;
+        let persisted = self.persisted_deletion_bitmap()?;
+        let buffered_deleted = self.deleted.read().clone();
+        let kept: Vec<usize> = matching_indices
+            .iter()
+            .copied()
+            .filter(|&row| {
+                let (bitmap, index) = if row < segments.base_rows {
+                    (&persisted, row)
+                } else if row < segments.base_rows + segments.delta_rows {
+                    return true;
+                } else {
+                    (
+                        &buffered_deleted,
+                        segments.buffer_base_rows + row - segments.base_rows - segments.delta_rows,
+                    )
+                };
+                let byte = index / 8;
+                byte >= bitmap.len() || (bitmap[byte] >> (index % 8)) & 1 == 0
+            })
+            .collect();
+        if kept.is_empty() {
+            return Ok((HashMap::new(), Vec::new()));
+        }
+        let mut columns = self.read_columns(column_names, 0, None)?;
+        let mut result = HashMap::with_capacity(columns.len());
+        for (name, data) in columns.drain() {
+            result.insert(name, data.filter_by_indices(&kept));
+        }
+        Ok((result, kept))
     }
 
     /// Read columns with predicate pushdown - filter rows at storage level
@@ -1803,10 +2084,24 @@ impl OnDemandStorage {
         filter_op: &str,
         filter_value: f64,
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
+
         let is_v4 = self.is_v4_format();
         // V4 without in-memory data: use mmap path
         if is_v4 && !self.has_v4_in_memory_data() {
             return self.read_columns_filtered_mmap(column_names, filter_column, filter_op, filter_value);
+        }
+        // A tail-only write buffer holds appended rows alone, so the buffer-only
+        // reader below would index it as the whole table and hide every persisted
+        // row. Compose the visible space instead.
+        if is_v4 && !self.v4_base_loaded.load(Ordering::SeqCst) {
+            let filter = self.read_columns(Some(&[filter_column]), 0, None)?;
+            let Some(filter_data) = filter.get(filter_column) else {
+                return Ok((HashMap::new(), Vec::new()));
+            };
+            return self.read_columns_filtered_visible(
+                column_names,
+                &numeric_filter_indices(filter_data, filter_op, filter_value),
+            );
         }
         
         let header = self.header.read();
@@ -1831,38 +2126,7 @@ impl OnDemandStorage {
         let filter_data = self.read_column_auto(filter_col_idx, filter_col_type, 0, total_rows, total_rows, is_v4)?;
         
         // Apply filter and collect matching row indices
-        let matching_indices: Vec<usize> = match &filter_data {
-            ColumnData::Int64(values) => {
-                let filter_val = filter_value as i64;
-                values.iter().enumerate()
-                    .filter(|(_, &v)| match filter_op {
-                        ">=" => v >= filter_val,
-                        ">" => v > filter_val,
-                        "<=" => v <= filter_val,
-                        "<" => v < filter_val,
-                        "=" | "==" => v == filter_val,
-                        "!=" | "<>" => v != filter_val,
-                        _ => true,
-                    })
-                    .map(|(i, _)| i)
-                    .collect()
-            }
-            ColumnData::Float64(values) => {
-                values.iter().enumerate()
-                    .filter(|(_, &v)| match filter_op {
-                        ">=" => v >= filter_value,
-                        ">" => v > filter_value,
-                        "<=" => v <= filter_value,
-                        "<" => v < filter_value,
-                        "=" | "==" => (v - filter_value).abs() < f64::EPSILON,
-                        "!=" | "<>" => (v - filter_value).abs() >= f64::EPSILON,
-                        _ => true,
-                    })
-                    .map(|(i, _)| i)
-                    .collect()
-            }
-            _ => (0..total_rows).collect(),
-        };
+        let matching_indices: Vec<usize> = numeric_filter_indices(&filter_data, filter_op, filter_value);
 
         if matching_indices.is_empty() {
             return Ok((HashMap::new(), Vec::new()));
@@ -2004,65 +2268,45 @@ impl OnDemandStorage {
         filter_value: &str,
         filter_eq: bool,  // true = equals, false = not equals
     ) -> io::Result<(HashMap<String, ColumnData>, Vec<usize>)> {
+
         // V4 FAST PATH: scan in-memory columns directly (no disk I/O)
         // LOCK-FREE: use cached_footer_offset for V4 detection
         {
             if self.cached_footer_offset.load(Ordering::Relaxed) > 0 {
                 if self.has_v4_in_memory_data() {
+                    // A tail-only write buffer holds appended rows alone: compose
+                    // the visible space instead of indexing the buffer as the
+                    // whole table (see `read_columns_filtered`).
+                    if !self.v4_base_loaded.load(Ordering::SeqCst) {
+                        let filter = self.read_columns(Some(&[filter_column]), 0, None)?;
+                        let Some(filter_data) = filter.get(filter_column) else {
+                            return Ok((HashMap::new(), Vec::new()));
+                        };
+                        return self.read_columns_filtered_visible(
+                            column_names,
+                            &string_filter_indices(filter_data, filter_value, filter_eq, None),
+                        );
+                    }
                     // In-memory fast path
                     let schema = self.schema.read();
                     let columns = self.columns.read();
                     let deleted = self.deleted.read();
-                    let total_rows = self.ids.read().len();
-                    
                     let filter_col_idx = match schema.get_index(filter_column) {
                         Some(idx) => idx,
                         None => return Ok((HashMap::new(), Vec::new())),
                     };
                     
-                    let filter_bytes = filter_value.as_bytes();
-                    let filter_len = filter_bytes.len();
                     let has_deleted = deleted.iter().any(|&b| b != 0);
-                    
-                    let mut matching_indices: Vec<usize> = Vec::with_capacity(1024);
-                    
-                    if filter_col_idx < columns.len() {
-                        if let ColumnData::String { offsets, data } = &columns[filter_col_idx] {
-                            let count = offsets.len().saturating_sub(1).min(total_rows);
-                            let first_byte = filter_bytes.first().copied();
-                            
-                            for i in 0..count {
-                                if has_deleted {
-                                    let byte_idx = i / 8;
-                                    let bit_idx = i % 8;
-                                    if byte_idx < deleted.len() && (deleted[byte_idx] >> bit_idx) & 1 != 0 {
-                                        continue;
-                                    }
-                                }
-                                
-                                let start = offsets[i] as usize;
-                                let end = offsets[i + 1] as usize;
-                                let str_len = end - start;
-                                
-                                if str_len != filter_len {
-                                    if !filter_eq { matching_indices.push(i); }
-                                    continue;
-                                }
-                                
-                                if let Some(fb) = first_byte {
-                                    if start < data.len() && data[start] != fb {
-                                        if !filter_eq { matching_indices.push(i); }
-                                        continue;
-                                    }
-                                }
-                                
-                                let matches = end <= data.len() && &data[start..end] == filter_bytes;
-                                if (filter_eq && matches) || (!filter_eq && !matches) {
-                                    matching_indices.push(i);
-                                }
-                            }
-                        }
-                    }
+                    let matching_indices: Vec<usize> = if filter_col_idx < columns.len() {
+                        string_filter_indices(
+                            &columns[filter_col_idx],
+                            filter_value,
+                            filter_eq,
+                            has_deleted.then_some(deleted.as_slice()),
+                        )
+                    } else {
+                        Vec::new()
+                    };
                     
                     if matching_indices.is_empty() {
                         return Ok((HashMap::new(), Vec::new()));
@@ -2698,6 +2942,13 @@ impl OnDemandStorage {
         col_name: &str,
     ) -> io::Result<Option<ahash::AHashMap<Box<str>, u64>>> {
         if self.has_pending_deltas() || self.delta_row_count() > 0 {
+            return Ok(None);
+        }
+        // A tail-only write buffer holds appended rows alone while `read_ids`
+        // composes the persisted base in front of them, so the buffer columns
+        // cannot be zipped with those IDs. Decline and let the caller read the
+        // merged view instead of publishing a misaligned map.
+        if self.has_v4_in_memory_data() && !self.v4_base_loaded.load(Ordering::SeqCst) {
             return Ok(None);
         }
 
@@ -3396,6 +3647,7 @@ impl OnDemandStorage {
         column_name: &str,
         row_indices: &[usize],
     ) -> io::Result<ColumnData> {
+
         let is_v4 = self.is_v4_format();
         
         let schema = self.schema.read();
@@ -3410,6 +3662,17 @@ impl OnDemandStorage {
         let total_rows = header.row_count as usize;
         drop(schema);
         drop(header);
+
+        // A tail-only write buffer holds appended rows alone, so the buffer-only
+        // scatter below would read a visible index as a buffer index and return the
+        // wrong rows. Compose the visible space instead.
+        if is_v4 && self.has_v4_in_memory_data() && !self.v4_base_loaded.load(Ordering::SeqCst) {
+            let mut columns = self.read_columns(Some(&[column_name]), 0, None)?;
+            return Ok(match columns.remove(column_name) {
+                Some(data) => data.filter_by_indices(row_indices),
+                None => Self::create_default_column(col_type, row_indices.len()),
+            });
+        }
 
         self.read_column_scattered_auto(col_idx, col_type, row_indices, total_rows, is_v4)
     }
@@ -3487,6 +3750,188 @@ impl OnDemandStorage {
         }
     }
 
+    /// The visible row composition every merged reader has to emit, in physical
+    /// order: `[persisted base rows][delta-file rows][buffered pending rows]`.
+    ///
+    /// The row-group scan and the delta reader each cover one segment; rows
+    /// appended since the base was persisted only exist in the write buffer, and
+    /// they are *not* part of the persisted base even though `header.row_count`
+    /// counts them while the buffer mirrors the base. A tail-only buffer (what
+    /// `spill_pending_v4_rows_to_delta` leaves behind) holds pending rows alone,
+    /// so the base segment has to be read from the mmap row groups.
+    pub(crate) fn visible_read_segments(&self) -> io::Result<ReadSegments> {
+        let base_rows = self.persisted_row_group_rows()?;
+        let buffer_rows = self.ids.read().len();
+        let pending_rows = self.pending_v4_in_memory_rows();
+        // The buffer prefix mirrors the base only when its *columns* were loaded
+        // too; `ensure_ids_loaded` fills `ids` on its own for resumable reads.
+        let mirrored = self.v4_base_loaded.load(Ordering::SeqCst) && self.has_v4_in_memory_data();
+        Ok(ReadSegments {
+            base_rows,
+            delta_rows: self.delta_row_count(),
+            pending_rows,
+            buffer_base_rows: if mirrored {
+                buffer_rows.saturating_sub(pending_rows)
+            } else {
+                0
+            },
+        })
+    }
+
+}
+
+/// Visible row composition of a V4 table (see [`OnDemandStorage::visible_read_segments`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadSegments {
+    /// Persisted row-group rows (deletion vectors not applied).
+    pub base_rows: usize,
+    /// Rows in the append-only `.delta` sidecar.
+    pub delta_rows: usize,
+    /// Buffered rows beyond the persisted base.
+    pub pending_rows: usize,
+    /// Leading rows of the write buffer that mirror the persisted base.
+    pub buffer_base_rows: usize,
+}
+
+impl ReadSegments {
+    #[inline]
+    pub(crate) fn total_rows(&self) -> usize {
+        self.base_rows + self.delta_rows + self.pending_rows
+    }
+}
+
+/// Expand packed NULL bits starting at `offset` into `out` (`true` means NULL).
+fn fill_null_mask(bitmap: &[u8], offset: usize, out: &mut [bool]) {
+    for (i, slot) in out.iter_mut().enumerate() {
+        let row = offset + i;
+        let byte = row / 8;
+        if byte < bitmap.len() {
+            *slot = (bitmap[byte] >> (row % 8)) & 1 != 0;
+        }
+    }
+}
+
+/// Row indices of `data` matching a numeric comparison (the single source for the
+/// filtered readers and their composed fallback).
+fn numeric_filter_indices(data: &ColumnData, op: &str, value: f64) -> Vec<usize> {
+    match data {
+        ColumnData::Int64(values) => {
+            let wanted = value as i64;
+            values
+                .iter()
+                .enumerate()
+                .filter(|(_, &v)| match op {
+                    ">=" => v >= wanted,
+                    ">" => v > wanted,
+                    "<=" => v <= wanted,
+                    "<" => v < wanted,
+                    "=" | "==" => v == wanted,
+                    "!=" | "<>" => v != wanted,
+                    _ => true,
+                })
+                .map(|(i, _)| i)
+                .collect()
+        }
+        ColumnData::Float64(values) => values
+            .iter()
+            .enumerate()
+            .filter(|(_, &v)| match op {
+                ">=" => v >= value,
+                ">" => v > value,
+                "<=" => v <= value,
+                "<" => v < value,
+                "=" | "==" => (v - value).abs() < f64::EPSILON,
+                "!=" | "<>" => (v - value).abs() >= f64::EPSILON,
+                _ => true,
+            })
+            .map(|(i, _)| i)
+            .collect(),
+        other => (0..other.len()).collect(),
+    }
+}
+
+/// Row indices of `data` matching a string comparison. NULL cells never match,
+/// for equality and inequality alike. `deleted` optionally masks buffer-space
+/// rows (the loaded-base fast path keeps its own deletion bitmap).
+fn string_filter_indices(
+    data: &ColumnData,
+    value: &str,
+    eq: bool,
+    deleted: Option<&[u8]>,
+) -> Vec<usize> {
+    let wanted = value.as_bytes();
+    let matches = |bytes: &[u8]| bytes == wanted;
+    let kept = |i: usize| {
+        deleted
+            .map(|bitmap| {
+                let byte = i / 8;
+                byte >= bitmap.len() || (bitmap[byte] >> (i % 8)) & 1 == 0
+            })
+            .unwrap_or(true)
+    };
+    match data {
+        ColumnData::String {
+            offsets,
+            data: bytes,
+        } => {
+            let count = offsets.len().saturating_sub(1);
+            let first = wanted.first().copied();
+            (0..count)
+                .filter(|&i| {
+                    if !kept(i) {
+                        return false;
+                    }
+                    let start = offsets[i] as usize;
+                    let end = offsets[i + 1] as usize;
+                    if end > bytes.len() || start > end {
+                        return !eq;
+                    }
+                    let cell = &bytes[start..end];
+                    if cell.len() != wanted.len() {
+                        return !eq;
+                    }
+                    if let Some(first) = first {
+                        if cell.first().copied() != Some(first) {
+                            return !eq;
+                        }
+                    }
+                    matches(cell) == eq
+                })
+                .collect()
+        }
+        ColumnData::StringDict {
+            indices,
+            dict_offsets,
+            dict_data,
+        } => (0..indices.len())
+            .filter(|&i| {
+                if !kept(i) {
+                    return false;
+                }
+                let code = indices[i] as usize;
+                // Dictionary code 0 is the NULL slot, which never matches.
+                if code == 0 || code + 1 >= dict_offsets.len() {
+                    return false;
+                }
+                let start = dict_offsets[code] as usize;
+                let end = dict_offsets[code + 1] as usize;
+                if end > dict_data.len() || start > end {
+                    return !eq;
+                }
+                let cell = &dict_data[start..end];
+                if cell.len() != wanted.len() {
+                    return !eq;
+                }
+                if let Some(first) = wanted.first().copied() {
+                    if cell.first().copied() != Some(first) {
+                        return !eq;
+                    }
+                }
+                matches(cell) == eq
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Physical persisted rows across the footer's row groups.

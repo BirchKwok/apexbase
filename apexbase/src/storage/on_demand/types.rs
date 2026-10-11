@@ -595,6 +595,21 @@ impl ColumnData {
         }
     }
 
+    /// Element count of a fixed-size vector column (`None` when unknown/empty).
+    ///
+    /// One table column has one established dimension: every row of every row
+    /// group must carry it, otherwise the fixed stride no longer describes the
+    /// data. Writers compare against this before appending.
+    #[inline]
+    pub fn vector_dim(&self) -> Option<u32> {
+        match self {
+            ColumnData::FixedList { dim, .. }
+            | ColumnData::Float16List { dim, .. }
+            | ColumnData::QuantizedList { dim, .. } => (*dim > 0).then_some(*dim),
+            _ => None,
+        }
+    }
+
     #[inline]
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -1396,12 +1411,16 @@ impl ColumnData {
                 }
             }
             (ColumnData::FixedList { data, dim }, ColumnData::FixedList { data: other_data, dim: other_dim }) => {
+                // A fixed stride describes the whole buffer: appending a
+                // different dimension would misalign every following row, so a
+                // mismatch is refused here (writers reject it with an error
+                // before this point).
                 if *dim == 0 && *other_dim > 0 { *dim = *other_dim; }
-                data.extend_from_slice(other_data);
+                if *dim == *other_dim { data.extend_from_slice(other_data); }
             }
             (ColumnData::Float16List { data, dim }, ColumnData::Float16List { data: other_data, dim: other_dim }) => {
                 if *dim == 0 && *other_dim > 0 { *dim = *other_dim; }
-                data.extend_from_slice(other_data);
+                if *dim == *other_dim { data.extend_from_slice(other_data); }
             }
             (ColumnData::QuantizedList { data, dim, codec },
              ColumnData::QuantizedList { data: other_data, dim: other_dim, codec: other_codec })

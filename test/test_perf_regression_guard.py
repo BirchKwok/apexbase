@@ -113,6 +113,25 @@ def test_qps_metrics_use_higher_is_better_semantics(guard):
     assert by_name["Q/s (single thread)"]["regressed"] is False
 
 
+def test_rows_per_second_metrics_use_higher_is_better_semantics(guard):
+    """A write-throughput metric must not be read as a latency."""
+    base = _report({"Mixed: writer rows/s (4 writers)": 4000.0})
+
+    dropped = guard.compare_reports(
+        base,
+        _report({"Mixed: writer rows/s (4 writers)": 3000.0}),
+        relative_threshold=0.15,
+    )
+    assert dropped[0]["regressed"] is True
+
+    improved = guard.compare_reports(
+        base,
+        _report({"Mixed: writer rows/s (4 writers)": 6000.0}),
+        relative_threshold=0.15,
+    )
+    assert improved[0]["regressed"] is False
+
+
 def test_missing_metric_is_an_error(guard):
     with pytest.raises(guard.ReportError, match="missing metrics"):
         guard.compare_reports(
@@ -473,8 +492,48 @@ def test_canary_with_qps_does_not_corrupt_recreated_table(benchmark):
     )
     results = canary.run_canary(rows=2000, warmup=1, iterations=1)
     qps = [row for row in results if row["category"] == "ApexBase Q/s"]
-    assert len(qps) == 2
+    assert len(qps) == len(canary.qps_metric_labels())
     assert all(row["ApexBase"] > 0 for row in qps)
-    assert {"Q/s (single thread)", "Q/s (4 threads)"} == {
-        row["query"] for row in qps
-    }
+    assert {
+        "Q/s (single thread)",
+        "Q/s (2 threads)",
+        "Q/s (4 threads)",
+        "Q/s (8 threads)",
+    } == {row["query"] for row in qps}
+
+
+def test_qps_profile_covers_the_read_scaling_curve():
+    canary = _load(
+        "bench_perf_canary_qps_curve",
+        ROOT / "benchmarks" / "bench_perf_canary.py",
+    )
+
+    # A single 4-thread point cannot show whether read throughput still scales,
+    # so the Q/s profile measures the whole curve in one run.
+    assert canary.QPS_THREAD_COUNTS == (1, 2, 4, 8)
+    labels = canary.qps_metric_labels()
+    assert [name for name, _key in labels] == [
+        "Q/s (single thread)",
+        "Q/s (2 threads)",
+        "Q/s (4 threads)",
+        "Q/s (8 threads)",
+    ]
+    assert [key for _name, key in labels] == [
+        "ApexBase_single",
+        "ApexBase_concurrent_2",
+        "ApexBase_concurrent_4",
+        "ApexBase_concurrent_8",
+    ]
+    # The historical single-level call site keeps exactly one label.
+    assert [name for name, _key in canary.qps_metric_labels((4,))] == [
+        "Q/s (single thread)",
+        "Q/s (4 threads)",
+    ]
+
+
+@pytest.mark.parametrize("thread_counts", ((), (0,), (4, -1)))
+def test_qps_benchmark_rejects_invalid_thread_counts(benchmark, thread_counts, tmp_path):
+    with pytest.raises(ValueError, match="thread_counts"):
+        benchmark.run_qps_benchmark(
+            tmp_path, {"name": ["a"]}, thread_counts=thread_counts
+        )

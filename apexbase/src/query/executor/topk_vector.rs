@@ -396,3 +396,361 @@ impl ApexExecutor {
         RecordBatch::try_new(out_schema, new_cols).map_err(|e| err_data(e.to_string()))
     }
 }
+
+impl ApexExecutor {
+    /// Metric for a SQL distance function name, or `None` when the name is not
+    /// one of the pairwise vector distance functions the SQL layer exposes.
+    ///
+    /// Must stay in step with the `evaluate_function` dispatch in
+    /// `expressions.rs`; a name accepted here but not there (or the reverse)
+    /// would make the fast path disagree with the general one.
+    fn distance_metric_for_name(name: &str) -> Option<crate::query::vector_ops::DistanceMetric> {
+        use crate::query::vector_ops::DistanceMetric;
+        Some(match name.to_ascii_uppercase().as_str() {
+            "ARRAY_DISTANCE" | "L2_DISTANCE" | "ARRAY_L2_DISTANCE" | "EUCLIDEAN_DISTANCE" => {
+                DistanceMetric::L2
+            }
+            "L2_SQUARED_DISTANCE" | "SQUARED_L2" => DistanceMetric::L2Squared,
+            "COSINE_DISTANCE" | "ARRAY_COSINE_DISTANCE" => DistanceMetric::CosineDistance,
+            "COSINE_SIMILARITY" | "ARRAY_COSINE_SIMILARITY" => DistanceMetric::CosineSimilarity,
+            "INNER_PRODUCT" | "DOT_PRODUCT" | "ARRAY_INNER_PRODUCT" => DistanceMetric::InnerProduct,
+            "NEGATIVE_INNER_PRODUCT" | "ARRAY_NEGATIVE_INNER_PRODUCT" => {
+                DistanceMetric::NegInnerProduct
+            }
+            "L1_DISTANCE" | "ARRAY_L1_DISTANCE" | "MANHATTAN_DISTANCE" => DistanceMetric::L1,
+            "LINF_DISTANCE" | "ARRAY_LINF_DISTANCE" | "CHEBYSHEV_DISTANCE" => DistanceMetric::LInf,
+            _ => return None,
+        })
+    }
+
+    /// Column, query vector and metric of an `ORDER BY <distance>(col, [q])`
+    /// clause, also resolving the `SELECT <expr> AS alias ... ORDER BY alias`
+    /// spelling. `None` when the clause is anything else.
+    fn order_by_distance_spec(
+        stmt: &SelectStatement,
+    ) -> Option<(String, Vec<f32>, crate::query::vector_ops::DistanceMetric)> {
+        if stmt.order_by.len() != 1 {
+            return None;
+        }
+        let clause = &stmt.order_by[0];
+        if clause.descending {
+            return None;
+        }
+        let expression = match clause.expr.as_ref() {
+            Some(expression) => expression,
+            None => {
+                let alias = clause.column.trim_matches('"');
+                stmt.columns.iter().find_map(|column| match column {
+                    SelectColumn::Expression {
+                        expr,
+                        alias: Some(name),
+                    } if name.eq_ignore_ascii_case(alias) => Some(expr),
+                    _ => None,
+                })?
+            }
+        };
+        let SqlExpr::Function { name, args } = expression else {
+            return None;
+        };
+        if args.len() != 2 {
+            return None;
+        }
+        let metric = Self::distance_metric_for_name(name)?;
+        let SqlExpr::Column(column) = &args[0] else {
+            return None;
+        };
+        // Only a literal query vector can be evaluated without a batch here; the
+        // other accepted forms (a vector column reference, …) keep the general
+        // path, which resolves them against the row batch.
+        let query: Vec<f32> = match &args[1] {
+            SqlExpr::ArrayLiteral(values) => values.iter().map(|&value| value as f32).collect(),
+            SqlExpr::Literal(crate::data::Value::String(text)) => {
+                let text = text.trim().trim_start_matches('[').trim_end_matches(']');
+                text.split(',')
+                    .map(|token| token.trim().parse::<f32>())
+                    .collect::<Result<Vec<f32>, _>>()
+                    .ok()?
+            }
+            _ => return None,
+        };
+        if query.is_empty() || query.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        Some((column.trim_matches('"').to_string(), query, metric))
+    }
+
+    /// Rows for `SELECT ... ORDER BY <distance>(col, [q]) LIMIT k` over a table.
+    ///
+    /// The general path evaluates the distance for every row — allocating a
+    /// `Vec<f32>` per row — and then fully sorts the result. The exact vector
+    /// TopK lane already has an allocation-free SIMD distance plus a bounded
+    /// heap; running that over the vector column and gathering the surviving
+    /// rows gives the same rows without the per-row allocation or the full sort.
+    /// The shared tail still re-applies ORDER BY (on `k` rows), projection and
+    /// LIMIT, so the output shape is unchanged.
+    fn try_fast_order_by_distance(
+        backend: &crate::storage::backend::TableStorageBackend,
+        stmt: &SelectStatement,
+        storage_path: &Path,
+    ) -> io::Result<Option<RecordBatch>> {
+        use crate::query::vector_ops::{
+            topk_heap_direct_parallel, topk_heap_direct_parallel_fixed, DistanceComputer,
+        };
+        use arrow::array::{BinaryArray, FixedSizeListArray, UInt32Array};
+
+        // Grouping, DISTINCT (including `DISTINCT ON`), OFFSET, a window or an
+        // aggregate has to run over the whole relation before the TopK is
+        // meaningful — or would change meaning if only the surviving rows reached
+        // it. A WHERE is allowed: the predicate is applied to the candidate rows
+        // before the heap below.
+        if !stmt.group_by.is_empty()
+            || stmt.having.is_some()
+            || stmt.distinct
+            || stmt.distinct_on.is_some()
+            || stmt.window_row_number_limit.is_some()
+            || stmt.offset.unwrap_or(0) > 0
+            || stmt
+                .columns
+                .iter()
+                .any(|column| matches!(column, SelectColumn::WindowFunction { .. }))
+            || stmt.columns.iter().any(|column| match column {
+                SelectColumn::Aggregate { .. } => true,
+                SelectColumn::Expression { expr, .. } => Self::expr_contains_aggregate(expr),
+                _ => false,
+            })
+        {
+            return Ok(None);
+        }
+        let Some(limit) = stmt.limit else {
+            return Ok(None);
+        };
+        if limit == 0 {
+            return Ok(None);
+        }
+        let Some((column, query, metric)) = Self::order_by_distance_spec(stmt) else {
+            return Ok(None);
+        };
+        // The heap lane returns the rows *nearest* in the metric's own sense,
+        // while `ORDER BY <fn> ASC` means "smallest function value". The two
+        // agree for distances and for `negative_inner_product` (whose value
+        // already negates the dot product), but the similarity-valued functions
+        // would come back in the opposite order.
+        if matches!(
+            metric,
+            crate::query::vector_ops::DistanceMetric::InnerProduct
+                | crate::query::vector_ops::DistanceMetric::CosineSimilarity
+        ) {
+            return Ok(None);
+        }
+
+        // Only the columns the statement needs: the TopK keeps `k` rows, so
+        // decoding an unprojected wide column (a long text or blob column) for
+        // every row would dominate the scan. `required_columns` covers the
+        // projection, the ordering expression and any residual predicate, and
+        // returns `None` for `SELECT *` — the same contract the general scan
+        // branch relies on.
+        let col_refs = Self::get_col_refs(stmt);
+        let col_refs_vec: Option<Vec<&str>> = col_refs
+            .as_ref()
+            .map(|refs| refs.iter().map(|name| name.as_str()).collect());
+
+        let computer = DistanceComputer::new(metric, query);
+
+        // Filter-aware pass (V5 §6.4 item 16): when the predicate selects a
+        // minority, read only those rows and score just them. The predicate runs
+        // again on the candidate batch, so a bitmap conjunct that is not part of
+        // the row selection (or a conjunction the scanner only partly applied)
+        // still filters exactly.
+        if let Some(where_clause) = stmt.where_clause.as_ref() {
+            return Self::filtered_distance_topk(
+                backend,
+                where_clause,
+                storage_path,
+                &column,
+                &computer,
+                col_refs_vec.as_deref(),
+                limit,
+            );
+        }
+
+        // Zero-copy scoring straight off the mmap when the persisted base is the
+        // whole visible view: the direct lane returns the surviving row indices
+        // (it declines deletions, pending deltas, compressed groups and a bare
+        // dimension mismatch) already ordered nearest-first, so only those `k`
+        // rows need materializing instead of the whole vector column.
+        if backend.overlay_state().is_clean_view() {
+            let direct = backend
+                .topk_fixedlist_direct(&column, &computer, limit)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    backend
+                        .topk_binary_direct(&column, &computer, limit)
+                        .ok()
+                        .flatten()
+                });
+            if let Some(topk) = direct {
+                if topk.is_empty() {
+                    return Ok(None);
+                }
+                crate::query::executor::record_path("order_by_distance_topk_direct");
+                let indices: Vec<usize> = topk.iter().map(|(index, _)| *index).collect();
+                let selected =
+                    backend.read_columns_by_indices_to_arrow(&indices, col_refs_vec.as_deref())?;
+                return Ok(Some(selected));
+            }
+        }
+
+        let batch = backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, None)?;
+        if batch.num_rows() == 0 {
+            return Ok(None);
+        }
+        let Some(values) = batch.column_by_name(&column) else {
+            return Ok(None);
+        };
+        let effective_k = limit.min(batch.num_rows());
+        let topk = if let Some(fixed) = values.as_any().downcast_ref::<FixedSizeListArray>() {
+            // The heap kernel reads the flat child values, so a NULL row would
+            // be scored as zeros; the general path sorts NULL distances last and
+            // must not be replaced when any exist.
+            if fixed.null_count() > 0 || fixed.value_length() as usize != computer.query.len() {
+                return Ok(None);
+            }
+            topk_heap_direct_parallel_fixed(fixed, &computer, effective_k)
+        } else if let Some(binary) = values.as_any().downcast_ref::<BinaryArray>() {
+            if binary.null_count() > 0 {
+                return Ok(None);
+            }
+            topk_heap_direct_parallel(binary, &computer, effective_k)
+        } else {
+            return Ok(None);
+        };
+        if topk.is_empty() {
+            return Ok(None);
+        }
+
+        let indices: Vec<u32> = topk.iter().map(|(index, _)| *index as u32).collect();
+        let take = UInt32Array::from(indices);
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
+        for array in batch.columns() {
+            let taken = arrow::compute::take(array.as_ref(), &take, None)
+                .map_err(|error| err_data(error.to_string()))?;
+            columns.push(taken);
+        }
+        RecordBatch::try_new(batch.schema(), columns)
+            .map(Some)
+            .map_err(|error| err_data(error.to_string()))
+    }
+}
+
+impl ApexExecutor {
+    /// Candidate row positions for the filter-aware distance TopK.
+    ///
+    /// `None` means "this predicate cannot drive a row selection"; the caller
+    /// then keeps the general path. Only single-column predicates the storage
+    /// layer can scan without materializing the projection are accepted: a
+    /// `MATCH()` never reaches here, because the FTS row selection runs first
+    /// and claims every shape whose bitmap is selective enough for this lane.
+    fn distance_lane_candidates(
+        backend: &crate::storage::backend::TableStorageBackend,
+        where_clause: &SqlExpr,
+    ) -> io::Result<Option<Vec<usize>>> {
+        // A single-column predicate the mmap scanners can evaluate directly. The
+        // extractors only match a complete predicate, so a conjunction falls
+        // through to the general path rather than selecting the wrong rows.
+        if let Some((column, low, high)) = Self::extract_between_range(where_clause)
+            .or_else(|| Self::extract_two_sided_same_col_range(where_clause))
+            .or_else(|| Self::extract_single_comparison_as_range(where_clause))
+        {
+            return backend.scan_numeric_range_mmap(&column, low, high, None);
+        }
+        if let Some((column, value)) = Self::extract_string_equality(where_clause) {
+            return backend.scan_string_filter_mmap(&column, &value, None);
+        }
+        Ok(None)
+    }
+
+    /// Rows for `SELECT ... WHERE <predicate> ORDER BY <distance>(col, [q]) LIMIT k`.
+    ///
+    /// Restricting the scan to the predicate's rows keeps the vector column out
+    /// of the read for everything the predicate rejects, and the bounded heap
+    /// replaces the general path's per-row allocation plus full sort. The shared
+    /// tail still applies the predicate (now a no-op), ORDER BY on `k` rows, the
+    /// projection and LIMIT.
+    fn filtered_distance_topk(
+        backend: &crate::storage::backend::TableStorageBackend,
+        where_clause: &SqlExpr,
+        storage_path: &Path,
+        column: &str,
+        computer: &crate::query::vector_ops::DistanceComputer,
+        col_refs: Option<&[&str]>,
+        limit: usize,
+    ) -> io::Result<Option<RecordBatch>> {
+        use crate::query::vector_ops::{
+            topk_heap_direct_parallel, topk_heap_direct_parallel_fixed,
+        };
+        use arrow::array::{BinaryArray, FixedSizeListArray, UInt32Array};
+
+        // The row selection indexes the *active* row space while the indexed
+        // extraction reads *physical* positions, so the two may only be used
+        // together when no deletion vector shifts them apart. Overlays change
+        // visibility after the scan as well.
+        if !backend.overlay_state().is_clean_view()
+            || backend.active_row_count() != backend.base_row_count()
+        {
+            return Ok(None);
+        }
+        let total = backend.active_row_count();
+        if total == 0 {
+            return Ok(None);
+        }
+        let Some(indices) = Self::distance_lane_candidates(backend, where_clause)? else {
+            return Ok(None);
+        };
+        // Reading by index has a per-row cost, so a predicate that keeps most of
+        // the table is cheaper to serve by the full scan.
+        if indices.is_empty() || (indices.len() as u64).saturating_mul(4) > total {
+            return Ok(None);
+        }
+
+        let candidates = backend.read_columns_by_indices_to_arrow(&indices, col_refs)?;
+        let filtered =
+            Self::apply_filter_with_storage(&candidates, where_clause, storage_path)?;
+        if filtered.num_rows() == 0 {
+            return Ok(None);
+        }
+        let Some(values) = filtered.column_by_name(column) else {
+            return Ok(None);
+        };
+        let effective_k = limit.min(filtered.num_rows());
+        let topk = if let Some(fixed) = values.as_any().downcast_ref::<FixedSizeListArray>() {
+            if fixed.null_count() > 0 || fixed.value_length() as usize != computer.query.len() {
+                return Ok(None);
+            }
+            topk_heap_direct_parallel_fixed(fixed, computer, effective_k)
+        } else if let Some(binary) = values.as_any().downcast_ref::<BinaryArray>() {
+            if binary.null_count() > 0 {
+                return Ok(None);
+            }
+            topk_heap_direct_parallel(binary, computer, effective_k)
+        } else {
+            return Ok(None);
+        };
+        if topk.is_empty() {
+            return Ok(None);
+        }
+
+        crate::query::executor::record_path("filtered_distance_topk");
+        let take = UInt32Array::from(topk.iter().map(|(index, _)| *index as u32).collect::<Vec<_>>());
+        let mut columns: Vec<ArrayRef> = Vec::with_capacity(filtered.num_columns());
+        for array in filtered.columns() {
+            columns.push(
+                arrow::compute::take(array.as_ref(), &take, None)
+                    .map_err(|error| err_data(error.to_string()))?,
+            );
+        }
+        RecordBatch::try_new(filtered.schema(), columns)
+            .map(Some)
+            .map_err(|error| err_data(error.to_string()))
+    }
+}

@@ -106,6 +106,22 @@ QUANTIZED_CODECS = (
     "turboquant4",
 )
 
+# Read-scaling curve measured by the Q/s profile. A single 4-thread point
+# cannot show whether read throughput still scales, so every level is measured
+# in the same run and compared base/current.
+QPS_THREAD_COUNTS = (1, 2, 4, 8)
+
+
+def qps_metric_labels(thread_counts=QPS_THREAD_COUNTS):
+    """(metric name, Q/s result key) pairs for one scaling-curve run."""
+    labels = [("Q/s (single thread)", "ApexBase_single")]
+    labels.extend(
+        (f"Q/s ({threads} threads)", f"ApexBase_concurrent_{threads}")
+        for threads in thread_counts
+        if threads > 1
+    )
+    return labels
+
 
 def _run_metric(bench, method_name, mode, warmup, iterations, setup_method=None):
     method = getattr(bench, method_name)
@@ -125,13 +141,72 @@ def _run_metric(bench, method_name, mode, warmup, iterations, setup_method=None)
     return full_bench.run_bench(method, warmup, iterations)
 
 
+# Recall floors per codec: recall@10 of the codec's *own* top-k against an exact
+# numpy L2 ground truth over the same corpus. Latency alone cannot catch a codec
+# that silently returns bad neighbours, and the gate previously measured only
+# latency. The bounds sit well below the measured values (float16/bfloat16 1.0,
+# int8 0.96-0.975, uint8 0.98-1.0, bit1 0.12-0.20, turboquant2 0.44-0.48,
+# turboquant3 0.56-0.595, turboquant4 0.76) so ordinary fixture variation cannot
+# trip them, while a collapse to random neighbours fails the run.
+QUANTIZED_RECALL_FLOORS = {
+    "float16": 0.95,
+    "bfloat16": 0.95,
+    "int8": 0.85,
+    "uint8": 0.85,
+    "bit1": 0.05,
+    "turboquant2": 0.30,
+    "turboquant3": 0.42,
+    "turboquant4": 0.62,
+}
+
+# Shortlist re-ranked exactly for the ground truth; wide enough that a float32
+# distance computation cannot push the true top-10 out of it.
+_RECALL_REFINE = 200
+
+
+def exact_topk_ids(vectors, queries, k):
+    """Exact L2 top-k row indices (0-based) for each query.
+
+    Distances are computed in float32 (the corpus is 1M x 128 at gate scale, so a
+    float64 copy would double the memory) and only the shortlist is re-ranked in
+    float64, which removes float32 cancellation from the final order.
+    """
+    x = np.asarray(vectors, dtype=np.float32)
+    q = np.asarray(queries, dtype=np.float32)
+    distances = (x * x).sum(1)[None, :] - 2.0 * (q @ x.T) + (q * q).sum(1)[:, None]
+    take = min(max(_RECALL_REFINE, k), x.shape[0])
+    candidates = np.argpartition(distances, take - 1, axis=1)[:, :take]
+    rows = np.arange(candidates.shape[0])[:, None]
+    refined = (
+        (x[candidates].astype(np.float64) - q[:, None, :].astype(np.float64)) ** 2
+    ).sum(axis=2)
+    order = np.lexsort((candidates, refined), axis=1)[:, :k]
+    return candidates[rows, order]
+
+
+def recall_at_k(exact_ids, returned_ids, k):
+    """Mean recall@k; ids are 1-based on the wire, `exact_ids` are 0-based."""
+    hits = 0
+    for query_index in range(exact_ids.shape[0]):
+        truth = set((exact_ids[query_index] + 1).tolist())
+        got = set(returned_ids[query_index, :k].tolist())
+        hits += len(truth & got) / float(k)
+    return hits / exact_ids.shape[0]
+
+
 def run_quantized_canary(rows, warmup, iterations):
-    """Measure compressed-domain L2 TopK without including column construction."""
+    """Measure compressed-domain L2 TopK without including column construction.
+
+    Returns the latency metric rows plus a recall detail block. Every codec's
+    recall@10 is asserted against `QUANTIZED_RECALL_FLOORS`, so a codec that gets
+    faster by returning wrong neighbours fails the benchmark.
+    """
     quant_rows = rows
     dim = 128
     rng = np.random.default_rng(20260822)
     vectors = rng.normal(size=(quant_rows, dim)).astype(np.float32)
     queries = vectors[:5] + rng.normal(scale=0.02, size=(5, dim)).astype(np.float32)
+    exact_ids = exact_topk_ids(vectors, queries, 10)
     with tempfile.TemporaryDirectory(prefix="apexbase_quant_canary_") as tmpdir:
         client = ApexClient(tmpdir, drop_if_exists=True)
         try:
@@ -142,6 +217,7 @@ def run_quantized_canary(rows, warmup, iterations):
                 for codec in QUANTIZED_CODECS
             }
             results = []
+            recall = {}
             for codec, target in targets.items():
                 def scan():
                     client.batch_topk_distance(target, queries, k=10)
@@ -149,6 +225,14 @@ def run_quantized_canary(rows, warmup, iterations):
                 elapsed_ms = full_bench.run_bench_nogc_median(
                     scan, warmup, iterations
                 ) / len(queries)
+                found = client.batch_topk_distance(target, queries, k=10)
+                measured = recall_at_k(exact_ids, found[:, :, 0].astype(np.int64), 10)
+                floor = QUANTIZED_RECALL_FLOORS.get(codec)
+                assert floor is None or measured >= floor, (
+                    f"{codec} recall@10 {measured:.3f} fell below its floor {floor}: "
+                    "the codec is returning different neighbours"
+                )
+                recall[codec] = round(measured, 6)
                 results.append({
                     "category": "ApexBase quantized vector",
                     "query": f"Batch quantized TopK L2 ({codec})",
@@ -157,8 +241,14 @@ def run_quantized_canary(rows, warmup, iterations):
                 print(
                     f"Batch quantized TopK L2 ({codec})".ljust(40)
                     + f" {elapsed_ms:>12.6f} ms/query"
+                    + f"  recall@10={measured:.3f}"
                 )
-            return results
+            return results, {
+                "recall_at_10": recall,
+                "floors": QUANTIZED_RECALL_FLOORS,
+                "corpus_rows": quant_rows,
+                "queries": len(queries),
+            }
         finally:
             client.close()
 
@@ -283,24 +373,26 @@ def run_canary(rows, warmup, iterations, qps_only=False, index_only=False, paral
                 })
                 print(f"{name:<34} {elapsed_ms:>12.6f} ms")
         if not index_only and not parallel_only:
-            results.extend(run_quantized_canary(rows, warmup, iterations))
+            quant_results, _quant_recall = run_quantized_canary(rows, warmup, iterations)
+            results.extend(quant_results)
 
         if not index_only and not parallel_only:
             # OLAP Q/s read profile (ApexBase-only). The harness recreates the
             # engine on a clean loaded copy, so the measurement is independent
-            # of the delta-heavy state left by the DML canary metrics.
+            # of the delta-heavy state left by the DML canary metrics. Every
+            # level of QPS_THREAD_COUNTS is measured in the same run, so the
+            # gate compares a read-scaling curve instead of a single point.
             qps = full_bench.run_qps_benchmark(
                 tmpdir,
                 data,
-                n_threads=4,
+                n_threads=QPS_THREAD_COUNTS[-1],
                 min_duration=1.0,
                 min_iterations=50,
                 existing_engines={"ApexBase": bench},
+                thread_counts=QPS_THREAD_COUNTS,
             )
-            for label, key in (
-                ("Q/s (single thread)", "ApexBase_single"),
-                ("Q/s (4 threads)", "ApexBase_concurrent_4"),
-            ):
+            qps_labels = qps_metric_labels(QPS_THREAD_COUNTS)
+            for label, key in qps_labels:
                 results.append({
                     "category": "ApexBase Q/s",
                     "query": label,
@@ -357,8 +449,11 @@ def main(argv=None):
         )
     if args.index_only and args.parallel_only:
         parser.error("--index-only and --parallel-only are mutually exclusive")
+    quantized_recall = None
     if args.quant_only:
-        results = run_quantized_canary(args.rows, args.warmup, args.iterations)
+        results, quantized_recall = run_quantized_canary(
+            args.rows, args.warmup, args.iterations
+        )
     elif args.index_only:
         results = run_canary(
             args.rows, args.warmup, args.iterations, index_only=True
@@ -380,6 +475,8 @@ def main(argv=None):
         },
         "results": results,
     }
+    if quantized_recall is not None:
+        report["quantized_recall"] = quantized_recall
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"Results saved to {args.output}")

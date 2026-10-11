@@ -459,3 +459,33 @@ def test_sql_ctas_existing_table_preserves_data(tmp_path):
         assert [row["k"] for row in rows] == [1, 2, 3]
     finally:
         client.close()
+
+
+def test_lock_file_uses_one_name_and_is_reaped_with_the_table(tmp_path):
+    """There is a single lock-file naming rule: `<table>.apex` -> `<table>.apex.lock`.
+
+    The executor, the Python bindings, the epoch tracker and `cross_process_lock`
+    all have to agree on it, and the deferred reaper has to match the same name:
+    its suffix list is applied to the full `t.apex` stem, so `.lock` yields
+    `t.apex.lock` (not `t.lock`). This pins both halves - no second scheme, and no
+    stale lock file left behind after the client closes.
+    """
+    db = tmp_path / "locknames"
+    client = ApexClient(dirpath=str(db), drop_if_exists=True)
+    try:
+        client.create_table("t", {"k": "int64", "s": "string"})
+        client.use_table("t")
+        client.store({"k": [1, 2, 3], "s": ["a", "b", "c"]})
+        client.flush()
+        # Only this table's own files: the directory also holds catalog-level locks
+        # (`.apex_tables.lock`), which follow their own names.
+        names = sorted(p.name for p in db.iterdir() if p.is_file() and p.name.startswith("t."))
+        assert "t.lock" not in names, f"legacy lock name must not be used: {names}"
+        table_locks = [n for n in names if n.endswith(".lock")]
+        assert all(n == "t.apex.lock" for n in table_locks), names
+        client.drop_table("t")
+    finally:
+        client.close()
+    remaining = sorted(p.name for p in db.iterdir() if p.is_file())
+    assert "t.apex.lock" not in remaining, remaining
+    assert not (db / "t.apex").exists(), remaining

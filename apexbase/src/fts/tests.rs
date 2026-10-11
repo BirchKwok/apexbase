@@ -55,6 +55,61 @@ mod tests {
     }
 
     #[test]
+    fn ranked_search_dedups_terms_and_scores_them_once() {
+        let engine = FtsEngine::memory_only(FtsConfig::default()).unwrap();
+        engine
+            .add_documents_arrow_texts(
+                &[1, 2, 3, 4],
+                &[
+                    "alpha beta beta gamma",
+                    "alpha alpha beta",
+                    "gamma delta",
+                    "beta gamma gamma gamma",
+                ],
+            )
+            .unwrap();
+
+        // A repeated query term is one scoring slot, not two: "beta beta" must
+        // rank (and score) exactly like "beta".
+        let repeated = engine.search_ranked("beta beta", 10).unwrap();
+        let single = engine.search_ranked("beta", 10).unwrap();
+        assert_eq!(repeated.len(), single.len());
+        for (repeated, single) in repeated.iter().zip(single.iter()) {
+            assert_eq!(repeated.doc_id, single.doc_id);
+            assert!(
+                (repeated.score - single.score).abs() < 1e-6,
+                "{repeated:?} vs {single:?}"
+            );
+        }
+
+        // Terms are deduped by id, so a multi-term query is order-independent.
+        // "beta gamma" matches two documents (ids 1 and 4).
+        let forward = engine.search_ranked("beta gamma", 10).unwrap();
+        let reverse = engine.search_ranked("gamma beta", 10).unwrap();
+        assert_eq!(forward.len(), 2);
+        assert_eq!(
+            forward.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            reverse.iter().map(|hit| hit.doc_id).collect::<Vec<_>>()
+        );
+        for (forward, reverse) in forward.iter().zip(reverse.iter()) {
+            assert!((forward.score - reverse.score).abs() < 1e-6);
+        }
+        // "beta" matches three documents; the limit keeps the best two of the
+        // unlimited ranking with unchanged scores.
+        assert_eq!(single.len(), 3);
+        let limited = engine.search_ranked("beta", 2).unwrap();
+        assert_eq!(limited.len(), 2);
+        for (limited, unlimited) in limited.iter().zip(single.iter()) {
+            assert_eq!(limited.doc_id, unlimited.doc_id);
+            assert!((limited.score - unlimited.score).abs() < 1e-6);
+        }
+
+        // A term that is absent from the index still empties the candidate set.
+        assert!(engine.search_ranked("alpha nosuchterm", 10).unwrap().is_empty());
+        assert!(engine.search_ids("nosuchterm").unwrap().is_empty());
+    }
+
+    #[test]
     fn initial_batch_builds_base_without_delta_bookkeeping() {
         let engine = FtsEngine::memory_only(FtsConfig::default()).unwrap();
         engine

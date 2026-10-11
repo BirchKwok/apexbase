@@ -89,7 +89,8 @@ impl ApexExecutor {
     }
 
     /// DISTINCT INTERSECT/EXCEPT fast path: both sides are
-    /// `SELECT <dict_col> FROM <table> WHERE <num_col> BETWEEN lo AND hi`.
+    /// `SELECT <dict_col> FROM <table> WHERE <num_col> BETWEEN lo AND hi`
+    /// (or the degenerate `= v`).
     /// Answers each side as a small distinct-value set via the storage layer and
     /// computes the set operation directly, returning a plain StringArray batch.
     fn try_fast_setop_distinct(
@@ -103,7 +104,15 @@ impl ApexExecutor {
             return Ok(None);
         }
 
-        let extract = |stmt: &SqlStatement| -> Option<(String, String, String, f64, f64)> {
+        // A side may omit WHERE: it then contributes every distinct value, which the
+        // same per-value count answers as the *full* range on the other side's numeric
+        // column (a bare side has none of its own). Rows whose numeric column is NULL
+        // would silently drop out of such a count, and the count walks dictionary
+        // entries only, so rows whose key is NULL would too -- both columns must be
+        // null-free before a bare side can take this route.
+        let extract = |stmt: &SqlStatement,
+                       bare_num_col: Option<&str>|
+         -> Option<(String, String, String, f64, f64, bool)> {
             let SqlStatement::Select(sel) = stmt else {
                 return None;
             };
@@ -125,40 +134,90 @@ impl ApexExecutor {
             let SelectColumn::Column(dict_col) = &sel.columns[0] else {
                 return None;
             };
-            let SqlExpr::Between {
-                column: num_col,
-                low,
-                high,
-                negated: false,
-            } = sel.where_clause.as_ref()?
-            else {
-                return None;
+            // `num_col BETWEEN lo AND hi` or the degenerate `num_col = v`, which the
+            // per-value count pass below already handles as the range [v, v]. The
+            // UNION lane accepted equality from the start; INTERSECT/EXCEPT did not,
+            // which left the *equality* form on the generic path -- 200k rows:
+            // EXCEPT 5.04 ms and INTERSECT 6.79 ms against 1.23 ms for the same
+            // operation written with BETWEEN.
+            let (num_col, lo, hi, bare) = match sel.where_clause.as_ref() {
+                None => (
+                    bare_num_col?.to_string(),
+                    f64::NEG_INFINITY,
+                    f64::INFINITY,
+                    true,
+                ),
+                Some(SqlExpr::Between {
+                    column,
+                    low,
+                    high,
+                    negated: false,
+                }) => (
+                    column.clone(),
+                    Self::extract_numeric_value(low).ok()?,
+                    Self::extract_numeric_value(high).ok()?,
+                    false,
+                ),
+                Some(SqlExpr::BinaryOp {
+                    left,
+                    op: crate::query::sql_parser::BinaryOperator::Eq,
+                    right,
+                }) => match (left.as_ref(), right.as_ref()) {
+                    (SqlExpr::Column(c), lit) | (lit, SqlExpr::Column(c)) => (
+                        c.clone(),
+                        Self::extract_numeric_value(lit).ok()?,
+                        Self::extract_numeric_value(lit).ok()?,
+                        false,
+                    ),
+                    _ => return None,
+                },
+                _ => return None,
             };
-            let lo = Self::extract_numeric_value(low).ok()?;
-            let hi = Self::extract_numeric_value(high).ok()?;
             Some((
                 table.clone(),
                 dict_col.trim_matches('"').to_string(),
                 num_col.trim_matches('"').to_string(),
                 lo,
                 hi,
+                bare,
             ))
         };
 
-        let (table, dict_col, num_col, lo1, hi1) = match extract(union.left.as_ref()) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
-        let (table2, dict_col2, num_col2, lo2, hi2) = match extract(union.right.as_ref()) {
-            Some(v) => v,
-            None => return Ok(None),
-        };
+        // The filtered side supplies the numeric column a bare side is counted on.
+        let (table, dict_col, num_col, lo1, hi1, bare1, table2, dict_col2, num_col2, lo2, hi2, bare2) =
+            match extract(union.left.as_ref(), None) {
+                Some((t, d, n, l, h, b)) => {
+                    let Some((t2, d2, n2, l2, h2, b2)) =
+                        extract(union.right.as_ref(), Some(&n))
+                    else {
+                        return Ok(None);
+                    };
+                    (t, d, n, l, h, b, t2, d2, n2, l2, h2, b2)
+                }
+                None => {
+                    let Some((t2, d2, n2, l2, h2, b2)) = extract(union.right.as_ref(), None)
+                    else {
+                        return Ok(None);
+                    };
+                    let Some((t, d, n, l, h, b)) = extract(union.left.as_ref(), Some(&n2))
+                    else {
+                        return Ok(None);
+                    };
+                    (t, d, n, l, h, b, t2, d2, n2, l2, h2, b2)
+                }
+            };
         if table != table2 || dict_col != dict_col2 || num_col != num_col2 {
             return Ok(None);
         }
 
         let table_path = Self::resolve_table_path(&table, base_dir, default_table_path);
         let backend = crate::query::executor::get_cached_backend(&table_path)?;
+
+        if (bare1 || bare2)
+            && (backend.column_has_nulls(&num_col) || backend.column_has_nulls(&dict_col))
+        {
+            return Ok(None);
+        }
 
         let counts = match backend.count_dict_values_two_ranges(
             &num_col, lo1, hi1, lo2, hi2, &dict_col,

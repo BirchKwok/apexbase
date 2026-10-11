@@ -1564,6 +1564,52 @@ impl StorageEngine {
                                 let mut moved_float_columns = Vec::new();
 
                                 // Allocate IDs
+                                // A fixed-size vector column has one dimension
+                                // for the whole table. Reject a mismatched
+                                // append here, before any column is written:
+                                // a mixed dimension would misalign the fixed
+                                // stride and silently corrupt later reads.
+                                for (col_name, col_type) in schema.iter() {
+                                    if col_type.vector_codec().is_none()
+                                        && !matches!(
+                                            col_type,
+                                            ColumnType::FixedList
+                                                | ColumnType::Float16List
+                                                | ColumnType::BFloat16List
+                                        )
+                                    {
+                                        continue;
+                                    }
+                                    let Some(established) =
+                                        storage.established_vector_dim(col_name)?
+                                    else {
+                                        continue;
+                                    };
+                                    // This entry point carries f32 rows, so the
+                                    // element count is bytes / 4.
+                                    let Some(rows) = fixedlist_columns.get(col_name) else {
+                                        continue;
+                                    };
+                                    for (row, value) in rows.iter().enumerate() {
+                                        let got = value.len() / 4;
+                                        if got != established as usize {
+                                            return Err(std::io::Error::new(
+                                                std::io::ErrorKind::InvalidInput,
+                                                format!(
+                                                    "column '{col_name}' stores {established}-dimension vectors; row {row} has {got}"
+                                                ),
+                                            ));
+                                        }
+                                    }
+                                }
+
+                                // This compat append into an existing V4 file
+                                // assigns the ids itself, so it has to reserve
+                                // them like every other write path: two
+                                // processes appending to one V4 file would
+                                // otherwise both start at the same stale
+                                // `next_id` and share ids.
+                                storage.ensure_id_block(row_count)?;
                                 let start_id = storage.next_id_value();
                                 let ids: Vec<u64> =
                                     (start_id..start_id + row_count as u64).collect();
@@ -1944,6 +1990,49 @@ impl StorageEngine {
                                 let mut new_nulls: Vec<Vec<u8>> =
                                     Vec::with_capacity(schema.len());
 
+                                // A fixed-size vector column has one dimension
+                                // for the whole table. Reject a mismatched
+                                // append here, before any column is written:
+                                // a mixed dimension would misalign the fixed
+                                // stride and silently corrupt later reads.
+                                for (col_name, col_type) in schema.iter() {
+                                    if col_type.vector_codec().is_none()
+                                        && !matches!(
+                                            col_type,
+                                            ColumnType::FixedList
+                                                | ColumnType::Float16List
+                                                | ColumnType::BFloat16List
+                                        )
+                                    {
+                                        continue;
+                                    }
+                                    let Some(established) =
+                                        storage.established_vector_dim(col_name)?
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(incoming) =
+                                        columns.get(col_name).and_then(|c| c.vector_dim())
+                                    else {
+                                        continue;
+                                    };
+                                    if incoming != established {
+                                        return Err(std::io::Error::new(
+                                            std::io::ErrorKind::InvalidInput,
+                                            format!(
+                                                "column '{col_name}' stores {established}-dimension vectors; got a {incoming}-dimension batch"
+                                            ),
+                                        ));
+                                    }
+                                }
+
+                                // This compat append into an existing V4 file
+                                // assigns the ids itself, so it has to reserve
+                                // them like every other write path: two
+                                // processes appending to one V4 file would
+                                // otherwise both start at the same stale
+                                // `next_id` and share ids.
+                                storage.ensure_id_block(row_count)?;
                                 let start_id = storage.next_id_value();
                                 let ids: Vec<u64> =
                                     (start_id..start_id + row_count as u64).collect();

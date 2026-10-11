@@ -1726,3 +1726,221 @@ def test_f16_topk_ordering_consistent_with_f32(tmp_path):
     assert overlap >= int(k * 0.8), (
         f"f16 vs f32 TopK overlap {overlap}/{k} < 80% for dim={dim}"
     )
+
+
+def test_topk_distance_excludes_deleted_rows_and_matches_brute_force(tmp_path):
+    """Correctness guard for the vector TopK lane around deletions.
+
+    A single DELETE used to send the zero-copy direct lane home entirely (it assumed
+    contiguously mapped rows), costing ~10x on every later TopK (200k x 64: 1.08 -> 11.6
+    ms). The lane now compacts live rows using the row group's deletion bitmap, so its
+    returned indices are already in the active row space.
+
+    Tie-safe by construction: this fixture has far fewer distinct vectors than rows, so
+    the assertion compares the *distances* of the returned neighbours against the exact
+    k smallest distances over the live rows, and separately checks that every returned id
+    is still live.
+    """
+    dim = 8
+    n = 400
+    tmp = tmp_path / "vecdel"
+    client = ApexClient(dirpath=str(tmp), drop_if_exists=True)
+    client.create_table("t")
+    client.use_table("t")
+    vectors = {i: [float((i * 3 + j) % 17) / 17.0 for j in range(dim)] for i in range(n)}
+    client.store([{"emb": vectors[i], "k": i % 10} for i in range(n)])
+    client.flush()
+    query = [0.5] * dim
+
+    def live_vectors():
+        """id -> vector, read back from the table so the test never assumes id layout."""
+        return {int(row["_id"]): [float(x) for x in row["emb"]]
+                for row in client.execute("SELECT _id, emb FROM t").to_dict()}
+
+    def topk_ids(k=5):
+        return [int(row["_id"]) for row in
+                client.topk_distance("emb", query, k=k, metric="l2").to_dict()]
+
+    def distance(vector):
+        return sum((a - b) ** 2 for a, b in zip(vector, query))
+
+    def expected_distances(k=5):
+        known = live_vectors()
+        return sorted(distance(v) for v in known.values())[:k]
+
+    def assert_topk_is_exact(k=5):
+        known = live_vectors()
+        got = topk_ids(k=k)
+        assert len(got) == len(set(got)), f"duplicate ids in {got}"
+        assert all(i in known for i in got), (got, sorted(known))
+        got_distances = sorted(distance(known[i]) for i in got)
+        want = expected_distances(k)
+        # The lane accumulates in f32 (and may reorder/SIMD), so compare within a
+        # tolerance instead of bit-for-bit against a Python f64 sum.
+        assert all(
+            abs(a - b) <= 1e-5 * max(1.0, abs(b))
+            for a, b in zip(got_distances, want)
+        ), (got, got_distances, want)
+
+    try:
+        assert_topk_is_exact()
+
+        client.execute(f"DELETE FROM t WHERE _id = {topk_ids()[0]}")
+        client.flush()
+        assert_topk_is_exact()
+
+        # A second deletion batch, then a run where most rows are gone: the compacting
+        # lane must stay exact for every k.
+        client.execute("DELETE FROM t WHERE k = 2")
+        client.flush()
+        assert_topk_is_exact()
+        client.execute("DELETE FROM t WHERE k < 8")
+        client.flush()
+        assert live_vectors(), "the last batch must leave some rows"
+        for k in (1, 3, 5):
+            assert_topk_is_exact(k)
+
+        # The f16 variant is a separate branch of the same lane and had a worse penalty
+        # (0.50 -> 13.32 ms, 26.8x) because the column is half the size. It must be exact
+        # under deletions too.
+        client.create_table("t16", schema={"emb": "float16_vector"})
+        client.use_table("t16")
+        client.store([{"emb": vectors[i], "k": i % 10} for i in range(n)])
+        client.flush()
+
+        def live16():
+            return {int(row["_id"]): [float(x) for x in row["emb"]]
+                    for row in client.execute("SELECT _id, emb FROM t16").to_dict()}
+
+        def topk16(k=5):
+            return [int(row["_id"]) for row in
+                    client.topk_distance("emb", query, k=k, metric="l2").to_dict()]
+
+        def assert_topk16_is_exact(k=5):
+            known = live16()
+            got = topk16(k=k)
+            assert len(got) == len(set(got)), f"duplicate ids in {got}"
+            assert all(i in known for i in got), (got, sorted(known))
+            got_distances = sorted(distance(known[i]) for i in got)
+            want = sorted(distance(v) for v in known.values())[:k]
+            # float16 storage quantizes values, so allow a coarser tolerance here.
+            assert all(
+                abs(a - b) <= 1e-2 * max(1.0, abs(b)) for a, b in zip(got_distances, want)
+            ), (got, got_distances, want)
+
+        assert_topk16_is_exact()
+        client.execute("DELETE FROM t16 WHERE k = 0")
+        client.flush()
+        assert_topk16_is_exact()
+        client.execute("DELETE FROM t16 WHERE k < 6")
+        client.flush()
+        assert live16(), "the f16 batches must leave some rows"
+        for k in (1, 3, 5):
+            assert_topk16_is_exact(k)
+
+        # Quantized codecs take the same encoded-buffer branch and carried the largest
+        # penalty of all (turboquant4: 0.36 -> 12.87 ms, 35.8x; int8 7.2x; bfloat16 5.2x).
+        for ctype in ("turboquant4_vector", "int8_vector", "bfloat16_vector"):
+            name = f"tq_{ctype}"
+            client.create_table(name, schema={"emb": ctype, "k": "int64"})
+            client.use_table(name)
+            client.store([{"emb": vectors[i], "k": i % 10} for i in range(n)])
+            client.flush()
+
+            def live_q():
+                return {int(row["_id"]): [float(x) for x in row["emb"]]
+                        for row in client.execute(f"SELECT _id, emb FROM {name}").to_dict()}
+
+            def assert_topk_q_is_exact(k=5):
+                known = live_q()
+                got = [int(row["_id"]) for row in
+                       client.topk_distance("emb", query, k=k, metric="l2").to_dict()]
+                assert len(got) == len(set(got)), (ctype, got)
+                assert all(i in known for i in got), (ctype, got, sorted(known))
+                got_distances = sorted(distance(known[i]) for i in got)
+                want = sorted(distance(v) for v in known.values())[:k]
+                # Quantized storage is lossy, so allow a coarser tolerance.
+                assert all(
+                    abs(a - b) <= 5e-2 * max(1.0, abs(b))
+                    for a, b in zip(got_distances, want)
+                ), (ctype, got, got_distances, want)
+
+            assert_topk_q_is_exact()
+            client.execute(f"DELETE FROM {name} WHERE k = 0")
+            client.flush()
+            assert_topk_q_is_exact()
+            client.execute(f"DELETE FROM {name} WHERE k < 6")
+            client.flush()
+            assert live_q(), f"{ctype} batches must leave some rows"
+            for k in (1, 3, 5):
+                assert_topk_q_is_exact(k)
+    finally:
+        client.close()
+
+
+def test_vector_topk_is_identical_under_a_tiny_scan_budget(tmp_path, monkeypatch):
+    """The whole-column vector scan buffer must respect `APEX_SCAN_BUFFER_MB`.
+
+    The TopK lanes copy the entire vector column into `scan_buf`/`scan_buf_f16`. On a column
+    bigger than the budget that buffer is what pins RSS, so the lane now stands down and the
+    caller reads a windowed batch instead. The contract is that both paths return exactly the
+    same neighbours: this pins that, plus `0` meaning unlimited.
+    """
+    dim, rows = 32, 20_000
+    tmp = tmp_path / "scanbudget"
+    client = ApexClient(dirpath=str(tmp), drop_if_exists=True)
+    client.create_table("t")
+    client.use_table("t")
+    client.store({
+        "emb": [[float((i + j) % 50) / 50.0 for j in range(dim)] for i in range(rows)],
+        "k": list(range(rows)),
+    })
+    client.flush()
+    query = [0.5] * dim
+
+    def topk_ids():
+        return [int(row["_id"]) for row in
+                client.topk_distance("emb", query, k=10, metric="l2").to_dict()]
+
+    try:
+        monkeypatch.delenv("APEX_SCAN_BUFFER_MB", raising=False)
+        default_ids = topk_ids()
+        assert default_ids, "the default budget must still answer"
+
+        # The column buffer is 20_000 * 32 * 4 B = 2.56 MB; 1 MB cannot hold it.
+        monkeypatch.setenv("APEX_SCAN_BUFFER_MB", "1")
+        assert topk_ids() == default_ids, "the windowed fallback must return the same rows"
+
+        monkeypatch.setenv("APEX_SCAN_BUFFER_MB", "0")
+        assert topk_ids() == default_ids, "0 means unlimited, not 'no buffer'"
+
+        monkeypatch.setenv("APEX_SCAN_BUFFER_MB", "nonsense")
+        assert topk_ids() == default_ids, "an invalid value keeps the default budget"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("vector_type", ["float16_vector", "float32_vector"])
+def test_batch_topk_is_identical_under_a_tiny_scan_budget(tmp_path, monkeypatch, vector_type):
+    """The batch vector lane must window its scan buffer instead of standing down.
+
+    Regression evidence: with an explicit `APEX_SCAN_BUFFER_MB` cap the batch lanes used to
+    return `None` and fall back to a slower path. They now score one bounded window at a time
+    and merge each query's top-k, so a capped run must return exactly the uncapped result.
+    """
+    rows, dim, queries = 40_000, 32, 3
+    client = ApexClient(str(tmp_path / vector_type), drop_if_exists=True)
+    client.create_table("t", schema={"emb": vector_type})
+    client.use_table("t")
+    client.store({"emb": [[float((i + j) % 50) / 50.0 for j in range(dim)] for i in range(rows)]})
+    client.flush()
+    query_vectors = [[float((q + j) % 50) / 50.0 for j in range(dim)] for q in range(queries)]
+    try:
+        monkeypatch.delenv("APEX_SCAN_BUFFER_MB", raising=False)
+        uncapped = repr(client.batch_topk_distance("emb", query_vectors, k=5, metric="l2"))
+        for cap in ("1", "4"):
+            monkeypatch.setenv("APEX_SCAN_BUFFER_MB", cap)
+            capped = repr(client.batch_topk_distance("emb", query_vectors, k=5, metric="l2"))
+            assert capped == uncapped, f"cap={cap}MB changed the batch top-k result"
+    finally:
+        client.close()

@@ -4,6 +4,39 @@ impl ApexExecutor {
     /// Try to use a secondary index to accelerate a SELECT query.
     /// Returns Some(result) if an index was used, None to fall through to scan paths.
     /// Only used for simple equality WHERE clauses on indexed columns (no GROUP BY/aggregation).
+    /// Whether a single-column equality index proves the predicate matches nothing.
+    ///
+    /// Exact when true -- the index is the authoritative key set for the persisted
+    /// rows -- and conservative otherwise (a stale index, no usable index, an error,
+    /// or a lookup that simply found no entry). Absence used to be the slow case for a
+    /// filtered aggregate: `COUNT(*) WHERE s = 'absent'` on a 200k-row indexed table
+    /// cost 1.16 ms against 0.14 ms for a value that exists, because it fell through
+    /// to a lane that materialized the whole column.
+    pub(in crate::query::executor) fn index_equality_matches_no_rows(
+        storage_path: &Path,
+        column: &str,
+        value: &crate::data::Value,
+    ) -> bool {
+        use crate::storage::index::index_manager::PredicateHint;
+
+        if indexes_stale(storage_path) {
+            return false;
+        }
+        let (base_dir, table_name) = base_dir_and_table(storage_path);
+        let manager = get_index_manager(&base_dir, &table_name);
+        let mut guard = manager.lock();
+        if !guard.has_single_column_index_on(column) {
+            return false;
+        }
+        let hint = PredicateHint::Eq(value.clone());
+        match guard.lookup(column, &hint) {
+            Ok(Some(result)) => result.row_ids.is_empty(),
+            // `None` means no usable index answered, which is not a proof.
+            Ok(None) => false,
+            Err(_) => false,
+        }
+    }
+
     fn try_index_accelerated_read(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
@@ -17,6 +50,15 @@ impl ApexExecutor {
         // A committed DML operation may have failed while persisting its
         // secondary index. Until REINDEX repairs it, scans are authoritative.
         if indexes_stale(storage_path) {
+            return Ok(None);
+        }
+
+        // The index covers the persisted row groups only. While an overlay is
+        // visible — an append delta, buffered appended rows or DeltaStore cells —
+        // the index is no longer the authoritative row set: the lookup, and the
+        // covering index-only scan that never touches the table at all, would
+        // silently drop every overlay row. Merged scans see them, so stand down.
+        if backend.requires_merged_read() {
             return Ok(None);
         }
 

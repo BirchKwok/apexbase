@@ -7,7 +7,7 @@ mod handler;
 mod pg_catalog;
 mod types;
 
-pub use handler::ApexBaseHandler;
+pub use handler::{default_query_concurrency, default_query_wait, ApexBaseHandler};
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +24,15 @@ pub struct ServerConfig {
     pub host: String,
     /// Port to listen on
     pub port: u16,
+    /// Statements that may execute at once (see
+    /// [`default_query_concurrency`]). Connections stay responsive past this
+    /// bound: extra statements queue on a semaphore instead of stalling the
+    /// reactor.
+    pub query_concurrency: usize,
+    /// How long a statement waits for a slot before it is rejected with `53300`
+    /// (see [`default_query_wait`]). Without a bound an overloaded server would
+    /// queue statements forever.
+    pub query_wait: std::time::Duration,
 }
 
 impl Default for ServerConfig {
@@ -32,6 +41,8 @@ impl Default for ServerConfig {
             data_dir: PathBuf::from("."),
             host: "127.0.0.1".to_string(),
             port: 5432,
+            query_concurrency: default_query_concurrency(),
+            query_wait: default_query_wait(),
         }
     }
 }
@@ -66,8 +77,14 @@ impl PgWireHandlerFactory for ApexBaseServerFactory {
 
 /// Start the PostgreSQL wire protocol server
 pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error::Error>> {
-    let handler = Arc::new(ApexBaseHandler::new(config.data_dir.clone()));
-    let factory = Arc::new(ApexBaseServerFactory { handler });
+    let handler = Arc::new(ApexBaseHandler::with_query_limits(
+        config.data_dir.clone(),
+        config.query_concurrency,
+        config.query_wait,
+    ));
+    let factory = Arc::new(ApexBaseServerFactory {
+        handler: Arc::clone(&handler),
+    });
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = TcpListener::bind(&addr).await?;
@@ -77,6 +94,11 @@ pub async fn start_server(config: ServerConfig) -> Result<(), Box<dyn std::error
     println!("ApexBase PostgreSQL-compatible server");
     println!("  Listening on: {}", addr);
     println!("  Data dir:     {}", config.data_dir.display());
+    println!(
+        "  Concurrency:  {} statement(s) at once, {} ms admission wait",
+        handler.query_concurrency(),
+        handler.query_wait().as_millis()
+    );
     println!("  Connect with: psql -h {} -p {}", config.host, config.port);
 
     loop {

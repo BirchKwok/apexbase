@@ -248,9 +248,34 @@ impl ApexExecutor {
             } else {
                 col_name
             };
+            // The lane already fetched `k = limit + offset` rows; LIMIT/OFFSET are
+            // applied to the returned batch by the caller. Skipping the offset here as
+            // well applied it twice: `LIMIT 4 OFFSET 3` returned one row starting at the
+            // seventh (the numeric lane had that bug all along).
             if let Some(heap) = backend.scan_top_k_indices_mmap(actual_col, k, clause.descending)? {
-                let final_indices: Vec<usize> =
-                    heap.into_iter().skip(offset).map(|(idx, _)| idx).collect();
+                let final_indices: Vec<usize> = heap.into_iter().map(|(idx, _)| idx).collect();
+                if !final_indices.is_empty() {
+                    return backend.read_columns_by_indices_to_arrow(&final_indices, None);
+                }
+                return backend.read_columns_to_arrow(None, 0, Some(0));
+            }
+            // A string sort column has no numeric value to rank, so ordering one used
+            // to materialise and sort every row. Rank its dictionary
+            // (`scan_top_k_string_indices_mmap`) or, for a high-cardinality column, its
+            // block-chained byte slices (`scan_top_k_plain_string_indices_mmap`).
+            if let Some(indices) =
+                backend.scan_top_k_string_indices_mmap(actual_col, k, clause.descending)?
+            {
+                let final_indices: Vec<usize> = indices;
+                if !final_indices.is_empty() {
+                    return backend.read_columns_by_indices_to_arrow(&final_indices, None);
+                }
+                return backend.read_columns_to_arrow(None, 0, Some(0));
+            }
+            if let Some(indices) =
+                backend.scan_top_k_plain_string_indices_mmap(actual_col, k, clause.descending)?
+            {
+                let final_indices: Vec<usize> = indices;
                 if !final_indices.is_empty() {
                     return backend.read_columns_by_indices_to_arrow(&final_indices, None);
                 }
@@ -295,8 +320,20 @@ impl ApexExecutor {
             };
 
             if let Some(col) = sort_batch.column_by_name(actual_col) {
-                // Fast path for Float64 DESC (most common case)
-                if let Some(float_arr) = col.as_any().downcast_ref::<Float64Array>() {
+                if col.null_count() > 0 {
+                    // The streaming heaps below score a NULL as ±infinity, so
+                    // NULLs always land last. That only matches the default for
+                    // ASC (`nulls_first == descending`); for DESC the default is
+                    // NULLs first, and an explicit NULLS FIRST/LAST is ignored.
+                    // A key that actually holds NULLs therefore takes the
+                    // general path, which honours the requested placement.
+                    Self::compute_topk_indices_generic(
+                        &sort_batch,
+                        &stmt.order_by,
+                        k_actual,
+                        stmt.offset,
+                    )
+                } else if let Some(float_arr) = col.as_any().downcast_ref::<Float64Array>() {
                     let descending = clause.descending;
 
                     // Streaming top-k: maintain sorted list of top k (value, index) pairs

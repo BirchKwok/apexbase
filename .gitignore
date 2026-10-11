@@ -87,3 +87,6 @@ AGENTS.md
 .cargo-home/
 
 .agent-tmp/
+
+# Architecture update ducumentation
+V5_*.md

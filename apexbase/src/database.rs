@@ -499,7 +499,8 @@ impl Database {
         null_positions: HashMap<String, Vec<bool>>,
         durability: DurabilityLevel,
     ) -> io::Result<Vec<u64>> {
-        engine().write_typed(
+        let _cross_process = crate::storage::cross_process_lock::lock_write(table_path)?;
+        let ids = engine().write_typed(
             table_path,
             int_columns,
             float_columns,
@@ -509,7 +510,12 @@ impl Database {
             bool_columns,
             null_positions,
             durability,
-        )
+        )?;
+        // The typed fast paths used to skip index maintenance entirely, which left
+        // a *trusted* stale index behind: indexed equality silently missed every
+        // row written through them.
+        Self::notify_indexes_after_write(table_path, &ids);
+        Ok(ids)
     }
 
     /// Write pre-built columnar data (borrowed-buffer path used by the Python
@@ -521,7 +527,10 @@ impl Database {
         null_positions: HashMap<String, Vec<bool>>,
         durability: DurabilityLevel,
     ) -> io::Result<Vec<u64>> {
-        engine().write_typed_columns(table_path, columns, null_positions, durability)
+        let _cross_process = crate::storage::cross_process_lock::lock_write(table_path)?;
+        let ids = engine().write_typed_columns(table_path, columns, null_positions, durability)?;
+        Self::notify_indexes_after_write(table_path, &ids);
+        Ok(ids)
     }
 
     #[inline]
@@ -647,6 +656,10 @@ impl Database {
         rows: &[HashMap<String, Value>],
         durability: DurabilityLevel,
     ) -> io::Result<Vec<u64>> {
+        // Every committed write goes through the cross-process table lock. It is
+        // re-entrant per thread, so callers that already hold it (the Python
+        // bindings, the executor's DML path) pay nothing extra.
+        let _cross_process = crate::storage::cross_process_lock::lock_write(table_path)?;
         let ids = engine().write(table_path, rows, durability)?;
         Self::notify_indexes_after_write(table_path, &ids);
         Ok(ids)

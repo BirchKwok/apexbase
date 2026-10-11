@@ -98,9 +98,9 @@ impl QueryMemoryBudget {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::OutOfMemory,
                 format!(
-                    "query memory budget exceeded: aggregation state would use {} bytes \
+                    "query memory budget exceeded: operator state would use {} bytes \
                      ({} already charged, limit {}); increase APEX_QUERY_MEMORY_MB or \
-                     reduce the group cardinality",
+                     reduce the result size / group cardinality",
                     total, previous, self.limit
                 ),
             ));
@@ -121,6 +121,42 @@ impl QueryMemoryBudget {
 thread_local! {
     static QUERY_MEMORY_BUDGET: RefCell<Option<Arc<QueryMemoryBudget>>> =
         const { RefCell::new(None) };
+}
+
+/// RAII charge against the current query's budget.
+///
+/// Operators that materialise per-row state (ORDER BY keys, JOIN build tables, DISTINCT sets)
+/// reserve their estimated footprint and let the guard release it on drop, so a failed or
+/// cancelled query cannot leak a charge into the next one. `APEX_QUERY_MEMORY_MB=0` (or no
+/// installed budget, e.g. a nested call outside a top-level query) makes this a no-op.
+pub struct QueryMemoryCharge {
+    budget: Option<Arc<QueryMemoryBudget>>,
+    bytes: usize,
+}
+
+impl QueryMemoryCharge {
+    /// Reserve `bytes` for the caller, or return
+    /// [`std::io::ErrorKind::OutOfMemory`] when that would cross the query's limit.
+    pub fn new(bytes: usize) -> std::io::Result<Self> {
+        let budget = query_memory_budget();
+        if let Some(ref budget) = budget {
+            budget.reserve(bytes)?;
+        }
+        Ok(Self { budget, bytes })
+    }
+
+    /// Bytes this charge holds, so a caller can grow or shrink it explicitly.
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+impl Drop for QueryMemoryCharge {
+    fn drop(&mut self) {
+        if let Some(ref budget) = self.budget {
+            budget.release(self.bytes);
+        }
+    }
 }
 
 /// The budget installed for the current thread's top-level query, if any.

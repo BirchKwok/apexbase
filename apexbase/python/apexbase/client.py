@@ -690,6 +690,62 @@ def _classify_sql_route(sql: str, sql_upper: Optional[str] = None):
     return sig, count_star_match, simple_projection
 
 
+# Statement heads whose answer is a single scalar row (`result`) rather than a
+# result set. Every one of them is reported by the scalar route without Arrow.
+_SCALAR_WRITE_HEADS = (
+    'INSERT',
+    'UPDATE',
+    'DELETE',
+    'TRUNCATE',
+    'ALTER',
+    'CREATE INDEX',
+    'DROP INDEX',
+    'CREATE TABLE',
+    'DROP TABLE',
+    'COPY',
+)
+
+
+def _is_scalar_write_sql(
+    sql_upper: str, in_txn: bool = False, has_table: bool = True
+) -> bool:
+    """
+    Report whether every statement in ``sql_upper`` answers with a scalar row.
+
+    Single ``UPDATE``/``DELETE``/``INSERT``/DDL statements answer with one
+    ``rows_affected`` row, and a batch of nothing but those statements answers
+    with one row as well -- the Arrow default path is only ever needed to decode
+    that row, at the price of the first ``import pyarrow`` in the process.
+
+    One shape is deliberately excluded because its *side effects*, not just its
+    result, belong to the Arrow route: a batch inside a transaction. The scalar
+    entry executes a batch statement by statement and each one commits, so a later
+    ``ROLLBACK`` could no longer discard it.
+
+    Args:
+        sql_upper: Upper-cased statement text (may hold several statements).
+        in_txn: Whether the session is inside an explicit transaction.
+        has_table: Whether a table is currently selected.
+
+    Returns:
+        ``True`` when the scalar route can answer the whole call.
+    """
+    statements = [part.strip() for part in sql_upper.split(';') if part.strip()]
+    if not statements:
+        return False
+    if len(statements) > 1 and in_txn:
+        return False
+    for statement in statements:
+        # `COPY <table> FROM <file>` can create the table it loads, and the scalar
+        # entry refuses to run without a selected table (the Arrow route falls back
+        # to the base directory). With a table already selected it is just a count.
+        if statement.startswith('COPY') and ' FROM ' in statement and not has_table:
+            return False
+        if not statement.startswith(_SCALAR_WRITE_HEADS):
+            return False
+    return True
+
+
 def _sql_route_family(sig: str) -> str:
     """
     Collapse a detailed Python fast-path signature into a routing family.
@@ -3030,6 +3086,68 @@ class ApexClient:
         if has_pending():
             self._storage.flush()
 
+    def _scalar_write_result_view(self, sql: str, sql_upper: str, show_internal_id):
+        """
+        Answer a write statement from its scalar row instead of through Arrow.
+
+        Every write statement answers with one ``rows_affected`` row, but the
+        default path decodes it through the Arrow C Data Interface -- which costs
+        the first ``import pyarrow`` of the process (43-51 ms measured, 33 ms of it
+        loading the C extensions) and put a one-time cliff on the first write of
+        every session, while the second write costs 0.4 ms and this route answers
+        the first in 0.2-2.2 ms.
+
+        Args:
+            sql: Statement text as the caller wrote it.
+            sql_upper: Upper-cased statement text.
+            show_internal_id: Whether ``_id`` should stay visible.
+
+        Returns:
+            A :class:`ResultView` carrying the same value and column name the
+            Arrow path reported, or ``None`` when the statement is not a scalar
+            write (nothing is executed in that case).
+        """
+        if not _is_scalar_write_sql(
+            sql_upper,
+            getattr(self, '_in_txn', False),
+            self._current_table is not None,
+        ):
+            return None
+        result = self._storage.execute(sql)
+        # The Arrow route syncs the selected table from storage after every
+        # statement -- `CREATE TABLE` and `COPY <table> FROM` publish the table they
+        # touch. Doing the same here is what keeps following unqualified statements
+        # working instead of raising "No table selected".
+        try:
+            _current = self._storage.current_table()
+        except Exception:
+            _current = None
+        if _current:
+            self._current_table = _current
+        if not isinstance(result, dict):
+            return None
+        columns_dict = result.get('columns_dict')
+        if columns_dict is not None:
+            return self._result_view_from_columns_dict(
+                sql, columns_dict, show_internal_id
+            )
+        cols = [
+            'result' if column == 'rows_affected' else column
+            for column in result.get('columns') or []
+        ]
+        rows = result.get('rows')
+        if not cols or not rows:
+            # The statement answered in a shape this route does not model; keep the
+            # value rather than silently dropping it.
+            view = ResultView(data=result.get('rows') or None)
+            view._show_internal_id = show_internal_id
+            return view
+        col_dict = {
+            column: [row[index] for row in rows]
+            for index, column in enumerate(cols)
+        }
+        return self._result_view_from_columns_dict(sql, col_dict, show_internal_id)
+
     @staticmethod
     def _should_use_columnar_materialization(sql_upper: str, sig: str) -> bool:
         """
@@ -4157,6 +4275,11 @@ class ApexClient:
 
             # ── Multi-statement: Arrow IPC with transaction support ──
             if _sig == 'multi':
+                # A batch of nothing but write statements answers with one scalar
+                # row too, and used to pay the same `import pyarrow` cliff.
+                _scalar_view = self._scalar_write_result_view(sql, sql_upper, show_internal_id)
+                if _scalar_view is not None:
+                    return _scalar_view
                 if getattr(self, '_fast_txn_active', False):
                     self._promote_fast_txn_to_rust_unlocked()
                 ipc_bytes = self._storage._execute_arrow_ipc(sql)
@@ -4235,6 +4358,11 @@ class ApexClient:
             if _sig == 'write':
                 self._has_writes = True
                 self._invalidate_replace_cache()
+
+            # ── Write statements: scalar result, no Arrow needed ──
+            _scalar_view = self._scalar_write_result_view(sql, sql_upper, show_internal_id)
+            if _scalar_view is not None:
+                return _scalar_view
 
             # ── Fast materialization: bounded SELECT → Rust-direct Python lists ──
             # `to_dict()` on a small LIMIT result is dominated by the PyArrow

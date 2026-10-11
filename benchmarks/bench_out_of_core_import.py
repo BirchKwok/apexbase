@@ -36,7 +36,13 @@ def current_rss_mb() -> float:
             ["ps", "-o", "rss=", "-p", str(os.getpid())], text=True
         )
         return int(output.strip()) / 1024.0
-    with open(f"/proc/{os.getpid()}/status", encoding="utf-8") as handle:
+    # `/proc` exists on Linux only; on Windows there is no equivalent file to
+    # read without a dependency, so report an unknown increment instead of
+    # failing the run (peak RSS still comes from `resource`).
+    status_path = Path(f"/proc/{os.getpid()}/status")
+    if not status_path.exists():
+        return 0.0
+    with status_path.open(encoding="utf-8") as handle:
         for line in handle:
             if line.startswith("VmRSS:"):
                 return int(line.split()[1]) / 1024.0
@@ -114,6 +120,23 @@ def generate_parquet(path: Path, rows: int) -> None:
             writer.write_batch(batch, row_group_size=GEN_BATCH_ROWS)
 
 
+def limit_budget_mb(text: str, divisor: int) -> int:
+    """Turn a DuckDB-style limit ("1GB", "256MB", "512m", bare MB) into an engine budget.
+
+    ApexBase budgets are megabytes; the process cap is split so the query state and the
+    whole-column scan buffers together stay well inside it.
+    """
+    raw = text.strip().lower()
+    scale = 1
+    for suffix, factor in (("gb", 1024), ("mb", 1), ("g", 1024), ("m", 1)):
+        if raw.endswith(suffix):
+            raw = raw[: -len(suffix)]
+            scale = factor
+            break
+    value = float(raw) * scale
+    return max(1, int(value // divisor))
+
+
 def apex_worker(
     source: Path,
     database: Path,
@@ -121,8 +144,17 @@ def apex_worker(
     source_format: str,
     warmups: int,
     runs: int,
+    memory_limit: str = "1GB",
 ) -> dict:
     from apexbase import ApexClient
+
+    # The benchmark only proves out-of-core behaviour if the engine is actually bounded:
+    # the per-query aggregation budget and the whole-column scan buffers are split out of
+    # the same process cap DuckDB runs under.
+    engine_query_mb = limit_budget_mb(memory_limit, 4)
+    engine_scan_mb = limit_budget_mb(memory_limit, 8)
+    os.environ["APEX_QUERY_MEMORY_MB"] = str(engine_query_mb)
+    os.environ["APEX_SCAN_BUFFER_MB"] = str(engine_scan_mb)
 
     before_rss = current_rss_mb()
     client = ApexClient(str(database), drop_if_exists=True)
@@ -171,6 +203,11 @@ def apex_worker(
         "peak_rss_mb": peak_rss_mb(),
         "incremental_peak_rss_mb": max(0.0, peak_rss_mb() - before_rss),
         "direct_filtered_rows": direct_filtered_rows,
+        "engine_budgets": {
+            "memory_limit": memory_limit,
+            "query_memory_mb": engine_query_mb,
+            "scan_buffer_mb": engine_scan_mb,
+        },
     }
 
 
@@ -250,7 +287,7 @@ def run_worker(args: argparse.Namespace) -> None:
         args.query_runs,
     )
     if args.engine == "apexbase":
-        result = apex_worker(*common)
+        result = apex_worker(*common, args.memory_limit)
     else:
         result = duckdb_worker(*common, args.memory_limit)
     if result["rows"] != args.rows:
@@ -409,6 +446,7 @@ def main() -> None:
             "query_runs": args.query_runs,
             "warmups": args.warmups,
             "duckdb_memory_limit": args.memory_limit,
+            "apexbase_engine_budgets": results["apexbase"].get("engine_budgets"),
             "engines": results,
             "comparison": comparison(results),
         }

@@ -47,8 +47,15 @@ pub fn apply_pending_deletes(path: &std::path::Path) -> io::Result<()> {
         Some(b) => b,
         None => return Ok(()),
     };
-    // Parse pending format: "APXP"[rg_count:u32][(rg_i:u32, offset:u64, len:u32, del_bytes)...][footer_off:u64][footer_len:u32][footer_bytes...]
-    if buf.len() < 24 || &buf[0..4] != b"APXP" {
+    // Parse pending format: "APXP"[dev:u64][ino:u64][len:u64][modified:u64][rg_count:u32]
+    // [(rg_i:u32, offset:u64, len:u32, del_bytes)...][footer_off:u64][footer_len:u32][footer_bytes...]
+    //
+    // The guard has to cover the fixed header (4 + 4*8 + 4 = 40 bytes): it used
+    // to check only 24 and then read `buf[28..36]`, so a shorter entry (a 29-byte
+    // one was seen from a reader thread) panicked with "range end index 36 out
+    // of range for slice of length 29" instead of being ignored.
+    const PENDING_FIXED_HEADER: usize = 40;
+    if buf.len() < PENDING_FIXED_HEADER || &buf[0..4] != b"APXP" {
         return Ok(());
     }
     let dev_id = u64::from_le_bytes(buf[4..12].try_into().unwrap());
@@ -169,7 +176,900 @@ pub fn clear_pending_deletes_for_dir(dir: &std::path::Path) {
         .map(|m| m.retain(|path, _| !path.starts_with(dir)));
 }
 
+/// True when any row in `start..end` is flagged NULL in `nulls[col_idx]`.
+fn null_bitmap_any_set(nulls: &[Vec<u8>], col_idx: usize, start: usize, end: usize) -> bool {
+    let Some(bitmap) = nulls.get(col_idx) else {
+        return false;
+    };
+    (start..end).any(|row| {
+        bitmap
+            .get(row / 8)
+            .is_some_and(|byte| ((byte >> (row % 8)) & 1) != 0)
+    })
+}
+
+/// Borrow `data[start..end]`, clamped to the slice.
+#[inline]
+fn slice_or_empty<T>(data: &[T], start: usize, end: usize) -> &[T] {
+    let lo = start.min(data.len());
+    let hi = end.min(data.len());
+    if hi > lo {
+        &data[lo..hi]
+    } else {
+        &[]
+    }
+}
+
+/// Rows per parallel zone-map task. Below this the sequential pass is cheaper
+/// than rayon's task overhead, so small appends keep the old path.
+const ZONE_MAP_PAR_MIN_ROWS: usize = 8_192;
+/// Values per parallel task inside one large string chunk.
+const ZONE_MAP_PAR_MIN_VALUES: usize = 16_384;
+/// Number of ways a large string chunk's value scan is split.
+const ZONE_MAP_PAR_PARTS: usize = 4;
+
+/// Partial zone ranges of a chunk of string values.
+#[derive(Clone, Copy)]
+struct StringRange {
+    min: i64,
+    max: i64,
+    values: usize,
+}
+
+impl StringRange {
+    const EMPTY: Self = Self {
+        min: i64::MAX,
+        max: i64::MIN,
+        values: 0,
+    };
+
+    fn merge(self, other: Self) -> Self {
+        Self {
+            min: self.min.min(other.min),
+            max: self.max.max(other.max),
+            values: self.values + other.values,
+        }
+    }
+}
+
+/// Split `lo..hi` into the ranges one parallel scan works on.
+fn zone_scan_ranges(lo: usize, hi: usize) -> Vec<(usize, usize)> {
+    let count = hi.saturating_sub(lo);
+    if count < ZONE_MAP_PAR_MIN_VALUES {
+        return vec![(lo, hi)];
+    }
+    let step = count.div_ceil(ZONE_MAP_PAR_PARTS);
+    (lo..hi)
+        .step_by(step)
+        .map(|start| (start, (start + step).min(hi)))
+        .collect()
+}
+
+/// Byte-length range and first-eight value range of `offsets[lo..hi]` values,
+/// split across threads for large chunks. The write path pays this scan per
+/// value of every string column, so it is the append-time cost of the string
+/// zone maps.
+fn string_zone_data(offsets: &[u64], data: &[u8], lo: usize, hi: usize) -> (StringRange, StringRange) {
+    use rayon::prelude::*;
+    let ranges = zone_scan_ranges(lo, hi);
+    let scan = |&(start, end): &(usize, usize)| {
+        let (mut lengths, mut keys) = (StringRange::EMPTY, StringRange::EMPTY);
+        for i in start..end {
+            let value = &data[offsets[i] as usize..offsets[i + 1] as usize];
+            let len = value.len() as i64;
+            lengths.min = lengths.min.min(len);
+            lengths.max = lengths.max.max(len);
+            let key = string_prefix_key(value);
+            keys.min = keys.min.min(key);
+            keys.max = keys.max.max(key);
+            lengths.values += 1;
+            keys.values += 1;
+        }
+        (lengths, keys)
+    };
+    if ranges.len() == 1 {
+        return scan(&ranges[0]);
+    }
+    ranges
+        .par_iter()
+        .map(scan)
+        .reduce(
+            || (StringRange::EMPTY, StringRange::EMPTY),
+            |left, right| (left.0.merge(right.0), left.1.merge(right.1)),
+        )
+}
+
+/// Second-eight tail range of `offsets[lo..hi]` values. Only computed for a
+/// chunk whose value range is degenerate (every value shares its first eight
+/// bytes), so the common case never pays for it.
+fn string_tail_data(offsets: &[u64], data: &[u8], lo: usize, hi: usize) -> StringRange {
+    use rayon::prelude::*;
+    let ranges = zone_scan_ranges(lo, hi);
+    let scan = |&(start, end): &(usize, usize)| {
+        let mut tails = StringRange::EMPTY;
+        for i in start..end {
+            let value = &data[offsets[i] as usize..offsets[i + 1] as usize];
+            let tail = string_tail_key(value);
+            tails.min = tails.min.min(tail);
+            tails.max = tails.max.max(tail);
+            tails.values += 1;
+        }
+        tails
+    };
+    if ranges.len() == 1 {
+        return scan(&ranges[0]);
+    }
+    ranges
+        .par_iter()
+        .map(scan)
+        .reduce(|| StringRange::EMPTY, StringRange::merge)
+}
+
+/// Push the zone-map entries of one string column chunk.
+///
+/// Entry order is a compatibility contract: the byte-length range comes first
+/// because readers that predate the value-range flags resolve a column's zone by
+/// its first non-float entry and must keep seeing the legacy length meaning. The
+/// first-eight value range follows, then the second-eight tail range when it
+/// carries information. A scan prunes the row group when any entry proves that
+/// no candidate value can appear in it.
+fn push_string_zone_entries(
+    zone_maps: &mut Vec<RgColumnZoneMap>,
+    col_idx: usize,
+    has_nulls: bool,
+    offsets: &[u64],
+    data: &[u8],
+    lo: usize,
+    hi: usize,
+) {
+    let (lengths, keys) = string_zone_data(offsets, data, lo, hi);
+    if lengths.values == 0 {
+        return;
+    }
+    zone_maps.push(RgColumnZoneMap {
+        col_idx: col_idx as u16,
+        min_bits: lengths.min,
+        max_bits: lengths.max,
+        has_nulls,
+        is_float: false,
+        is_string_prefix: false,
+        is_string_tail: false,
+    });
+    zone_maps.push(RgColumnZoneMap {
+        col_idx: col_idx as u16,
+        min_bits: keys.min,
+        max_bits: keys.max,
+        has_nulls,
+        is_float: false,
+        is_string_prefix: true,
+        is_string_tail: false,
+    });
+    // The tail range only adds information when every value shares its first
+    // eight bytes (otherwise the value range already separates them) and the
+    // tails are not constant; writing it otherwise would cost footer bytes and a
+    // reader check on every scan for nothing.
+    if keys.min == keys.max {
+        let tails = string_tail_data(offsets, data, lo, hi);
+        if tails.min != tails.max {
+            zone_maps.push(RgColumnZoneMap {
+                col_idx: col_idx as u16,
+                min_bits: tails.min,
+                max_bits: tails.max,
+                has_nulls,
+                is_float: false,
+                is_string_prefix: false,
+                is_string_tail: true,
+            });
+        }
+    }
+}
+
+/// Zone-map entries of one column chunk.
+///
+/// Numeric columns record min/max; string columns record the byte-length range,
+/// the first-eight value range and (when informative) the second-eight tail
+/// range; Bool columns record their observed bit range.
+///
+/// `has_nulls` is persisted from the real null bitmap rather than hardcoded.
+/// Readers treat a present zone-map entry as authoritative for NULL presence
+/// (they skip re-scanning the bitmap), so a `false` entry on a column that does
+/// hold NULLs makes them rank a placeholder value instead of ordering the NULL.
+/// Writers without a null bitmap pass `None`, which stores `false` for every
+/// entry just like the pre-zone-map code did.
+fn column_zone_maps(
+    column: &ColumnData,
+    nulls: Option<&[Vec<u8>]>,
+    col_idx: usize,
+    start: usize,
+    end: usize,
+) -> Vec<RgColumnZoneMap> {
+    let mut zone_maps: Vec<RgColumnZoneMap> = Vec::new();
+    let has_nulls = nulls.is_some_and(|nulls| null_bitmap_any_set(nulls, col_idx, start, end));
+    match column {
+        ColumnData::Int64(data) => {
+            let slice = slice_or_empty(data, start, end);
+            if !slice.is_empty() {
+                let (mut mn, mut mx) = (i64::MAX, i64::MIN);
+                for &v in slice {
+                    mn = mn.min(v);
+                    mx = mx.max(v);
+                }
+                zone_maps.push(RgColumnZoneMap {
+                    col_idx: col_idx as u16,
+                    min_bits: mn,
+                    max_bits: mx,
+                    has_nulls,
+                    is_float: false,
+                    is_string_prefix: false,
+                    is_string_tail: false,
+                });
+            }
+        }
+        ColumnData::Float64(data) => {
+            let slice = slice_or_empty(data, start, end);
+            if !slice.is_empty() {
+                let (mut mn, mut mx) = (f64::INFINITY, f64::NEG_INFINITY);
+                for &v in slice {
+                    if v < mn {
+                        mn = v;
+                    }
+                    if v > mx {
+                        mx = v;
+                    }
+                }
+                zone_maps.push(RgColumnZoneMap {
+                    col_idx: col_idx as u16,
+                    min_bits: mn.to_bits() as i64,
+                    max_bits: mx.to_bits() as i64,
+                    has_nulls,
+                    is_float: true,
+                    is_string_prefix: false,
+                    is_string_tail: false,
+                });
+            }
+        }
+        ColumnData::String { offsets, data } => {
+            let lo = start.min(offsets.len().saturating_sub(1));
+            let hi = end.min(offsets.len().saturating_sub(1));
+            if hi > lo {
+                push_string_zone_entries(&mut zone_maps, col_idx, has_nulls, offsets, data, lo, hi);
+            }
+        }
+        ColumnData::StringDict {
+            dict_offsets,
+            dict_data,
+            ..
+        } => {
+            // Each Row Group carries its own dictionary, so the whole dict
+            // belongs to this group: its value range covers every row.
+            let hi = dict_offsets.len().saturating_sub(1);
+            if hi > 0 {
+                push_string_zone_entries(
+                    &mut zone_maps,
+                    col_idx,
+                    has_nulls,
+                    dict_offsets,
+                    dict_data,
+                    0,
+                    hi,
+                );
+            }
+        }
+        ColumnData::Bool { data, len } => {
+            // Packed bits: the zone carries the observed bit range as 0/1.
+            // Deleting rows can only shrink the true range, and null rows
+            // keep whatever bit they had, so the range stays a superset.
+            if let Some((mn, mx)) = bool_bit_range(data, *len, start, end) {
+                zone_maps.push(RgColumnZoneMap {
+                    col_idx: col_idx as u16,
+                    min_bits: mn,
+                    max_bits: mx,
+                    has_nulls,
+                    is_float: false,
+                    is_string_prefix: false,
+                    is_string_tail: false,
+                });
+            }
+        }
+        _ => {}
+    }
+    zone_maps
+}
+
+/// Zone maps for the rows in `start..end` of `columns`.
+///
+/// Columns are independent, so a chunk large enough to matter computes them in
+/// parallel; the write path therefore pays the string value scan on every core
+/// instead of serially, and appends keep their pre-zone-map throughput. The
+/// returned entries are in column order, which readers rely on when they resolve
+/// a column's zone by its first non-float entry.
+fn compute_rg_zone_maps(
+    columns: &[ColumnData],
+    nulls: &[Vec<u8>],
+    start: usize,
+    end: usize,
+) -> Vec<RgColumnZoneMap> {
+    let per_column = |columns: &[ColumnData]| -> Vec<Vec<RgColumnZoneMap>> {
+        if end.saturating_sub(start) < ZONE_MAP_PAR_MIN_ROWS {
+            return columns
+                .iter()
+                .enumerate()
+                .map(|(col_idx, column)| {
+                    column_zone_maps(column, Some(nulls), col_idx, start, end)
+                })
+                .collect();
+        }
+        use rayon::prelude::*;
+        columns
+            .par_iter()
+            .enumerate()
+            .map(|(col_idx, column)| column_zone_maps(column, Some(nulls), col_idx, start, end))
+            .collect()
+    };
+    let mut parts = per_column(columns);
+    parts.drain(..).flatten().collect()
+}
+
+/// Observed bit range of a packed `Bool` column slice, `false < true`.
+///
+/// `len` is the logical row count; the last byte may carry padding bits, which
+/// are ignored. Returns `None` for an empty slice so no zone map is emitted.
+pub(super) fn bool_bit_range(data: &[u8], len: usize, start: usize, end: usize) -> Option<(i64, i64)> {
+    let lo = start.min(len);
+    let hi = end.min(len);
+    if hi <= lo {
+        return None;
+    }
+    let (mut mn, mut mx) = (1i64, 0i64);
+    for i in lo..hi {
+        let bit = ((data[i / 8] >> (i % 8)) & 1) as i64;
+        if bit < mn {
+            mn = bit;
+        }
+        if bit > mx {
+            mx = bit;
+        }
+    }
+    Some((mn, mx))
+}
+
+/// One decoded cell of a fully decoded column as a row `Value`.
+///
+/// Shared by the compressed and uncompressed point-read fallbacks so every
+/// physical encoding and column kind maps identically. They used to carry
+/// separate, divergent matches: the compressed one only knew Int64/Float64/
+/// String, so a dictionary-encoded string or a Bool column on a compressed row
+/// group silently read back as NULL.
+fn column_value_at(col_data: &ColumnData, local_idx: usize) -> crate::data::Value {
+    use crate::data::Value;
+    match col_data {
+        ColumnData::Int64(v) => {
+            if local_idx < v.len() {
+                Value::Int64(v[local_idx])
+            } else {
+                Value::Null
+            }
+        }
+        ColumnData::Float64(v) => {
+            if local_idx < v.len() {
+                Value::Float64(v[local_idx])
+            } else {
+                Value::Null
+            }
+        }
+        ColumnData::Bool { data, len } => {
+            if local_idx < *len {
+                Value::Bool((data[local_idx / 8] >> (local_idx % 8)) & 1 == 1)
+            } else {
+                Value::Null
+            }
+        }
+        ColumnData::String { offsets, data } => {
+            let count = offsets.len().saturating_sub(1);
+            if local_idx < count {
+                let s = offsets[local_idx] as usize;
+                let e = offsets[local_idx + 1] as usize;
+                Value::String(std::str::from_utf8(&data[s..e]).unwrap_or("").to_string())
+            } else {
+                Value::Null
+            }
+        }
+        ColumnData::Binary { offsets, data } => {
+            let count = offsets.len().saturating_sub(1);
+            if local_idx < count {
+                let s = offsets[local_idx] as usize;
+                let e = offsets[local_idx + 1] as usize;
+                Value::Binary(data[s..e].to_vec())
+            } else {
+                Value::Null
+            }
+        }
+        // Vector columns are returned as their raw row bytes, exactly like the
+        // Python binding's `ColumnValue::FixedList` -> bytes conversion. The
+        // fixed stride is the column's dimension, so the row slice is exact.
+        ColumnData::FixedList { data, dim } => {
+            if *dim == 0 {
+                return Value::Null;
+            }
+            let stride = *dim as usize * 4;
+            let start = local_idx * stride;
+            if start + stride <= data.len() {
+                Value::FixedList(data[start..start + stride].to_vec())
+            } else {
+                Value::Null
+            }
+        }
+        ColumnData::Float16List { data, dim } => {
+            if *dim == 0 {
+                return Value::Null;
+            }
+            let stride = *dim as usize * 2;
+            let start = local_idx * stride;
+            if start + stride <= data.len() {
+                Value::FixedList(data[start..start + stride].to_vec())
+            } else {
+                Value::Null
+            }
+        }
+        ColumnData::QuantizedList { data, dim, codec } => {
+            let Ok(stride) = codec.row_width(*dim as usize) else {
+                return Value::Null;
+            };
+            let start = local_idx * stride;
+            if stride > 0 && start + stride <= data.len() {
+                Value::FixedList(data[start..start + stride].to_vec())
+            } else {
+                Value::Null
+            }
+        }
+        ColumnData::StringDict {
+            indices,
+            dict_offsets,
+            dict_data,
+            ..
+        } => {
+            if local_idx < indices.len() {
+                let di = indices[local_idx];
+                if di == 0 {
+                    Value::Null
+                } else {
+                    let idx = (di - 1) as usize;
+                    if idx < dict_offsets.len() {
+                        let s = dict_offsets[idx] as usize;
+                        let e = if idx + 1 < dict_offsets.len() {
+                            dict_offsets[idx + 1] as usize
+                        } else {
+                            dict_data.len()
+                        };
+                        Value::String(
+                            std::str::from_utf8(&dict_data[s..e])
+                                .unwrap_or("")
+                                .to_string(),
+                        )
+                    } else {
+                        Value::Null
+                    }
+                }
+            } else {
+                Value::Null
+            }
+        }
+    }
+}
+
+/// Order-preserving key of a string's first eight bytes.
+///
+/// The key is the big-endian u64 of the zero-padded prefix with the sign bit
+/// flipped, so comparing keys as `i64` gives the same order as comparing the
+/// padded byte prefixes. Two strings whose keys differ are ordered by those
+/// keys; equal keys mean "not decisive" (one string may be a prefix of the
+/// other), which callers treat conservatively.
+pub(super) fn string_prefix_key(value: &[u8]) -> i64 {
+    string_byte_key(value, 0)
+}
+
+/// Order-preserving key of the eight bytes starting at `offset`.
+///
+/// `offset = 8` gives the "tail" key used by the second string value-range
+/// entry: values sharing their first eight bytes (timestamps, UUIDs, prefixed
+/// ids) are indistinguishable to `string_prefix_key`, while their tails still
+/// differ. Bytes past the value are zero padding, which keeps the mapping
+/// injective on the eight-byte window: two values whose first 16 bytes differ
+/// always get different keys, so a range that excludes the candidate's key
+/// proves the candidate absent.
+pub(super) fn string_tail_key(value: &[u8]) -> i64 {
+    string_byte_key(value, 8)
+}
+
+fn string_byte_key(value: &[u8], offset: usize) -> i64 {
+    let mut window = [0u8; 8];
+    if value.len() > offset {
+        let end = value.len().min(offset + 8);
+        window[..end - offset].copy_from_slice(&value[offset..end]);
+    }
+    (u64::from_be_bytes(window) ^ (1u64 << 63)) as i64
+}
+
+/// Column names of one typed bucket in a deterministic order.
+///
+/// Schema inference used to iterate the bucket `HashMap` directly. Its hasher
+/// seeds per process, so the inferred column order — and with it the physical
+/// layout of every Row Group — differed between runs of the identical workload.
+/// Sorting makes the same input always produce the same file, which is a
+/// prerequisite for reproducible builds, stable performance comparisons, and
+/// any future content-addressed storage.
+fn sorted_keys<V>(bucket: &HashMap<String, V>) -> Vec<&String> {
+    let mut names: Vec<&String> = bucket.keys().collect();
+    names.sort();
+    names
+}
+
+/// Row group that can contain `id`, or `None` when no group's id range covers it.
+///
+/// Row groups are published in id order — appends extend the id sequence and the
+/// rewrite paths preserve row order — so `min_id` is non-decreasing and the last
+/// group whose `min_id <= id` is the only candidate. This is the point-read
+/// directory lookup; the linear walk it replaces cost one footer comparison per
+/// row group on every `_id = X` access.
+fn find_row_group_for_id(row_groups: &[RowGroupMeta], id: u64) -> Option<usize> {
+    let end = row_groups.partition_point(|rg| rg.min_id <= id);
+    if end == 0 {
+        return None;
+    }
+    let index = end - 1;
+    let rg = &row_groups[index];
+    (rg.row_count > 0 && id <= rg.max_id).then_some(index)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Compressed point reads served from the row group's column directory on
+    /// this thread (as opposed to the sequential body walk that has to decode
+    /// column order to find the row). Proves the directory lane is the one that
+    /// answered, not merely that both lanes agree.
+    pub(crate) static COMPRESSED_DIRECTORY_POINT_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Compressed point reads served from the column directory on this thread.
+#[cfg(test)]
+pub(crate) fn compressed_directory_point_reads() -> usize {
+    COMPRESSED_DIRECTORY_POINT_READS.with(|count| count.get())
+}
+
+/// One column value at `local_idx`, decoded from that column's bytes.
+///
+/// Both point-read lanes go through here: the directory lane, which jumps
+/// straight to the columns it was asked for, and the sequential lane that walks
+/// the body when a group carries no usable directory. They used to keep separate
+/// copies of this match, and the copies drifted — the directory lane never got
+/// the targeted BITPACK/RLE readers, so serving a compressed group from the
+/// directory silently fell back to decoding whole columns. One decoder means a
+/// new encoding cannot reach only one lane.
+fn decode_point_column_value(
+    col_bytes: &[u8],
+    col_type: ColumnType,
+    encoding_version: u8,
+    local_idx: usize,
+    read_blob: &dyn Fn(&[u8]) -> io::Result<Vec<u8>>,
+) -> io::Result<crate::data::Value> {
+    use crate::data::Value;
+    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+    let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+        col_bytes[0]
+    } else {
+        COL_ENCODING_PLAIN
+    };
+    let data_bytes = col_bytes.get(enc_offset..).unwrap_or(&[]);
+    let val = match (encoding, col_type) {
+                    (
+                        COL_ENCODING_PLAIN,
+                        ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date,
+                    ) => {
+                        let off = 8 + local_idx * 8;
+                        if off + 8 <= data_bytes.len() {
+                            Value::Int64(i64::from_le_bytes(
+                                data_bytes[off..off + 8].try_into().unwrap(),
+                            ))
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::Float64 | ColumnType::Float32) => {
+                        let off = 8 + local_idx * 8;
+                        if off + 8 <= data_bytes.len() {
+                            Value::Float64(f64::from_le_bytes(
+                                data_bytes[off..off + 8].try_into().unwrap(),
+                            ))
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    (COL_ENCODING_PLAIN_F32, ColumnType::Float32) => {
+                        let off = 8 + local_idx * 4;
+                        if off + 4 <= data_bytes.len() {
+                            Value::Float64(
+                                f32::from_le_bytes(data_bytes[off..off + 4].try_into().unwrap())
+                                    as f64,
+                            )
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    (COL_ENCODING_FLOAT_DICTIONARY, ColumnType::Float64 | ColumnType::Float32) => {
+                        FloatDictView::parse(data_bytes)?
+                            .value(local_idx)
+                            .map(Value::Float64)
+                            .unwrap_or(Value::Null)
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::Bool) => {
+                        let byte_off = 8 + local_idx / 8;
+                        if byte_off < data_bytes.len() {
+                            Value::Bool((data_bytes[byte_off] >> (local_idx % 8)) & 1 == 1)
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::String) => {
+                        if data_bytes.len() >= 8 {
+                            let count =
+                                u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                            let off_s = 8 + local_idx * 4;
+                            let off_e = 8 + (local_idx + 1) * 4;
+                            if off_e + 4 <= data_bytes.len() && local_idx < count {
+                                let s = u32::from_le_bytes(
+                                    data_bytes[off_s..off_s + 4].try_into().unwrap(),
+                                ) as usize;
+                                let e = u32::from_le_bytes(
+                                    data_bytes[off_e..off_e + 4].try_into().unwrap(),
+                                ) as usize;
+                                let ds = 8 + (count + 1) * 4 + 8;
+                                if ds + e <= data_bytes.len() {
+                                    Value::String(
+                                        std::str::from_utf8(&data_bytes[ds + s..ds + e])
+                                            .unwrap_or("")
+                                            .to_string(),
+                                    )
+                                } else {
+                                    Value::Null
+                                }
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    // Vector columns: [count:u64][dim:u32][raw rows]. A point read
+                    // needs one row, not the whole 200k x dim buffer.
+                    (
+                        COL_ENCODING_PLAIN,
+                        ColumnType::FixedList | ColumnType::Float16List,
+                    ) => {
+                        if data_bytes.len() >= 12 {
+                            let count =
+                                u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                            let dim =
+                                u32::from_le_bytes(data_bytes[8..12].try_into().unwrap()) as usize;
+                            let width = match col_type {
+                                ColumnType::Float16List | ColumnType::BFloat16List => dim * 2,
+                                _ => dim * 4,
+                            };
+                            let off = 12 + local_idx * width;
+                            if local_idx < count && width > 0 && off + width <= data_bytes.len() {
+                                Value::FixedList(data_bytes[off..off + width].to_vec())
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    // Dictionary strings decode one entry, not the whole column.
+                    (COL_ENCODING_COMPACT_DICTIONARY, ColumnType::StringDict) => {
+                        let view = StringDictView::parse(data_bytes, true)?;
+                        view.index(local_idx)
+                            .and_then(|index| view.value(index))
+                            .map(|bytes| {
+                                Value::String(String::from_utf8_lossy(bytes).into_owned())
+                            })
+                            .unwrap_or(Value::Null)
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::StringDict) => {
+                        let view = StringDictView::parse(data_bytes, false)?;
+                        view.index(local_idx)
+                            .and_then(|index| view.value(index))
+                            .map(|bytes| {
+                                Value::String(String::from_utf8_lossy(bytes).into_owned())
+                            })
+                            .unwrap_or(Value::Null)
+                    }
+                    (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob) => {
+                        // [count:u64][(start:u32,end:u32) × count][data_len:u64][data]
+                        if data_bytes.len() >= 8 {
+                            let count =
+                                u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                            let off_s = 8 + local_idx * 4;
+                            let off_e = 8 + (local_idx + 1) * 4;
+                            if off_e + 4 <= data_bytes.len() && local_idx < count {
+                                let start = u32::from_le_bytes(
+                                    data_bytes[off_s..off_s + 4].try_into().unwrap(),
+                                ) as usize;
+                                let end = u32::from_le_bytes(
+                                    data_bytes[off_e..off_e + 4].try_into().unwrap(),
+                                ) as usize;
+                                let data_start = 8 + (count + 1) * 4 + 8;
+                                if data_start + end <= data_bytes.len() && start <= end {
+                                    let bytes = data_bytes[data_start + start..data_start + end].to_vec();
+                                    if col_type == ColumnType::Blob {
+                                        // A Blob cell holds a sidecar descriptor
+                                        // (inline / packed / dedicated); the
+                                        // resolver returns the payload bytes and
+                                        // passes a plain value through unchanged.
+                                        Value::Blob(read_blob(&bytes)?)
+                                    } else {
+                                        Value::Binary(bytes)
+                                    }
+                                } else {
+                                    Value::Null
+                                }
+                            } else {
+                                Value::Null
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    // Targeted decodes: the compressed fallback has the whole
+                    // row-group body in memory, so decoding a single value beats
+                    // decoding the column (the default arm below still does that
+                    // for the encodings without a per-value reader).
+                    (
+                        COL_ENCODING_BITPACK,
+                        ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date,
+                    ) => bitpack_decode_at_idx(data_bytes, local_idx)
+                        .map(Value::Int64)
+                        .unwrap_or(Value::Null),
+                    (
+                        COL_ENCODING_RLE,
+                        ColumnType::Int64
+                        | ColumnType::Int8
+                        | ColumnType::Int16
+                        | ColumnType::Int32
+                        | ColumnType::UInt8
+                        | ColumnType::UInt16
+                        | ColumnType::UInt32
+                        | ColumnType::UInt64
+                        | ColumnType::Timestamp
+                        | ColumnType::Date,
+                    ) => {
+                        // [count:u64][num_runs:u64][(value:i64, run_len:u32) × runs]
+                        let mut value = Value::Null;
+                        if data_bytes.len() >= 16 {
+                            let count =
+                                u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                            let num_runs =
+                                u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+                            if local_idx < count {
+                                let mut cumulative = 0usize;
+                                for run in 0..num_runs {
+                                    let off = 16 + run * 12;
+                                    if off + 12 > data_bytes.len() {
+                                        break;
+                                    }
+                                    let run_len = u32::from_le_bytes(
+                                        data_bytes[off + 8..off + 12].try_into().unwrap(),
+                                    ) as usize;
+                                    cumulative += run_len;
+                                    if local_idx < cumulative {
+                                        value = Value::Int64(i64::from_le_bytes(
+                                            data_bytes[off..off + 8].try_into().unwrap(),
+                                        ));
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        value
+                    }
+                    (COL_ENCODING_RLE_BOOL, ColumnType::Bool) => {
+                        let mut value = Value::Null;
+                        if data_bytes.len() >= 16 {
+                            let count =
+                                u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
+                            let num_runs =
+                                u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
+                            if local_idx < count {
+                                let mut cumulative = 0usize;
+                                for run in 0..num_runs {
+                                    let off = 16 + run * 5;
+                                    if off + 5 > data_bytes.len() {
+                                        break;
+                                    }
+                                    let run_len = u32::from_le_bytes(
+                                        data_bytes[off + 1..off + 5].try_into().unwrap(),
+                                    ) as usize;
+                                    cumulative += run_len;
+                                    if local_idx < cumulative {
+                                        value = Value::Bool(data_bytes[off] != 0);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        value
+                    }
+                    _ => {
+                        let (cd, _) = if encoding_version == RG_ENCODING_VERSION {
+                            read_column_encoded(col_bytes, col_type)?
+                        } else {
+                            ColumnData::from_bytes_typed(col_bytes, col_type)?
+                        };
+                        column_value_at(&cd, local_idx)
+                    }
+                };
+    Ok(val)
+}
+
 impl OnDemandStorage {
+    /// Physical row position of every requested id, from the row-group directory.
+    ///
+    /// The mapping is only exact while each row group holds a dense, undeleted id
+    /// range: then `id - min_id` is the local index and the cumulative row counts
+    /// give the global one. `None` means the directory cannot prove that (a gap,
+    /// a count/range mismatch or a deletion vector), and the caller has to map
+    /// the ids through the `_id` column instead.
+    ///
+    /// This exists because reading the whole `_id` column to locate a minority of
+    /// rows costs more than the row read itself on a wide table.
+    pub fn positions_for_ids(&self, ids: &[u64]) -> io::Result<Option<Vec<usize>>> {
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        let mut starts: Vec<usize> = Vec::with_capacity(footer.row_groups.len());
+        let mut cumulative = 0usize;
+        for rg in &footer.row_groups {
+            if rg.row_count > 0
+                && (rg.deletion_count > 0
+                    || rg.max_id < rg.min_id
+                    || rg.max_id - rg.min_id + 1 != u64::from(rg.row_count))
+            {
+                return Ok(None);
+            }
+            starts.push(cumulative);
+            cumulative += rg.row_count as usize;
+        }
+
+        let mut positions = Vec::with_capacity(ids.len());
+        for &id in ids {
+            // An id no group covers was deleted or never existed; the id reader
+            // skips it the same way.
+            let Some(rg_i) = find_row_group_for_id(&footer.row_groups, id) else {
+                continue;
+            };
+            positions.push(starts[rg_i] + (id - footer.row_groups[rg_i].min_id) as usize);
+        }
+        Ok(Some(positions))
+    }
+
     /// Append one borrowed row to an existing schema without allocating ColumnValue objects.
     pub fn insert_one_schema_stable_borrowed(
         &self,
@@ -211,6 +1111,7 @@ impl OnDemandStorage {
             return Err(err_data("column storage shorter than schema"));
         }
 
+        self.ensure_id_block(1)?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let row_idx = {
             let mut ids = self.ids.write();
@@ -313,8 +1214,16 @@ impl OnDemandStorage {
                         } else {
                             RG_COMPRESS_NONE
                         };
-                        let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-                        let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+                        let decompressed = self.decompressed_rg_body(
+                            rg_meta.offset,
+                            rg_meta.offset + rg_meta.data_size,
+                            compress_flag,
+                            rg_bytes.get(32..).unwrap_or(&[]),
+                        )?;
+                        let body: &[u8] = decompressed
+                            .as_ref()
+                            .map(|buf| buf.as_slice())
+                            .unwrap_or(rg_bytes.get(32..).unwrap_or(&[]));
                         let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
                         if let Some(id) =
                             rg_id_at(body, end - start, rg_meta.min_id, id_encoding, local)
@@ -360,7 +1269,8 @@ impl OnDemandStorage {
             return Ok(Vec::new());
         }
 
-        // Allocate IDs atomically
+        // Allocate from the block this process reserved (see `ensure_id_block`).
+        self.ensure_id_block(row_count)?;
         let start_id = self.next_id.fetch_add(row_count as u64, Ordering::SeqCst);
         let ids: Vec<u64> = (start_id..start_id + row_count as u64).collect();
 
@@ -372,19 +1282,19 @@ impl OnDemandStorage {
             let existing_row_count = self.ids.read().len();
 
             // First, add any new columns to schema
-            for name in int_columns.keys() {
+            for name in sorted_keys(&int_columns) {
                 schema.add_column(name, ColumnType::Int64);
             }
-            for name in float_columns.keys() {
+            for name in sorted_keys(&float_columns) {
                 schema.add_column(name, ColumnType::Float64);
             }
-            for name in string_columns.keys() {
+            for name in sorted_keys(&string_columns) {
                 schema.add_column(name, ColumnType::String);
             }
-            for name in binary_columns.keys() {
+            for name in sorted_keys(&binary_columns) {
                 schema.add_column(name, ColumnType::Binary);
             }
-            for name in bool_columns.keys() {
+            for name in sorted_keys(&bool_columns) {
                 schema.add_column(name, ColumnType::Bool);
             }
 
@@ -563,19 +1473,19 @@ impl OnDemandStorage {
             let mut nulls = self.nulls.write();
             let existing_row_count = self.ids.read().len();
 
-            for name in int_columns.keys() {
+            for name in sorted_keys(&int_columns) {
                 schema.add_column(name, ColumnType::Int64);
             }
-            for name in float_columns.keys() {
+            for name in sorted_keys(&float_columns) {
                 schema.add_column(name, ColumnType::Float64);
             }
-            for name in string_columns.keys() {
+            for name in sorted_keys(&string_columns) {
                 schema.add_column(name, ColumnType::String);
             }
-            for name in binary_columns.keys() {
+            for name in sorted_keys(&binary_columns) {
                 schema.add_column(name, ColumnType::Binary);
             }
-            for name in bool_columns.keys() {
+            for name in sorted_keys(&bool_columns) {
                 schema.add_column(name, ColumnType::Bool);
             }
 
@@ -872,7 +1782,8 @@ impl OnDemandStorage {
             return Ok(Vec::new());
         }
 
-        // Allocate IDs atomically
+        // Allocate from the block this process reserved (see `ensure_id_block`).
+        self.ensure_id_block(row_count)?;
         let start_id = self.next_id.fetch_add(row_count as u64, Ordering::SeqCst);
         let ids: Vec<u64> = (start_id..start_id + row_count as u64).collect();
 
@@ -885,7 +1796,7 @@ impl OnDemandStorage {
             let mut nulls = self.nulls.write();
             let existing_row_count = self.ids.read().len();
 
-            for name in int_columns.keys() {
+            for name in sorted_keys(&int_columns) {
                 let idx = schema.add_column(name, ColumnType::Int64);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
@@ -900,7 +1811,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in float_columns.keys() {
+            for name in sorted_keys(&float_columns) {
                 let idx = schema.add_column(name, ColumnType::Float64);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
@@ -913,7 +1824,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in string_columns.keys() {
+            for name in sorted_keys(&string_columns) {
                 let idx = schema.add_column(name, ColumnType::String);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
@@ -929,7 +1840,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in binary_columns.keys() {
+            for name in sorted_keys(&binary_columns) {
                 let idx = schema.add_column(name, ColumnType::Binary);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
@@ -944,7 +1855,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in fixedlist_columns.keys() {
+            for name in sorted_keys(&fixedlist_columns) {
                 let idx = schema.add_column(name, ColumnType::FixedList);
                 col_name_to_idx.insert(name.clone(), idx);
                 let actual_type = schema
@@ -959,7 +1870,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in blob_columns.keys() {
+            for name in sorted_keys(&blob_columns) {
                 let idx = schema.add_column(name, ColumnType::Blob);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
@@ -974,7 +1885,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in bool_columns.keys() {
+            for name in sorted_keys(&bool_columns) {
                 let idx = schema.add_column(name, ColumnType::Bool);
                 col_name_to_idx.insert(name.clone(), idx);
                 while columns.len() <= idx {
@@ -985,6 +1896,33 @@ impl OnDemandStorage {
                     columns.push(col);
                     // The padded rows have no value for this column: mark them NULL.
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
+                }
+            }
+        }
+
+        // Fixed-size vector columns have one established dimension for the
+        // whole table: the physical layout is a fixed stride, so appending a
+        // row with a different dimension would misalign every following row.
+        // Validate the whole batch up front, before any column is mutated.
+        for (name, values) in &fixedlist_columns {
+            let Some(expected) = self.established_vector_dim(name)? else {
+                continue;
+            };
+            for (row, value) in values.iter().enumerate() {
+                if value.is_empty() {
+                    // An omitted column arrives as an empty row (SQL INSERT
+                    // that does not mention it); it appends no bytes and is
+                    // not a dimension mismatch.
+                    continue;
+                }
+                let got = value.len() / 4;
+                if got != expected as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "column '{name}' stores {expected}-dimension vectors; row {row} has {got}"
+                        ),
+                    ));
                 }
             }
         }
@@ -1351,6 +2289,7 @@ impl OnDemandStorage {
         id: u64,
         column_names: Option<&[&str]>,
     ) -> io::Result<Option<HashMap<String, ColumnData>>> {
+
         let is_v4 = self.is_v4_format();
 
         let schema = self.schema.read();
@@ -1399,40 +2338,41 @@ impl OnDemandStorage {
                 let mmap_ref = mmap_guard.get_or_create(file)?;
                 let mut found_rg_i: Option<usize> = None;
                 let mut local_idx_found = 0usize;
-                for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
-                    if rg_meta.max_id < id || rg_meta.row_count == 0 {
-                        continue;
-                    }
+                if let Some(rg_i) = find_row_group_for_id(&footer.row_groups, id) {
+                    let rg_meta = &footer.row_groups[rg_i];
                     let rg_rows = rg_meta.row_count as usize;
                     let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
-                    if rg_end > mmap_ref.len() {
-                        continue;
-                    }
-                    let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
-                    let cflag = if rg_bytes.len() >= 32 {
-                        rg_bytes[28]
-                    } else {
-                        RG_COMPRESS_NONE
-                    };
-                    let dec = decompress_rg_body(cflag, &rg_bytes[32..])?;
-                    let body = dec.as_deref().unwrap_or(&rg_bytes[32..]);
-                    let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
-                    let id_section_len = rg_id_section_len(rg_rows, id_encoding);
-                    if id_section_len > body.len() {
-                        continue;
-                    }
-                    let local_idx = if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
-                        id.checked_sub(rg_meta.min_id)
-                            .and_then(|offset| (offset < rg_rows as u64).then_some(offset as usize))
-                    } else {
-                        bytes_as_u64_slice(&body[..id_section_len], rg_rows)
-                            .binary_search(&id)
-                            .ok()
-                    };
-                    if let Some(idx) = local_idx {
-                        found_rg_i = Some(rg_i);
-                        local_idx_found = idx;
-                        break;
+                    if rg_end <= mmap_ref.len() {
+                        let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+                        let cflag = if rg_bytes.len() >= 32 {
+                            rg_bytes[28]
+                        } else {
+                            RG_COMPRESS_NONE
+                        };
+                        let dec = self.decompressed_rg_body(
+                            rg_meta.offset,
+                            rg_meta.offset + rg_meta.data_size,
+                            cflag,
+                            rg_bytes.get(32..).unwrap_or(&[]),
+                        )?;
+                        let body = dec.as_deref().map_or(rg_bytes.get(32..).unwrap_or(&[]), |body| body.as_slice());
+                        let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
+                        let id_section_len = rg_id_section_len(rg_rows, id_encoding);
+                        if id_section_len <= body.len() {
+                            let local_idx = if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+                                id.checked_sub(rg_meta.min_id).and_then(|offset| {
+                                    (offset < rg_rows as u64).then_some(offset as usize)
+                                })
+                            } else {
+                                bytes_as_u64_slice(&body[..id_section_len], rg_rows)
+                                    .binary_search(&id)
+                                    .ok()
+                            };
+                            if let Some(idx) = local_idx {
+                                found_rg_i = Some(rg_i);
+                                local_idx_found = idx;
+                            }
+                        }
                     }
                 }
                 drop(mmap_guard);
@@ -1574,6 +2514,41 @@ impl OnDemandStorage {
         Ok(Value::Float64(f64::from_le_bytes(value)))
     }
 
+    /// Whether the RCIX point-read lane can serve `id` from the base file.
+    ///
+    /// `retrieve_rcix` reports both "row absent" and "lane unavailable" as
+    /// `None`. Point-read callers have to tell them apart: an absent row is the
+    /// final answer, while an unavailable lane (a compressed row group, an
+    /// unknown encoding version, or no RCIX directory) must fall back to the
+    /// decoding reader (`read_row_by_id`) instead of degrading the SQL fast path
+    /// to a full table scan.
+    pub(crate) fn point_read_lane_available(&self, id: u64) -> io::Result<bool> {
+        if self.v4_footer.read().is_none() {
+            let _ = self.get_or_load_footer()?;
+        }
+        let (rg_offset, lane_ready) = {
+            let fg = self.v4_footer.read();
+            let footer = match fg.as_ref() {
+                Some(f) => f,
+                None => return Ok(true),
+            };
+            match find_row_group_for_id(&footer.row_groups, id) {
+                // No group covers the id: the lane is fine, the row is absent.
+                None => return Ok(true),
+                Some(rg_i) => (
+                    footer.row_groups[rg_i].offset,
+                    rg_i < footer.col_offsets.len() && !footer.col_offsets[rg_i].is_empty(),
+                ),
+            }
+        };
+        if !lane_ready {
+            return Ok(false);
+        }
+        let mut rg_hdr = [0u8; 32];
+        self.read_cached_bytes(rg_offset, &mut rg_hdr)?;
+        Ok(rg_hdr[28] == RG_COMPRESS_NONE && rg_hdr[29] == RG_ENCODING_VERSION)
+    }
+
     pub(crate) fn retrieve_rcix(
         &self,
         id: u64,
@@ -1593,14 +2568,7 @@ impl OnDemandStorage {
                 Some(f) => f,
                 None => return Ok(None),
             };
-            let mut rg_i_found = None;
-            for (i, rg) in footer.row_groups.iter().enumerate() {
-                if rg.min_id <= id && id <= rg.max_id && rg.row_count > 0 {
-                    rg_i_found = Some(i);
-                    break;
-                }
-            }
-            let rg_i = match rg_i_found {
+            let rg_i = match find_row_group_for_id(&footer.row_groups, id) {
                 Some(i) => i,
                 None => return Ok(None),
             };
@@ -1627,7 +2595,7 @@ impl OnDemandStorage {
         // Read RG header (32 bytes) to check compression + encoding version
         let mut rg_hdr = [0u8; 32];
         self.read_cached_bytes(rg_offset, &mut rg_hdr)?;
-        if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] < 1 {
+        if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] != RG_ENCODING_VERSION {
             return Ok(None);
         }
 
@@ -1742,6 +2710,13 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (8 + local_idx * 8) as u64, &mut v)?;
                     Value::Float64(f64::from_le_bytes(v))
                 }
+                (COL_ENCODING_PLAIN_F32, ColumnType::Float32) => {
+                    // V5 narrow payload: [count:u64][f32 value]..., four bytes
+                    // per row. Widened back to f64 like every other read lane.
+                    let mut v = [0u8; 4];
+                    self.read_cached_bytes(data_base + (8 + local_idx * 4) as u64, &mut v)?;
+                    Value::Float64(f32::from_le_bytes(v) as f64)
+                }
                 (COL_ENCODING_FLOAT_DICTIONARY, ColumnType::Float64 | ColumnType::Float32) => {
                     self.read_float_dict_value(data_base, local_idx)?
                 }
@@ -1851,31 +2826,14 @@ impl OnDemandStorage {
                     | ColumnType::Date,
                 ) => {
                     // BitPack format: [count:u64][bit_width:u8][min_value:i64][packed_bits...]
-                    let mut hdr = [0u8; 17];
-                    self.read_cached_bytes(data_base, &mut hdr)?;
-                    let count = u64::from_le_bytes(hdr[0..8].try_into().unwrap()) as usize;
-                    let bit_width = hdr[8] as usize;
-                    let min_val = i64::from_le_bytes(hdr[9..17].try_into().unwrap());
-                    if local_idx >= count || bit_width == 0 {
-                        result.push((col_name, Value::Null));
-                        continue;
+                    // BitPack format: [count:u64][bit_width:u8][min_value:i64][packed_bits...]
+                    match self.read_bitpack_i64_at(data_base, local_idx)? {
+                        Some(value) => Value::Int64(value),
+                        None => {
+                            result.push((col_name, Value::Null));
+                            continue;
+                        }
                     }
-                    let bit_pos = local_idx * bit_width;
-                    let byte_off = bit_pos / 8;
-                    let bit_shift = bit_pos % 8;
-                    let bytes_needed = ((bit_shift + bit_width + 7) / 8).min(3);
-                    let mut bits = [0u8; 3];
-                    self.read_cached_bytes(
-                        data_base + 17 + byte_off as u64,
-                        &mut bits[..bytes_needed],
-                    )?;
-                    let raw = (bits[0] as u64) | ((bits[1] as u64) << 8) | ((bits[2] as u64) << 16);
-                    let mask = if bit_width >= 64 {
-                        u64::MAX
-                    } else {
-                        (1u64 << bit_width) - 1
-                    };
-                    Value::Int64(min_val + ((raw >> bit_shift) & mask) as i64)
                 }
                 (
                     COL_ENCODING_RLE,
@@ -1939,6 +2897,28 @@ impl OnDemandStorage {
                     }
                     found
                 }
+                (
+                    COL_ENCODING_PLAIN,
+                    ColumnType::FixedList | ColumnType::Float16List,
+                ) => {
+                    // [count:u64][dim:u32][raw rows]: read the header plus the one
+                    // row's bytes instead of materializing the whole vector column.
+                    let mut hdr = [0u8; 12];
+                    self.read_cached_bytes(data_base, &mut hdr)?;
+                    let count = u64::from_le_bytes(hdr[0..8].try_into().unwrap()) as usize;
+                    let dim = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+                    let width = match col_type {
+                        ColumnType::Float16List | ColumnType::BFloat16List => dim * 2,
+                        _ => dim * 4,
+                    };
+                    if local_idx >= count || width == 0 {
+                        result.push((col_name, Value::Null));
+                        continue;
+                    }
+                    let mut buf = vec![0u8; width];
+                    self.read_cached_bytes(data_base + (12 + local_idx * width) as u64, &mut buf)?;
+                    Value::FixedList(buf)
+                }
                 _ => {
                     // Unknown encoding: fall back to read_row_by_id_values
                     return Ok(None);
@@ -1971,14 +2951,7 @@ impl OnDemandStorage {
                 Some(f) => f,
                 None => return Ok(None),
             };
-            let mut rg_i_found = None;
-            for (i, rg) in footer.row_groups.iter().enumerate() {
-                if rg.min_id <= id && id <= rg.max_id && rg.row_count > 0 {
-                    rg_i_found = Some(i);
-                    break;
-                }
-            }
-            let rg_i = match rg_i_found {
+            let rg_i = match find_row_group_for_id(&footer.row_groups, id) {
                 Some(i) => i,
                 None => return Ok(None),
             };
@@ -2012,7 +2985,7 @@ impl OnDemandStorage {
 
         let mut rg_hdr = [0u8; 32];
         self.read_cached_bytes(rg_offset, &mut rg_hdr)?;
-        if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] < 1 {
+        if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] != RG_ENCODING_VERSION {
             return Ok(None);
         }
 
@@ -2110,6 +3083,13 @@ impl OnDemandStorage {
                     let mut v = [0u8; 8];
                     self.read_cached_bytes(data_base + (8 + local_idx * 8) as u64, &mut v)?;
                     Value::Float64(f64::from_le_bytes(v))
+                }
+                (COL_ENCODING_PLAIN_F32, ColumnType::Float32) => {
+                    // V5 narrow payload: [count:u64][f32 value]..., four bytes
+                    // per row. Widened back to f64 like every other read lane.
+                    let mut v = [0u8; 4];
+                    self.read_cached_bytes(data_base + (8 + local_idx * 4) as u64, &mut v)?;
+                    Value::Float64(f32::from_le_bytes(v) as f64)
                 }
                 (COL_ENCODING_FLOAT_DICTIONARY, ColumnType::Float64 | ColumnType::Float32) => {
                     self.read_float_dict_value(data_base, local_idx)?
@@ -2219,31 +3199,14 @@ impl OnDemandStorage {
                     | ColumnType::Timestamp
                     | ColumnType::Date,
                 ) => {
-                    let mut hdr = [0u8; 17];
-                    self.read_cached_bytes(data_base, &mut hdr)?;
-                    let count = u64::from_le_bytes(hdr[0..8].try_into().unwrap()) as usize;
-                    let bit_width = hdr[8] as usize;
-                    let min_val = i64::from_le_bytes(hdr[9..17].try_into().unwrap());
-                    if local_idx >= count || bit_width == 0 {
-                        result.push((col_name, Value::Null));
-                        continue;
+                    // BitPack format: [count:u64][bit_width:u8][min_value:i64][packed_bits...]
+                    match self.read_bitpack_i64_at(data_base, local_idx)? {
+                        Some(value) => Value::Int64(value),
+                        None => {
+                            result.push((col_name, Value::Null));
+                            continue;
+                        }
                     }
-                    let bit_pos = local_idx * bit_width;
-                    let byte_off = bit_pos / 8;
-                    let bit_shift = bit_pos % 8;
-                    let bytes_needed = ((bit_shift + bit_width + 7) / 8).min(3);
-                    let mut bits = [0u8; 3];
-                    self.read_cached_bytes(
-                        data_base + 17 + byte_off as u64,
-                        &mut bits[..bytes_needed],
-                    )?;
-                    let raw = (bits[0] as u64) | ((bits[1] as u64) << 8) | ((bits[2] as u64) << 16);
-                    let mask = if bit_width >= 64 {
-                        u64::MAX
-                    } else {
-                        (1u64 << bit_width) - 1
-                    };
-                    Value::Int64(min_val + ((raw >> bit_shift) & mask) as i64)
                 }
                 (
                     COL_ENCODING_RLE,
@@ -2305,6 +3268,28 @@ impl OnDemandStorage {
                     }
                     found
                 }
+                (
+                    COL_ENCODING_PLAIN,
+                    ColumnType::FixedList | ColumnType::Float16List,
+                ) => {
+                    // Same targeted read as the full point lane: header plus the
+                    // one row's bytes, never the whole vector column.
+                    let mut hdr = [0u8; 12];
+                    self.read_cached_bytes(data_base, &mut hdr)?;
+                    let count = u64::from_le_bytes(hdr[0..8].try_into().unwrap()) as usize;
+                    let dim = u32::from_le_bytes(hdr[8..12].try_into().unwrap()) as usize;
+                    let width = match col_type {
+                        ColumnType::Float16List | ColumnType::BFloat16List => dim * 2,
+                        _ => dim * 4,
+                    };
+                    if local_idx >= count || width == 0 {
+                        result.push((col_name, Value::Null));
+                        continue;
+                    }
+                    let mut buf = vec![0u8; width];
+                    self.read_cached_bytes(data_base + (12 + local_idx * width) as u64, &mut buf)?;
+                    Value::FixedList(buf)
+                }
                 _ => return Ok(None),
             };
             result.push((col_name, val));
@@ -2362,7 +3347,7 @@ impl OnDemandStorage {
         // Check RG header compression flag
         let mut rg_hdr = [0u8; 32];
         self.read_cached_bytes(rg_meta.offset, &mut rg_hdr)?;
-        if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] < 1 {
+        if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] != RG_ENCODING_VERSION {
             return Ok(None);
         }
 
@@ -2370,11 +3355,20 @@ impl OnDemandStorage {
         let mut arrays: Vec<arrow::array::ArrayRef> = Vec::new();
 
         if include_id {
-            let mut id_buf = vec![0u8; n * 8];
-            self.read_cached_bytes(body_base, &mut id_buf)?;
-            let ids: Vec<i64> = (0..n)
-                .map(|i| i64::from_le_bytes(id_buf[i * 8..i * 8 + 8].try_into().unwrap()))
-                .collect();
+            // A contiguous row group stores no ID section: rebuild the IDs from
+            // `min_id`, exactly as `rg_id_at` does. Decoding column bytes as IDs
+            // would read the deletion vector, null bitmap and encoding prefix.
+            let ids: Vec<i64> = if rg_hdr[30] == RG_IDS_IMPLICIT_CONTIGUOUS {
+                (0..n)
+                    .map(|i| rg_meta.min_id.saturating_add(i as u64) as i64)
+                    .collect()
+            } else {
+                let mut id_buf = vec![0u8; n * 8];
+                self.read_cached_bytes(body_base, &mut id_buf)?;
+                (0..n)
+                    .map(|i| i64::from_le_bytes(id_buf[i * 8..i * 8 + 8].try_into().unwrap()))
+                    .collect()
+            };
             fields.push(Field::new("_id", ArrowDataType::Int64, false));
             arrays.push(Arc::new(Int64Array::from(ids)));
         }
@@ -2606,21 +3600,22 @@ impl OnDemandStorage {
                                 let bit_pos = i * bit_width;
                                 let byte_off = bit_pos / 8;
                                 let bit_shift = bit_pos % 8;
-                                let bytes_need = ((bit_shift + bit_width + 7) / 8).min(3);
-                                let mut b = [0u8; 3];
+                                // Full window: a three-byte read dropped the high
+                                // bits of any value wider than ~17 bits.
+                                let bytes_need = ((bit_shift + bit_width + 7) / 8).min(8);
+                                let mut b = [0u8; 8];
                                 for k in 0..bytes_need {
                                     if byte_off + k < packed.len() {
                                         b[k] = packed[byte_off + k];
                                     }
                                 }
-                                let raw =
-                                    (b[0] as u64) | ((b[1] as u64) << 8) | ((b[2] as u64) << 16);
+                                let raw = u64::from_le_bytes(b);
                                 let mask = if bit_width >= 64 {
                                     u64::MAX
                                 } else {
                                     (1u64 << bit_width) - 1
                                 };
-                                Some(min_val + ((raw >> bit_shift) & mask) as i64)
+                                Some(min_val.wrapping_add(((raw >> bit_shift) & mask) as i64))
                             })
                             .collect();
                         Arc::new(Int64Array::from(vals))
@@ -2697,6 +3692,49 @@ impl OnDemandStorage {
 
     /// Ultra-fast point lookup: returns Vec<(col_name, Value)> directly from V4 columns
     /// Bypasses Arrow conversion and HashMap overhead
+    /// Read one BITPACK int64 value from a page-cached row-group body.
+    ///
+    /// The bit window must cover `bit_shift + bit_width` bits. Reading a fixed
+    /// three-byte window silently dropped the high bits of every value above
+    /// ~17 bits of width (a 22-bit value at shift 6 needs 29 bits), which made
+    /// `retrieve` return truncated values for wide ranges while scans were
+    /// correct. The window is read in full and only clamped to the packed
+    /// section, whose padding bits are zero.
+    fn read_bitpack_i64_at(&self, data_base: u64, local_idx: usize) -> io::Result<Option<i64>> {
+        let mut hdr = [0u8; 17];
+        self.read_cached_bytes(data_base, &mut hdr)?;
+        let count = u64::from_le_bytes(hdr[0..8].try_into().unwrap()) as usize;
+        let bit_width = hdr[8] as usize;
+        let min_val = i64::from_le_bytes(hdr[9..17].try_into().unwrap());
+        if local_idx >= count {
+            return Ok(None);
+        }
+        if bit_width == 0 {
+            return Ok(Some(min_val));
+        }
+        if bit_width > 64 {
+            return Err(err_data("BitPack Int64: invalid bit width"));
+        }
+        let bit_pos = local_idx * bit_width;
+        let byte_off = bit_pos / 8;
+        let bit_shift = bit_pos % 8;
+        let packed_bytes = (count * bit_width + 7) / 8;
+        let available = packed_bytes.saturating_sub(byte_off);
+        if available == 0 {
+            return Ok(None);
+        }
+        let take = ((bit_shift + bit_width + 7) / 8).min(8).min(available);
+        let mut bits = [0u8; 8];
+        self.read_cached_bytes(data_base + 17 + byte_off as u64, &mut bits[..take])?;
+        let raw = u64::from_le_bytes(bits);
+        let mask = if bit_width >= 64 {
+            u64::MAX
+        } else {
+            (1u64 << bit_width) - 1
+        };
+        Ok(Some(min_val.wrapping_add(((raw >> bit_shift) & mask) as i64)))
+    }
+
     fn read_in_memory_row_by_id_values(
         &self,
         id: u64,
@@ -2720,7 +3758,7 @@ impl OnDemandStorage {
         let mut result = Vec::with_capacity(schema.column_count() + 1);
         result.push(("_id".to_string(), Value::Int64(id as i64)));
 
-        for (col_idx, (col_name, col_type)) in schema.columns.iter().enumerate() {
+        for (col_idx, (col_name, _)) in schema.columns.iter().enumerate() {
             // Check null
             if col_idx < nulls.len() && !nulls[col_idx].is_empty() {
                 let b = row_idx / 8;
@@ -2736,88 +3774,7 @@ impl OnDemandStorage {
                 continue;
             }
 
-            let val = match &columns[col_idx] {
-                ColumnData::Int64(v) => {
-                    if row_idx < v.len() {
-                        Value::Int64(v[row_idx])
-                    } else {
-                        Value::Null
-                    }
-                }
-                ColumnData::Float64(v) => {
-                    if row_idx < v.len() {
-                        Value::Float64(v[row_idx])
-                    } else {
-                        Value::Null
-                    }
-                }
-                ColumnData::String { offsets, data } => {
-                    let count = offsets.len().saturating_sub(1);
-                    if row_idx < count {
-                        let s = offsets[row_idx] as usize;
-                        let e = offsets[row_idx + 1] as usize;
-                        Value::String(std::str::from_utf8(&data[s..e]).unwrap_or("").to_string())
-                    } else {
-                        Value::Null
-                    }
-                }
-                ColumnData::Bool { data, len } => {
-                    if row_idx < *len {
-                        let b = row_idx / 8;
-                        let bit = row_idx % 8;
-                        if b < data.len() {
-                            Value::Bool((data[b] >> bit) & 1 == 1)
-                        } else {
-                            Value::Null
-                        }
-                    } else {
-                        Value::Null
-                    }
-                }
-                ColumnData::Binary { offsets, data } => {
-                    let count = offsets.len().saturating_sub(1);
-                    if row_idx < count {
-                        let s = offsets[row_idx] as usize;
-                        let e = offsets[row_idx + 1] as usize;
-                        let bytes = data[s..e].to_vec();
-                        if *col_type == ColumnType::Blob {
-                            Value::Blob(self.read_blob_value(&bytes)?)
-                        } else {
-                            Value::Binary(bytes)
-                        }
-                    } else {
-                        Value::Null
-                    }
-                }
-                ColumnData::StringDict {
-                    indices,
-                    dict_offsets,
-                    dict_data,
-                } => {
-                    if row_idx < indices.len() {
-                        let idx = indices[row_idx];
-                        if idx == 0 {
-                            Value::Null
-                        } else {
-                            let di = (idx - 1) as usize;
-                            if di + 1 < dict_offsets.len() {
-                                let s = dict_offsets[di] as usize;
-                                let e = dict_offsets[di + 1] as usize;
-                                Value::String(
-                                    std::str::from_utf8(&dict_data[s..e])
-                                        .unwrap_or("")
-                                        .to_string(),
-                                )
-                            } else {
-                                Value::Null
-                            }
-                        }
-                    } else {
-                        Value::Null
-                    }
-                }
-                _ => Value::Null,
-            };
+            let val = column_value_at(&columns[col_idx], row_idx);
             result.push((col_name.clone(), val));
         }
 
@@ -2828,6 +3785,24 @@ impl OnDemandStorage {
         &self,
         id: u64,
     ) -> io::Result<Option<Vec<(String, crate::data::Value)>>> {
+        self.read_row_by_id_values_projected(id, None)
+    }
+
+    /// Point read that decodes only the columns the caller named (`None` = all).
+    ///
+    /// A compressed row group used to be read by walking every column in body
+    /// order and decoding each one just to reach the requested row. The write
+    /// path has always recorded the per-column directory (`col_offsets`) for
+    /// those groups as well — it is filled before `compress_rg_body` is called —
+    /// and the decompressed body is byte-identical to the uncompressed layout the
+    /// directory addresses. This lane therefore uses the directory for compressed
+    /// groups too, and never decodes a column the caller did not ask for.
+    pub fn read_row_by_id_values_projected(
+        &self,
+        id: u64,
+        columns: Option<&[&str]>,
+    ) -> io::Result<Option<Vec<(String, crate::data::Value)>>> {
+
         use crate::data::Value;
 
         let is_v4 = self.is_v4_format();
@@ -2841,10 +3816,52 @@ impl OnDemandStorage {
             // RCIX MMAP PATH: always try first, even if data is also in memory.
             // Avoids building the 1M-entry id_to_idx HashMap (~0.76ms).
             // DIRECT MMAP PATH: Find RG via min_id/max_id (no decompression needed).
-            let footer = match self.get_or_load_footer()? {
-                Some(f) => f,
-                None => return Ok(None),
+            //
+            // Only the fields a point read needs are taken from the footer:
+            // `get_or_load_footer` hands back an owned copy of the whole footer
+            // (row groups, zone maps, every group's column directory, schema
+            // strings), and at a few dozen row groups that copy costs more than
+            // the read it serves (measured ~27 us for 200k rows x 16 columns in 49
+            // groups). `retrieve_rcix` has always extracted fields this way; the
+            // decoding lane did not.
+            if self.v4_footer.read().is_none() {
+                let _ = self.get_or_load_footer()?;
+            }
+            let (rg_offset, rg_data_size, rg_rows, rg_min_id, col_offsets_rg, schema_columns) = {
+                let fg = self.v4_footer.read();
+                let Some(footer) = fg.as_ref() else {
+                    return Ok(None);
+                };
+                let Some(rg_i) = find_row_group_for_id(&footer.row_groups, id) else {
+                    return Ok(None);
+                };
+                let rg_meta = &footer.row_groups[rg_i];
+                (
+                    rg_meta.offset,
+                    rg_meta.data_size,
+                    rg_meta.row_count as usize,
+                    rg_meta.min_id,
+                    footer.col_offsets.get(rg_i).cloned().unwrap_or_default(),
+                    footer.schema.columns.clone(),
+                )
             };
+            let col_count = schema_columns.len();
+            // `_id` is always returned (the projected callers select from the
+            // returned pairs), so a named projection only narrows the physical
+            // columns decoded below.
+            let selected: Vec<usize> = match columns {
+                None => (0..col_count).collect(),
+                Some(names) => names
+                    .iter()
+                    .filter(|name| **name != "_id")
+                    .filter_map(|name| {
+                        schema_columns
+                            .iter()
+                            .position(|(col_name, _)| col_name == name)
+                    })
+                    .collect(),
+            };
+
             let file_guard = self.file.read();
             let file = file_guard
                 .as_ref()
@@ -2852,25 +3869,12 @@ impl OnDemandStorage {
             let mut mmap_guard = self.mmap_cache.write();
             let mmap_ref = mmap_guard.get_or_create(file)?;
 
-            // Step 1: Find RG via min_id/max_id — O(N_rgs), zero decompression.
-            let mut found_rg_i: Option<usize> = None;
-            for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
-                if rg_meta.min_id <= id && id <= rg_meta.max_id && rg_meta.row_count > 0 {
-                    found_rg_i = Some(rg_i);
-                    break;
-                }
-            }
-            let rg_i = match found_rg_i {
-                Some(i) => i,
-                None => return Ok(None),
-            };
-            let rg_meta = &footer.row_groups[rg_i];
-            let rg_rows = rg_meta.row_count as usize;
-            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            // Step 1: Find RG via the id directory — O(log N_rgs), zero decompression.
+            let rg_end = (rg_offset + rg_data_size) as usize;
             if rg_end > mmap_ref.len() {
                 return Err(err_data("RG extends past EOF"));
             }
-            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            let rg_bytes = &mmap_ref[rg_offset as usize..rg_end];
             if rg_bytes.len() < 32 {
                 return Ok(None);
             }
@@ -2879,24 +3883,36 @@ impl OnDemandStorage {
             let id_encoding = rg_bytes[30];
             let id_section_len = rg_id_section_len(rg_rows, id_encoding);
 
-            // Step 2: RCIX fast path — uncompressed, enc_ver ≥ 1, col_offsets present.
-            let col_count = footer.schema.column_count();
-            let has_rcix = compress_flag == RG_COMPRESS_NONE
-                && encoding_version >= 1
-                && rg_i < footer.col_offsets.len()
-                && footer.col_offsets[rg_i].len() >= col_count;
+            // Step 2: RCIX fast path — enc_ver ≥ 1 and a column directory present.
+            // The directory addresses the *logical* body layout, so it serves a
+            // compressed group too once that group's body has been decompressed
+            // (which is cached across point reads).
+            let has_rcix = encoding_version == RG_ENCODING_VERSION
+                && col_offsets_rg.len() >= col_count;
 
             if has_rcix {
-                let body = &rg_bytes[32..];
+                let cached_body = if compress_flag == RG_COMPRESS_NONE {
+                    None
+                } else {
+                    self.decompressed_rg_body(
+                        rg_offset,
+                        rg_offset + rg_data_size,
+                        compress_flag,
+                        rg_bytes.get(32..).unwrap_or(&[]),
+                    )?
+                };
+                let body: &[u8] = cached_body
+                    .as_ref()
+                    .map_or(rg_bytes.get(32..).unwrap_or(&[]), |buf| buf.as_slice());
 
                 // Step 3: O(1) local_idx — try direct id-based index, verify, else binary search.
-                let guess = (id.saturating_sub(rg_meta.min_id)) as usize;
+                let guess = (id.saturating_sub(rg_min_id)) as usize;
                 let local_idx = if guess < rg_rows {
                     if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
                         guess
                     } else {
                         let Some(id_at) =
-                            rg_id_at(body, rg_rows, rg_meta.min_id, id_encoding, guess)
+                            rg_id_at(body, rg_rows, rg_min_id, id_encoding, guess)
                         else {
                             return Ok(None);
                         };
@@ -2931,15 +3947,20 @@ impl OnDemandStorage {
                 }
 
                 let null_bitmap_len = (rg_rows + 7) / 8;
-                let col_offsets = &footer.col_offsets[rg_i];
-                let schema = &footer.schema;
-                let mut result = Vec::with_capacity(col_count + 1);
+                #[cfg(test)]
+                if compress_flag != RG_COMPRESS_NONE {
+                    COMPRESSED_DIRECTORY_POINT_READS.with(|count| count.set(count.get() + 1));
+                }
+                let col_offsets = &col_offsets_rg;
+                let schema = &schema_columns;
+                let mut result = Vec::with_capacity(selected.len() + 1);
                 result.push(("_id".to_string(), Value::Int64(id as i64)));
 
-                // Step 5: RCIX jump to each column — O(1) per column, no sequential scan.
-                for col_idx in 0..col_count {
-                    let col_name = schema.columns[col_idx].0.clone();
-                    let col_type = schema.columns[col_idx].1;
+                // Step 5: RCIX jump to each requested column — O(1) per column,
+                // no sequential scan, and no decode of an unrequested column.
+                for &col_idx in &selected {
+                    let col_name = schema[col_idx].0.clone();
+                    let col_type = schema[col_idx].1;
                     let col_start = col_offsets[col_idx] as usize;
 
                     if col_start + null_bitmap_len > body.len() {
@@ -2953,301 +3974,14 @@ impl OnDemandStorage {
                         continue;
                     }
                     let col_bytes = &body[data_start..];
-                    let encoding = col_bytes[0]; // enc_ver >= 1
-                    let data_bytes = &col_bytes[1..];
 
-                    let val = match (encoding, col_type) {
-                        (
-                            COL_ENCODING_PLAIN,
-                            ColumnType::Int64
-                            | ColumnType::Int8
-                            | ColumnType::Int16
-                            | ColumnType::Int32
-                            | ColumnType::UInt8
-                            | ColumnType::UInt16
-                            | ColumnType::UInt32
-                            | ColumnType::UInt64
-                            | ColumnType::Timestamp
-                            | ColumnType::Date,
-                        ) => {
-                            // Plain Int64: [count:u64][data: count*8]
-                            let off = 8 + local_idx * 8;
-                            if off + 8 <= data_bytes.len() {
-                                Value::Int64(i64::from_le_bytes(
-                                    data_bytes[off..off + 8].try_into().unwrap(),
-                                ))
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (COL_ENCODING_PLAIN, ColumnType::Float64 | ColumnType::Float32) => {
-                            let off = 8 + local_idx * 8;
-                            if off + 8 <= data_bytes.len() {
-                                Value::Float64(f64::from_le_bytes(
-                                    data_bytes[off..off + 8].try_into().unwrap(),
-                                ))
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (
-                            COL_ENCODING_FLOAT_DICTIONARY,
-                            ColumnType::Float64 | ColumnType::Float32,
-                        ) => FloatDictView::parse(data_bytes)?
-                            .value(local_idx)
-                            .map(Value::Float64)
-                            .unwrap_or(Value::Null),
-                        (COL_ENCODING_PLAIN, ColumnType::Bool) => {
-                            // Plain Bool: [len:u64][packed bits]
-                            let byte_off = 8 + local_idx / 8;
-                            let bit = local_idx % 8;
-                            if byte_off < data_bytes.len() {
-                                Value::Bool((data_bytes[byte_off] >> bit) & 1 == 1)
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (COL_ENCODING_PLAIN, ColumnType::String) => {
-                            // Plain String: [count:u64][offsets:(count+1)*4][data_len:u64][data]
-                            if data_bytes.len() >= 8 {
-                                let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap())
-                                    as usize;
-                                let off_start = 8 + local_idx * 4;
-                                let off_end = 8 + (local_idx + 1) * 4;
-                                if off_end + 4 <= data_bytes.len() && local_idx < count {
-                                    let s = u32::from_le_bytes(
-                                        data_bytes[off_start..off_start + 4].try_into().unwrap(),
-                                    ) as usize;
-                                    let e = u32::from_le_bytes(
-                                        data_bytes[off_end..off_end + 4].try_into().unwrap(),
-                                    ) as usize;
-                                    let offsets_end = 8 + (count + 1) * 4;
-                                    let data_len_off = offsets_end;
-                                    if data_len_off + 8 <= data_bytes.len() {
-                                        let data_start = data_len_off + 8;
-                                        if data_start + e <= data_bytes.len() {
-                                            Value::String(
-                                                std::str::from_utf8(
-                                                    &data_bytes[data_start + s..data_start + e],
-                                                )
-                                                .unwrap_or("")
-                                                .to_string(),
-                                            )
-                                        } else {
-                                            Value::Null
-                                        }
-                                    } else {
-                                        Value::Null
-                                    }
-                                } else {
-                                    Value::Null
-                                }
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob) => {
-                            // Plain Binary: same layout as String: [count:u64][offsets:(count+1)*4][data_len:u64][data]
-                            if data_bytes.len() >= 8 {
-                                let count = u64::from_le_bytes(data_bytes[0..8].try_into().unwrap())
-                                    as usize;
-                                let off_start = 8 + local_idx * 4;
-                                let off_end = 8 + (local_idx + 1) * 4;
-                                if off_end + 4 <= data_bytes.len() && local_idx < count {
-                                    let s = u32::from_le_bytes(
-                                        data_bytes[off_start..off_start + 4].try_into().unwrap(),
-                                    ) as usize;
-                                    let e = u32::from_le_bytes(
-                                        data_bytes[off_end..off_end + 4].try_into().unwrap(),
-                                    ) as usize;
-                                    let offsets_end = 8 + (count + 1) * 4;
-                                    let data_len_off = offsets_end;
-                                    if data_len_off + 8 <= data_bytes.len() {
-                                        let data_start = data_len_off + 8;
-                                        if data_start + e <= data_bytes.len() {
-                                            let bytes =
-                                                data_bytes[data_start + s..data_start + e].to_vec();
-                                            if col_type == ColumnType::Blob {
-                                                Value::Blob(self.read_blob_value(&bytes)?)
-                                            } else {
-                                                Value::Binary(bytes)
-                                            }
-                                        } else {
-                                            Value::Null
-                                        }
-                                    } else {
-                                        Value::Null
-                                    }
-                                } else {
-                                    Value::Null
-                                }
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        (COL_ENCODING_COMPACT_DICTIONARY, ColumnType::StringDict) => {
-                            let view = StringDictView::parse(data_bytes, true)?;
-                            view.index(local_idx)
-                                .and_then(|index| view.value(index))
-                                .map(|value| {
-                                    Value::String(
-                                        std::str::from_utf8(value).unwrap_or("").to_string(),
-                                    )
-                                })
-                                .unwrap_or(Value::Null)
-                        }
-                        (COL_ENCODING_PLAIN, ColumnType::StringDict) => {
-                            // StringDict: [row_count:u64][dict_size:u64][indices:row_count*4][dict_offsets:dict_size*4][dict_data_len:u64][dict_data]
-                            if data_bytes.len() >= 16 {
-                                let row_count =
-                                    u64::from_le_bytes(data_bytes[0..8].try_into().unwrap())
-                                        as usize;
-                                let dict_size =
-                                    u64::from_le_bytes(data_bytes[8..16].try_into().unwrap())
-                                        as usize;
-                                let idx_off = 16 + local_idx * 4;
-                                if idx_off + 4 <= data_bytes.len() && local_idx < row_count {
-                                    let dict_idx = u32::from_le_bytes(
-                                        data_bytes[idx_off..idx_off + 4].try_into().unwrap(),
-                                    );
-                                    if dict_idx == 0 {
-                                        Value::Null
-                                    } else {
-                                        let di = (dict_idx - 1) as usize;
-                                        let dict_off_start = 16 + row_count * 4;
-                                        let do_off = dict_off_start + di * 4;
-                                        let do_off_next = dict_off_start + (di + 1) * 4;
-                                        if do_off_next + 4 <= data_bytes.len() && di < dict_size {
-                                            let ds = u32::from_le_bytes(
-                                                data_bytes[do_off..do_off + 4].try_into().unwrap(),
-                                            )
-                                                as usize;
-                                            let de = u32::from_le_bytes(
-                                                data_bytes[do_off_next..do_off_next + 4]
-                                                    .try_into()
-                                                    .unwrap(),
-                                            )
-                                                as usize;
-                                            let dict_data_len_off = dict_off_start + dict_size * 4;
-                                            if dict_data_len_off + 8 <= data_bytes.len() {
-                                                let dict_data_start = dict_data_len_off + 8;
-                                                if dict_data_start + de <= data_bytes.len() {
-                                                    Value::String(
-                                                        std::str::from_utf8(
-                                                            &data_bytes[dict_data_start + ds
-                                                                ..dict_data_start + de],
-                                                        )
-                                                        .unwrap_or("")
-                                                        .to_string(),
-                                                    )
-                                                } else {
-                                                    Value::Null
-                                                }
-                                            } else {
-                                                Value::Null
-                                            }
-                                        } else {
-                                            Value::Null
-                                        }
-                                    }
-                                } else {
-                                    Value::Null
-                                }
-                            } else {
-                                Value::Null
-                            }
-                        }
-                        _ => {
-                            // RLE/Bitpack/other: fallback to full decode, extract single value
-                            let (col_data, _consumed) = if encoding_version >= 1 {
-                                read_column_encoded(col_bytes, col_type)?
-                            } else {
-                                ColumnData::from_bytes_typed(col_bytes, col_type)?
-                            };
-                            match &col_data {
-                                ColumnData::Int64(v) => {
-                                    if local_idx < v.len() {
-                                        Value::Int64(v[local_idx])
-                                    } else {
-                                        Value::Null
-                                    }
-                                }
-                                ColumnData::Float64(v) => {
-                                    if local_idx < v.len() {
-                                        Value::Float64(v[local_idx])
-                                    } else {
-                                        Value::Null
-                                    }
-                                }
-                                ColumnData::Bool { data, len } => {
-                                    if local_idx < *len {
-                                        Value::Bool(
-                                            (data[local_idx / 8] >> (local_idx % 8)) & 1 == 1,
-                                        )
-                                    } else {
-                                        Value::Null
-                                    }
-                                }
-                                ColumnData::String { offsets, data } => {
-                                    let count = offsets.len().saturating_sub(1);
-                                    if local_idx < count {
-                                        let s = offsets[local_idx] as usize;
-                                        let e = offsets[local_idx + 1] as usize;
-                                        Value::String(
-                                            std::str::from_utf8(&data[s..e])
-                                                .unwrap_or("")
-                                                .to_string(),
-                                        )
-                                    } else {
-                                        Value::Null
-                                    }
-                                }
-                                ColumnData::Binary { offsets, data } => {
-                                    let count = offsets.len().saturating_sub(1);
-                                    if local_idx < count {
-                                        let s = offsets[local_idx] as usize;
-                                        let e = offsets[local_idx + 1] as usize;
-                                        Value::Binary(data[s..e].to_vec())
-                                    } else {
-                                        Value::Null
-                                    }
-                                }
-                                ColumnData::StringDict {
-                                    indices,
-                                    dict_offsets,
-                                    dict_data,
-                                    ..
-                                } => {
-                                    if local_idx < indices.len() {
-                                        let di = indices[local_idx];
-                                        if di == 0 {
-                                            Value::Null
-                                        } else {
-                                            let idx = (di - 1) as usize;
-                                            if idx < dict_offsets.len() {
-                                                let s = dict_offsets[idx] as usize;
-                                                let e = if idx + 1 < dict_offsets.len() {
-                                                    dict_offsets[idx + 1] as usize
-                                                } else {
-                                                    dict_data.len()
-                                                };
-                                                Value::String(
-                                                    std::str::from_utf8(&dict_data[s..e])
-                                                        .unwrap_or("")
-                                                        .to_string(),
-                                                )
-                                            } else {
-                                                Value::Null
-                                            }
-                                        }
-                                    } else {
-                                        Value::Null
-                                    }
-                                }
-                                _ => Value::Null,
-                            }
-                        }
-                    };
+                    let val = decode_point_column_value(
+                        col_bytes,
+                        col_type,
+                        encoding_version,
+                        local_idx,
+                        &|bytes| self.read_blob_value(bytes),
+                    )?;
 
                     result.push((col_name, val));
                 }
@@ -3257,14 +3991,20 @@ impl OnDemandStorage {
                 return Ok(Some(result));
             }
 
-            // Fallback: compressed RG or no RCIX — decompress, binary search, sequential scan.
-            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            // Fallback: compressed RG or no RCIX — decompress (cached across point
+            // reads), binary search, sequential scan.
+            let cached_body = self.decompressed_rg_body(
+                rg_offset,
+                rg_offset + rg_data_size,
+                compress_flag,
+                rg_bytes.get(32..).unwrap_or(&[]),
+            )?;
+            let body: &[u8] = cached_body.as_deref().map_or(rg_bytes.get(32..).unwrap_or(&[]), |body| body.as_slice());
             if id_section_len > body.len() {
                 return Ok(None);
             }
             let local_idx = if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
-                let offset = id.saturating_sub(rg_meta.min_id) as usize;
+                let offset = id.saturating_sub(rg_min_id) as usize;
                 if offset >= rg_rows {
                     return Ok(None);
                 }
@@ -3286,9 +4026,15 @@ impl OnDemandStorage {
             }
             let mut pos = del_start + del_vec_len;
             let null_bitmap_len = (rg_rows + 7) / 8;
-            let schema = &footer.schema;
-            let mut result = Vec::with_capacity(col_count + 1);
+            let schema = &schema_columns;
+            let mut result = Vec::with_capacity(selected.len() + 1);
             result.push(("_id".to_string(), Value::Int64(id as i64)));
+            let mut wanted = vec![false; col_count];
+            for &col_idx in &selected {
+                if col_idx < col_count {
+                    wanted[col_idx] = true;
+                }
+            }
             for col_idx in 0..col_count {
                 if pos + null_bitmap_len > body.len() {
                     break;
@@ -3296,140 +4042,33 @@ impl OnDemandStorage {
                 let null_bytes = &body[pos..pos + null_bitmap_len];
                 pos += null_bitmap_len;
                 let is_null = (null_bytes[local_idx / 8] >> (local_idx % 8)) & 1 == 1;
-                let col_type = schema.columns[col_idx].1;
-                let col_name = schema.columns[col_idx].0.clone();
+                let col_type = schema[col_idx].1;
+                let col_name = schema[col_idx].0.clone();
                 let col_bytes = &body[pos..];
-                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
-                    col_bytes[0]
-                } else {
-                    COL_ENCODING_PLAIN
-                };
-                let consumed = if encoding_version >= 1 {
+                let consumed = if encoding_version == RG_ENCODING_VERSION {
                     skip_column_encoded(col_bytes, col_type)?
                 } else {
                     ColumnData::skip_bytes_typed(col_bytes, col_type)?
                 };
+                // The body is walked in column order because that is how the
+                // bytes are laid out; a column the caller did not request still
+                // needs no decode at all.
+                if !wanted[col_idx] {
+                    pos += consumed;
+                    continue;
+                }
                 if is_null {
                     pos += consumed;
                     result.push((col_name, Value::Null));
                     continue;
                 }
-                let data_bytes = &col_bytes[enc_offset..];
-                let val = match (encoding, col_type) {
-                    (
-                        COL_ENCODING_PLAIN,
-                        ColumnType::Int64
-                        | ColumnType::Int8
-                        | ColumnType::Int16
-                        | ColumnType::Int32
-                        | ColumnType::UInt8
-                        | ColumnType::UInt16
-                        | ColumnType::UInt32
-                        | ColumnType::UInt64
-                        | ColumnType::Timestamp
-                        | ColumnType::Date,
-                    ) => {
-                        let off = 8 + local_idx * 8;
-                        if off + 8 <= data_bytes.len() {
-                            Value::Int64(i64::from_le_bytes(
-                                data_bytes[off..off + 8].try_into().unwrap(),
-                            ))
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    (COL_ENCODING_PLAIN, ColumnType::Float64 | ColumnType::Float32) => {
-                        let off = 8 + local_idx * 8;
-                        if off + 8 <= data_bytes.len() {
-                            Value::Float64(f64::from_le_bytes(
-                                data_bytes[off..off + 8].try_into().unwrap(),
-                            ))
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    (COL_ENCODING_FLOAT_DICTIONARY, ColumnType::Float64 | ColumnType::Float32) => {
-                        FloatDictView::parse(data_bytes)?
-                            .value(local_idx)
-                            .map(Value::Float64)
-                            .unwrap_or(Value::Null)
-                    }
-                    (COL_ENCODING_PLAIN, ColumnType::Bool) => {
-                        let byte_off = 8 + local_idx / 8;
-                        if byte_off < data_bytes.len() {
-                            Value::Bool((data_bytes[byte_off] >> (local_idx % 8)) & 1 == 1)
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    (COL_ENCODING_PLAIN, ColumnType::String) => {
-                        if data_bytes.len() >= 8 {
-                            let count =
-                                u64::from_le_bytes(data_bytes[0..8].try_into().unwrap()) as usize;
-                            let off_s = 8 + local_idx * 4;
-                            let off_e = 8 + (local_idx + 1) * 4;
-                            if off_e + 4 <= data_bytes.len() && local_idx < count {
-                                let s = u32::from_le_bytes(
-                                    data_bytes[off_s..off_s + 4].try_into().unwrap(),
-                                ) as usize;
-                                let e = u32::from_le_bytes(
-                                    data_bytes[off_e..off_e + 4].try_into().unwrap(),
-                                ) as usize;
-                                let ds = 8 + (count + 1) * 4 + 8;
-                                if ds + e <= data_bytes.len() {
-                                    Value::String(
-                                        std::str::from_utf8(&data_bytes[ds + s..ds + e])
-                                            .unwrap_or("")
-                                            .to_string(),
-                                    )
-                                } else {
-                                    Value::Null
-                                }
-                            } else {
-                                Value::Null
-                            }
-                        } else {
-                            Value::Null
-                        }
-                    }
-                    _ => {
-                        let (cd, _) = if encoding_version >= 1 {
-                            read_column_encoded(col_bytes, col_type)?
-                        } else {
-                            ColumnData::from_bytes_typed(col_bytes, col_type)?
-                        };
-                        match &cd {
-                            ColumnData::Int64(v) => {
-                                if local_idx < v.len() {
-                                    Value::Int64(v[local_idx])
-                                } else {
-                                    Value::Null
-                                }
-                            }
-                            ColumnData::Float64(v) => {
-                                if local_idx < v.len() {
-                                    Value::Float64(v[local_idx])
-                                } else {
-                                    Value::Null
-                                }
-                            }
-                            ColumnData::String { offsets, data } => {
-                                let c = offsets.len().saturating_sub(1);
-                                if local_idx < c {
-                                    let s = offsets[local_idx] as usize;
-                                    let e = offsets[local_idx + 1] as usize;
-                                    Value::String(
-                                        std::str::from_utf8(&data[s..e]).unwrap_or("").to_string(),
-                                    )
-                                } else {
-                                    Value::Null
-                                }
-                            }
-                            _ => Value::Null,
-                        }
-                    }
-                };
+                let val = decode_point_column_value(
+                    col_bytes,
+                    col_type,
+                    encoding_version,
+                    local_idx,
+                    &|bytes| self.read_blob_value(bytes),
+                )?;
                 pos += consumed;
                 result.push((col_name, val));
             }
@@ -3446,6 +4085,7 @@ impl OnDemandStorage {
         &self,
         limit: usize,
     ) -> io::Result<Option<(Vec<String>, Vec<Vec<crate::data::Value>>)>> {
+
         use crate::data::Value;
 
         let is_v4 = self.is_v4_format();
@@ -3616,6 +4256,7 @@ impl OnDemandStorage {
         ids: &[u64],
         column_names: Option<&[&str]>,
     ) -> io::Result<Vec<(u64, HashMap<String, ColumnData>)>> {
+
         if ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -3798,7 +4439,7 @@ impl OnDemandStorage {
     ) -> io::Result<()> {
         let is_v4 = {
             let header = self.header.read();
-            header.version == FORMAT_VERSION_V4 && header.footer_offset > 0
+            supported_file_version(header.version) && header.footer_offset > 0
         };
         let base_loaded = self.v4_base_loaded.load(Ordering::SeqCst);
 
@@ -3958,7 +4599,7 @@ impl OnDemandStorage {
             let existing_row_count = ids.len();
             drop(ids);
 
-            for name in int_columns.keys() {
+            for name in sorted_keys(&int_columns) {
                 let idx = schema.add_column(name, ColumnType::Int64);
                 while columns.len() <= idx {
                     // New column - pad with defaults for existing rows
@@ -3971,7 +4612,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in float_columns.keys() {
+            for name in sorted_keys(&float_columns) {
                 let idx = schema.add_column(name, ColumnType::Float64);
                 while columns.len() <= idx {
                     let mut col = ColumnData::new(ColumnType::Float64);
@@ -3983,7 +4624,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in string_columns.keys() {
+            for name in sorted_keys(&string_columns) {
                 let idx = schema.add_column(name, ColumnType::String);
                 while columns.len() <= idx {
                     let mut col = ColumnData::new(ColumnType::String);
@@ -3998,7 +4639,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in binary_columns.keys() {
+            for name in sorted_keys(&binary_columns) {
                 let idx = schema.add_column(name, ColumnType::Binary);
                 while columns.len() <= idx {
                     let mut col = ColumnData::new(ColumnType::Binary);
@@ -4012,7 +4653,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in fixedlist_columns.keys() {
+            for name in sorted_keys(&fixedlist_columns) {
                 let idx = schema.add_column(name, ColumnType::FixedList);
                 let actual_type = schema.columns[idx].1;
                 while columns.len() <= idx {
@@ -4021,7 +4662,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in blob_columns.keys() {
+            for name in sorted_keys(&blob_columns) {
                 let idx = schema.add_column(name, ColumnType::Blob);
                 while columns.len() <= idx {
                     let mut col = ColumnData::new(ColumnType::Blob);
@@ -4035,7 +4676,7 @@ impl OnDemandStorage {
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
                 }
             }
-            for name in bool_columns.keys() {
+            for name in sorted_keys(&bool_columns) {
                 let idx = schema.add_column(name, ColumnType::Bool);
                 while columns.len() <= idx {
                     let mut col = ColumnData::new(ColumnType::Bool);
@@ -4045,6 +4686,33 @@ impl OnDemandStorage {
                     columns.push(col);
                     // The padded rows have no value for this column: mark them NULL.
                     nulls.push(missing_rows_null_bitmap(existing_row_count));
+                }
+            }
+        }
+
+        // Fixed-size vector columns have one established dimension for the
+        // whole table: the physical layout is a fixed stride, so appending a
+        // row with a different dimension would misalign every following row.
+        // Validate the whole batch up front, before any column is mutated.
+        for (name, values) in &fixedlist_columns {
+            let Some(expected) = self.established_vector_dim(name)? else {
+                continue;
+            };
+            for (row, value) in values.iter().enumerate() {
+                if value.is_empty() {
+                    // An omitted column arrives as an empty row (SQL INSERT
+                    // that does not mention it); it appends no bytes and is
+                    // not a dimension mismatch.
+                    continue;
+                }
+                let got = value.len() / 4;
+                if got != expected as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "column '{name}' stores {expected}-dimension vectors; row {row} has {got}"
+                        ),
+                    ));
                 }
             }
         }
@@ -4232,7 +4900,7 @@ impl OnDemandStorage {
         // All other cases use the proven save_v4() full-rewrite path.
         // Note: append optimization is handled at engine level (write_typed→append_row_group).
         let header = self.header.read();
-        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        let is_v4 = supported_file_version(header.version) && header.footer_offset > 0;
         drop(header);
 
         if is_v4 {
@@ -4577,7 +5245,12 @@ impl OnDemandStorage {
 
         // Phase 2: Write V4 format from active data (no lock contention).
         let adaptive_rg_size =
-            Self::compute_adaptive_row_group_size(&schema_clone, &active_columns, active_count);
+            Self::compute_adaptive_row_group_size(
+                &schema_clone,
+                &active_columns,
+                active_count,
+                self.compression(),
+            );
         {
             let mut header = self.header.write();
             header.row_group_size = adaptive_rg_size;
@@ -4623,17 +5296,10 @@ impl OnDemandStorage {
             let chunk_ids = &active_ids[chunk_start..chunk_end];
             let min_id = chunk_ids.iter().copied().min().unwrap_or(0);
             let max_id = chunk_ids.iter().copied().max().unwrap_or(0);
-            let id_encoding = if self
-                .path
-                .components()
-                .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"))
-                && ids_are_contiguous(chunk_ids)
-            {
-                RG_IDS_IMPLICIT_CONTIGUOUS
-            } else {
-                RG_IDS_PLAIN
-            };
+            let id_encoding =
+                rg_id_encoding_for(chunk_ids, implicit_ids_allowed(&self.path));
             let id_section_len = rg_id_section_len(chunk_rows, id_encoding);
+            let encoding_options = self.column_encoding_options();
 
             // Serialize RG body to buffer (IDs + deletion vector + columns)
             let is_single_rg = chunk_start == 0 && chunk_end == active_count;
@@ -4683,6 +5349,15 @@ impl OnDemandStorage {
                     if rg_metas.is_empty() {
                         let actual_type = match processed {
                             ColumnData::StringDict { .. } => ColumnType::StringDict,
+                            // The encoder is allowed to *drop* dictionary encoding --
+                            // `dict_encode_if_smaller` declines below 1000 rows, which a
+                            // compaction after a delete can cross. The footer must then
+                            // record a plain string: readers that take the column type
+                            // from the schema instead of the body's encoding tag (the
+                            // length-prefixed row groups do) would otherwise parse plain
+                            // bytes as a dictionary and silently return '' or fail with
+                            // "StringDict dict_offsets truncated".
+                            ColumnData::String { .. } => ColumnType::String,
                             _ => schema_clone.columns[col_idx].1,
                         };
                         actual_col_types.push(actual_type);
@@ -4703,6 +5378,7 @@ impl OnDemandStorage {
                         processed,
                         schema_clone.columns[col_idx].1,
                         &mut body_writer,
+                        encoding_options,
                     )?
                 }
                 all_rg_col_offsets.push(rg_col_offsets);
@@ -4722,117 +5398,14 @@ impl OnDemandStorage {
             // RG body (possibly compressed)
             writer.write_all(&disk_body)?;
 
-            // Compute zone maps for this RG's numeric columns
-            let mut rg_zmaps: Vec<RgColumnZoneMap> = Vec::new();
-            for col_idx in 0..col_count {
-                let chunk_col_ref: &ColumnData = if is_single_rg {
-                    &active_columns[col_idx]
-                } else {
-                    // Already sliced above — re-slice for zone map
-                    // Use active_columns directly since we only need min/max
-                    &active_columns[col_idx]
-                };
-                match chunk_col_ref {
-                    ColumnData::Int64(data) => {
-                        if !data.is_empty() {
-                            let slice = if is_single_rg {
-                                &data[..]
-                            } else {
-                                &data[chunk_start..chunk_end]
-                            };
-                            let (mut mn, mut mx) = (i64::MAX, i64::MIN);
-                            for &v in slice {
-                                mn = mn.min(v);
-                                mx = mx.max(v);
-                            }
-                            rg_zmaps.push(RgColumnZoneMap {
-                                col_idx: col_idx as u16,
-                                min_bits: mn,
-                                max_bits: mx,
-                                has_nulls: false,
-                                is_float: false,
-                            });
-                        }
-                    }
-                    ColumnData::Float64(data) => {
-                        if !data.is_empty() {
-                            let slice = if is_single_rg {
-                                &data[..]
-                            } else {
-                                &data[chunk_start..chunk_end]
-                            };
-                            let (mut mn, mut mx) = (f64::INFINITY, f64::NEG_INFINITY);
-                            for &v in slice {
-                                if v < mn {
-                                    mn = v;
-                                }
-                                if v > mx {
-                                    mx = v;
-                                }
-                            }
-                            rg_zmaps.push(RgColumnZoneMap {
-                                col_idx: col_idx as u16,
-                                min_bits: mn.to_bits() as i64,
-                                max_bits: mx.to_bits() as i64,
-                                has_nulls: false,
-                                is_float: true,
-                            });
-                        }
-                    }
-                    ColumnData::String { offsets, .. } => {
-                        // Store min/max string byte-length for zone-skip in string filter scans
-                        let end_idx = chunk_end.min(offsets.len().saturating_sub(1));
-                        let start_idx = if is_single_rg { 0 } else { chunk_start };
-                        if end_idx > start_idx {
-                            let (mut mn, mut mx) = (u64::MAX, 0u64);
-                            for i in start_idx..end_idx {
-                                let len = offsets[i + 1].saturating_sub(offsets[i]);
-                                if len < mn {
-                                    mn = len;
-                                }
-                                if len > mx {
-                                    mx = len;
-                                }
-                            }
-                            if mn <= mx {
-                                rg_zmaps.push(RgColumnZoneMap {
-                                    col_idx: col_idx as u16,
-                                    min_bits: mn as i64,
-                                    max_bits: mx as i64,
-                                    has_nulls: false,
-                                    is_float: false,
-                                });
-                            }
-                        }
-                    }
-                    ColumnData::StringDict { dict_offsets, .. } => {
-                        // Store min/max dict-entry byte-length for zone-skip
-                        if dict_offsets.len() > 1 {
-                            let (mut mn, mut mx) = (u64::MAX, 0u64);
-                            for i in 0..dict_offsets.len().saturating_sub(1) {
-                                let len = dict_offsets[i + 1].saturating_sub(dict_offsets[i]);
-                                if len < mn {
-                                    mn = len;
-                                }
-                                if len > mx {
-                                    mx = len;
-                                }
-                            }
-                            if mn <= mx {
-                                rg_zmaps.push(RgColumnZoneMap {
-                                    col_idx: col_idx as u16,
-                                    min_bits: mn as i64,
-                                    max_bits: mx as i64,
-                                    has_nulls: false,
-                                    is_float: false,
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            all_zone_maps.push(rg_zmaps);
+            // Zone maps describe the same rows and the same null bitmaps as
+            // the column bodies above, so `has_nulls` reflects the real bitmap.
+            all_zone_maps.push(compute_rg_zone_maps(
+                &active_columns,
+                &active_nulls,
+                chunk_start,
+                chunk_end,
+            ));
 
             let rg_end = writer.stream_position()?;
             rg_metas.push(RowGroupMeta {
@@ -4880,7 +5453,7 @@ impl OnDemandStorage {
         // Seek back to fix header
         {
             let mut header = self.header.write();
-            header.version = FORMAT_VERSION_V4;
+            header.version = self.required_format_version();
             header.row_count = active_count as u64;
             header.column_count = col_count as u32;
             header.footer_offset = footer_offset;
@@ -4989,6 +5562,48 @@ impl OnDemandStorage {
         }
 
         Ok(())
+    }
+
+    /// Established element count of a fixed-size vector column.
+    ///
+    /// Every row of every row group of one column must carry the same
+    /// dimension: the physical layout is a fixed stride, so a row with a
+    /// different dimension would misalign every following row. Writers call
+    /// this before appending and reject a mismatch.
+    ///
+    /// In-memory (unflushed) data wins; otherwise the first persisted row of
+    /// the column is decoded, which also covers compressed row groups.
+    pub(crate) fn established_vector_dim(&self, col_name: &str) -> io::Result<Option<u32>> {
+        let dtype = match self.schema.read().get_index(col_name) {
+            Some(idx) => {
+                let schema = self.schema.read();
+                schema.columns[idx].1
+            }
+            None => return Ok(None),
+        };
+        if dtype.vector_codec().is_none()
+            && !matches!(
+                dtype,
+                ColumnType::FixedList | ColumnType::Float16List | ColumnType::BFloat16List
+            )
+        {
+            return Ok(None);
+        }
+        {
+            let columns = self.columns.read();
+            if let Some(idx) = self.schema.read().get_index(col_name) {
+                if let Some(col) = columns.get(idx) {
+                    if let Some(dim) = col.vector_dim() {
+                        return Ok(Some(dim));
+                    }
+                }
+            }
+        }
+        if self.persisted_row_count.load(Ordering::SeqCst) == 0 {
+            return Ok(None);
+        }
+        let read = self.read_columns(Some(&[col_name]), 0, Some(1))?;
+        Ok(read.get(col_name).and_then(|col| col.vector_dim()))
     }
 
     /// Write the initial V4 file for a freshly created table in one shot.
@@ -5145,8 +5760,16 @@ impl OnDemandStorage {
             let id_encoding = rg_buf.get(30).copied().unwrap_or(RG_IDS_PLAIN);
 
             // Get the body bytes (after 32-byte RG header), decompressing if needed
-            let decompressed_buf = decompress_rg_body(compress_flag, &rg_buf[32..])?;
-            let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_buf[32..]);
+            let decompressed_buf = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                rg_buf.get(32..).unwrap_or(&[]),
+            )?;
+            let body: &[u8] = decompressed_buf
+                .as_ref()
+                .map(|buf| buf.as_slice())
+                .unwrap_or(rg_buf.get(32..).unwrap_or(&[]));
             let mut pos: usize = 0;
 
             // Parse IDs — OPTIMIZATION: bulk memcpy instead of per-element loop
@@ -5259,7 +5882,7 @@ impl OnDemandStorage {
 
                 // Parse column data (encoding-aware for version 1, plain for version 0)
                 let col_type = footer.schema.columns[col_idx].1;
-                let (col_data, consumed) = if encoding_version >= 1 {
+                let (col_data, consumed) = if encoding_version == RG_ENCODING_VERSION {
                     read_column_encoded(&body[pos..], col_type)?
                 } else {
                     ColumnData::from_bytes_typed(&body[pos..], col_type)?
@@ -5354,7 +5977,7 @@ impl OnDemandStorage {
     /// is not loaded into memory (mmap-only mode).
     pub fn update_v4_footer_schema(&self) -> io::Result<()> {
         let header = self.header.read();
-        if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
+        if !supported_file_version(header.version) || header.footer_offset == 0 {
             return Err(err_data("update_v4_footer_schema requires V4 format file"));
         }
         let footer_offset = header.footer_offset;
@@ -5437,7 +6060,7 @@ impl OnDemandStorage {
     /// Also updates the footer's per-RG deletion_count and the header's row_count.
     fn save_deletion_vectors(&self) -> io::Result<()> {
         let header = self.header.read();
-        if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
+        if !supported_file_version(header.version) || header.footer_offset == 0 {
             return Err(err_data("save_deletion_vectors requires V4 format file"));
         }
         let footer_offset = header.footer_offset;
@@ -5559,6 +6182,14 @@ impl OnDemandStorage {
         // Reopen file handle
         *self.file.write() = Some(open_for_sequential_read(&self.path)?);
 
+        // Keep the cached footer in step with the file that was just rewritten: it
+        // still carried the pre-delete `deletion_count` values, so every later read
+        // on this instance believed the rows were alive. Anything that derives
+        // deletion state from the footer inherits that mistake -- the cached group-by
+        // aggregation does, which is how a deleted row kept being counted (and why
+        // the lane had to be refused for tables with deletions at all).
+        *self.v4_footer.write() = Some(footer);
+
         if self.durability == super::DurabilityLevel::Fast {
             self.mark_main_sync_pending();
         } else {
@@ -5585,7 +6216,7 @@ impl OnDemandStorage {
             return Ok(());
         }
         let header = self.header.read();
-        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        let is_v4 = supported_file_version(header.version) && header.footer_offset > 0;
         drop(header);
 
         if !is_v4 {
@@ -5655,7 +6286,7 @@ impl OnDemandStorage {
         high: f64,
     ) -> io::Result<Option<i64>> {
         let header = self.header.read();
-        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        let is_v4 = supported_file_version(header.version) && header.footer_offset > 0;
         let footer_offset = header.footer_offset;
         drop(header);
         if !is_v4 {
@@ -5805,8 +6436,8 @@ impl OnDemandStorage {
                 let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
                 let data_start = col_body_off + null_bitmap_len;
                 let col_bytes = &body[data_start..];
-                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
+                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -5833,7 +6464,16 @@ impl OnDemandStorage {
                     }
                     let count = u64::from_le_bytes(rle_data[0..8].try_into().unwrap()) as usize;
                     let num_runs = u64::from_le_bytes(rle_data[8..16].try_into().unwrap()) as usize;
-                    if rle_data.len() < 16 + num_runs * 12 {
+                    // `num_runs * 12` wraps for a corrupt header, and the wrapped
+                    // value can satisfy a plain `<` check while the loop below then
+                    // slices past the end of `rle_data` (an "end index N out of
+                    // range" panic). Require the exact byte count with checked
+                    // arithmetic.
+                    let Some(needed) = num_runs.checked_mul(12).and_then(|n| n.checked_add(16)) else {
+                        can_fast_delete = false;
+                        break 'rg_loop;
+                    };
+                    if rle_data.len() < needed {
                         can_fast_delete = false;
                         break 'rg_loop;
                     }
@@ -5907,7 +6547,9 @@ impl OnDemandStorage {
 
                 // Only enqueue a write if this RG actually had new deletions
                 if rg_newly_deleted > 0 {
-                    let del_vec_offset = rg_meta.offset + 32 + (rg_rows as u64 * 8);
+                    // The ID section is empty for contiguous row groups, so the
+                    // deletion vector starts right after the body header.
+                    let del_vec_offset = rg_meta.offset + 32 + id_section as u64;
                     rg_writes.push((
                         rg_i,
                         RgWrite {
@@ -6126,7 +6768,7 @@ impl OnDemandStorage {
         }
 
         let header = self.header.read();
-        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        let is_v4 = supported_file_version(header.version) && header.footer_offset > 0;
         let footer_offset = header.footer_offset;
         drop(header);
         if !is_v4 {
@@ -6311,11 +6953,19 @@ impl OnDemandStorage {
         // footer — resurrecting deleted rows and orphaning the new Row Group.
         let _rewrite_guard = crate::storage::table_save_lock::rewrite_lock(&self.path);
         let header = self.header.read();
-        if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
+        if !supported_file_version(header.version) || header.footer_offset == 0 {
             return Err(err_data("write_row_group_to_disk requires V4 format file"));
         }
         let footer_offset = header.footer_offset;
-        let rg_size = (header.row_group_size as usize).max(1024);
+        let header_rg_size = (header.row_group_size as usize).max(1024);
+        // Compressed appends follow the same granularity cap as a full rewrite;
+        // a header written before that cap must not reintroduce whole-group
+        // decode costs on the new row groups.
+        let rg_size = if matches!(self.compression(), CompressionType::None) {
+            header_rg_size
+        } else {
+            header_rg_size.min(Self::COMPRESSED_ROW_GROUP_SIZE as usize)
+        };
         drop(header);
 
         // Read existing footer
@@ -6372,17 +7022,10 @@ impl OnDemandStorage {
             let chunk_ids = &new_ids[chunk_start..chunk_end];
             let min_id = chunk_ids.iter().copied().min().unwrap_or(0);
             let max_id = chunk_ids.iter().copied().max().unwrap_or(0);
-            let id_encoding = if self
-                .path
-                .components()
-                .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"))
-                && ids_are_contiguous(chunk_ids)
-            {
-                RG_IDS_IMPLICIT_CONTIGUOUS
-            } else {
-                RG_IDS_PLAIN
-            };
+            let id_encoding =
+                rg_id_encoding_for(chunk_ids, implicit_ids_allowed(&self.path));
             let id_section_len = rg_id_section_len(rg_rows, id_encoding);
+            let encoding_options = self.column_encoding_options();
 
             // Serialize RG body to buffer (IDs + deletion vector + columns)
             let null_bitmap_len = (rg_rows + 7) / 8;
@@ -6457,16 +7100,31 @@ impl OnDemandStorage {
                             && matches!(col, ColumnData::String { .. })
                         {
                             if let Some(dict) = col.to_dict_encoded() {
-                                write_column_encoded(&dict, col_type, &mut body_writer)?;
+                                write_column_encoded(&dict, col_type, &mut body_writer, encoding_options)?;
                             } else {
-                                write_column_encoded(col, col_type, &mut body_writer)?;
+                                write_column_encoded(col, col_type, &mut body_writer, encoding_options)?;
                             }
                         } else {
-                            write_column_encoded(col, col_type, &mut body_writer)?;
+                            write_column_encoded(col, col_type, &mut body_writer, encoding_options)?;
                         }
                     }
                 }
                 footer.col_offsets.push(new_rg_col_offsets);
+
+                // The ZMAP section is positional per Row Group, so the section
+                // has to be padded up to this group's index before ours can be
+                // appended. Earlier groups that were written before this
+                // metadata existed keep an empty slot and simply stay unprunable
+                // instead of shifting every later group's maps by one.
+                while footer.zone_maps.len() < footer.row_groups.len() {
+                    footer.zone_maps.push(Vec::new());
+                }
+                footer.zone_maps.push(compute_rg_zone_maps(
+                    &new_columns,
+                    new_nulls,
+                    chunk_start,
+                    chunk_end,
+                ));
             }
 
             // Compress body using configured compression algorithm
@@ -6520,6 +7178,7 @@ impl OnDemandStorage {
         let writer_inner = writer.get_mut();
         {
             let mut header = self.header.write();
+            header.version = self.required_format_version();
             header.row_count = active_rows_after;
             header.footer_offset = new_footer_offset;
             header.row_group_count = footer.row_groups.len() as u32;
@@ -6695,7 +7354,33 @@ impl OnDemandStorage {
         PathBuf::from(format!("{}.stats", self.path.display()))
     }
 
+    /// Row-group size for a compressed table.
+    ///
+    /// A compressed row group carries no RCIX, so a reader has to decode the
+    /// whole group before it can look at one column of one row: `LIMIT` and
+    /// point reads pay for every row and column in the group (measured at
+    /// 10–19x the plain twin in the round-59 record). Capping the group keeps a
+    /// random touch proportional to a fixed row count while a full scan still
+    /// decodes the same total bytes. The plain layout has the RCIX fast lanes
+    /// and keeps the larger adaptive groups.
+    const COMPRESSED_ROW_GROUP_SIZE: u32 = 4_096;
+
+    /// Choose the on-disk row-group size for new data.
     fn compute_adaptive_row_group_size(
+        schema: &OnDemandSchema,
+        columns: &[ColumnData],
+        row_count: usize,
+        compression: CompressionType,
+    ) -> u32 {
+        let adaptive = Self::adaptive_row_group_size(schema, columns, row_count);
+        if matches!(compression, CompressionType::None) {
+            adaptive
+        } else {
+            adaptive.min(Self::COMPRESSED_ROW_GROUP_SIZE)
+        }
+    }
+
+    fn adaptive_row_group_size(
         schema: &OnDemandSchema,
         columns: &[ColumnData],
         row_count: usize,

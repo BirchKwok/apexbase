@@ -117,6 +117,17 @@ impl OnDemandHeader {
         pos += 8;
 
         let version = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+        // A newer writer may store column bodies this build cannot decode, and
+        // every V4 code path is gated on an exact version match, so an unknown
+        // version must fail here instead of silently falling into legacy reads.
+        if version > FORMAT_VERSION_MAX {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported ApexBase format version {version} (this build supports up to {FORMAT_VERSION_MAX})"
+                ),
+            ));
+        }
         pos += 4;
         let flags = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
         pos += 4;
@@ -247,6 +258,20 @@ pub struct RgColumnZoneMap {
     pub has_nulls: bool,
     /// True if this is a Float64 column (min_bits/max_bits are f64::to_bits)
     pub is_float: bool,
+    /// True when this is a String/StringDict column whose min/max are the
+    /// order-preserving prefixes of the lexicographic value range
+    /// (`string_prefix_key`), not the byte lengths written by older builds.
+    /// Files from before this flag keep the length meaning and must never be
+    /// compared against string values.
+    pub is_string_prefix: bool,
+    /// True when this is a String/StringDict column whose min/max are the
+    /// order-preserving keys of the value's **second** eight bytes
+    /// (`string_tail_key`). This entry only decides equality: values that share
+    /// their first eight bytes (timestamps, UUIDs, prefixed ids) are otherwise
+    /// indistinguishable to the value range. A row group is skippable when the
+    /// candidate's second eight bytes fall outside this range, because every
+    /// value in the group has its tail inside it.
+    pub is_string_tail: bool,
 }
 
 impl RgColumnZoneMap {
@@ -339,7 +364,10 @@ impl V4Footer {
                     buf.extend_from_slice(&zm.col_idx.to_le_bytes());
                     buf.extend_from_slice(&zm.min_bits.to_le_bytes());
                     buf.extend_from_slice(&zm.max_bits.to_le_bytes());
-                    let flags: u8 = (zm.has_nulls as u8) | ((zm.is_float as u8) << 1);
+                    let flags: u8 = (zm.has_nulls as u8)
+                        | ((zm.is_float as u8) << 1)
+                        | ((zm.is_string_prefix as u8) << 2)
+                        | ((zm.is_string_tail as u8) << 3);
                     buf.push(flags);
                 }
             }
@@ -423,6 +451,8 @@ impl V4Footer {
                         max_bits,
                         has_nulls: (flags & 1) != 0,
                         is_float: (flags & 2) != 0,
+                        is_string_prefix: (flags & 4) != 0,
+                        is_string_tail: (flags & 8) != 0,
                     });
                 }
                 zone_maps.push(rg_zmaps);

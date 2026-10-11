@@ -327,7 +327,7 @@ impl ApexExecutor {
             }
         }
 
-        let sort_cols: Vec<(ArrayRef, bool)> = order_by
+        let sort_cols: Vec<(ArrayRef, bool, bool)> = order_by
             .iter()
             .filter_map(|clause| {
                 let col_name = clause.column.trim_matches('"');
@@ -336,20 +336,43 @@ impl ApexExecutor {
                 } else {
                     col_name
                 };
-                sort_batch
-                    .column_by_name(actual_col)
-                    .map(|col| (col.clone(), clause.descending))
+                sort_batch.column_by_name(actual_col).map(|col| {
+                    (
+                        col.clone(),
+                        clause.descending,
+                        clause.nulls_first.unwrap_or(clause.descending),
+                    )
+                })
             })
             .collect();
 
         let compare_rows = |a: usize, b: usize| -> std::cmp::Ordering {
-            for (col, descending) in &sort_cols {
-                let ord = Self::compare_array_values(col, a, b);
-                if ord != std::cmp::Ordering::Equal {
-                    return if *descending { ord.reverse() } else { ord };
+            use std::cmp::Ordering;
+            for (col, descending, nulls_first) in &sort_cols {
+                let a_null = col.is_null(a);
+                let b_null = col.is_null(b);
+                let ord = if a_null || b_null {
+                    // NULL placement is independent of the value direction.
+                    if a_null && b_null {
+                        Ordering::Equal
+                    } else if a_null == *nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                } else {
+                    let ord = Self::compare_array_values(col, a, b);
+                    if *descending {
+                        ord.reverse()
+                    } else {
+                        ord
+                    }
+                };
+                if ord != Ordering::Equal {
+                    return ord;
                 }
             }
-            std::cmp::Ordering::Equal
+            Ordering::Equal
         };
 
         let mut indices: Vec<usize> = (0..num_rows).collect();

@@ -179,5 +179,59 @@ class TestColumnEncoding:
             client.close()
 
 
+class TestDictionaryDropOnCompaction:
+    """A compaction may drop dictionary encoding; the footer must follow.
+
+    `dict_encode_if_smaller` declines below 1000 rows, which a delete-then-compact
+    can cross. The writer used to keep the *old* schema type in that case, so the
+    footer claimed a dictionary while the body held plain strings. Readers that
+    take the column type from the schema (the length-prefixed row groups do) then
+    parsed plain bytes as a dictionary: on a zstd table `SELECT s` silently
+    returned `''` and `GROUP BY s` failed with "StringDict dict_offsets truncated",
+    while numbers and uncompressed tables looked fine.
+    """
+
+    @pytest.mark.parametrize("compression", [None, "zstd"])
+    @pytest.mark.parametrize("total,keep", [(2000, 999), (2000, 500), (5000, 1), (5000, 1000)])
+    def test_values_survive_a_compaction_that_drops_the_dictionary(
+        self, compression, total, keep
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # A low-cardinality column over >= 1000 rows is dictionary encoded.
+            client = ab.ApexClient(dirpath=tmpdir, enable_cache=False)
+            client.create_table("t", {"c0": "int64", "s": "string"})
+            client.use_table("t")
+            if compression:
+                assert client.set_compression(compression) is not False
+            client.store(
+                {
+                    "c0": list(range(total)),
+                    "s": [f"v{index % 97}" for index in range(total)],
+                }
+            )
+            client.flush()
+            client.execute(f"DELETE FROM t WHERE c0 < {total - keep}")
+            client.flush()
+            client.close()
+
+            # Read through a fresh client so the footer is parsed from disk.
+            client = ab.ApexClient(dirpath=tmpdir, enable_cache=False)
+            client.use_table("t")
+            want = [f"v{index % 97}" for index in range(total - keep, total)]
+            assert [row["s"] for row in client.execute("SELECT s FROM t").to_dict()] == want
+            assert [
+                row["s"] for row in client.execute("SELECT s FROM t LIMIT 5").to_dict()
+            ] == want[:5]
+            assert len(
+                client.execute("SELECT s, count(*) AS n FROM t GROUP BY s").to_dict()
+            ) == len(set(want))
+            assert client.execute("SELECT count(s) AS n FROM t").to_dict()[0]["n"] == keep
+            # The last row is still readable by id, with its own value.
+            assert client.execute(
+                f"SELECT s FROM t WHERE _id = {total}"
+            ).to_dict() == [{"s": f"v{(total - 1) % 97}"}]
+            client.close()
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

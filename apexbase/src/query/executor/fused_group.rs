@@ -764,24 +764,17 @@ impl ApexExecutor {
         }
     }
 
-    /// Smallest representable f64 strictly above `v` (strict-inequality
-    /// epsilon bounds; mirrors extract_single_comparison_as_range).
+    /// Smallest representable f64 strictly above `v`, and largest strictly below.
+    /// Both live in `query_signature` so the strict-inequality epsilon bound is
+    /// computed exactly once: the copy that used to live here tested `v > 0.0`,
+    /// which sent `v == 0.0` to the positive side and made `k < 0` match `k = 0`.
     #[inline]
     fn fused_next_f64(v: f64) -> f64 {
-        if v >= 0.0 {
-            f64::from_bits(v.to_bits() + 1)
-        } else {
-            f64::from_bits(v.to_bits() - 1)
-        }
+        crate::query::query_signature::next_up_f64(v)
     }
 
-    /// Largest representable f64 strictly below `v`.
     #[inline]
     fn fused_prev_f64(v: f64) -> f64 {
-        if v > 0.0 {
-            f64::from_bits(v.to_bits() - 1)
-        } else {
-            f64::from_bits(v.to_bits() + 1)
-        }
+        crate::query::query_signature::next_down_f64(v)
     }
 }

@@ -20,7 +20,10 @@ CONFIG_KEYS = (
     "skip_vector",
 )
 SYSTEM_KEYS = ("platform", "machine", "processor", "cpu_count", "python")
-THROUGHPUT_METRIC_HINTS = ("Q/s",)
+# Metric names whose larger value is better. The guard's default assumption is a
+# latency ("lower is better"), so every throughput-shaped metric must be listed
+# here or an improvement would be reported as a regression.
+THROUGHPUT_METRIC_HINTS = ("Q/s", "rows/s")
 SELF_DEPENDENCY_KEYS = ("apexbase",)
 
 

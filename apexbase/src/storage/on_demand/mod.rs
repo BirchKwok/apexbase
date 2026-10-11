@@ -420,7 +420,27 @@ fn pread_fallback(file: &mut File, buf: &mut [u8], offset: u64) -> io::Result<()
 // ============================================================================
 
 const MAGIC: &[u8; 8] = b"APEXV3\0\0";
+/// Newest file format version this build understands. Files that declare a
+/// newer version are rejected instead of being guessed at.
+///
+/// V5 is a separate architecture: it reads every V4 file (both layouts are
+/// supported below), while V4 builds are not expected to read V5 files. V5 only
+/// bumps the version when a file actually uses a V5-only encoding, so files that
+/// stay within V4 rules remain readable by older builds.
+const FORMAT_VERSION_MAX: u32 = FORMAT_VERSION_V5;
 const FORMAT_VERSION_V4: u32 = 4;
+const FORMAT_VERSION_V5: u32 = 5;
+
+/// True for file versions this build reads: V4 and V5 share the row-group
+/// layout, so every V4-specific code path also applies to V5.
+#[inline]
+fn supported_file_version(version: u32) -> bool {
+    (FORMAT_VERSION_V4..=FORMAT_VERSION_MAX).contains(&version)
+}
+/// Column-body encoding revision stored in Row Group header byte 29. Every
+/// writer emits this value today; a reader that meets a newer revision must
+/// refuse the Row Group rather than interpret its bytes with older rules.
+const RG_ENCODING_VERSION: u8 = 1;
 const HEADER_SIZE: usize = 256;
 const COLUMN_INDEX_ENTRY_SIZE: usize = 32;
 const DEFAULT_ROW_GROUP_SIZE: u32 = 65536;
@@ -441,6 +461,21 @@ const RG_COMPRESS_NONE: u8 = 0;
 const RG_COMPRESS_LZ4: u8 = 1;
 const RG_COMPRESS_ZSTD: u8 = 2;
 
+/// Whether newly created tables should opt into width fidelity.
+///
+/// Off by default because older builds cannot read the narrow encoding; set
+/// `APEX_WIDTH_FIDELITY=1` to make new tables use it, or call
+/// `set_width_fidelity` on an empty table.
+fn narrow_float32_requested() -> bool {
+    // V5 default: a `Float32` column is stored at its declared width. Set
+    // `APEX_WIDTH_FIDELITY=0` to keep writing the V4-compatible full-width
+    // layout (for example to hand a file to an older build).
+    !matches!(
+        std::env::var("APEX_WIDTH_FIDELITY").ok().as_deref(),
+        Some("0") | Some("false") | Some("FALSE") | Some("no")
+    )
+}
+
 /// Minimum RG body size (bytes) to bother compressing.
 /// Below this threshold, compression overhead exceeds savings.
 const COMPRESS_MIN_BODY_SIZE: usize = 512;
@@ -450,6 +485,14 @@ const FLAG_COMPRESS_MASK: u32 = 0b11;
 const FLAG_COMPRESS_NONE: u32 = 0;
 const FLAG_COMPRESS_LZ4: u32 = 1;
 const FLAG_COMPRESS_ZSTD: u32 = 2;
+/// Bit 2: store `Float32` columns at their declared width (4 bytes/value).
+///
+/// Off by default: a build that predates this encoding falls back to its plain
+/// decoder for an unknown encoding byte, which reads the shared row-group body
+/// with the wrong stride, so narrow files must only be written when the operator
+/// asks for them (`APEX_WIDTH_FIDELITY=1` or `set_width_fidelity`). Readers
+/// always understand both widths.
+const FLAG_NARROW_FLOAT32: u32 = 1 << 2;
 
 /// Compression algorithm for Row Group bodies.
 /// Default is `None` (no compression) for maximum read performance.
@@ -508,6 +551,10 @@ const COL_ENCODING_BITPACK: u8 = 2;
 const COL_ENCODING_RLE_BOOL: u8 = 3;
 const COL_ENCODING_COMPACT_DICTIONARY: u8 = 4;
 const COL_ENCODING_FLOAT_DICTIONARY: u8 = 5;
+/// Plain Float32 payload: `[count:u64][f32 value]...`, one 4-byte value per row.
+/// Only written for `ColumnType::Float32` columns on tables that opted into
+/// width fidelity; readers widen the values back to f64.
+const COL_ENCODING_PLAIN_F32: u8 = 6;
 
 // Row-group header byte 30 controls the physical ID section. Sequential IDs
 // are already described by min_id/max_id and need no per-row u64 payload.
@@ -524,6 +571,32 @@ fn rg_id_section_len(row_count: usize, id_encoding: u8) -> usize {
 }
 
 #[inline]
+/// ID encoding for one row group's `ids`.
+///
+/// Contiguous IDs need no per-row ID section: readers rebuild them as
+/// `min_id + row` (see `rg_id_at`), which saves 8 bytes per row. Any other ID
+/// set — sparse IDs left by a rewrite after deletions, for example — keeps the
+/// explicit section.
+///
+/// `allow_implicit` carries the V4 enablement gate (temporary tables, whose
+/// path carries an `.apex_tmp` component). The encoding itself is implemented
+/// for every table, but enabling it for regular tables still costs ~15% on the
+/// 8-worker parallel batch scan on this machine even after the parallel-fold
+/// rework (§2.8.3), so the on-disk default stays as V4 had it.
+fn rg_id_encoding_for(ids: &[u64], allow_implicit: bool) -> u8 {
+    if allow_implicit && ids_are_contiguous(ids) {
+        RG_IDS_IMPLICIT_CONTIGUOUS
+    } else {
+        RG_IDS_PLAIN
+    }
+}
+
+/// True when this table's path enables the implicit-ID encoding.
+fn implicit_ids_allowed(path: &std::path::Path) -> bool {
+    path.components()
+        .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"))
+}
+
 fn ids_are_contiguous(ids: &[u64]) -> bool {
     ids.first().is_none_or(|&first| {
         ids.iter()
@@ -1120,6 +1193,77 @@ pub(super) fn bitpack_decode_at_idx(bytes: &[u8], idx: usize) -> Option<i64> {
     Some(min_val.wrapping_add(delta as i64))
 }
 
+/// Count how many bit-packed values fall inside `[low, high]`.
+///
+/// The layout is `[count: u64][bit_width: u8][min_val: i64][packed bits]` with the same
+/// little-endian bit order as `bitpack_decode_at_idx`, so this agrees with the per-row
+/// decoder while parsing the header once and reading whole words instead of single bits.
+pub(super) fn bitpack_count_in_range(bytes: &[u8], low: f64, high: f64) -> Option<usize> {
+    let (count, bit_width, min_val, packed) = bitpack_header(bytes)?;
+    if bit_width == 0 {
+        let value = min_val as f64;
+        return Some(if value >= low && value <= high { count } else { 0 });
+    }
+    let mut matched = 0usize;
+    let mut bit_pos = 0usize;
+    for _ in 0..count {
+        let delta = bitpack_read_bits(packed, bit_pos, bit_width)?;
+        let value = min_val.wrapping_add(delta as i64) as f64;
+        if value >= low && value <= high {
+            matched += 1;
+        }
+        bit_pos += bit_width;
+    }
+    Some(matched)
+}
+
+/// Split a BITPACK payload into `(count, bit_width, min_val, packed bits)`.
+///
+/// The layout is `[count: u64][bit_width: u8][min_val: i64][packed bits]`, the same one
+/// `bitpack_decode_at_idx` reads.
+pub(super) fn bitpack_header(bytes: &[u8]) -> Option<(usize, usize, i64, &[u8])> {
+    if bytes.len() < 17 {
+        return None;
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().ok()?) as usize;
+    let bit_width = bytes[8] as usize;
+    let min_val = i64::from_le_bytes(bytes[9..17].try_into().ok()?);
+    if bit_width > 63 {
+        return None;
+    }
+    let packed_bytes = (count * bit_width + 7) / 8;
+    if bytes.len() < 17 + packed_bytes {
+        return None;
+    }
+    Some((count, bit_width, min_val, &bytes[17..17 + packed_bytes]))
+}
+
+/// Read `bit_width` bits starting at `bit_pos` from a packed payload.
+///
+/// Reads whole bytes instead of single bits, which is what makes the covering and
+/// range-count shortcuts fast: the per-row decoder parsed the payload header and
+/// walked one bit at a time for every value.
+#[inline]
+pub(super) fn bitpack_read_bits(packed: &[u8], bit_pos: usize, bit_width: usize) -> Option<u64> {
+    if bit_width == 0 {
+        return Some(0);
+    }
+    if bit_width > 63 {
+        return None;
+    }
+    let byte = bit_pos / 8;
+    let shift = bit_pos % 8;
+    let needed = (shift + bit_width + 7) / 8;
+    if byte + needed > packed.len() {
+        return None;
+    }
+    let mut word: u64 = 0;
+    for k in 0..needed {
+        word |= (packed[byte + k] as u64) << (8 * k);
+    }
+    Some((word >> shift) & ((1u64 << bit_width) - 1))
+}
+
 /// Compute (sum, min, max, count, bytes_consumed) directly from BITPACK bytes without Vec allocation.
 /// Returns None if input is too short or bit_width is unsupported.
 pub(super) fn bitpack_agg_i64(bytes: &[u8]) -> Option<(i64, i64, i64, usize, usize)> {
@@ -1357,16 +1501,78 @@ fn rle_decode_bool(bytes: &[u8]) -> io::Result<(ColumnData, usize)> {
 
 /// Write a column with encoding prefix: [encoding:u8][encoded_data...]
 /// Tries RLE → Bit-pack → Plain, picks the smallest encoding.
+/// Byte length of a `COL_ENCODING_PLAIN_F32` payload: `[count:u64][f32 values]`.
+fn f32_payload_len(bytes: &[u8]) -> io::Result<usize> {
+    if bytes.len() < 8 {
+        return Err(err_data("Float32 column header truncated"));
+    }
+    let count = u64::from_le_bytes(bytes[0..8].try_into().unwrap()) as usize;
+    let byte_len = 8 + count
+        .checked_mul(4)
+        .ok_or_else(|| err_data("Float32 column count overflow"))?;
+    if byte_len > bytes.len() {
+        return Err(err_data("Float32 column data truncated"));
+    }
+    Ok(byte_len)
+}
+
+/// Decode a `COL_ENCODING_PLAIN_F32` payload, widening every value to f64.
+fn decode_plain_f32(bytes: &[u8]) -> io::Result<ColumnData> {
+    let byte_len = f32_payload_len(bytes)?;
+    let count = (byte_len - 8) / 4;
+    let mut values = Vec::with_capacity(count);
+    for index in 0..count {
+        let start = 8 + index * 4;
+        values.push(f32::from_le_bytes(bytes[start..start + 4].try_into().unwrap()) as f64);
+    }
+    Ok(ColumnData::Float64(values))
+}
+
+/// Physical-width choices applied while writing one column.
+#[derive(Clone, Copy, Default)]
+struct ColumnEncodingOptions {
+    /// Store `Float32` columns at 4 bytes/value (see `FLAG_NARROW_FLOAT32`).
+    narrow_float32: bool,
+}
+
 fn write_column_encoded<W: Write>(
     col: &ColumnData,
-    _col_type: ColumnType,
+    col_type: ColumnType,
     writer: &mut W,
+    options: ColumnEncodingOptions,
 ) -> io::Result<()> {
     match col {
         ColumnData::Float64(data) => {
             if let Some(encoded) = dictionary_encode_f64(data) {
                 writer.write_all(&[COL_ENCODING_FLOAT_DICTIONARY])?;
                 return writer.write_all(&encoded);
+            }
+            if options.narrow_float32 && matches!(col_type, ColumnType::Float32) {
+                // Only when every value survives the round trip: a value outside
+                // f32's range would silently become an infinity.
+                let narrow: Option<Vec<u8>> = data
+                    .iter()
+                    .map(|value| {
+                        let narrowed = *value as f32;
+                        if !narrowed.is_finite() && value.is_finite() {
+                            None
+                        } else {
+                            Some(narrowed.to_le_bytes())
+                        }
+                    })
+                    .collect::<Option<Vec<[u8; 4]>>>()
+                    .map(|values| {
+                        let mut buf = Vec::with_capacity(8 + values.len() * 4);
+                        buf.extend_from_slice(&(data.len() as u64).to_le_bytes());
+                        for value in values {
+                            buf.extend_from_slice(&value);
+                        }
+                        buf
+                    });
+                if let Some(payload) = narrow {
+                    writer.write_all(&[COL_ENCODING_PLAIN_F32])?;
+                    return writer.write_all(&payload);
+                }
             }
             writer.write_all(&[COL_ENCODING_PLAIN])?;
             col.write_to(writer)
@@ -1714,6 +1920,9 @@ fn read_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<(Column
             let (col, consumed) = ColumnData::from_bytes_typed(data_bytes, col_type)?;
             Ok((col, 1 + consumed))
         }
+        COL_ENCODING_PLAIN_F32 => {
+            Ok((decode_plain_f32(data_bytes)?, 1 + f32_payload_len(data_bytes)?))
+        }
         COL_ENCODING_RLE => {
             match col_type {
                 ColumnType::Int64
@@ -1836,6 +2045,7 @@ fn skip_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<usize> 
             let num_runs = u64::from_le_bytes(data_bytes[8..16].try_into().unwrap()) as usize;
             Ok(1 + 16 + num_runs * 5)
         }
+        COL_ENCODING_PLAIN_F32 => Ok(1 + f32_payload_len(data_bytes)?),
         COL_ENCODING_COMPACT_DICTIONARY if col_type == ColumnType::StringDict => {
             Ok(1 + StringDictView::parse(data_bytes, true)?.consumed)
         }
@@ -1949,3 +2159,78 @@ include!("fused.rs");
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod bitpack_count_tests {
+    use super::{bitpack_count_in_range, bitpack_decode_at_idx};
+
+    fn encode(values: &[i64], bit_width: usize, min_val: i64) -> Vec<u8> {
+        let count = values.len();
+        let mut packed = vec![0u8; (count * bit_width + 7) / 8];
+        for (idx, &v) in values.iter().enumerate() {
+            let delta = v.wrapping_sub(min_val) as u64;
+            let bit_offset = idx * bit_width;
+            for b in 0..bit_width {
+                if (delta >> b) & 1 == 1 {
+                    let global = bit_offset + b;
+                    packed[global / 8] |= 1 << (global % 8);
+                }
+            }
+        }
+        let mut out = Vec::with_capacity(17 + packed.len());
+        out.extend_from_slice(&(count as u64).to_le_bytes());
+        out.push(bit_width as u8);
+        out.extend_from_slice(&min_val.to_le_bytes());
+        out.extend_from_slice(&packed);
+        out
+    }
+
+    #[test]
+    fn bitpack_count_in_range_matches_the_per_row_decoder() {
+        for &bit_width in &[0usize, 1, 3, 7, 8, 9, 16, 17, 20, 32] {
+            let n = 97usize;
+            let min_val = -1234i64;
+            let span = if bit_width == 0 {
+                0
+            } else {
+                (1i64 << bit_width.min(62)) - 1
+            };
+            let values: Vec<i64> = (0..n)
+                .map(|i| min_val + ((i as i64 * 7919) % span.max(1)))
+                .collect();
+            let bytes = encode(&values, bit_width, min_val);
+            // Every value must decode identically to the per-row decoder.
+            for (i, &v) in values.iter().enumerate() {
+                assert_eq!(
+                    bitpack_decode_at_idx(&bytes, i),
+                    Some(v),
+                    "width={bit_width} idx={i}"
+                );
+            }
+            // The word-based reader must agree with the per-row decoder too.
+            for i in 0..n {
+                let expected = values[i].wrapping_sub(min_val) as u64;
+                let packed_start = 17;
+                let got = super::bitpack_read_bits(&bytes[packed_start..], i * bit_width, bit_width);
+                assert_eq!(got, Some(expected), "reader width={bit_width} idx={i}");
+            }
+            // And the range count must agree with a scan of those values.
+            for (low, high) in [
+                (f64::NEG_INFINITY, f64::INFINITY),
+                (min_val as f64, (min_val + 100) as f64),
+                ((min_val + 50) as f64, f64::INFINITY),
+                (1.0e18, 2.0e18),
+            ] {
+                let want = values
+                    .iter()
+                    .filter(|&&v| (v as f64) >= low && (v as f64) <= high)
+                    .count();
+                assert_eq!(
+                    bitpack_count_in_range(&bytes, low, high),
+                    Some(want),
+                    "width={bit_width} range=({low},{high})"
+                );
+            }
+        }
+    }
+}

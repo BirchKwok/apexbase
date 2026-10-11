@@ -1273,9 +1273,15 @@ impl ApexExecutor {
                 modulus,
                 &agg_refs,
                 &agg_ops,
+            crate::query::executor::memory::configured_query_memory_limit(),
             )?
         } else {
-            backend.execute_numeric_group_agg_mmap(group_col, &agg_refs, &agg_ops)?
+            backend.execute_numeric_group_agg_mmap(
+                group_col,
+                &agg_refs,
+                &agg_ops,
+                crate::query::executor::memory::configured_query_memory_limit(),
+            )?
         };
         let Some(raw) = raw else {
             return Ok(None);

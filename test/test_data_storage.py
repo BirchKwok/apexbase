@@ -25,6 +25,7 @@ import time
 import numpy as np
 from datetime import datetime, date
 from decimal import Decimal
+from fractions import Fraction
 
 # Add the apexbase python module to path
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'apexbase', 'python'))
@@ -716,6 +717,179 @@ print(row, flush=True)
             
             client.close()
     
+    def test_store_int64_boundaries_round_trip(self):
+        """
+        Every integer that fits INT64 must keep round-tripping exactly.
+
+        Covers the two range ends plus 2**53 + 1, which is the smallest positive
+        integer that an f64 cannot represent exactly: it must stay an int.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("bounds", schema={"v": "int64"})
+            client.use_table("bounds")
+
+            for index, value in enumerate(
+                (-(2**63), 2**63 - 1, 2**53 + 1, 2**53 - 1, 0, -1)
+            ):
+                client.store({"v": value})
+                client.flush()
+                assert client.retrieve(index + 1)["v"] == value
+                assert isinstance(client.retrieve(index + 1)["v"], int)
+
+            client.close()
+
+    def test_store_integer_above_int64_is_rejected_not_silently_nulled(self):
+        """
+        Integers outside the INT64 range must raise, never degrade silently.
+
+        Regression: an out-of-range Python int was extracted as an f64 (a lossy
+        rounding) and the rounded float was then written into the integer column
+        as SQL NULL. `store({"v": 2**64 - 1})` therefore used to read back
+        `None`, and on a schemaless table it used to become the float
+        `1.8446744073709552e+19`, with no error in either case.
+        """
+        out_of_range = (2**63, 2**64 - 1, -(2**63) - 1, 2**200, -(2**200), 10**400)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            # Declared unsigned column: the historical silent-NULL case.
+            client.create_table("declared", schema={"v": "uint64"})
+            client.use_table("declared")
+            for value in out_of_range:
+                with pytest.raises((ValueError, OverflowError)):
+                    client.store({"v": value})
+                    client.flush()
+                assert client.count_rows() == 0, (
+                    f"{value} produced a row instead of an error"
+                )
+
+            # Schemaless table: the historical silent-float case.
+            client.create_table("inferred")
+            client.use_table("inferred")
+            for value in out_of_range:
+                with pytest.raises((ValueError, OverflowError)):
+                    client.store({"v": value})
+                    client.flush()
+                assert client.count_rows() == 0
+
+            # NumPy integer scalars take the same conversion path.
+            client.create_table("numpy_u64", schema={"v": "uint64"})
+            client.use_table("numpy_u64")
+            with pytest.raises((ValueError, OverflowError)):
+                client.store({"v": np.uint64(2**64 - 1)})
+                client.flush()
+            assert client.count_rows() == 0
+
+            # A message that names the value is required: silent range clipping
+            # is the bug, so the diagnostic must be actionable.
+            with pytest.raises((ValueError, OverflowError)) as excinfo:
+                client.store({"v": 2**64 - 1})
+                client.flush()
+            assert "18446744073709551615" in str(excinfo.value)
+
+            client.close()
+
+    def test_store_columnar_integer_above_int64_is_rejected(self):
+        """
+        Columnar and batch writes take the same guard as single-row writes.
+
+        Regression: the columnar type detector treats an integer that fails the
+        i64 conversion as a float column (`extract::<f64>()` succeeds), so
+        `store({"v": [2**64 - 1]})` used to publish a rounded float column with
+        no error, and the int-column promotion path absorbed it the same way.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+
+            # Columnar, out-of-range value first.
+            client.create_table("col_first")
+            client.use_table("col_first")
+            with pytest.raises((ValueError, OverflowError)):
+                client.store({"v": [2**64 - 1, 1, 2]})
+                client.flush()
+            assert client.count_rows() == 0
+
+            # Columnar, out-of-range value after a normal integer: detection
+            # sees an int column, so the assembly loop has to reject it.
+            client.create_table("col_later")
+            client.use_table("col_later")
+            with pytest.raises((ValueError, OverflowError)):
+                client.store({"v": [1, 2, -(2**63) - 1]})
+                client.flush()
+            assert client.count_rows() == 0
+
+            # Batch of row dicts routes through the columnar conversion too.
+            client.create_table("batch")
+            client.use_table("batch")
+            with pytest.raises((ValueError, OverflowError)):
+                client.store([{"v": 1}, {"v": np.uint64(2**64 - 1)}])
+                client.flush()
+            assert client.count_rows() == 0
+
+            # Out-of-range integer in a declared float column still has to raise
+            # rather than round.
+            client.create_table("declared_float", schema={"v": "float64"})
+            client.use_table("declared_float")
+            with pytest.raises((ValueError, OverflowError)):
+                client.store({"v": [2**64 - 1]})
+                client.flush()
+            assert client.count_rows() == 0
+
+            client.close()
+
+    def test_store_columnar_integer_promotion_still_works(self):
+        """A genuine float must still promote an integer column to float."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("promoted")
+            client.use_table("promoted")
+
+            client.store({"v": [1, 2, 3.5, 4]})
+            client.flush()
+            rows = client.execute("SELECT v FROM promoted ORDER BY v").to_dict()
+            assert [row["v"] for row in rows] == [1.0, 2.0, 3.5, 4.0]
+
+            client.close()
+
+    def test_store_float_like_values_are_unaffected_by_integer_guard(self):
+        """
+        The out-of-range integer guard must only reject integral values.
+
+        Python floats take a dedicated fast path, and other float-like objects
+        (NumPy floats, Decimal, Fraction) must keep converting to f64 exactly as
+        they did before the guard existed.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("floats", schema={"v": "float64"})
+            client.use_table("floats")
+
+            cases = (
+                ("python_float", 3.5, 3.5),
+                ("numpy_float64", np.float64(2.5), 2.5),
+                ("numpy_float32", np.float32(1.5), 1.5),
+                ("decimal", Decimal("1.5"), 1.5),
+                ("fraction", Fraction(3, 2), 1.5),
+                ("large_float", 1e300, 1e300),
+                ("negative_float", -7.25, -7.25),
+            )
+            for index, (name, value, expected) in enumerate(cases):
+                client.store({"v": value})
+                client.flush()
+                stored = client.retrieve(index + 1)["v"]
+                assert isinstance(stored, float), f"{name} did not stay a float"
+                assert stored == expected, f"{name}: {stored!r} != {expected!r}"
+
+            # Integral floats (a float column holding a whole number) are floats
+            # too: `2.0` must not be treated as an out-of-range integer.
+            client.store({"v": 2.0**63})
+            client.flush()
+            assert client.retrieve(len(cases) + 1)["v"] == 2.0**63
+
+            client.close()
+
     def test_store_empty_dict(self):
         """Test storing empty dictionary"""
         with tempfile.TemporaryDirectory() as temp_dir:

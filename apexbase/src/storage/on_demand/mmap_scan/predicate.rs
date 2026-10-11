@@ -14,6 +14,105 @@ static SORTED_COL_CACHE: once_cell::sync::Lazy<
     >,
 > = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 
+/// True when the row group's zone map proves that no value of `col_idx` can
+/// fall inside `[low, high]`.
+///
+/// Zone maps describe pre-deletion data, which can only *widen* the true value
+/// range, so a zone that cannot overlap the range means no active row can match
+/// either. Missing zone maps and non-numeric zones never prune. Shared by the
+/// sequential and parallel numeric range scans so both prune identically.
+fn zone_map_excludes_range(
+    footer: &V4Footer,
+    rg_i: usize,
+    col_idx: usize,
+    low: f64,
+    high: f64,
+) -> bool {
+    let Some(rg_zmaps) = footer.zone_maps.get(rg_i) else {
+        return false;
+    };
+    let Some(zm) = rg_zmaps.iter().find(|z| z.col_idx as usize == col_idx) else {
+        return false;
+    };
+    let disjoint = if zm.is_float {
+        !zm.may_overlap_float_range(low, high)
+    } else {
+        !zm.may_overlap_int_range(low.ceil() as i64, high.floor() as i64)
+    };
+    // Pruning happens on the calling thread before any work is handed to a
+    // worker, so a thread-local counter can prove it in tests.
+    #[cfg(test)]
+    if disjoint {
+        ZONE_PRUNED_ROW_GROUPS.with(|count| count.set(count.get() + 1));
+    }
+    disjoint
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Row groups skipped by `zone_map_excludes_range` on this thread.
+    pub(crate) static ZONE_PRUNED_ROW_GROUPS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Row groups pruned by zone maps on the current thread since the last reset.
+#[cfg(test)]
+pub(crate) fn zone_pruned_row_groups() -> usize {
+    ZONE_PRUNED_ROW_GROUPS.with(|count| count.get())
+}
+
+/// True when a row group cannot contain any of `values` in column `col_idx`.
+///
+/// A string column carries up to three zone entries: the byte-length range
+/// written by every build, the lexicographic value range as order-preserving
+/// prefix keys (`is_string_prefix`), and the tail range over the value's second
+/// eight bytes (`is_string_tail`). The row group is skipped when any range proves
+/// every candidate value is absent, which keeps the legacy length pruning
+/// (decisive when the value length tracks the row range), adds the value pruning
+/// (decisive where all values share a length) and covers values that share their
+/// first eight bytes but differ later. A file written before the value-range
+/// entries existed has only the length one, so the same code covers every
+/// layout. All three meanings are decisive only for equality: the ordering
+/// comparisons go through the typed-predicate lane, which uses the first-eight
+/// value range alone.
+fn string_zone_excludes(
+    zmaps: &[crate::storage::on_demand::RgColumnZoneMap],
+    col_idx: usize,
+    values: &[&[u8]],
+) -> bool {
+    if values.is_empty() {
+        return false;
+    }
+    zmaps.iter()
+        .filter(|zm| zm.col_idx as usize == col_idx && !zm.is_float)
+        .any(|zm| single_string_zone_excludes(zm, values))
+}
+
+/// True when one string zone entry cannot contain any of `values` under its own
+/// meaning (first-eight prefix keys, second-eight tail keys, or byte lengths).
+fn single_string_zone_excludes(
+    zm: &crate::storage::on_demand::RgColumnZoneMap,
+    values: &[&[u8]],
+) -> bool {
+    use crate::storage::on_demand::{string_prefix_key, string_tail_key};
+    if zm.is_string_tail {
+        values.iter().all(|value| {
+            let key = string_tail_key(value);
+            key < zm.min_bits || key > zm.max_bits
+        })
+    } else if zm.is_string_prefix {
+        values.iter().all(|value| {
+            let key = string_prefix_key(value);
+            key < zm.min_bits || key > zm.max_bits
+        })
+    } else {
+        // Legacy byte-length zone.
+        let min_len = values.iter().map(|value| value.len()).min().unwrap_or(0) as i64;
+        let max_len = values.iter().map(|value| value.len()).max().unwrap_or(0) as i64;
+        max_len < zm.min_bits || min_len > zm.max_bits
+    }
+}
+
 /// Safe: cast byte slice to &[i64]. Falls back to owned Vec when pointer is not 8-byte aligned.
 #[inline(always)]
 pub(super) fn bytes_as_i64_slice(bytes: &[u8], n: usize) -> std::borrow::Cow<'_, [i64]> {
@@ -348,7 +447,7 @@ impl OnDemandStorage {
                 let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
                 let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
                 compress_flag == RG_COMPRESS_NONE
-                    && enc_ver >= 1
+                    && enc_ver == RG_ENCODING_VERSION
                     && footer
                         .col_offsets
                         .get(rg_i)
@@ -372,20 +471,14 @@ impl OnDemandStorage {
                     id_section_len: usize,
                 }
                 let mut rg_descs: Vec<RgDesc> = Vec::with_capacity(footer.row_groups.len());
-                let target_len_i64 = target_bytes.len() as i64;
                 let mut off = 0usize;
                 for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
                     let global_off = off;
                     off += rg_meta.row_count as usize;
 
                     if let Some(zmaps) = footer.zone_maps.get(rg_i) {
-                        if let Some(zm) = zmaps
-                            .iter()
-                            .find(|z| z.col_idx as usize == col_idx && !z.is_float)
-                        {
-                            if target_len_i64 < zm.min_bits || target_len_i64 > zm.max_bits {
-                                continue;
-                            }
+                        if string_zone_excludes(zmaps, col_idx, &[target_bytes]) {
+                            continue;
                         }
                     }
 
@@ -504,8 +597,16 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let decompressed = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed
+                .as_ref()
+                .map(|body| body.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
             let del_vec_len = (rg_rows + 7) / 8;
             let del_start =
                 rg_id_section_len(rg_rows, rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN));
@@ -516,25 +617,17 @@ impl OnDemandStorage {
             let has_deletes = rg_meta.deletion_count > 0;
             let null_bitmap_len = (rg_rows + 7) / 8;
 
-            // Zone-map skip: if RG has a string-length zone map for this column,
-            // skip the entire RG when target_len is outside [min_len, max_len].
-            // This eliminates scanning 15/16 RGs for typical queries (e.g. 9-char target
-            // in a dataset where only RG0 has 9-char strings).
+            // Zone-map skip: the zone carries the column's value range (or, in
+            // files predating the prefix flag, its byte lengths).
             if let Some(zmaps) = footer.zone_maps.get(rg_i) {
-                if let Some(zm) = zmaps
-                    .iter()
-                    .find(|z| z.col_idx as usize == col_idx && !z.is_float)
-                {
-                    let tlen = target_bytes.len() as i64;
-                    if tlen < zm.min_bits || tlen > zm.max_bits {
-                        global_row_offset += rg_rows;
-                        continue;
-                    }
+                if string_zone_excludes(zmaps, col_idx, &[target_bytes]) {
+                    global_row_offset += rg_rows;
+                    continue;
                 }
             }
 
             // RCIX fast path: jump directly to target column without scanning all columns
-            let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version >= 1 {
+            let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version == RG_ENCODING_VERSION {
                 footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx)
             } else {
                 None
@@ -550,8 +643,8 @@ impl OnDemandStorage {
                 let ct = schema.columns[col_idx].1;
                 let col_bytes = &body[col_off + null_bitmap_len..];
                 {
-                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                    let encoding = if encoding_version >= 1 {
+                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                    let encoding = if encoding_version == RG_ENCODING_VERSION {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN
@@ -616,7 +709,7 @@ impl OnDemandStorage {
                         }
                     } else if encoding != COL_ENCODING_PLAIN && matches!(ct, ColumnType::String) {
                         // Non-PLAIN encoded String: decode then scan
-                        let (col_data, _consumed) = if encoding_version >= 1 {
+                        let (col_data, _consumed) = if encoding_version == RG_ENCODING_VERSION {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -680,8 +773,8 @@ impl OnDemandStorage {
                     let ct = schema.columns[ci].1;
                     if ci == col_idx {
                         let col_bytes = &body[pos..];
-                        let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                        let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
+                        let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                        let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
                             col_bytes[0]
                         } else {
                             COL_ENCODING_PLAIN
@@ -745,7 +838,7 @@ impl OnDemandStorage {
                             }
                         }
                     }
-                    let consumed = if encoding_version >= 1 {
+                    let consumed = if encoding_version == RG_ENCODING_VERSION {
                         skip_column_encoded(&body[pos..], ct)?
                     } else {
                         ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -758,6 +851,142 @@ impl OnDemandStorage {
         drop(mmap_guard);
         drop(file_guard);
         Ok(Some(matches))
+    }
+
+    /// Whether the row-group string zone maps prove an equality matches nothing.
+    ///
+    /// This works for plain (non-dictionary) string columns too: a value outside every
+    /// group's value range cannot be stored. `Some(true)` is exact; `Some(false)` and
+    /// `None` keep the caller on the scanning path.
+    pub fn string_eq_zone_excludes_all_mmap(
+        &self,
+        col_name: &str,
+        target: &str,
+    ) -> io::Result<Option<bool>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let col_idx = match footer.schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        let target_bytes = target.as_bytes();
+        let mut checked_any = false;
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            if rg_meta.row_count == 0 {
+                continue;
+            }
+            // A group with deletions may have held the value in the rows that were
+            // removed, so its zone cannot prove absence.
+            if rg_meta.deletion_count > 0 {
+                return Ok(None);
+            }
+            let Some(zmaps) = footer.zone_maps.get(rg_i) else {
+                return Ok(None);
+            };
+            if !string_zone_excludes(zmaps, col_idx, &[target_bytes]) {
+                // The range can hold the value, so absence is not proven.
+                return Ok(Some(false));
+            }
+            checked_any = true;
+        }
+        Ok(if checked_any { Some(true) } else { None })
+    }
+
+    /// Whether a string equality provably matches no row at all.
+    ///
+    /// Every row group carries its own string dictionary, so a value that appears in
+    /// none of them cannot be present: `Some(true)` here is exact. `Some(false)` and
+    /// `None` leave the caller on the scanning path. Absence used to be the expensive
+    /// case -- `COUNT(*) WHERE s = 'absent'` materialized the whole column (200k rows:
+    /// 1.16 ms against 0.14 ms for a value that exists).
+    pub fn string_eq_matches_nothing_mmap(
+        &self,
+        col_name: &str,
+        target: &str,
+    ) -> io::Result<Option<bool>> {
+        let footer = match self.get_or_load_footer()? {
+            Some(f) => f,
+            None => return Ok(None),
+        };
+        let schema = &footer.schema;
+        let col_idx = match schema.get_index(col_name) {
+            Some(i) => i,
+            None => return Ok(None),
+        };
+        if !matches!(schema.columns[col_idx].1, ColumnType::StringDict) {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for string metadata scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let target_bytes = target.as_bytes();
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 {
+                continue;
+            }
+            // A group with deletions may have had the matching rows removed, and the
+            // dictionary cannot say which: leave the answer to the scanning path.
+            if rg_meta.deletion_count > 0 {
+                return Ok(None);
+            }
+            let rg_start = rg_meta.offset as usize;
+            let rg_end = rg_start + rg_meta.data_size as usize;
+            if rg_end > mmap_ref.len() || rg_end < rg_start + 32 {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_start..rg_end];
+            let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
+            let encoding_version = rg_bytes.get(29).copied().unwrap_or(0);
+            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+                return Ok(None);
+            }
+            let Some(rcix) = footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx) else {
+                return Ok(None);
+            };
+            let body = &rg_bytes[32..];
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let col_off = rcix[col_idx] as usize;
+            if col_off + null_bitmap_len > body.len() {
+                return Ok(None);
+            }
+            let null_bytes = &body[col_off..col_off + null_bitmap_len];
+            if null_bytes.iter().any(|&byte| byte != 0) {
+                return Ok(None);
+            }
+            let col_bytes = &body[col_off + null_bitmap_len..];
+            let Some(&encoding) = col_bytes.first() else {
+                return Ok(None);
+            };
+            if !matches!(
+                encoding,
+                COL_ENCODING_PLAIN | COL_ENCODING_COMPACT_DICTIONARY
+            ) {
+                return Ok(None);
+            }
+            let view = match StringDictView::parse(
+                &col_bytes[1..],
+                encoding == COL_ENCODING_COMPACT_DICTIONARY,
+            ) {
+                Ok(view) => view,
+                Err(_) => return Ok(None),
+            };
+            if view.row_count < rg_rows || view.dict_size <= 1 {
+                return Ok(None);
+            }
+            if view.find_value(target_bytes).is_some() {
+                // The value exists in this group, so the equality can match.
+                return Ok(Some(false));
+            }
+        }
+        Ok(Some(true))
     }
 
     pub fn string_eq_matches_all_mmap(
@@ -802,7 +1031,7 @@ impl OnDemandStorage {
             let rg_bytes = &mmap_ref[rg_start..rg_end];
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let encoding_version = rg_bytes.get(29).copied().unwrap_or(0);
-            if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
                 return Ok(None);
             }
             let Some(rcix) = footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx) else {
@@ -898,7 +1127,7 @@ impl OnDemandStorage {
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
             compress_flag == RG_COMPRESS_NONE
-                && enc_ver >= 1
+                && enc_ver == RG_ENCODING_VERSION
                 && footer
                     .col_offsets
                     .get(rg_i)
@@ -923,8 +1152,6 @@ impl OnDemandStorage {
         }
 
         let target_bytes: Vec<&[u8]> = values.iter().map(|s| s.as_bytes()).collect();
-        let min_len = values.iter().map(|s| s.len()).min().unwrap_or(0) as i64;
-        let max_len = values.iter().map(|s| s.len()).max().unwrap_or(0) as i64;
         let matches_any = |bytes: &[u8]| -> bool {
             target_bytes
                 .iter()
@@ -1104,13 +1331,8 @@ impl OnDemandStorage {
                 .par_iter()
                 .filter_map(|desc| {
                     if let Some(zmaps) = footer.zone_maps.get(desc.rg_idx) {
-                        if let Some(zm) = zmaps
-                            .iter()
-                            .find(|z| z.col_idx as usize == col_idx && !z.is_float)
-                        {
-                            if max_len < zm.min_bits || min_len > zm.max_bits {
-                                return None;
-                            }
+                        if string_zone_excludes(zmaps, col_idx, &target_bytes) {
+                            return None;
                         }
                     }
                     let mmap =
@@ -1126,13 +1348,8 @@ impl OnDemandStorage {
                     break;
                 }
                 if let Some(zmaps) = footer.zone_maps.get(desc.rg_idx) {
-                    if let Some(zm) = zmaps
-                        .iter()
-                        .find(|z| z.col_idx as usize == col_idx && !z.is_float)
-                    {
-                        if max_len < zm.min_bits || min_len > zm.max_bits {
-                            continue;
-                        }
+                    if string_zone_excludes(zmaps, col_idx, &target_bytes) {
+                        continue;
                     }
                 }
                 let mut local = scan_rg(desc, mmap_ref);
@@ -1204,7 +1421,7 @@ impl OnDemandStorage {
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
             compress_flag == RG_COMPRESS_NONE
-                && enc_ver >= 1
+                && enc_ver == RG_ENCODING_VERSION
                 && footer
                     .col_offsets
                     .get(rg_i)
@@ -1432,7 +1649,7 @@ impl OnDemandStorage {
             let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
-            if compress_flag != RG_COMPRESS_NONE || enc_ver < 1 {
+            if compress_flag != RG_COMPRESS_NONE || enc_ver != RG_ENCODING_VERSION {
                 return false;
             }
             let Some(col_offsets) = footer.col_offsets.get(rg_i) else {
@@ -1691,7 +1908,7 @@ impl OnDemandStorage {
             let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
-            if compress_flag != RG_COMPRESS_NONE || enc_ver < 1 {
+            if compress_flag != RG_COMPRESS_NONE || enc_ver != RG_ENCODING_VERSION {
                 return false;
             }
             let Some(col_offsets) = footer.col_offsets.get(rg_i) else {
@@ -2170,7 +2387,7 @@ impl OnDemandStorage {
                 let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
                 let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
                 compress_flag == RG_COMPRESS_NONE
-                    && enc_ver >= 1
+                    && enc_ver == RG_ENCODING_VERSION
                     && footer
                         .col_offsets
                         .get(rg_i)
@@ -2383,8 +2600,16 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let decompressed = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed
+                .as_ref()
+                .map(|body| body.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
             let bitmap_len = (rg_rows + 7) / 8;
             let del_start =
                 rg_id_section_len(rg_rows, rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN));
@@ -2396,7 +2621,7 @@ impl OnDemandStorage {
             let has_deletes = rg_meta.deletion_count > 0;
 
             // RCIX: jump directly to the target column
-            let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version >= 1 {
+            let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version == RG_ENCODING_VERSION {
                 footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx)
             } else {
                 None
@@ -2568,7 +2793,7 @@ impl OnDemandStorage {
                     let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
                     let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
                     let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
-                    if compress_flag != RG_COMPRESS_NONE || enc_ver < 1 {
+                    if compress_flag != RG_COMPRESS_NONE || enc_ver != RG_ENCODING_VERSION {
                         return false;
                     }
                     let Some(col_offsets) = footer.col_offsets.get(rg_i) else {
@@ -2614,6 +2839,14 @@ impl OnDemandStorage {
                 let mut rg_descs: Vec<RgDesc> = Vec::with_capacity(footer.row_groups.len());
                 let mut off = 0usize;
                 for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+                    // Zone-map pruning: a row group whose zone cannot overlap the
+                    // requested range holds no matches, so it needs no descriptor
+                    // and is never touched by a worker. `off` still advances so
+                    // match positions stay in the global row space.
+                    if zone_map_excludes_range(&footer, rg_i, col_idx, low, high) {
+                        off += rg_meta.row_count as usize;
+                        continue;
+                    }
                     rg_descs.push(RgDesc {
                         rg_offset: rg_meta.offset as usize,
                         rg_data_size: rg_meta.data_size as usize,
@@ -2755,21 +2988,9 @@ impl OnDemandStorage {
             }
 
             // Zone map pruning: skip RG if filter range can't overlap
-            if rg_i < footer.zone_maps.len() {
-                if let Some(zm) = footer.zone_maps[rg_i]
-                    .iter()
-                    .find(|z| z.col_idx as usize == col_idx)
-                {
-                    let skip = if zm.is_float {
-                        !zm.may_overlap_float_range(low, high)
-                    } else {
-                        !zm.may_overlap_int_range(low.ceil() as i64, high.floor() as i64)
-                    };
-                    if skip {
-                        global_row_offset += rg_rows;
-                        continue;
-                    }
-                }
+            if zone_map_excludes_range(&footer, rg_i, col_idx, low, high) {
+                global_row_offset += rg_rows;
+                continue;
             }
 
             let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
@@ -2787,8 +3008,16 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let decompressed = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed
+                .as_ref()
+                .map(|body| body.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
             let del_vec_len = (rg_rows + 7) / 8;
             let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
             let id_section = rg_id_section_len(rg_rows, id_encoding);
@@ -2812,8 +3041,8 @@ impl OnDemandStorage {
                 let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
                 let data_start = col_body_off + null_bitmap_len;
                 let col_bytes = &body[data_start..];
-                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
+                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -2956,8 +3185,8 @@ impl OnDemandStorage {
 
                 if ci == col_idx {
                     let col_bytes = &body[pos..];
-                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                    let encoding = if encoding_version >= 1 {
+                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                    let encoding = if encoding_version == RG_ENCODING_VERSION {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN
@@ -3024,7 +3253,7 @@ impl OnDemandStorage {
                         }
                     } else {
                         // Non-PLAIN encoding (RLE, BITPACK, etc.): decode then scan
-                        let (col_data, _consumed) = if encoding_version >= 1 {
+                        let (col_data, _consumed) = if encoding_version == RG_ENCODING_VERSION {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -3068,7 +3297,7 @@ impl OnDemandStorage {
                         }
                     }
                 }
-                let consumed = if encoding_version >= 1 {
+                let consumed = if encoding_version == RG_ENCODING_VERSION {
                     skip_column_encoded(&body[pos..], ct)?
                 } else {
                     ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -3536,7 +3765,7 @@ impl OnDemandStorage {
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
             compress_flag == RG_COMPRESS_NONE
-                && enc_ver >= 1
+                && enc_ver == RG_ENCODING_VERSION
                 && footer
                     .col_offsets
                     .get(rg_i)
@@ -3943,8 +4172,16 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let decompressed = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed
+                .as_ref()
+                .map(|body| body.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
             let del_vec_len = (rg_rows + 7) / 8;
             let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
             let id_section = rg_id_section_len(rg_rows, id_encoding);
@@ -3968,8 +4205,8 @@ impl OnDemandStorage {
                 let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
                 let data_start = col_body_off + null_bitmap_len;
                 let col_bytes = &body[data_start..];
-                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
+                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -4047,8 +4284,8 @@ impl OnDemandStorage {
 
                 if ci == col_idx {
                     let col_bytes = &body[pos..];
-                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                    let encoding = if encoding_version >= 1 {
+                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                    let encoding = if encoding_version == RG_ENCODING_VERSION {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN
@@ -4113,7 +4350,7 @@ impl OnDemandStorage {
                         }
                     } else {
                         // Non-PLAIN encoding: decode then scan
-                        let (col_data, _consumed) = if encoding_version >= 1 {
+                        let (col_data, _consumed) = if encoding_version == RG_ENCODING_VERSION {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -4155,7 +4392,7 @@ impl OnDemandStorage {
                         }
                     }
                 }
-                let consumed = if encoding_version >= 1 {
+                let consumed = if encoding_version == RG_ENCODING_VERSION {
                     skip_column_encoded(&body[pos..], ct)?
                 } else {
                     ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -4318,7 +4555,7 @@ impl OnDemandStorage {
 
             if is_int {
                 // Try zero-copy PLAIN path first
-                let enc = if encoding_version >= 1 && !where_col_bytes.is_empty() {
+                let enc = if encoding_version == RG_ENCODING_VERSION && !where_col_bytes.is_empty() {
                     where_col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -4367,7 +4604,7 @@ impl OnDemandStorage {
                     }
                 }
             } else {
-                let enc = if encoding_version >= 1 && !where_col_bytes.is_empty() {
+                let enc = if encoding_version == RG_ENCODING_VERSION && !where_col_bytes.is_empty() {
                     where_col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -4401,7 +4638,7 @@ impl OnDemandStorage {
                 continue;
             }
             let set_data = &body[set_col_off + null_bitmap_len..];
-            let set_enc = if encoding_version >= 1 && !set_data.is_empty() {
+            let set_enc = if encoding_version == RG_ENCODING_VERSION && !set_data.is_empty() {
                 set_data[0]
             } else {
                 COL_ENCODING_PLAIN
@@ -4413,7 +4650,9 @@ impl OnDemandStorage {
                 return Ok(None);
             }
             let set_count = u64::from_le_bytes(set_data[1..9].try_into().unwrap()) as usize;
-            if set_count < n || set_data.len() < 9 + n * 8 {
+            // Checked: a corrupt `n` can wrap `n * 8` below the real byte count.
+            let needed_bytes = n.checked_mul(8).and_then(|count| count.checked_add(9));
+            if set_count < n || needed_bytes.is_none_or(|needed| set_data.len() < needed) {
                 return Ok(None);
             }
             let set_values = &set_data[9..9 + n * 8];
@@ -4679,15 +4918,11 @@ impl OnDemandStorage {
             return Ok(None);
         }
 
-        let (rg_i, rg_meta) = match footer
-            .row_groups
-            .iter()
-            .enumerate()
-            .find(|(_, rg)| rg.min_id <= id && id <= rg.max_id && rg.row_count > 0)
-        {
-            Some(v) => v,
+        let rg_i = match find_row_group_for_id(&footer.row_groups, id) {
+            Some(i) => i,
             None => return Ok(Some((footer_offset, 0, 0, 0))),
         };
+        let rg_meta = &footer.row_groups[rg_i];
         if rg_i >= footer.col_offsets.len() || set_idx >= footer.col_offsets[rg_i].len() {
             return Ok(None);
         }
@@ -4715,7 +4950,7 @@ impl OnDemandStorage {
         } else {
             0
         };
-        if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+        if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
             return Ok(None);
         }
 
@@ -4802,15 +5037,11 @@ impl OnDemandStorage {
             return Ok(None);
         }
 
-        let (rg_i, rg_meta) = match footer
-            .row_groups
-            .iter()
-            .enumerate()
-            .find(|(_, rg)| rg.min_id <= id && id <= rg.max_id && rg.row_count > 0)
-        {
-            Some(v) => v,
+        let rg_i = match find_row_group_for_id(&footer.row_groups, id) {
+            Some(i) => i,
             None => return Ok(Some((0, false))),
         };
+        let rg_meta = &footer.row_groups[rg_i];
         if rg_i >= footer.col_offsets.len() || set_idx >= footer.col_offsets[rg_i].len() {
             return Ok(None);
         }
@@ -4838,7 +5069,7 @@ impl OnDemandStorage {
         } else {
             0
         };
-        if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+        if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
             return Ok(None);
         }
 
@@ -5023,12 +5254,8 @@ impl OnDemandStorage {
             Some(f) => f,
             None => return Ok(None),
         };
-        let rg_meta = match footer
-            .row_groups
-            .iter()
-            .find(|rg| rg.min_id <= id && id <= rg.max_id && rg.row_count > 0)
-        {
-            Some(rg) => rg,
+        let rg_meta = match find_row_group_for_id(&footer.row_groups, id) {
+            Some(i) => &footer.row_groups[i],
             None => return Ok(Some(false)),
         };
         let rg_rows = rg_meta.row_count as usize;
@@ -5167,8 +5394,16 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let decompressed = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed
+                .as_ref()
+                .map(|body| body.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
 
             let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
             let id_section = rg_id_section_len(rg_rows, id_encoding);
@@ -5193,8 +5428,8 @@ impl OnDemandStorage {
                 let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
                 let data_start = col_body_off + null_bitmap_len;
                 let col_bytes = &body[data_start..];
-                let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
+                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -5295,8 +5530,8 @@ impl OnDemandStorage {
                 let ct = schema.columns[ci].1;
                 if ci == col_idx {
                     let col_bytes = &body[pos..];
-                    let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-                    let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
+                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+                    let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN
@@ -5346,7 +5581,7 @@ impl OnDemandStorage {
                     } else {
                         // Range pruning before full decode: read min/max from encoding
                         // header without allocating to skip RGs with no matching values.
-                        if is_int && encoding_version >= 1 {
+                        if is_int && encoding_version == RG_ENCODING_VERSION {
                             let data = &col_bytes[enc_offset..];
                             let can_skip = if encoding == COL_ENCODING_BITPACK && data.len() >= 17 {
                                 let bit_width = data[8] as u32;
@@ -5386,7 +5621,7 @@ impl OnDemandStorage {
                                 break;
                             }
                         }
-                        let (col_data, _) = if encoding_version >= 1 {
+                        let (col_data, _) = if encoding_version == RG_ENCODING_VERSION {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -5431,7 +5666,7 @@ impl OnDemandStorage {
                     }
                     break; // Found and processed the target column, move to next RG
                 }
-                let consumed = if encoding_version >= 1 {
+                let consumed = if encoding_version == RG_ENCODING_VERSION {
                     skip_column_encoded(&body[pos..], ct)?
                 } else {
                     ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -5602,6 +5837,13 @@ impl OnDemandStorage {
                 let mmap = unsafe { std::slice::from_raw_parts(mmap_ptr as *const u8, mmap_len) };
                 let col_idx = desc.col_idx;
                 let mut matches: Vec<usize> = Vec::new();
+                // Built once per predicate rather than once per row group.
+                let string_in_targets: Vec<&[u8]> = match pred {
+                    MmapScanPred::StringIn { values, .. } => {
+                        values.iter().map(|s| s.as_bytes()).collect()
+                    }
+                    _ => Vec::new(),
+                };
 
                 for (rg_i, rg) in rg_infos.iter().enumerate() {
                     let rg_rows = rg.row_count;
@@ -5611,57 +5853,54 @@ impl OnDemandStorage {
 
                     // Zone map pruning
                     if rg_i < footer.zone_maps.len() {
-                        if let Some(zm) = footer.zone_maps[rg_i]
-                            .iter()
-                            .find(|z| z.col_idx as usize == col_idx)
-                        {
-                            let skip = match pred {
-                                MmapScanPred::NumericRange { low, high, .. } => {
-                                    if zm.is_float {
-                                        !zm.may_overlap_float_range(*low, *high)
-                                    } else {
-                                        !zm.may_overlap_int_range(
-                                            low.ceil() as i64,
-                                            high.floor() as i64,
-                                        )
-                                    }
-                                }
-                                MmapScanPred::NumericIn { values, .. } => {
-                                    if let (Some(&mn), Some(&mx)) =
-                                        (values.iter().min(), values.iter().max())
-                                    {
-                                        if zm.is_float {
-                                            !zm.may_overlap_float_range(mn as f64, mx as f64)
-                                        } else {
-                                            !zm.may_overlap_int_range(mn, mx)
-                                        }
-                                    } else {
-                                        false
-                                    }
-                                }
-                                MmapScanPred::StringEq { value, .. } => {
-                                    if !zm.is_float {
-                                        let tlen = value.len() as i64;
-                                        tlen < zm.min_bits || tlen > zm.max_bits
-                                    } else {
-                                        false
-                                    }
-                                }
-                                MmapScanPred::StringIn { values, .. } => {
-                                    if !zm.is_float && !values.is_empty() {
-                                        let min_len =
-                                            values.iter().map(|s| s.len()).min().unwrap() as i64;
-                                        let max_len =
-                                            values.iter().map(|s| s.len()).max().unwrap() as i64;
-                                        max_len < zm.min_bits || min_len > zm.max_bits
-                                    } else {
-                                        false
-                                    }
-                                }
-                            };
-                            if skip {
-                                continue;
+                        let zmaps = &footer.zone_maps[rg_i];
+                        let skip = match pred {
+                            MmapScanPred::StringEq { value, .. } => {
+                                string_zone_excludes(zmaps, col_idx, &[value.as_bytes()])
                             }
+                            MmapScanPred::StringIn { .. } => {
+                                // Reuses the byte slices built once per
+                                // predicate, not once per row group.
+                                string_zone_excludes(zmaps, col_idx, &string_in_targets)
+                            }
+                            _ => {
+                                let zm = zmaps.iter().find(|z| z.col_idx as usize == col_idx);
+                                match zm {
+                                    Some(zm) => match pred {
+                                        MmapScanPred::NumericRange { low, high, .. } => {
+                                            if zm.is_float {
+                                                !zm.may_overlap_float_range(*low, *high)
+                                            } else {
+                                                !zm.may_overlap_int_range(
+                                                    low.ceil() as i64,
+                                                    high.floor() as i64,
+                                                )
+                                            }
+                                        }
+                                        MmapScanPred::NumericIn { values, .. } => {
+                                            if let (Some(&mn), Some(&mx)) =
+                                                (values.iter().min(), values.iter().max())
+                                            {
+                                                if zm.is_float {
+                                                    !zm.may_overlap_float_range(
+                                                        mn as f64,
+                                                        mx as f64,
+                                                    )
+                                                } else {
+                                                    !zm.may_overlap_int_range(mn, mx)
+                                                }
+                                            } else {
+                                                false
+                                            }
+                                        }
+                                        _ => false,
+                                    },
+                                    None => false,
+                                }
+                            }
+                        };
+                        if skip {
+                            continue;
                         }
                     }
 
@@ -5695,8 +5934,8 @@ impl OnDemandStorage {
                     }
                     let null_bytes = &body[col_off..col_off + null_bitmap_len];
                     let col_bytes = &body[col_off + null_bitmap_len..];
-                    let enc_offset = if encoding_version >= 1 { 1usize } else { 0 };
-                    let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
+                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1usize } else { 0 };
+                    let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN
@@ -5985,7 +6224,7 @@ impl OnDemandStorage {
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
             compress_flag == RG_COMPRESS_NONE
-                && enc_ver >= 1
+                && enc_ver == RG_ENCODING_VERSION
                 && footer
                     .col_offsets
                     .get(rg_i)

@@ -1,6 +1,556 @@
 use super::*;
 
 impl OnDemandStorage {
+    /// Top-k row indices for a plain (non-dictionary) string column.
+    ///
+    /// High-cardinality strings are not dictionary-encoded, so
+    /// `scan_top_k_string_indices_mmap` declines them and `ORDER BY <col> LIMIT k` read
+    /// the whole column into Arrow and sorted it (200k rows: 7.6 ms against 0.3 ms for
+    /// the dictionary form). The column is stored as a chain of blocks, each
+    /// `[count: u64][offsets: u32 x (count+1)][len: u64][data]` (a 65k-row group arrives
+    /// as 256-value blocks), so a bounded heap over the byte slices picks the k best
+    /// without building any Arrow strings.
+    ///
+    /// A group whose sort column holds NULLs declines the query, as in the other lanes:
+    /// a heap of byte slices cannot express NULLS FIRST/LAST.
+    pub fn scan_top_k_plain_string_indices_mmap(
+        &self,
+        col_name: &str,
+        k: usize,
+        descending: bool,
+    ) -> io::Result<Option<Vec<usize>>> {
+        // Ascending only. The bounded heap improves on every row when the values arrive
+        // in the opposite order to the request, so `DESC` over ascending data degraded
+        // to O(n*k) churn -- 1M rows: 43 ms against 1.7 ms on the general path. (The
+        // dictionary lane avoids this by ranking the dictionary instead.)
+        if descending {
+            return Ok(None);
+        }
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        let schema = &footer.schema;
+        let Some(col_idx) = schema.get_index(col_name) else {
+            return Ok(None);
+        };
+        if !matches!(schema.columns[col_idx].1, ColumnType::String) {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for top-k scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let mut merged: Vec<(Vec<u8>, usize)> = Vec::new();
+        let mut global_offset: usize = 0;
+        // Still non-decreasing across every group seen so far.
+        let mut monotone = true;
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 {
+                continue;
+            }
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            if rg_bytes.len() < 32 {
+                return Ok(None);
+            }
+            let compress_flag = rg_bytes[28];
+            let encoding_version = rg_bytes[29];
+            let id_section =
+                rg_id_section_len(rg_rows, rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN));
+            let del_vec_len = (rg_rows + 7) / 8;
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let has_deletes = rg_meta.deletion_count > 0;
+
+            let decompressed = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed
+                .as_ref()
+                .map(|body| body.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
+
+            let del_bytes = if id_section + del_vec_len <= body.len() {
+                &body[id_section..id_section + del_vec_len]
+            } else {
+                &[]
+            };
+
+            let (col_bytes, col_nulls): (&[u8], &[u8]) = if rg_i < footer.col_offsets.len()
+                && col_idx < footer.col_offsets[rg_i].len()
+                && compress_flag == RG_COMPRESS_NONE
+            {
+                let col_body_off = footer.col_offsets[rg_i][col_idx] as usize;
+                let data_start = col_body_off + null_bitmap_len;
+                if data_start > body.len() {
+                    return Ok(None);
+                }
+                (&body[data_start..], &body[col_body_off..data_start])
+            } else {
+                let mut pos = id_section + del_vec_len;
+                let mut found: &[u8] = &[];
+                let mut found_nulls: &[u8] = &[];
+                for ci in 0..schema.column_count() {
+                    if pos + null_bitmap_len > body.len() {
+                        break;
+                    }
+                    let nulls = &body[pos..pos + null_bitmap_len];
+                    pos += null_bitmap_len;
+                    if ci == col_idx {
+                        found = &body[pos..];
+                        found_nulls = nulls;
+                        break;
+                    }
+                    let consumed = if encoding_version == RG_ENCODING_VERSION {
+                        skip_column_encoded(&body[pos..], schema.columns[ci].1)?
+                    } else {
+                        ColumnData::skip_bytes_typed(&body[pos..], schema.columns[ci].1)?
+                    };
+                    pos += consumed;
+                }
+                (found, found_nulls)
+            };
+
+            if col_bytes.is_empty() || col_nulls.iter().any(|&byte| byte != 0) {
+                return Ok(None);
+            }
+            // The column tag is the first byte of a versioned payload; a legacy group has
+            // no tag and starts straight at the data. (The dictionary lane indexes
+            // `col_bytes[enc_offset..]` because `StringDictView::parse` expects the
+            // payload *including* that byte, which is why this split differs.)
+            let (encoding, payload) = if encoding_version == RG_ENCODING_VERSION {
+                let Some(&tag) = col_bytes.first() else {
+                    return Ok(None);
+                };
+                (tag, &col_bytes[1..])
+            } else {
+                (COL_ENCODING_PLAIN, col_bytes)
+            };
+            if encoding != COL_ENCODING_PLAIN {
+                return Ok(None);
+            }
+
+            // Walk the block chain, recording where each block's offsets and data live.
+            // Anything that does not cover exactly `rg_rows` values declines.
+            let mut blocks: Vec<(usize, usize, usize, usize, usize)> = Vec::new();
+            let mut cursor = 0usize;
+            let mut seen = 0usize;
+            while seen < rg_rows {
+                if cursor + 16 > payload.len() {
+                    return Ok(None);
+                }
+                let count =
+                    u64::from_le_bytes(payload[cursor..cursor + 8].try_into().unwrap()) as usize;
+                if count == 0 || seen + count > rg_rows {
+                    return Ok(None);
+                }
+                let offsets_pos = cursor + 8;
+                let offsets_end = offsets_pos + (count + 1) * 4;
+                if offsets_end + 8 > payload.len() {
+                    return Ok(None);
+                }
+                let data_len = u64::from_le_bytes(
+                    payload[offsets_end..offsets_end + 8].try_into().unwrap(),
+                ) as usize;
+                let data_start = offsets_end + 8;
+                if count == 0 || seen + count > rg_rows {
+                    return Ok(None);
+                }
+                if data_start + data_len > payload.len() {
+                    return Ok(None);
+                }
+                blocks.push((seen, count, offsets_pos, data_start, data_len));
+                seen += count;
+                cursor = data_start + data_len;
+            }
+
+            // Values arriving in the requested order (the common case for append-only
+            // data) need no selection at all: verify the column is still non-decreasing
+            // and take the first k live rows. The check exits on the first inversion, so
+            // unsorted data pays almost nothing for it.
+            if monotone && seen > 0 {
+                let mut previous: Option<&[u8]> = None;
+                let offset_at_for = |offsets_pos: usize, idx: usize| -> usize {
+                    u32::from_le_bytes(
+                        payload[offsets_pos + idx * 4..offsets_pos + idx * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    ) as usize
+                };
+                'scan: for (row0, rows, offsets_pos, data_start, data_len) in blocks.iter() {
+                    for local_row in 0..*rows {
+                        let i = row0 + local_row;
+                        if has_deletes
+                            && !del_bytes.is_empty()
+                            && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                        {
+                            continue;
+                        }
+                        let (start, end) = (
+                            offset_at_for(*offsets_pos, local_row),
+                            offset_at_for(*offsets_pos, local_row + 1),
+                        );
+                        if start > end || end > *data_len || data_start + end > payload.len() {
+                            return Ok(None);
+                        }
+                        let value = &payload[data_start + start..data_start + end];
+                        if let Some(previous) = previous {
+                            if value < previous {
+                                monotone = false;
+                                break 'scan;
+                            }
+                        }
+                        previous = Some(value);
+                    }
+                }
+                if monotone {
+                    let mut picked: Vec<(Vec<u8>, usize)> = Vec::with_capacity(k);
+                    'pick: for (row0, rows, offsets_pos, data_start, data_len) in blocks.iter() {
+                        for local_row in 0..*rows {
+                            let i = row0 + local_row;
+                            if has_deletes
+                                && !del_bytes.is_empty()
+                                && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                            {
+                                continue;
+                            }
+                            let (start, end) = (
+                                offset_at_for(*offsets_pos, local_row),
+                                offset_at_for(*offsets_pos, local_row + 1),
+                            );
+                            if start > end || end > *data_len || data_start + end > payload.len() {
+                                return Ok(None);
+                            }
+                            picked.push((
+                                payload[data_start + start..data_start + end].to_vec(),
+                                global_offset + i,
+                            ));
+                            if picked.len() == k {
+                                break 'pick;
+                            }
+                        }
+                    }
+                    merged.extend(picked);
+                    global_offset += rg_rows;
+                    continue;
+                }
+            }
+
+            let mut local: Vec<(Vec<u8>, usize)> = Vec::with_capacity(k + 1);
+            for (row0, rows, offsets_pos, data_start, data_len) in blocks {
+                let offset_at = |idx: usize| -> usize {
+                    u32::from_le_bytes(
+                        payload[offsets_pos + idx * 4..offsets_pos + idx * 4 + 4]
+                            .try_into()
+                            .unwrap(),
+                    ) as usize
+                };
+                for local_row in 0..rows {
+                    let i = row0 + local_row;
+                    if has_deletes && !del_bytes.is_empty() && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
+                    {
+                        continue;
+                    }
+                    let (start, end) = (offset_at(local_row), offset_at(local_row + 1));
+                    if start > end || end > data_len || data_start + end > payload.len() {
+                        return Ok(None);
+                    }
+                    let value = &payload[data_start + start..data_start + end];
+                    let better = match local.last() {
+                        None => true,
+                        Some((last, _)) => {
+                            if descending {
+                                value > last.as_slice()
+                            } else {
+                                value < last.as_slice()
+                            }
+                        }
+                    };
+                    if local.len() < k || better {
+                        let pos = local.partition_point(|(v, _)| {
+                            if descending {
+                                v.as_slice() > value
+                            } else {
+                                v.as_slice() < value
+                            }
+                        });
+                        local.insert(pos, (value.to_vec(), global_offset + i));
+                        if local.len() > k {
+                            local.pop();
+                        }
+                    }
+                }
+            }
+            merged.extend(local);
+            global_offset += rg_rows;
+        }
+
+        merged.sort_by(|a, b| {
+            if descending {
+                b.0.cmp(&a.0)
+            } else {
+                a.0.cmp(&b.0)
+            }
+        });
+        merged.truncate(k);
+        Ok(Some(merged.into_iter().map(|(_, idx)| idx).collect()))
+    }
+
+    /// Top-k row indices for a dictionary-encoded string column.
+    ///
+    /// `scan_top_k_indices_mmap` compares raw numeric values; a string column has none,
+    /// so `ORDER BY <string> LIMIT k` fell back to materialising and sorting every row
+    /// (200k rows: `ORDER BY city LIMIT 5` cost 10.3 ms against 0.33 ms for the numeric
+    /// shape). Each row group carries its own dictionary, so rank that dictionary once
+    /// per group, take the group's own top-k by rank, and merge the (already ordered)
+    /// per-group lists -- no row sort and no value materialisation.
+    ///
+    /// A group whose sort column holds NULLs declines the whole query, exactly like the
+    /// numeric lane, because a rank cannot express NULLS FIRST/LAST.
+    pub fn scan_top_k_string_indices_mmap(
+        &self,
+        col_name: &str,
+        k: usize,
+        descending: bool,
+    ) -> io::Result<Option<Vec<usize>>> {
+        if k == 0 {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        let schema = &footer.schema;
+        let Some(col_idx) = schema.get_index(col_name) else {
+            return Ok(None);
+        };
+        if !matches!(schema.columns[col_idx].1, ColumnType::StringDict) {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let file = file_guard
+            .as_ref()
+            .ok_or_else(|| err_not_conn("File not open for top-k scan"))?;
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let mut merged: Vec<(String, usize)> = Vec::new();
+        let mut global_offset: usize = 0;
+
+        for (rg_i, rg_meta) in footer.row_groups.iter().enumerate() {
+            let rg_rows = rg_meta.row_count as usize;
+            if rg_rows == 0 {
+                continue;
+            }
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                return Err(err_data("RG extends past EOF"));
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            if rg_bytes.len() < 32 {
+                return Ok(None);
+            }
+            let compress_flag = rg_bytes[28];
+            let encoding_version = rg_bytes[29];
+            let id_section =
+                rg_id_section_len(rg_rows, rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN));
+            let del_vec_len = (rg_rows + 7) / 8;
+            let null_bitmap_len = (rg_rows + 7) / 8;
+            let has_deletes = rg_meta.deletion_count > 0;
+
+            // Decompression borrows from a local, so the group is fully resolved
+            // inside this scope before the next iteration.
+            let decompressed = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed
+                .as_ref()
+                .map(|body| body.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
+
+            let del_bytes = if id_section + del_vec_len <= body.len() {
+                &body[id_section..id_section + del_vec_len]
+            } else {
+                &[]
+            };
+
+            let (col_bytes, col_nulls): (&[u8], &[u8]) = if rg_i < footer.col_offsets.len()
+                && col_idx < footer.col_offsets[rg_i].len()
+                && compress_flag == RG_COMPRESS_NONE
+            {
+                let col_body_off = footer.col_offsets[rg_i][col_idx] as usize;
+                let data_start = col_body_off + null_bitmap_len;
+                if data_start > body.len() {
+                    return Ok(None);
+                }
+                (&body[data_start..], &body[col_body_off..data_start])
+            } else {
+                let mut pos = id_section + del_vec_len;
+                let mut found: &[u8] = &[];
+                let mut found_nulls: &[u8] = &[];
+                for ci in 0..schema.column_count() {
+                    if pos + null_bitmap_len > body.len() {
+                        break;
+                    }
+                    let nulls = &body[pos..pos + null_bitmap_len];
+                    pos += null_bitmap_len;
+                    if ci == col_idx {
+                        found = &body[pos..];
+                        found_nulls = nulls;
+                        break;
+                    }
+                    let consumed = if encoding_version == RG_ENCODING_VERSION {
+                        skip_column_encoded(&body[pos..], schema.columns[ci].1)?
+                    } else {
+                        ColumnData::skip_bytes_typed(&body[pos..], schema.columns[ci].1)?
+                    };
+                    pos += consumed;
+                }
+                (found, found_nulls)
+            };
+
+            if col_bytes.is_empty() || col_nulls.iter().any(|&byte| byte != 0) {
+                return Ok(None);
+            }
+            let enc_offset = if encoding_version == RG_ENCODING_VERSION {
+                1
+            } else {
+                0
+            };
+            let Some(&encoding) = col_bytes.first() else {
+                return Ok(None);
+            };
+            if !matches!(
+                encoding,
+                COL_ENCODING_PLAIN | COL_ENCODING_COMPACT_DICTIONARY
+            ) {
+                return Ok(None);
+            }
+            let view = match StringDictView::parse(
+                &col_bytes[enc_offset..],
+                encoding == COL_ENCODING_COMPACT_DICTIONARY,
+            ) {
+                Ok(view) => view,
+                Err(_) => return Ok(None),
+            };
+            if view.row_count < rg_rows || view.dict_size <= 1 {
+                return Ok(None);
+            }
+
+            // Order this group's dictionary once, then rank the rows by it.
+            let mut order: Vec<u32> = (1..view.dict_size as u32).collect();
+            let value_of = |key: u32| -> Option<&str> {
+                view.value(key).and_then(|bytes| std::str::from_utf8(bytes).ok())
+            };
+            order.sort_unstable_by(|a, b| match (value_of(*a), value_of(*b)) {
+                (Some(x), Some(y)) => x.cmp(y),
+                _ => std::cmp::Ordering::Equal,
+            });
+            let mut rank_of_dict = vec![u32::MAX; view.dict_size];
+            for (rank, key) in order.iter().enumerate() {
+                rank_of_dict[*key as usize] = rank as u32;
+            }
+
+            let mut counts = vec![0u32; order.len()];
+            for i in 0..rg_rows {
+                if has_deletes && !del_bytes.is_empty() && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                    continue;
+                }
+                let Some(key) = view.index(i) else { continue };
+                if let Some(slot) = rank_of_dict.get(key as usize) {
+                    if *slot != u32::MAX {
+                        counts[*slot as usize] += 1;
+                    }
+                }
+            }
+
+            // Walk ranks best-first until k rows are accounted for.
+            let mut needed = k;
+            let mut threshold: Option<u32> = None;
+            let indices: Vec<usize> = if descending {
+                (0..counts.len()).rev().collect()
+            } else {
+                (0..counts.len()).collect()
+            };
+            for rank in indices {
+                let count = counts[rank] as usize;
+                if count == 0 {
+                    continue;
+                }
+                if count >= needed {
+                    threshold = Some(rank as u32);
+                    break;
+                }
+                needed -= count;
+            }
+            let Some(threshold) = threshold else { continue };
+            let at_threshold = needed;
+
+            // Collect them: everything better than the threshold, then the first
+            // `at_threshold` rows that sit exactly on it.
+            let mut taken_at_threshold = 0usize;
+            let mut local: Vec<(String, usize)> = Vec::new();
+            for i in 0..rg_rows {
+                if has_deletes && !del_bytes.is_empty() && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                    continue;
+                }
+                let Some(key) = view.index(i) else { continue };
+                let Some(slot) = rank_of_dict.get(key as usize).copied() else {
+                    continue;
+                };
+                if slot == u32::MAX {
+                    continue;
+                }
+                // Ranks ascend with the value, so a rank "better" than the
+                // threshold is a *larger* one when descending and a smaller one
+                // when ascending.
+                // Ranks ascend with the value, so a rank better than the threshold is
+                // a larger one when descending and a smaller one when ascending.
+                let better = if descending {
+                    slot > threshold
+                } else {
+                    slot < threshold
+                };
+                if better {
+                    if let Some(value) = value_of(key) {
+                        local.push((value.to_string(), global_offset + i));
+                    }
+                } else if slot == threshold && taken_at_threshold < at_threshold {
+                    taken_at_threshold += 1;
+                    if let Some(value) = value_of(key) {
+                        local.push((value.to_string(), global_offset + i));
+                    }
+                }
+                if local.len() >= k {
+                    break;
+                }
+            }
+            merged.extend(local);
+            global_offset += rg_rows;
+        }
+
+        merged.sort_by(|a, b| if descending { b.0.cmp(&a.0) } else { a.0.cmp(&b.0) });
+        merged.truncate(k);
+        Ok(Some(merged.into_iter().map(|(_, idx)| idx).collect()))
+    }
+
     pub fn scan_top_k_indices_mmap(
         &self,
         col_name: &str,
@@ -71,8 +621,16 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            let decompressed = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed.as_deref().unwrap_or(&rg_bytes[32..]);
+            let decompressed = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed
+                .as_ref()
+                .map(|body| body.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
             let id_section =
                 rg_id_section_len(rg_rows, rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN));
             let del_vec_len = (rg_rows + 7) / 8;
@@ -112,7 +670,7 @@ impl OnDemandStorage {
                         found_nulls = nulls;
                         break;
                     }
-                    let consumed = if encoding_version >= 1 {
+                    let consumed = if encoding_version == RG_ENCODING_VERSION {
                         skip_column_encoded(&body[pos..], schema.columns[ci].1)?
                     } else {
                         ColumnData::skip_bytes_typed(&body[pos..], schema.columns[ci].1)?
@@ -126,24 +684,20 @@ impl OnDemandStorage {
                 global_offset += rg_rows;
                 continue;
             }
-            // Numeric V4 zone maps already persist NULL presence per Row Group.
-            // Use that O(1) metadata on current files; scan the bitmap only for
-            // older files whose footer predates zone-map null metadata.
-            let has_nulls = footer
-                .zone_maps
-                .get(rg_i)
-                .and_then(|zone_maps| {
-                    zone_maps
-                        .iter()
-                        .find(|zone_map| zone_map.col_idx as usize == col_idx)
-                })
-                .map_or_else(
-                    || col_nulls.iter().any(|&byte| byte != 0),
-                    |zone_map| zone_map.has_nulls,
-                );
+            // This lane ranks raw column values, so a NULL would compete as its
+            // stored placeholder (0) instead of being ordered by NULLS
+            // FIRST/LAST. A row group whose sort column holds NULLs therefore
+            // cannot be served here and falls back to the general path.
+            //
+            // The per-row-group null bitmap is authoritative. The persisted
+            // zone-map null flag is not usable as a shortcut: it is written as
+            // `false` on every path that builds zone maps.
+            if col_nulls.iter().any(|&byte| byte != 0) {
+                return Ok(None);
+            }
 
-            let enc_offset = if encoding_version >= 1 { 1 } else { 0 };
-            let encoding = if encoding_version >= 1 && !col_bytes.is_empty() {
+            let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
+            let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
                 col_bytes[0]
             } else {
                 COL_ENCODING_PLAIN
@@ -155,20 +709,13 @@ impl OnDemandStorage {
                 let n = count.min(rg_rows).min((payload.len() - 8) / 8);
 
                 macro_rules! topk_scan {
-                    ($vals:expr, $check_nulls:expr) => {{
+                    ($vals:expr) => {{
                         if descending {
                             // Keep k largest: heap sorted descending, threshold = heap[k-1]
                             for i in 0..n {
                                 if has_deletes
                                     && !del_bytes.is_empty()
                                     && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
-                                {
-                                    continue;
-                                }
-                                if $check_nulls
-                                    && col_nulls
-                                    .get(i / 8)
-                                    .is_some_and(|byte| ((byte >> (i % 8)) & 1) != 0)
                                 {
                                     continue;
                                 }
@@ -191,13 +738,6 @@ impl OnDemandStorage {
                                 {
                                     continue;
                                 }
-                                if $check_nulls
-                                    && col_nulls
-                                    .get(i / 8)
-                                    .is_some_and(|byte| ((byte >> (i % 8)) & 1) != 0)
-                                {
-                                    continue;
-                                }
                                 let val = $vals[i];
                                 if heap.len() < k {
                                     let pos = heap.partition_point(|(v, _)| *v < val);
@@ -216,32 +756,20 @@ impl OnDemandStorage {
                     let ptr = payload[8..].as_ptr();
                     if ptr as usize % std::mem::align_of::<f64>() == 0 {
                         let vals = unsafe { std::slice::from_raw_parts(ptr as *const f64, n) };
-                        if has_nulls {
-                            topk_scan!(vals, true);
-                        } else {
-                            topk_scan!(vals, false);
-                        }
+                        topk_scan!(vals);
                     } else {
                         let data = &payload[8..8 + n * 8];
                         let vals: Vec<f64> = (0..n)
                             .map(|i| f64::from_le_bytes(data[i * 8..i * 8 + 8].try_into().unwrap()))
                             .collect();
-                        if has_nulls {
-                            topk_scan!(vals, true);
-                        } else {
-                            topk_scan!(vals, false);
-                        }
+                        topk_scan!(vals);
                     }
                 } else {
                     let ptr = payload[8..].as_ptr();
                     if ptr as usize % std::mem::align_of::<i64>() == 0 {
                         let vals = unsafe { std::slice::from_raw_parts(ptr as *const i64, n) };
                         let fvals: Vec<f64> = vals.iter().map(|&v| v as f64).collect();
-                        if has_nulls {
-                            topk_scan!(fvals, true);
-                        } else {
-                            topk_scan!(fvals, false);
-                        }
+                        topk_scan!(fvals);
                     } else {
                         let data = &payload[8..8 + n * 8];
                         let fvals: Vec<f64> = (0..n)
@@ -250,16 +778,12 @@ impl OnDemandStorage {
                                     as f64
                             })
                             .collect();
-                        if has_nulls {
-                            topk_scan!(fvals, true);
-                        } else {
-                            topk_scan!(fvals, false);
-                        }
+                        topk_scan!(fvals);
                     }
                 }
             } else {
                 // Non-PLAIN: decode and scan
-                let (col_data, _) = if encoding_version >= 1 {
+                let (col_data, _) = if encoding_version == RG_ENCODING_VERSION {
                     read_column_encoded(col_bytes, col_type)?
                 } else {
                     ColumnData::from_bytes_typed(col_bytes, col_type)?
@@ -274,19 +798,12 @@ impl OnDemandStorage {
                 };
                 let n = fvals.len().min(rg_rows);
                 macro_rules! topk_scan2 {
-                    ($vals:expr, $check_nulls:expr) => {{
+                    ($vals:expr) => {{
                         if descending {
                             for i in 0..n {
                                 if has_deletes
                                     && !del_bytes.is_empty()
                                     && (del_bytes[i / 8] >> (i % 8)) & 1 == 1
-                                {
-                                    continue;
-                                }
-                                if $check_nulls
-                                    && col_nulls
-                                    .get(i / 8)
-                                    .is_some_and(|byte| ((byte >> (i % 8)) & 1) != 0)
                                 {
                                     continue;
                                 }
@@ -308,13 +825,6 @@ impl OnDemandStorage {
                                 {
                                     continue;
                                 }
-                                if $check_nulls
-                                    && col_nulls
-                                    .get(i / 8)
-                                    .is_some_and(|byte| ((byte >> (i % 8)) & 1) != 0)
-                                {
-                                    continue;
-                                }
                                 let val = $vals[i];
                                 if heap.len() < k {
                                     let pos = heap.partition_point(|(v, _)| *v < val);
@@ -328,11 +838,7 @@ impl OnDemandStorage {
                         }
                     }};
                 }
-                if has_nulls {
-                    topk_scan2!(fvals, true);
-                } else {
-                    topk_scan2!(fvals, false);
-                }
+                topk_scan2!(fvals);
             }
             global_offset += rg_rows;
         }
@@ -438,7 +944,7 @@ impl OnDemandStorage {
                 let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
                 let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
                 let enc_ver = rg_bytes.get(29).copied().unwrap_or(0);
-                if compress_flag != RG_COMPRESS_NONE || enc_ver < 1 {
+                if compress_flag != RG_COMPRESS_NONE || enc_ver != RG_ENCODING_VERSION {
                     return false;
                 }
                 let Some(col_offsets) = footer.col_offsets.get(rg_i) else {
@@ -688,7 +1194,7 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            if compress_flag != RG_COMPRESS_NONE || encoding_version < 1 {
+            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
                 return Ok(None); // compressed / legacy encodings → fall back
             }
             let body = &rg_bytes[32..];

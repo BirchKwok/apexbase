@@ -135,3 +135,80 @@ def test_blob_type_helpers_distinguish_null_and_empty_payloads_after_reopen(blob
         ]
 
         reopened.close()
+
+
+def test_sql_insert_rejects_a_text_literal_for_a_binary_column():
+    """A non-binary literal must not silently become an empty/NULL BLOB.
+
+    `INSERT INTO t (k, b) VALUES (3, 'plain text')` used to report success and store
+    NULL for `b`, while the UPDATE path already rejected the same assignment with
+    "Cannot assign VARCHAR to BINARY column 'b'". Silent data loss is worse than an
+    error, so INSERT now fails loudly too - while NULL, already-binary values and the
+    JSON-style vector string form all keep working.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("t", schema={"k": "int64", "b": "binary", "bl": "blob"})
+        client.use_table("t")
+        try:
+            client.store({"k": [1], "b": [b"\x01\x02"], "bl": [b"\x03\x04"]})
+            client.flush()
+            assert client.execute("SELECT k, b, bl FROM t").to_dict() == [
+                {"k": 1, "b": b"\x01\x02", "bl": b"\x03\x04"}]
+
+            client.execute("INSERT INTO t (k, b) VALUES (2, NULL)")
+            client.flush()
+            assert client.execute(
+                "SELECT k, b FROM t ORDER BY k").to_dict()[1]["b"] is None
+
+            # The vector-string form still auto-encodes into a BINARY column.
+            client.execute("INSERT INTO t (k, b) VALUES (3, '[1.0, 2.0, 3.0]')")
+            client.flush()
+            encoded = client.execute("SELECT k, b FROM t ORDER BY k").to_dict()[2]["b"]
+            assert isinstance(encoded, (bytes, bytearray)) and len(encoded) == 12
+
+            with pytest.raises(Exception) as excinfo:
+                client.execute("INSERT INTO t (k, b) VALUES (4, 'plain text')")
+            assert "BINARY" in str(excinfo.value), str(excinfo.value)
+            # And nothing was written for that row.
+            assert client.execute("SELECT COUNT(*) AS n FROM t").to_dict() == [{"n": 3}]
+        finally:
+            client.close()
+
+
+def test_unrepresentable_python_values_error_instead_of_storing_null():
+    """A value the writer cannot represent must not silently become NULL or ''.
+
+    `store([{"s": SomeObject()}])` reported success and stored NULL, and a single-row
+    `store({"s": object()})` stored an empty string - both silent data loss. The
+    converters and the scalar string path now refuse loudly, while `None` remains the
+    explicit way to write NULL. (Known remaining gap, not asserted here: the
+    columnar/type-mismatch decline path still turns e.g. an int into a NULL string
+    column - registered separately.)
+    """
+    class Opaque:
+        pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("t", schema={"k": "int64", "s": "string"})
+        client.use_table("t")
+        try:
+            with pytest.raises(Exception) as excinfo:
+                client.store({"k": 1, "s": Opaque()})
+            assert "unsupported Python value" in str(excinfo.value), str(excinfo.value)
+
+            with pytest.raises(Exception) as excinfo:
+                client.store([{"k": 2, "s": Opaque()}])
+            assert "unsupported Python value" in str(excinfo.value), str(excinfo.value)
+
+            # Nothing was written by the rejected calls.
+            assert client.execute("SELECT COUNT(*) AS n FROM t").to_dict() == [{"n": 0}]
+
+            # None still writes NULL, and ordinary strings still work.
+            client.store([{"k": 3, "s": None}, {"k": 4, "s": "text"}])
+            client.flush()
+            rows = client.execute("SELECT k, s FROM t ORDER BY k").to_dict()
+            assert rows == [{"k": 3, "s": None}, {"k": 4, "s": "text"}], rows
+        finally:
+            client.close()

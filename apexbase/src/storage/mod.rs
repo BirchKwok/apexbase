@@ -9,6 +9,7 @@
 pub mod backend;
 pub mod bloom;
 pub mod concurrent;
+pub mod cross_process_lock;
 pub mod delta;
 pub mod engine;
 pub mod epoch;

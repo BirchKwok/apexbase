@@ -8,18 +8,36 @@ fn phrase_query(query: &str) -> (&str, bool) {
 }
 
 fn matching_docs(state: &IndexState, analyzed: &AnalyzedDocument, phrase: bool) -> FtsResult<RoaringTreemap> {
-    let mut postings: Vec<RoaringTreemap> = analyzed
+    let postings: Vec<RoaringTreemap> = analyzed
         .terms
         .iter()
         .map(|term| state.posting(term))
         .collect::<FtsResult<Vec<_>>>()?;
-    postings.sort_unstable_by_key(RoaringTreemap::len);
-    let mut postings = postings.into_iter();
-    let Some(mut result) = postings.next() else {
+    matching_docs_from_postings(state, &postings, analyzed, phrase)
+}
+
+/// Intersect postings the caller already materialized.
+///
+/// Ranked search needs the same term bitmaps for candidate selection and for
+/// IDF, and building a posting means cloning the live bitmap; taking them as an
+/// argument keeps one materialization per term per query.
+fn matching_docs_from_postings(
+    state: &IndexState,
+    postings: &[RoaringTreemap],
+    analyzed: &AnalyzedDocument,
+    phrase: bool,
+) -> FtsResult<RoaringTreemap> {
+    let mut order: Vec<usize> = (0..postings.len()).collect();
+    order.sort_unstable_by_key(|&index| postings[index].len());
+    let Some(&smallest) = order.first() else {
         return Ok(RoaringTreemap::new());
     };
-    for posting in postings {
-        result &= posting;
+    let mut result = postings[smallest].clone();
+    if result.is_empty() {
+        return Ok(result);
+    }
+    for &index in &order[1..] {
+        result &= &postings[index];
         if result.is_empty() {
             return Ok(result);
         }

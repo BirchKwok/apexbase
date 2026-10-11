@@ -1441,8 +1441,8 @@ impl OnDemandStorage {
         if data.is_empty() {
             return Ok(FusedLaneDecoded::Missing);
         }
-        let enc = if encoding_version >= 1 { data[0] } else { COL_ENCODING_PLAIN };
-        let payload = if encoding_version >= 1 { &data[1..] } else { data };
+        let enc = if encoding_version == RG_ENCODING_VERSION { data[0] } else { COL_ENCODING_PLAIN };
+        let payload = if encoding_version == RG_ENCODING_VERSION { &data[1..] } else { data };
         if enc == COL_ENCODING_PLAIN && payload.len() >= 8 {
             let count =
                 u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
@@ -1469,7 +1469,7 @@ impl OnDemandStorage {
         // BITPACK int columns decode straight into the caller buffer:
         // the generic path would allocate a second per-RG Vec.
         if is_int
-            && encoding_version >= 1
+            && encoding_version == RG_ENCODING_VERSION
             && enc == COL_ENCODING_BITPACK
             && payload.len() >= 17
         {
@@ -1492,7 +1492,7 @@ impl OnDemandStorage {
                 return Ok(FusedLaneDecoded::BufferI64);
             }
         }
-        let (col_data, _) = if encoding_version >= 1 {
+        let (col_data, _) = if encoding_version == RG_ENCODING_VERSION {
             read_column_encoded(data, col_type)?
         } else {
             ColumnData::from_bytes_typed(data, col_type)?
@@ -1536,6 +1536,13 @@ impl OnDemandStorage {
             if al >= lanes.len() {
                 return Ok(None);
             }
+        }
+        // A value aggregate (mask bit 1/2/4) is computed from one lane's
+        // values, so it needs that lane. Without one the scatter loop would
+        // read through a null value pointer; the caller falls back to the
+        // generic pipeline, which resolves the aggregate itself.
+        if agg_mask != 0 && agg_lane.is_none() {
+            return Ok(None);
         }
         let footer = match self.get_or_load_footer()? {
             Some(f) => f,
@@ -1658,8 +1665,16 @@ impl OnDemandStorage {
                 rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
             );
 
-            let decompressed_buf = decompress_rg_body(compress_flag, &rg_bytes[32..])?;
-            let body: &[u8] = decompressed_buf.as_deref().unwrap_or(&rg_bytes[32..]);
+            let decompressed_buf = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed_buf
+                .as_ref()
+                .map(|buf| buf.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
             let del_bytes: &[u8] = if has_deleted && del_start + null_bitmap_len <= body.len() {
                 &body[del_start..del_start + null_bitmap_len]
             } else {

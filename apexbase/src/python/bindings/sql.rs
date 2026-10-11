@@ -1630,12 +1630,45 @@ impl ApexStorageImpl {
         }
 
         if let Some(id) = pk_id {
-            // Single-row point reads use the lean RCIX reader.
-            if let Some(columns) = pk_columns {
+            // Single-row point reads use the lean RCIX reader, and fall back to
+            // the decoding reader when that lane declines.
+            //
+            // `retrieve_rcix*` reports "row absent" and "lane unavailable" as the
+            // same `None`. A compressed row group declines the lean lane while
+            // still carrying the column directory the decoding reader needs, so
+            // reading the decline as absence sent every `_id = X` on a compressed
+            // table through the full SQL executor: measured on a 200k x 16 zstd
+            // table, ~11.5 us per read that way against ~0.9 us through this
+            // path, because the executor re-parses and re-plans the statement.
+            let lane_available = |id: u64| {
+                backend
+                    .storage
+                    .point_read_lane_available(id)
+                    .unwrap_or(true)
+            };
+            let single = if let Some(columns) = pk_columns {
                 let projected_cols: Vec<&str> = columns.iter().map(String::as_str).collect();
-                if let Ok(Some(vals)) = backend.storage.retrieve_rcix_projected(id, &projected_cols)
-                {
-                    let out = PyDict::new_bound(py);
+                match backend.storage.retrieve_rcix_projected(id, &projected_cols) {
+                    Ok(Some(vals)) => Some(vals),
+                    Ok(None) if !lane_available(id) => backend
+                        .storage
+                        .read_row_by_id_values_projected(id, Some(&projected_cols))
+                        .ok()
+                        .flatten(),
+                    _ => None,
+                }
+            } else {
+                match backend.storage.retrieve_rcix(id) {
+                    Ok(Some(vals)) => Some(vals),
+                    Ok(None) if !lane_available(id) => {
+                        backend.storage.read_row_by_id_values(id).ok().flatten()
+                    }
+                    _ => None,
+                }
+            };
+            if let Some(vals) = single {
+                let out = PyDict::new_bound(py);
+                if let Some(columns) = pk_columns {
                     if row_result {
                         if let Some(row) = projected_values_to_row_dict(py, &vals, columns)? {
                             out.set_item("row", row)?;
@@ -1649,12 +1682,7 @@ impl ApexStorageImpl {
                     } else {
                         return Ok(None);
                     }
-                    out.set_item("rows_affected", 0i64)?;
-                    return Ok(Some(out.into()));
-                }
-            } else if let Ok(Some(vals)) = backend.storage.retrieve_rcix(id) {
-                let out = PyDict::new_bound(py);
-                if row_result {
+                } else if row_result {
                     let row = PyDict::new_bound(py);
                     for (col_name, val) in &vals {
                         row.set_item(col_name.as_str(), value_to_py(py, val)?)?;
@@ -1664,8 +1692,7 @@ impl ApexStorageImpl {
                     let columns_dict = PyDict::new_bound(py);
                     for (col_name, val) in &vals {
                         let pyval = value_to_py(py, val)?;
-                        columns_dict
-                            .set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
+                        columns_dict.set_item(col_name.as_str(), PyList::new_bound(py, [pyval]))?;
                     }
                     out.set_item("columns_dict", columns_dict)?;
                 }
@@ -1685,7 +1712,29 @@ impl ApexStorageImpl {
             backend.storage.retrieve_many_mmap_columns(&sorted_ids)
         };
         if let Ok(Some(batch_cols)) = batch_result {
-            if batch_cols.row_count == sorted_ids.len() {
+            // `_id IN (...)` is a filter, so an id that is missing (or deleted by
+            // the persisted deletion vector) only removes *its* row: the rows that
+            // are present are the whole answer and the lane already reports them in
+            // the same ascending-id order a scan produces. Requiring a full hit
+            // sent every such statement back through the SQL executor to re-parse,
+            // re-plan and scan: measured on a 200k x 16 plain table, 1000 ids with
+            // one missing id cost 3.71 ms against 0.43 ms when all ids exist (8.7x);
+            // the zstd twin 1.23 ms against 0.43 ms (2.9x).
+            //
+            // A *partial* hit is only authoritative while the lane's view is the
+            // whole visible view: it reads the persisted row groups, so once an
+            // appended delta sidecar exists (a spilled transaction, not a pending
+            // one -- `has_pending_writes` was already checked above) a row that
+            // lives only in the sidecar, or a cell it patched, would be silently
+            // dropped where the executor merges it. Full hits keep their old
+            // contract, and empty results still decline so the executor supplies
+            // the projected schema.
+            // `has_delta()` is a file stat, so it is only evaluated when the
+            // batch did *not* come back complete: a full hit answers from the
+            // persisted rows either way.
+            if batch_cols.row_count == sorted_ids.len()
+                || (batch_cols.row_count > 0 && !backend.has_delta())
+            {
                 if let Some(columns_dict) =
                     mmap_batch_columns_to_pydict(py, batch_cols, pk_columns)?
                 {

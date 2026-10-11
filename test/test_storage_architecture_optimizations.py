@@ -50,6 +50,46 @@ def test_adaptive_row_group_size_for_wide_table(tmp_path):
     assert _read_row_group_size(table_path) == 32_768
 
 
+def test_compressed_tables_use_finer_row_groups(tmp_path):
+    """A compressed row group carries no RCIX, so its size is capped.
+
+    A reader that touches one column of one row still decodes the whole
+    compressed group, so the group is kept small; the plain layout keeps the
+    large adaptive group, where the RCIX fast lanes give O(1) column access.
+    """
+    db_dir = tmp_path / "compressed_rg"
+    client = ApexClient(str(db_dir), drop_if_exists=True)
+    rows = 20_000
+    for table, compression in (("plain_rg", None), ("zstd_rg", "zstd")):
+        client.create_table(table, schema={"k": "int64", "s": "string"})
+        client.use_table(table)
+        if compression:
+            assert client.set_compression(compression) is not False
+        client.store({"k": list(range(rows)), "s": [f"v{i % 50}" for i in range(rows)]})
+        client.flush()
+    client.close()
+
+    plain_size = _read_row_group_size(db_dir / "plain_rg.apex")
+    zstd_size = _read_row_group_size(db_dir / "zstd_rg.apex")
+    assert plain_size == 65_536
+    assert zstd_size == 4_096
+    assert zstd_size < plain_size
+
+    # The cap is a layout choice: both files must read back whole.
+    reopened = ApexClient(str(db_dir))
+    for table in ("plain_rg", "zstd_rg"):
+        reopened.use_table(table)
+        assert reopened.execute(f"SELECT count(*) FROM {table}").scalar() == rows
+        assert (
+            reopened.execute(f"SELECT sum(k) FROM {table}").scalar()
+            == rows * (rows - 1) // 2
+        )
+        row = reopened.execute(f"SELECT k, s FROM {table} WHERE _id = {rows - 3}").to_dict()[0]
+        assert row["k"] == rows - 4
+        assert row["s"] == f"v{(rows - 4) % 50}"
+    reopened.close()
+
+
 def test_string_encoding_stays_consistent_across_row_groups(tmp_path):
     db_dir = tmp_path / "mixed_string_encoding"
     client = ApexClient(str(db_dir), drop_if_exists=True)

@@ -526,13 +526,12 @@ fn nanos_elapsed(stored: u64) -> u64 {
 // ============================================================================
 // Two-layer locking for concurrent access safety:
 // Layer 1: parking_lot::Mutex (~10-20ns uncontended) — same-process threads
-// Layer 2: fs2 flock on cached File handle (~0.5μs) — cross-process safety
-//
-// The File handle is opened once and cached, so repeated writes only pay
-// the flock() syscall cost, not open()+flock().
+// Layer 2: fs2 flock — cross-process safety, taken through
+//          `storage::cross_process_lock`, which owns the lock-file naming rule and
+//          the per-thread re-entrancy state shared with the Python bindings and
+//          the `Database::write*` entry points.
 struct TableLock {
     mutex: parking_lot::Mutex<()>,
-    file: Option<std::fs::File>,
 }
 
 static TABLE_WRITE_LOCKS: Lazy<RwLock<AHashMap<PathBuf, Arc<TableLock>>>> =
@@ -547,25 +546,9 @@ fn get_table_lock(table_path: &Path) -> Arc<TableLock> {
             return lock.clone();
         }
     }
-    // Slow path: create lock + open sidecar .lock file once
-    let lock_path = {
-        let mut p = table_path.to_path_buf();
-        let name = p
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        p.set_file_name(format!("{}.lock", name));
-        p
-    };
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .open(&lock_path)
-        .ok();
+    // Slow path: create the lock entry once.
     let entry = Arc::new(TableLock {
         mutex: parking_lot::Mutex::new(()),
-        file,
     });
     let mut locks = TABLE_WRITE_LOCKS.write();
     locks
@@ -581,20 +564,12 @@ fn with_table_write_lock<F, R>(table_path: &Path, f: F) -> io::Result<R>
 where
     F: FnOnce() -> io::Result<R>,
 {
+    let __t = std::time::Instant::now();
     let lock = get_table_lock(table_path);
-    // Layer 1: in-process serialization
     let _guard = lock.mutex.lock();
-    // Layer 2: cross-process serialization (best-effort, ~0.5μs)
-    if let Some(ref file) = lock.file {
-        use fs2::FileExt;
-        let _ = file.lock_exclusive();
-    }
-    let result = f();
-    // Release cross-process lock immediately
-    if let Some(ref file) = lock.file {
-        let _ = file.unlock();
-    }
-    result
+    let _cross_process = crate::storage::cross_process_lock::lock_write(table_path)?;
+    let __r = f();
+    __r
 }
 
 /// Evict least recently used entries from cache if over limit

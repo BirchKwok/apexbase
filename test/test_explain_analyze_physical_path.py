@@ -66,8 +66,10 @@ def test_explain_analyze_reports_simple_read_paths():
             plan = _plan_text(client, "EXPLAIN ANALYZE SELECT COUNT(*) FROM users")
             assert "Actual Path: count_star_metadata" in plan
 
+            # A projected page read is bounded now; it used to materialize the
+            # table and slice, which made any non-zero OFFSET a full table read.
             plan = _plan_text(client, "EXPLAIN ANALYZE SELECT city FROM users LIMIT 5")
-            assert "Actual Path: generic_executor" in plan
+            assert "Actual Path: bounded_projection" in plan
 
             plan = _plan_text(
                 client, "EXPLAIN ANALYZE SELECT city, code FROM users WHERE _id = 3"

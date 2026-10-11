@@ -294,24 +294,34 @@ impl FtsEngine {
             return Ok(Vec::new());
         }
         let state = self.core.state.read();
-        let candidates = matching_docs(&state, &analyzed, phrase)?;
+        // One materialization per query term: the live bitmaps that pick the
+        // candidates also carry the document frequencies the IDF needs. Building
+        // them twice per query was pure duplication (a posting is a bitmap clone
+        // plus the delete/delta set arithmetic).
+        let postings: Vec<RoaringTreemap> = analyzed
+            .terms
+            .iter()
+            .map(|term| state.posting(term))
+            .collect::<FtsResult<Vec<_>>>()?;
+        let candidates = matching_docs_from_postings(&state, &postings, &analyzed, phrase)?;
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
 
-        let mut query_terms: Vec<(&str, u32)> = analyzed
+        let mut query_terms: Vec<(u32, usize)> = analyzed
             .tokens
             .iter()
             .filter_map(|&local_id| {
                 if local_id == 0 {
                     return None;
                 }
-                let term = analyzed.terms.get(local_id as usize - 1)?;
-                state.term_id(term).map(|term_id| (term.as_str(), term_id))
+                let index = local_id as usize - 1;
+                let term = analyzed.terms.get(index)?;
+                state.term_id(term).map(|term_id| (term_id, index))
             })
             .collect();
-        query_terms.sort_unstable_by_key(|(_, term_id)| *term_id);
-        query_terms.dedup_by_key(|(_, term_id)| *term_id);
+        query_terms.sort_unstable_by_key(|(term_id, _)| *term_id);
+        query_terms.dedup_by_key(|(term_id, _)| *term_id);
         if query_terms.is_empty() {
             return Ok(Vec::new());
         }
@@ -319,8 +329,8 @@ impl FtsEngine {
         let doc_count = state.live_docs().len().max(1) as f32;
         let average_length = (state.live_term_total() as f32 / doc_count).max(1.0);
         let mut idf = Vec::with_capacity(query_terms.len());
-        for (term, term_id) in query_terms {
-            let document_frequency = state.posting(term)?.len() as f32;
+        for (term_id, index) in query_terms {
+            let document_frequency = postings[index].len() as f32;
             let score =
                 ((doc_count - document_frequency + 0.5) / (document_frequency + 0.5) + 1.0).ln();
             idf.push((term_id, score));
@@ -330,15 +340,29 @@ impl FtsEngine {
         const B: f32 = 0.75;
         let heap_limit = limit.min(candidates.len() as usize);
         let mut top = BinaryHeap::with_capacity(heap_limit.saturating_add(1));
+        // Score one document with a single pass over its tokens instead of one
+        // scan per query term; `idf` is sorted by term id, so the slot of the
+        // (rare) query term a token belongs to is one binary search.
+        let mut frequencies = vec![0u32; idf.len()];
         for doc_id in candidates.iter() {
             let Some(tokens) = state.tokens_for_doc(doc_id) else {
                 continue;
             };
-            let document_length = tokens.iter().filter(|&&token| token != 0).count() as f32;
-            let normalization = K1 * (1.0 - B + B * document_length / average_length);
+            frequencies.iter_mut().for_each(|count| *count = 0);
+            let mut document_length = 0usize;
+            for &token in tokens {
+                if token == 0 {
+                    continue;
+                }
+                document_length += 1;
+                if let Ok(slot) = idf.binary_search_by_key(&token, |(term_id, _)| *term_id) {
+                    frequencies[slot] += 1;
+                }
+            }
+            let normalization = K1 * (1.0 - B + B * document_length as f32 / average_length);
             let mut score = 0.0f32;
-            for &(term_id, term_idf) in &idf {
-                let frequency = tokens.iter().filter(|&&token| token == term_id).count() as f32;
+            for (slot, (_, term_idf)) in idf.iter().enumerate() {
+                let frequency = frequencies[slot] as f32;
                 if frequency > 0.0 {
                     score += term_idf * frequency * (K1 + 1.0) / (frequency + normalization);
                 }

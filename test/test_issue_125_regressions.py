@@ -737,7 +737,13 @@ def test_truncated_storage_fails_without_rust_panic(tmp_path):
 
     reopened = ApexClient(dirpath=str(root))
     try:
-        with pytest.raises((RuntimeError, OSError), match="Corrupt|corrupt|footer|storage"):
+        # A file truncated below the 256-byte header fails on the header read
+        # before any footer parse, so the explicit EOF wording is accepted too.
+        # The point of this test is that neither path panics.
+        with pytest.raises(
+            (RuntimeError, OSError),
+            match="Corrupt|corrupt|footer|storage|Read past EOF",
+        ):
             reopened.use_table("t")
             reopened.count_rows()
     finally:

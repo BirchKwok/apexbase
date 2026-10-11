@@ -202,6 +202,13 @@ impl ApexStorageImpl {
             } else if let Ok(v) = value.extract::<i64>() {
                 int_columns.insert(col_name.clone(), vec![v]);
                 null_positions.insert(col_name, vec![false]);
+            } else if !value.is_instance_of::<pyo3::types::PyFloat>()
+                && is_integral_scalar(&value)
+            {
+                // An integer outside the i64 range must not be stored as a
+                // rounded float: the value would change silently. Python floats
+                // skip this check, so their path stays untouched.
+                return Err(out_of_range_integer_error(&value));
             } else if let Ok(v) = value.extract::<f64>() {
                 float_columns.insert(col_name.clone(), vec![v]);
                 null_positions.insert(col_name, vec![false]);
@@ -223,17 +230,20 @@ impl ApexStorageImpl {
                     fixedlist_columns_map.insert(col_name.clone(), vec![bytes]);
                     null_positions.insert(col_name, vec![false]);
                 } else {
-                    string_columns.insert(
-                        col_name.clone(),
-                        vec![value.extract::<String>().unwrap_or_default()],
-                    );
+                    // An object that is not a string must not become an empty string: it
+                    // was silently stored as '' and the value was lost. Fail loudly instead;
+                    // `None` remains the explicit way to write NULL.
+                    let text = value
+                        .extract::<String>()
+                        .map_err(|_| super::unsupported_value_error(&value))?;
+                    string_columns.insert(col_name.clone(), vec![text]);
                     null_positions.insert(col_name, vec![false]);
                 }
             } else {
-                string_columns.insert(
-                    col_name.clone(),
-                    vec![value.extract::<String>().unwrap_or_default()],
-                );
+                let text = value
+                    .extract::<String>()
+                    .map_err(|_| super::unsupported_value_error(&value))?;
+                string_columns.insert(col_name.clone(), vec![text]);
                 null_positions.insert(col_name, vec![false]);
             }
         }
@@ -415,7 +425,11 @@ impl ApexStorageImpl {
                     } else if let Ok(v) = value.extract::<String>() {
                         v
                     } else {
-                        return Ok(None);
+                        // A non-string for a string column used to decline this bulk path,
+                        // and the fallback then stored NULL - silent data loss (dropping
+                        // `store({"s": 42})` into NULL). There is no coercion to a string
+                        // here, so fail loudly; `None` stays the explicit way to write NULL.
+                        return Err(super::unsupported_value_error(&value));
                     };
                     string_columns.insert(col_name.clone(), vec![v]);
                     null_positions.insert(col_name, vec![value.is_none()]);
@@ -802,6 +816,11 @@ impl ApexStorageImpl {
                         col_type = Some("fixedlist");
                     } else if item.extract::<i64>().is_ok() {
                         col_type = Some("int");
+                    } else if is_integral_scalar(&item) {
+                        // An integer that does not fit i64 must not be detected as
+                        // a float column: the f64 conversion below would round it
+                        // and the value would be published silently changed.
+                        return Err(out_of_range_integer_error(&item));
                     } else if item.extract::<f64>().is_ok() {
                         col_type = Some("float");
                     } else if item.extract::<&str>().is_ok() {
@@ -825,11 +844,15 @@ impl ApexStorageImpl {
                         let is_null = item.is_none();
                         nulls.push(is_null);
                         if let Some(promoted) = floats.as_mut() {
-                            promoted.push(if is_null {
-                                0.0
+                            if is_null {
+                                promoted.push(0.0);
                             } else {
-                                item.extract::<f64>().unwrap_or(0.0)
-                            });
+                                // An integer that fits i64 is a legitimate member
+                                // of a promoted column; only an out-of-range one
+                                // must be rejected instead of rounded.
+                                reject_out_of_range_integer_element(&item)?;
+                                promoted.push(item.extract::<f64>().unwrap_or(0.0));
+                            }
                             continue;
                         }
                         if is_null {
@@ -838,20 +861,28 @@ impl ApexStorageImpl {
                         }
                         match item.extract::<i64>() {
                             Ok(value) => vals.push(value),
-                            Err(_) => match item.extract::<f64>() {
-                                Ok(value) => {
-                                    let mut promoted: Vec<f64> =
-                                        vals.iter().map(|&v| v as f64).collect();
-                                    promoted.push(value);
-                                    floats = Some(promoted);
+                            Err(_) => {
+                                // Only a genuine float may promote an integer
+                                // column. An integer outside i64 must not be
+                                // absorbed here as a rounded f64.
+                                if is_integral_scalar(&item) {
+                                    return Err(out_of_range_integer_error(&item));
                                 }
-                                Err(_) => {
-                                    // Not a number at all: keep the value absent
-                                    // instead of publishing a fabricated 0.
-                                    vals.push(0);
-                                    *nulls.last_mut().unwrap() = true;
+                                match item.extract::<f64>() {
+                                    Ok(value) => {
+                                        let mut promoted: Vec<f64> =
+                                            vals.iter().map(|&v| v as f64).collect();
+                                        promoted.push(value);
+                                        floats = Some(promoted);
+                                    }
+                                    Err(_) => {
+                                        // Not a number at all: keep the value absent
+                                        // instead of publishing a fabricated 0.
+                                        vals.push(0);
+                                        *nulls.last_mut().unwrap() = true;
+                                    }
                                 }
-                            },
+                            }
                         }
                     }
                     match floats {
@@ -876,6 +907,11 @@ impl ApexStorageImpl {
                         }
                         match item.extract::<f64>() {
                             Ok(value) => {
+                                // A float column still accepts in-range integers
+                                // (they convert exactly enough) but must reject an
+                                // integer that does not fit i64 rather than round
+                                // it silently.
+                                reject_out_of_range_integer_element(&item)?;
                                 nulls.push(false);
                                 vals.push(value);
                             }
@@ -1446,6 +1482,7 @@ impl ApexStorageImpl {
     }
 
     fn delete_where(&self, py: Python<'_>, where_clause: &str) -> PyResult<i64> {
+        let __t = std::time::Instant::now();
         let (table_path, table_name) = self.get_current_table_info()?;
         // Rows a single-row fast path buffered in the warm memtable backend are
         // invisible to this route; publish them before touching the table.
@@ -1457,6 +1494,7 @@ impl ApexStorageImpl {
         // Execute using ApexExecutor
         let base_dir = self.current_base_dir();
         let root_dir = self.root_dir.clone();
+        let __t2 = std::time::Instant::now();
         let exec_result = py.allow_threads(|| {
             crate::Session::new(&base_dir, &table_path)
                 .with_root_dir(&root_dir)
@@ -2081,8 +2119,7 @@ impl ApexStorageImpl {
             let result: PyResult<()> = (|| {
                 for (backend, needs_save) in actions {
                     if needs_save {
-                        backend
-                            .save()
+                        Self::publish_buffered_rows(&backend)
                             .and_then(|_| backend.sync())
                             .map_err(|e| PyIOError::new_err(format!("Failed to flush: {}", e)))?;
                     } else {

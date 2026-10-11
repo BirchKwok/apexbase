@@ -8,6 +8,40 @@ const SYNC_PENDING_MAIN: u8 = 0b001;
 const SYNC_PENDING_DELTA: u8 = 0b010;
 const SYNC_PENDING_DELTASTORE: u8 = 0b100;
 
+/// Page granularity of the point-read page cache.
+const PAGE_CACHE_PAGE_BYTES: usize = 4096;
+/// Default byte budget for one backend's point-read page cache. The cache only
+/// removes repeated soft page faults for hot pages, so 16 MiB (4096 pages) is
+/// far more than any point-read working set needs while keeping a long scan
+/// from pinning the whole file in heap memory.
+const DEFAULT_PAGE_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
+
+/// Byte budget for the whole-column scan buffers (`scan_buf` / `scan_buf_f16`) used by the
+/// vector TopK lanes.
+///
+/// **Unlimited by default**: those buffers are the zero-copy fast lane's working set, and a
+/// default cap made ordinary vector queries stand down — a 128 MB default cost
+/// `Batch quantized TopK L2 (float16)` **+1479%** in the full gate (1M x 128 f16 needs 256 MB).
+/// The cap is therefore opt-in: set `APEX_SCAN_BUFFER_MB` to bound a column (out-of-core runs
+/// do this from the process cap — the OOC harness passes limit/8), leaving the lane to decline
+/// and the caller to read a windowed batch instead. The principled fix, windowed scoring that
+/// bounds RSS without losing the lane, is still open (OOC-6).
+const DEFAULT_SCAN_BUFFER_BUDGET_BYTES: usize = usize::MAX;
+
+/// `APEX_SCAN_BUFFER_MB` parsing, kept pure so it can be tested without mutating the
+/// process environment: `0` means unlimited, an unparsable value falls back to the
+/// default budget.
+pub(crate) fn parse_scan_buffer_budget(raw: Option<&str>) -> usize {
+    match raw {
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(0) => usize::MAX,
+            Ok(mb) => mb.saturating_mul(1024 * 1024),
+            Err(_) => DEFAULT_SCAN_BUFFER_BUDGET_BYTES,
+        },
+        None => DEFAULT_SCAN_BUFFER_BUDGET_BYTES,
+    }
+}
+
 struct DeltaStringIndexCache {
     len: u64,
     modified: std::time::SystemTime,
@@ -84,6 +118,11 @@ fn parse_v4_row_group(
     } else {
         0
     };
+    if encoding_version > RG_ENCODING_VERSION {
+        return Err(err_data(format!(
+            "row group encoding version {encoding_version} is newer than this build supports ({RG_ENCODING_VERSION})"
+        )));
+    }
     let id_encoding = rg_buf.get(30).copied().unwrap_or(RG_IDS_PLAIN);
 
     let decompressed = decompress_rg_body(compress_flag, &rg_buf[32..])?;
@@ -147,7 +186,7 @@ fn parse_v4_row_group(
             .get(col_idx)
             .map(|(_, ct)| *ct)
             .unwrap_or(ColumnType::Null);
-        let (mut col, consumed) = if encoding_version >= 1 {
+        let (mut col, consumed) = if encoding_version == RG_ENCODING_VERSION {
             read_column_encoded(&body[pos..], col_type)?
         } else {
             ColumnData::from_bytes_typed(&body[pos..], col_type)?
@@ -626,9 +665,10 @@ fn flush_streamed_out_rg<W: std::io::Write + std::io::Seek>(
     all_zone_maps: &mut RgZoneMaps,
     all_rg_col_offsets: &mut Vec<Vec<u32>>,
     compression: CompressionType,
-    implicit_ids_ok: bool,
     written_rows: &mut u64,
     stats: &mut [StreamingColumnStats],
+    implicit_ids_ok: bool,
+    encoding_options: ColumnEncodingOptions,
 ) -> io::Result<()> {
     let n = ids.len();
     if n == 0 {
@@ -650,6 +690,7 @@ fn flush_streamed_out_rg<W: std::io::Write + std::io::Seek>(
         all_rg_col_offsets,
         compression,
         implicit_ids_ok,
+        encoding_options,
     )?;
     *first_rg = false;
     *written_rows += n as u64;
@@ -734,11 +775,25 @@ pub struct OnDemandStorage {
     /// Row Group body compression algorithm. Default: None (no compression).
     /// Persisted in header flags bits 0-1. Can only be set on empty tables.
     compression: std::sync::atomic::AtomicU8,
+    /// End (exclusive) of the row ids this backend already reserved from the
+    /// table's shared high-water mark.
+    id_pool_end: AtomicU64,
+    /// Store `Float32` columns at 4 bytes/value (header flag bit 2). Off unless
+    /// the table opted in; see `FLAG_NARROW_FLOAT32`.
+    narrow_float32: std::sync::atomic::AtomicBool,
     /// User-space page cache for retrieve_rcix point lookups.
     /// Caches 4KB file pages as heap memory to avoid mmap page-fault overhead on macOS.
     /// On-demand: only pages actually accessed are cached (~13 pages = ~52KB per backend).
     /// Invalidated after every write (save_v4).
+    ///
+    /// Bounded by `page_cache_budget`: the pread path can touch one page per
+    /// requested row, so without a budget the cache grows with every distinct
+    /// page a workload reads (up to the whole file, per backend).
     pub(crate) page_cache: RwLock<HashMap<u64, Box<[u8; 4096]>>>,
+    /// Decompressed row-group bodies (see `decompressed_rg_body`).
+    pub(crate) decompressed_rg_cache: RwLock<DecompressedRgCache>,
+    /// Byte budget for `page_cache`; see `cache_page`.
+    page_cache_budget: std::sync::atomic::AtomicUsize,
     /// Bounded cache of decoded, NULL-free numeric columns used by repeated
     /// analytical scans. Entries are shared by Arc so GROUP BY, filtered
     /// aggregation, and TopK paths can rescan values without copying them.
@@ -766,10 +821,6 @@ pub struct OnDemandStorage {
     pub(crate) scan_buf_f16_file_size: std::sync::atomic::AtomicU64,
     /// Column name whose f16 data is currently in scan_buf_f16 (empty = none).
     pub(crate) scan_buf_f16_col: std::sync::Mutex<String>,
-    /// Global lock for thread-safe concurrent access to file and mmap.
-    /// This prevents "File not open" and "V4 footer: schema overflow" errors
-    /// when multiple threads access the storage simultaneously.
-    pub(crate) global_lock: parking_lot::RwLock<()>,
 }
 
     /// Result of parsing a WAL for crash recovery.
@@ -873,7 +924,22 @@ impl OnDemandStorage {
         durability: super::DurabilityLevel,
         schema: OnDemandSchema,
     ) -> io::Result<Self> {
-        let header = OnDemandHeader::new();
+        let mut header = OnDemandHeader::new();
+        // Persist the deployment-wide opt-in so reopening the table keeps the
+        // narrow encoding (and so the flag is visible to other processes).
+        let narrow_float32 = narrow_float32_requested();
+        if narrow_float32 {
+            header.flags |= FLAG_NARROW_FLOAT32;
+            // A `Float32` column will be stored at its declared width, which is
+            // a V5-only payload: declare the file as V5.
+            if schema
+                .columns
+                .iter()
+                .any(|(_, column_type)| matches!(column_type, ColumnType::Float32))
+            {
+                header.version = FORMAT_VERSION_V5;
+            }
+        }
         let columns = schema
             .columns
             .iter()
@@ -907,6 +973,7 @@ impl OnDemandStorage {
             columns: RwLock::new(columns),
             ids: RwLock::new(Vec::new()),
             next_id: AtomicU64::new(crate::storage::FIRST_ROW_ID),
+            id_pool_end: AtomicU64::new(crate::storage::FIRST_ROW_ID),
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(Vec::new()),
             id_to_idx: RwLock::new(Some(ahash::AHashMap::new())),
@@ -924,7 +991,12 @@ impl OnDemandStorage {
             delta_store: RwLock::new(DeltaStore::new(path)),
             sync_pending: AtomicU8::new(0),
             compression: std::sync::atomic::AtomicU8::new(CompressionType::None as u8),
+            narrow_float32: std::sync::atomic::AtomicBool::new(narrow_float32_requested()),
             page_cache: RwLock::new(HashMap::new()),
+            decompressed_rg_cache: RwLock::new(DecompressedRgCache::default()),
+            page_cache_budget: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_PAGE_CACHE_BUDGET_BYTES,
+            ),
             numeric_scan_cache: RwLock::new(Vec::new()),
             numeric_scan_cache_populated: AtomicBool::new(false),
             scan_buf: std::sync::Mutex::new(Vec::new()),
@@ -933,7 +1005,6 @@ impl OnDemandStorage {
             scan_buf_f16: std::sync::Mutex::new(Vec::new()),
             scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_f16_col: std::sync::Mutex::new(String::new()),
-            global_lock: parking_lot::RwLock::new(()),
         };
 
         if !in_memory {
@@ -1105,6 +1176,7 @@ impl OnDemandStorage {
 
         // Read compression type from header flags
         let comp_type = CompressionType::from_flags(header.flags);
+        let narrow_float32 = header.flags & FLAG_NARROW_FLOAT32 != 0;
 
         let storage = Self {
             path: path.to_path_buf(),
@@ -1119,6 +1191,7 @@ impl OnDemandStorage {
             columns: RwLock::new(columns),
             ids: RwLock::new(Vec::new()), // Empty - lazy loaded when needed
             next_id: AtomicU64::new(final_next_id),
+            id_pool_end: AtomicU64::new(final_next_id),
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
             id_to_idx: RwLock::new(None), // Lazy loaded when needed
@@ -1148,7 +1221,12 @@ impl OnDemandStorage {
             ),
             sync_pending: AtomicU8::new(0),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
+            narrow_float32: std::sync::atomic::AtomicBool::new(narrow_float32),
             page_cache: RwLock::new(HashMap::new()),
+            decompressed_rg_cache: RwLock::new(DecompressedRgCache::default()),
+            page_cache_budget: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_PAGE_CACHE_BUDGET_BYTES,
+            ),
             numeric_scan_cache: RwLock::new(Vec::new()),
             numeric_scan_cache_populated: AtomicBool::new(false),
             scan_buf: std::sync::Mutex::new(Vec::new()),
@@ -1157,7 +1235,6 @@ impl OnDemandStorage {
             scan_buf_f16: std::sync::Mutex::new(Vec::new()),
             scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_f16_col: std::sync::Mutex::new(String::new()),
-            global_lock: parking_lot::RwLock::new(()),
         };
 
         // Crash recovery: repair torn delta tails on write opens, roll back
@@ -1240,6 +1317,7 @@ impl OnDemandStorage {
         let deleted = vec![0u8; deleted_len];
         let cached_fo = header.footer_offset;
         let comp_type = CompressionType::from_flags(header.flags);
+        let narrow_float32 = header.flags & FLAG_NARROW_FLOAT32 != 0;
 
         // Crash convergence: a WAL-backed table may hold committed records
         // that never reached the table (kill or failed commit between the
@@ -1286,6 +1364,7 @@ impl OnDemandStorage {
             columns: RwLock::new(columns),
             ids: RwLock::new(Vec::new()),
             next_id: AtomicU64::new(next_id),
+            id_pool_end: AtomicU64::new(next_id),
             nulls: RwLock::new(nulls),
             deleted: RwLock::new(deleted),
             id_to_idx: RwLock::new(None),
@@ -1312,7 +1391,12 @@ impl OnDemandStorage {
             ),
             sync_pending: AtomicU8::new(0),
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
+            narrow_float32: std::sync::atomic::AtomicBool::new(narrow_float32),
             page_cache: RwLock::new(HashMap::new()),
+            decompressed_rg_cache: RwLock::new(DecompressedRgCache::default()),
+            page_cache_budget: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_PAGE_CACHE_BUDGET_BYTES,
+            ),
             numeric_scan_cache: RwLock::new(Vec::new()),
             numeric_scan_cache_populated: AtomicBool::new(false),
             scan_buf: std::sync::Mutex::new(Vec::new()),
@@ -1321,7 +1405,6 @@ impl OnDemandStorage {
             scan_buf_f16: std::sync::Mutex::new(Vec::new()),
             scan_buf_f16_file_size: std::sync::atomic::AtomicU64::new(0),
             scan_buf_f16_col: std::sync::Mutex::new(String::new()),
-            global_lock: parking_lot::RwLock::new(()),
         };
 
         if let Some(scan) = &wal_scan {
@@ -1428,22 +1511,6 @@ impl OnDemandStorage {
             .fetch_and(!SYNC_PENDING_DELTASTORE, Ordering::SeqCst);
     }
 
-    /// Acquire global read lock for thread-safe concurrent reads.
-    /// Returns a guard that releases the lock when dropped.
-    /// Multiple readers can hold the lock simultaneously.
-    #[inline]
-    pub fn read_lock(&self) -> parking_lot::RwLockReadGuard<'_, ()> {
-        self.global_lock.read()
-    }
-
-    /// Acquire global write lock for thread-safe writes.
-    /// Returns a guard that releases the lock when dropped.
-    /// Only one writer can hold the lock; readers are blocked while held.
-    #[inline]
-    pub fn write_lock(&self) -> parking_lot::RwLockWriteGuard<'_, ()> {
-        self.global_lock.write()
-    }
-
     /// Estimate current in-memory data size in bytes
     pub fn estimate_memory_bytes(&self) -> u64 {
         let columns = self.columns.read();
@@ -1514,15 +1581,76 @@ impl OnDemandStorage {
             dst[written..written + to_copy].copy_from_slice(&buf[page_off..page_off + to_copy]);
             written += to_copy;
             cur_off += to_copy as u64;
-            self.page_cache.write().insert(page_num, Box::new(buf));
+            self.cache_page(page_num, Box::new(buf));
         }
         Ok(())
     }
 
+    /// Insert one 4 KiB page into the bounded point-read page cache.
+    ///
+    /// The cache exists to remove repeated soft page faults for hot pages, so a
+    /// bounded window is enough: once the budget is reached the window is
+    /// dropped and refilled. That keeps per-backend memory proportional to
+    /// `page_cache_budget` instead of to the number of distinct pages a
+    /// long-running workload happens to touch.
+    fn cache_page(&self, page_num: u64, page: Box<[u8; 4096]>) {
+        let budget_pages = (self
+            .page_cache_budget
+            .load(Ordering::Relaxed)
+            / PAGE_CACHE_PAGE_BYTES)
+            .max(1);
+        let mut cache = self.page_cache.write();
+        if cache.len() >= budget_pages {
+            cache.clear();
+        }
+        cache.insert(page_num, page);
+    }
+
+    /// Number of cached 4 KiB pages (test hook).
+    #[cfg(test)]
+    pub(crate) fn page_cache_len(&self) -> usize {
+        self.page_cache.read().len()
+    }
+
+    /// Override the page-cache byte budget (test hook).
+    #[cfg(test)]
+    pub(crate) fn set_page_cache_budget_bytes(&self, bytes: usize) {
+        self.page_cache_budget.store(bytes, Ordering::Relaxed);
+    }
+
     /// Invalidate the user-space page cache and raw Arrow batch cache.
     /// Called after every write (save_v4, append_row_group, open_v4_data).
+    /// Decompressed body of a compressed row group, cached across point reads.
+    ///
+    /// A compressed row group carries no RCIX, so a point read has to decode the
+    /// group before it can find one row; without this cache every read paid the
+    /// full decompression again (a zstd point read measured ~1.43 ms against
+    /// 0.014 ms on the plain twin). Returns `None` for uncompressed groups, where
+    /// the caller keeps using the mmap slice directly.
+    pub(crate) fn decompressed_rg_body(
+        &self,
+        rg_offset: u64,
+        rg_end: u64,
+        compress_flag: u8,
+        raw: &[u8],
+    ) -> io::Result<Option<std::sync::Arc<Vec<u8>>>> {
+        if compress_flag == RG_COMPRESS_NONE {
+            return Ok(None);
+        }
+        let key = (rg_offset, rg_end - rg_offset);
+        if let Some(body) = self.decompressed_rg_cache.read().get(key) {
+            return Ok(Some(body));
+        }
+        let decompressed = decompress_rg_body(compress_flag, raw)?.unwrap_or_default();
+        let body = std::sync::Arc::new(decompressed);
+        let mut cache = self.decompressed_rg_cache.write();
+        cache.insert(key, std::sync::Arc::clone(&body));
+        Ok(Some(body))
+    }
+
     pub(crate) fn invalidate_page_cache(&self) {
         self.page_cache.write().clear();
+        self.decompressed_rg_cache.write().clear();
         if self
             .numeric_scan_cache_populated
             .swap(false, std::sync::atomic::Ordering::AcqRel)
@@ -1593,6 +1721,62 @@ impl OnDemandStorage {
     /// Set compression type. Only effective on empty tables (row_count == 0).
     /// The setting is persisted in the header flags and survives restarts.
     /// Returns Ok(true) if applied, Ok(false) if table is non-empty (no-op).
+    /// Whether this table stores `Float32` columns at their declared width.
+    pub(crate) fn width_fidelity(&self) -> bool {
+        self.narrow_float32.load(Ordering::Relaxed)
+    }
+
+    /// File format version this table's layout requires.
+    ///
+    /// A `Float32` column stored at its declared width uses a V5-only payload,
+    /// so the file declares version 5. Layouts that stay within V4 rules keep
+    /// declaring version 4 and remain readable by older builds.
+    pub(crate) fn required_format_version(&self) -> u32 {
+        let narrow_float = self.width_fidelity()
+            && self
+                .schema
+                .read()
+                .columns
+                .iter()
+                .any(|(_, column_type)| matches!(column_type, ColumnType::Float32));
+        if narrow_float {
+            FORMAT_VERSION_V5
+        } else {
+            FORMAT_VERSION_V4
+        }
+    }
+
+    /// Column-encoding options for the next Row Group this table writes.
+    fn column_encoding_options(&self) -> ColumnEncodingOptions {
+        ColumnEncodingOptions {
+            narrow_float32: self.width_fidelity(),
+        }
+    }
+
+    /// Opt an empty table into width fidelity (4 bytes per `Float32` value).
+    ///
+    /// Only files written after this call use the narrow encoding, and only
+    /// builds that know `COL_ENCODING_PLAIN_F32` can read them, so it is an
+    /// explicit opt-in rather than a default.
+    pub fn set_width_fidelity(&self, enabled: bool) -> io::Result<bool> {
+        if self.active_count.load(Ordering::SeqCst) > 0
+            || self.persisted_row_count.load(Ordering::SeqCst) > 0
+        {
+            return Ok(false);
+        }
+        self.narrow_float32.store(enabled, Ordering::SeqCst);
+        {
+            let mut header = self.header.write();
+            if enabled {
+                header.flags |= FLAG_NARROW_FLOAT32;
+            } else {
+                header.flags &= !FLAG_NARROW_FLOAT32;
+            }
+        }
+        self.save()?;
+        Ok(true)
+    }
+
     pub fn set_compression(&self, comp: CompressionType) -> io::Result<bool> {
         if self.active_count.load(Ordering::SeqCst) > 0
             || self.persisted_row_count.load(Ordering::SeqCst) > 0
@@ -2114,15 +2298,160 @@ impl OnDemandStorage {
         let Some(physical_base) = self.persisted_physical_base_row_count()? else {
             return Ok(None);
         };
-        self.ensure_ids_loaded()?;
-        let deleted = self.deleted.read().clone();
-        Ok(Some((physical_base, deleted)))
+        Ok(Some((physical_base, self.persisted_deletion_bitmap()?)))
+    }
+
+    /// Budget for a whole-column scan buffer, from `APEX_SCAN_BUFFER_MB`
+    /// (`0` = unlimited). Read per call: the lanes run once per query, so the
+    /// environment lookup is irrelevant next to the scan it guards, and tests can
+    /// toggle it between queries.
+    pub(crate) fn scan_buffer_budget_bytes(&self) -> usize {
+        parse_scan_buffer_budget(std::env::var("APEX_SCAN_BUFFER_MB").ok().as_deref())
+    }
+
+    /// The row-group deletion vector, read straight from the mmap row groups.
+    ///
+    /// `self.deleted` tracks the *buffer* rows, and an append-only write buffer
+    /// starts after the persisted base, so it is empty (or shifted) exactly when a
+    /// merged reader needs the persisted vector most.
+    pub(crate) fn persisted_deletion_bitmap(&self) -> io::Result<Vec<u8>> {
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(Vec::new());
+        };
+        let file_guard = self.file.read();
+        let Some(file) = file_guard.as_ref() else {
+            return Ok(Vec::new());
+        };
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+
+        let total_rows: usize = footer
+            .row_groups
+            .iter()
+            .map(|rg| rg.row_count as usize)
+            .sum();
+        let mut result: Vec<u8> = Vec::with_capacity((total_rows + 7) / 8);
+        for rg_meta in &footer.row_groups {
+            let rg_rows = rg_meta.row_count as usize;
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap_ref.len() {
+                break;
+            }
+            let rg_bytes = &mmap_ref[rg_meta.offset as usize..rg_end];
+            let compress_flag = if rg_bytes.len() >= 32 {
+                rg_bytes[28]
+            } else {
+                RG_COMPRESS_NONE
+            };
+            let decompressed_buf = self.decompressed_rg_body(
+                rg_meta.offset,
+                rg_meta.offset + rg_meta.data_size,
+                compress_flag,
+                &rg_bytes[32..],
+            )?;
+            let body: &[u8] = decompressed_buf
+                .as_ref()
+                .map(|buf| buf.as_slice())
+                .unwrap_or(&rg_bytes[32..]);
+            // The deletion vector follows the ID section, so the IDs can be skipped.
+            let pos = rg_id_section_len(
+                rg_rows,
+                rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN),
+            );
+            let del_vec_len = (rg_rows + 7) / 8;
+            if pos + del_vec_len > body.len() {
+                break;
+            }
+            result.extend_from_slice(&body[pos..pos + del_vec_len]);
+        }
+        Ok(result)
+    }
+
+    /// Make sure the next `count` ids come from a range this process owns.
+    ///
+    /// Every writer derives its next id from the base file it read, so two
+    /// processes used to hand out the same ids: the rows survived but their
+    /// identity was shared (`retrieve`/`DELETE WHERE _id = x` hit one of them).
+    /// Reserving against the table's shared high-water mark makes the ranges
+    /// disjoint.
+    ///
+    /// The reservation is idempotent for nested write paths: `id_pool_end` marks
+    /// how far the ids already reserved for this backend reach, so an inner
+    /// insert that runs before the outer one allocates does not burn a second
+    /// range (which showed up as skipped ids).
+    #[inline]
+    pub(crate) fn ensure_id_block(&self, count: usize) -> io::Result<()> {
+        if count == 0 || self.in_memory {
+            return Ok(());
+        }
+        let next = self.next_id.load(Ordering::SeqCst);
+        let pool_end = self.id_pool_end.load(Ordering::SeqCst);
+        if next.saturating_add(count as u64) <= pool_end {
+            return Ok(());
+        }
+        let base = crate::storage::epoch::reserve_row_ids(&self.path, next, count as u64);
+        self.next_id.store(base, Ordering::SeqCst);
+        self.id_pool_end
+            .store(base.saturating_add(count as u64), Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Rows currently held in the in-memory buffer (a base mirror plus appended
+    /// rows, or appended rows alone for a tail-only buffer).
+    pub fn buffered_row_count(&self) -> usize {
+        self.ids.read().len()
+    }
+
+    /// Buffered rows that are not part of this backend's base snapshot.
+    ///
+    /// A buffer that mirrors the loaded base holds those rows first, so the
+    /// appended prefix is the difference from `persisted_row_count` — the count
+    /// this backend read or wrote last, which stays the *snapshot* even when the
+    /// file itself has moved on since (another process committed). A tail-only
+    /// buffer holds appended rows alone, so all of them are new.
+    pub fn rows_buffered_since_snapshot(&self) -> usize {
+        let buffered = self.buffered_row_count();
+        if self.v4_base_loaded.load(Ordering::SeqCst) {
+            buffered.saturating_sub(self.persisted_row_count() as usize)
+        } else {
+            buffered
+        }
     }
 
     /// Persisted base row count in the active-row space used by
     /// `read_columns` when no row-group deletion vector is present.
     pub(crate) fn header_row_count(&self) -> u64 {
         self.header.read().row_count
+    }
+
+    /// `row_count` field of the base file's on-disk header, or `None` for an
+    /// in-memory database.
+    ///
+    /// A writer that keeps a long-lived buffer compares this with the count it
+    /// snapshotted to notice that another process committed in the meantime; its
+    /// cached header/footer would otherwise still describe the older file.
+    pub fn on_disk_header_row_count(&self) -> io::Result<Option<u64>> {
+        if self.in_memory {
+            return Ok(None);
+        }
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(&self.path)?;
+        let mut buffer = [0u8; 8];
+        file.seek(SeekFrom::Start(16))?;
+        file.read_exact(&mut buffer)?;
+        Ok(Some(u64::from_le_bytes(buffer)))
+    }
+
+    /// Rows in the persisted row groups (the physical base), excluding buffered
+    /// appended rows. This is the row-space origin of an overlay tail.
+    pub(crate) fn persisted_row_group_rows(&self) -> io::Result<usize> {
+        if let Some(footer) = self.v4_footer.read().as_ref() {
+            return Ok(footer_physical_rows(footer));
+        }
+        Ok(self
+            .get_or_load_footer()?
+            .map(|footer| footer_physical_rows(&footer))
+            .unwrap_or(0))
     }
 
     /// Get the number of pending delta updates.
@@ -2138,6 +2467,11 @@ impl OnDemandStorage {
     /// Check whether pending DeltaStore updates modify a specific column.
     pub fn delta_updates_column(&self, column_name: &str) -> bool {
         self.delta_store.read().updates_column(column_name)
+    }
+
+    /// Every pending DeltaStore cell update as `(row_id, column, new_value)`.
+    pub fn delta_updated_cells(&self) -> Vec<(u64, String, crate::data::Value)> {
+        self.delta_store.read().updated_cells()
     }
 
     /// Return row IDs whose pending DeltaStore update sets `column_name` to `value`.
@@ -3653,6 +3987,7 @@ impl OnDemandStorage {
         drop(schema);
 
         // Allocate IDs
+        self.ensure_id_block(rows.len())?;
         let mut ids = Vec::with_capacity(rows.len());
         for _ in 0..rows.len() {
             ids.push(self.next_id.fetch_add(1, Ordering::SeqCst));
@@ -3793,6 +4128,7 @@ impl OnDemandStorage {
         }
 
         // Allocate IDs
+        self.ensure_id_block(row_count)?;
         let mut ids = Vec::with_capacity(row_count);
         for _ in 0..row_count {
             ids.push(self.next_id.fetch_add(1, Ordering::SeqCst));
@@ -3854,15 +4190,27 @@ impl OnDemandStorage {
     /// bursts fast while preserving cross-process visibility through the
     /// existing delta merge path.
     pub fn spill_pending_v4_rows_to_delta(&self) -> io::Result<bool> {
+        let pending = self.pending_v4_in_memory_rows();
+        if pending == 0 {
+            return Ok(false);
+        }
+        let ids_len = self.ids.read().len();
+        self.spill_pending_v4_rows_to_delta_from(ids_len.saturating_sub(pending))
+    }
+
+    /// Spill the buffered rows that start at `pending_start` into the append sidecar.
+    ///
+    /// The caller may know the exact first buffered row index — a memtable writer
+    /// counts the rows it appended — which stays correct even after another writer
+    /// changed the persisted base under this backend: the cached footer would then
+    /// report a *smaller* on-disk row count and misclassify base rows as pending.
+    /// Preserving the original ids keeps the rows addressable, and the sidecar is
+    /// merged on top of whatever the base now contains.
+    pub fn spill_pending_v4_rows_to_delta_from(&self, pending_start: usize) -> io::Result<bool> {
         if self.in_memory {
             return Ok(false);
         }
         if !self.is_v4_format() {
-            return Ok(false);
-        }
-
-        let pending = self.pending_v4_in_memory_rows();
-        if pending == 0 {
             return Ok(false);
         }
 
@@ -3878,7 +4226,15 @@ impl OnDemandStorage {
                 .sum();
             (rows, footer.schema.columns.clone())
         };
-        if on_disk_rows == 0 {
+        // The *file* decides whether a base exists, not this backend's cached
+        // footer: a buffer opened on an empty table still sees an empty footer
+        // after another process published rows, and refusing there would force a
+        // full save over that process's rows.
+        let file_rows = self
+            .on_disk_header_row_count()?
+            .map(|rows| rows as usize)
+            .unwrap_or(on_disk_rows);
+        if file_rows == 0 {
             // New/empty tables must write the initial base file so schema/footer metadata
             // is persisted together with the first rows.
             return Ok(false);
@@ -3886,10 +4242,10 @@ impl OnDemandStorage {
 
         let ids = self.ids.read();
         let ids_len = ids.len();
-        if ids_len < pending {
+        if pending_start >= ids_len {
             return Ok(false);
         }
-        let pending_start = ids_len - pending;
+        let pending = ids_len - pending_start;
         // Whether the in-memory prefix *is* the persisted base is decided by
         // `v4_base_loaded`, never by the first buffered ID. A loaded base does not
         // have to start at `_id` 1 — after `replace()` re-appends a row the base
@@ -3897,7 +4253,13 @@ impl OnDemandStorage {
         // both guards below, so the replacement's delete of the old copy was
         // dropped and the base copy stayed visible next to the appended one.
         let base_buffered = self.v4_base_loaded.load(Ordering::SeqCst);
-        if base_buffered && pending_start < on_disk_rows {
+        // The snapshot this backend read or wrote last is the boundary that counts:
+        // `on_disk_rows` comes from the (possibly freshly reloaded) footer and would
+        // report the *current* file, so a buffer opened on an empty base would look
+        // as if current base rows were mixed into its prefix — exactly the case a
+        // stale publish has to replay.
+        let snapshot_rows = self.persisted_row_count() as usize;
+        if base_buffered && pending_start < snapshot_rows {
             // Some persisted base rows are mixed into the in-memory prefix. Fall back to a
             // full save so we do not misclassify base rows as pending append-only rows.
             return Ok(false);
@@ -4241,7 +4603,7 @@ impl OnDemandStorage {
         }
 
         let header = self.header.read();
-        let is_v4 = header.version == FORMAT_VERSION_V4 && header.footer_offset > 0;
+        let is_v4 = supported_file_version(header.version) && header.footer_offset > 0;
         let base_loaded = self.v4_base_loaded.load(Ordering::SeqCst);
         drop(header);
 
@@ -4296,7 +4658,7 @@ impl OnDemandStorage {
         // Serialize base-file replacement per table (see `table_save_lock`).
         let _rewrite_guard = crate::storage::table_save_lock::rewrite_lock(&self.path);
         let header = self.header.read();
-        if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
+        if !supported_file_version(header.version) || header.footer_offset == 0 {
             return Err(err_data("streaming V4 rewrite requires a V4 base file"));
         }
         let rg_size_target = (header.row_group_size as usize).max(1024);
@@ -4393,11 +4755,10 @@ impl OnDemandStorage {
             .iter()
             .map(|(_, column_type)| StreamingColumnStats::new(*column_type))
             .collect();
-        let implicit_ids_ok = self
-            .path
-            .components()
-            .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"));
         let compression = self.compression();
+        // V4 enablement gate for the implicit-ID encoding (temporary tables).
+        let implicit_ids_ok = implicit_ids_allowed(&self.path);
+        let encoding_options = self.column_encoding_options();
 
         macro_rules! flush_out_rg {
             () => {{
@@ -4413,9 +4774,10 @@ impl OnDemandStorage {
                     &mut all_zone_maps,
                     &mut all_rg_col_offsets,
                     compression,
-                    implicit_ids_ok,
                     &mut written_rows,
                     &mut column_stats,
+                    implicit_ids_ok,
+                    encoding_options,
                 )?;
                 out_ids.len()
             }};
@@ -4563,6 +4925,7 @@ impl OnDemandStorage {
                 &mut all_rg_col_offsets,
                 compression,
                 implicit_ids_ok,
+                encoding_options,
             )?;
         }
 
@@ -4715,6 +5078,7 @@ impl OnDemandStorage {
         all_rg_col_offsets: &mut Vec<Vec<u32>>,
         compression: CompressionType,
         implicit_ids_ok: bool,
+        encoding_options: ColumnEncodingOptions,
     ) -> io::Result<()> {
         let chunk_rows = chunk_end - chunk_start;
         let col_count = schema_cols.len();
@@ -4743,11 +5107,7 @@ impl OnDemandStorage {
         let chunk_ids = &ids[chunk_start..chunk_end];
         let min_id = chunk_ids.iter().copied().min().unwrap_or(0);
         let max_id = chunk_ids.iter().copied().max().unwrap_or(0);
-        let id_encoding = if implicit_ids_ok && ids_are_contiguous(chunk_ids) {
-            RG_IDS_IMPLICIT_CONTIGUOUS
-        } else {
-            RG_IDS_PLAIN
-        };
+        let id_encoding = rg_id_encoding_for(chunk_ids, implicit_ids_ok);
         let id_section_len = rg_id_section_len(chunk_rows, id_encoding);
         let null_bitmap_len = (chunk_rows + 7) / 8;
         let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + chunk_rows * col_count);
@@ -4778,6 +5138,14 @@ impl OnDemandStorage {
                 if is_first_rg {
                     let actual_type = match processed {
                         ColumnData::StringDict { .. } => ColumnType::StringDict,
+                        // The encoder drops dictionary encoding below 1000 rows, which a
+                        // delete-then-compact can cross. Recording the *old* schema type
+                        // here left the footer claiming a dictionary while the body held
+                        // plain strings, and every reader that takes the column type from
+                        // the schema (the length-prefixed row groups) then parsed plain
+                        // bytes as a dictionary: `SELECT s` silently returned '' and
+                        // `GROUP BY s` failed with "StringDict dict_offsets truncated".
+                        ColumnData::String { .. } => ColumnType::String,
                         _ => schema_cols[col_idx].1,
                     };
                     actual_col_types.push(actual_type);
@@ -4786,7 +5154,7 @@ impl OnDemandStorage {
                 let chunk_nulls =
                     Self::slice_null_bitmap(&nulls[col_idx], chunk_start, chunk_end);
                 bw.write_all(&chunk_nulls)?;
-                write_column_encoded(processed, schema_cols[col_idx].1, &mut bw)?;
+                write_column_encoded(processed, schema_cols[col_idx].1, &mut bw, encoding_options)?;
             }
             all_rg_col_offsets.push(rg_col_offsets);
         }
@@ -4800,75 +5168,34 @@ impl OnDemandStorage {
         writer.write_all(&[compress_flag, 1, id_encoding, 0])?;
         writer.write_all(&disk_body)?;
 
-        // Per-RG zone maps (numeric min/max; string byte-length min/max).
-        let mut rg_zmaps: Vec<RgColumnZoneMap> = Vec::new();
-        for col_idx in 0..col_count {
-            match &columns[col_idx] {
-                ColumnData::Int64(data) => {
-                    let slice = &data[chunk_start..chunk_end];
-                    if !slice.is_empty() {
-                        let (mut mn, mut mx) = (i64::MAX, i64::MIN);
-                        for &v in slice {
-                            mn = mn.min(v);
-                            mx = mx.max(v);
-                        }
-                        rg_zmaps.push(RgColumnZoneMap {
-                            col_idx: col_idx as u16,
-                            min_bits: mn,
-                            max_bits: mx,
-                            has_nulls: false,
-                            is_float: false,
-                        });
-                    }
+        // Per-RG zone maps (numeric min/max; string length + value + tail
+        // ranges; bool bit range). Columns are independent, so the shared
+        // builder computes them in parallel for a chunk large enough to matter:
+        // the per-value string scan is the append-time cost of these zones.
+        let rg_zmaps: Vec<RgColumnZoneMap> = {
+            let per_column = || -> Vec<Vec<RgColumnZoneMap>> {
+                if chunk_end.saturating_sub(chunk_start) < ZONE_MAP_PAR_MIN_ROWS {
+                    return columns
+                        .iter()
+                        .enumerate()
+                        .map(|(col_idx, column)| {
+                            column_zone_maps(column, None, col_idx, chunk_start, chunk_end)
+                        })
+                        .collect();
                 }
-                ColumnData::Float64(data) => {
-                    let slice = &data[chunk_start..chunk_end];
-                    if !slice.is_empty() {
-                        let (mut mn, mut mx) = (f64::INFINITY, f64::NEG_INFINITY);
-                        for &v in slice {
-                            if v < mn {
-                                mn = v;
-                            }
-                            if v > mx {
-                                mx = v;
-                            }
-                        }
-                        rg_zmaps.push(RgColumnZoneMap {
-                            col_idx: col_idx as u16,
-                            min_bits: mn.to_bits() as i64,
-                            max_bits: mx.to_bits() as i64,
-                            has_nulls: false,
-                            is_float: true,
-                        });
-                    }
-                }
-                ColumnData::String { offsets, .. } => {
-                    let end_idx = chunk_end.min(offsets.len().saturating_sub(1));
-                    if end_idx > chunk_start {
-                        let (mut mn, mut mx) = (u64::MAX, 0u64);
-                        for i in chunk_start..end_idx {
-                            let len = offsets[i + 1].saturating_sub(offsets[i]);
-                            if len < mn {
-                                mn = len;
-                            }
-                            if len > mx {
-                                mx = len;
-                            }
-                        }
-                        if mn <= mx {
-                            rg_zmaps.push(RgColumnZoneMap {
-                                col_idx: col_idx as u16,
-                                min_bits: mn as i64,
-                                max_bits: mx as i64,
-                                has_nulls: false,
-                                is_float: false,
-                            });
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+                use rayon::prelude::*;
+                columns
+                    .par_iter()
+                    .enumerate()
+                    .map(|(col_idx, column)| {
+                        column_zone_maps(column, None, col_idx, chunk_start, chunk_end)
+                    })
+                    .collect()
+            };
+            let mut parts = per_column();
+            parts.drain(..).flatten().collect()
+        };
+
         all_zone_maps.push(rg_zmaps);
 
         let rg_end = writer.stream_position()?;
@@ -4895,7 +5222,7 @@ impl OnDemandStorage {
         // Serialize base-file replacement per table (see `table_save_lock`).
         let _rewrite_guard = crate::storage::table_save_lock::rewrite_lock(&self.path);
         let header = self.header.read();
-        if header.version != FORMAT_VERSION_V4 || header.footer_offset == 0 {
+        if !supported_file_version(header.version) || header.footer_offset == 0 {
             return Err(err_data("rewrite_v4_drop_columns requires a V4 base file"));
         }
         let rg_size_target = (header.row_group_size as usize).max(1024);
@@ -4981,11 +5308,10 @@ impl OnDemandStorage {
             .iter()
             .map(|(_, column_type)| StreamingColumnStats::new(*column_type))
             .collect();
-        let implicit_ids_ok = self
-            .path
-            .components()
-            .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"));
         let compression = self.compression();
+        // V4 enablement gate for the implicit-ID encoding (temporary tables).
+        let implicit_ids_ok = implicit_ids_allowed(&self.path);
+        let encoding_options = self.column_encoding_options();
 
         macro_rules! flush_out_rg {
             () => {{
@@ -5001,9 +5327,10 @@ impl OnDemandStorage {
                     &mut all_zone_maps,
                     &mut all_rg_col_offsets,
                     compression,
-                    implicit_ids_ok,
                     &mut written_rows,
                     &mut column_stats,
+                    implicit_ids_ok,
+                    encoding_options,
                 )?;
                 out_ids.len()
             }};
@@ -5080,6 +5407,7 @@ impl OnDemandStorage {
                 &mut all_rg_col_offsets,
                 compression,
                 implicit_ids_ok,
+                encoding_options,
             )?;
         }
 
@@ -6115,4 +6443,55 @@ fn physical_base_with_deletions(footer: &V4Footer) -> Option<usize> {
         .map(|group| group.row_count as usize)
         .sum();
     (physical > 0).then_some(physical)
+}
+
+/// Bounded cache of decompressed row-group bodies.
+///
+/// Keyed by `(row-group offset, compressed length)`; the whole cache is dropped
+/// when the table changes (`invalidate_page_cache`), exactly like the page cache,
+/// so a stale body can never outlive a write.
+#[derive(Default)]
+pub(crate) struct DecompressedRgCache {
+    entries: HashMap<(u64, u64), std::sync::Arc<Vec<u8>>>,
+    order: std::collections::VecDeque<(u64, u64)>,
+    bytes: usize,
+}
+
+/// Byte budget for `DecompressedRgCache` (the whole group is kept, so the budget
+/// is per table rather than per page).
+pub(crate) const DECOMPRESSED_RG_BUDGET: usize = 64 << 20;
+
+impl DecompressedRgCache {
+    fn get(&self, key: (u64, u64)) -> Option<std::sync::Arc<Vec<u8>>> {
+        self.entries.get(&key).cloned()
+    }
+
+    fn insert(&mut self, key: (u64, u64), body: std::sync::Arc<Vec<u8>>) {
+        if body.len() > DECOMPRESSED_RG_BUDGET {
+            return;
+        }
+        if self.entries.insert(key, std::sync::Arc::clone(&body)).is_none() {
+            self.order.push_back(key);
+            self.bytes += body.len();
+        }
+        while self.bytes > DECOMPRESSED_RG_BUDGET {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(evicted) = self.entries.remove(&oldest) {
+                self.bytes -= evicted.len();
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.order.clear();
+        self.bytes = 0;
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
 }

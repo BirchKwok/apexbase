@@ -10,6 +10,24 @@ use super::*;
 /// per-page fault overhead of a very large mapping.
 const SEQUENTIAL_READ_THRESHOLD: u64 = 512 * 1024 * 1024;
 
+/// Default streaming window for the CSV numeric aggregation: the file is scanned in bounded
+/// windows (see `csv_numeric_agg_windowed`) so a CSV larger than RAM never becomes resident.
+const DEFAULT_CSV_SCAN_WINDOW_BYTES: usize = 32 * 1024 * 1024;
+
+/// `APEX_CSV_WINDOW_MB` parsing, kept pure so it can be tested without touching the process
+/// environment: `0` means "whole file" (the pre-streaming behaviour), an unparsable value
+/// keeps the default.
+pub(crate) fn parse_csv_scan_window_bytes(raw: Option<&str>) -> usize {
+    match raw {
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(0) => 0,
+            Ok(mb) => mb.saturating_mul(1024 * 1024),
+            Err(_) => DEFAULT_CSV_SCAN_WINDOW_BYTES,
+        },
+        None => DEFAULT_CSV_SCAN_WINDOW_BYTES,
+    }
+}
+
 /// Read an entire CSV file into memory with a single sequential pass.
 ///
 /// The buffer is pre-sized from the file length so `read_to_end` performs no
@@ -1519,92 +1537,21 @@ impl ApexExecutor {
     /// caller receives `None` so it can preserve the parser's existing error or
     /// skip-row behaviour.  The scan validates field counts while it finds the
     /// requested fields, so valid rows are never silently omitted.
-    pub(in crate::query::executor) fn try_fast_csv_numeric_agg(
-        path: &str,
-        options: &[(String, String)],
-        columns: &[String],
-        predicates: &[(String, f64, f64)],
+    /// Aggregate one quote-free CSV byte slice (header optional) into per-column numeric
+    /// stats. Extracted from `try_fast_csv_numeric_agg` so the same kernel can serve
+    /// bounded windows: a file larger than RAM must not be pinned in memory (out-of-core).
+    fn csv_numeric_agg_slice(
+        data: &[u8],
+        has_header: bool,
+        delimiter: u8,
+        bad_line_policy: CsvBadLinePolicy,
+        target_specs: &[(usize, usize, bool)],
+        scan_column_count: usize,
+        columns: usize,
+        predicate_specs: &[(usize, f64, f64)],
     ) -> io::Result<Option<(i64, Vec<CsvNumericStats>)>> {
         use arrow::datatypes::DataType;
         use rayon::prelude::*;
-
-        if columns.is_empty() {
-            return Ok(None);
-        }
-
-        let has_header = options
-            .iter()
-            .find(|(k, _)| k == "header")
-            .map(|(_, v)| !matches!(v.to_lowercase().as_str(), "false" | "0"))
-            .unwrap_or(true);
-        let bad_line_policy = csv_bad_line_policy(options)?;
-        // The full parser emits one warning for every skipped malformed row.
-        // Keep that observable behaviour by letting it handle the `warn`
-        // policy instead of silently skipping rows in the parallel scanner.
-        if bad_line_policy == CsvBadLinePolicy::Warn {
-            return Ok(None);
-        }
-
-        let file = std::fs::File::open(path).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Cannot open CSV file '{}': {}", path, e),
-            )
-        })?;
-        let buffer = if file.metadata()?.len() >= SEQUENTIAL_READ_THRESHOLD {
-            CsvBuffer::Owned(read_file_sequential(path)?)
-        } else {
-            let mmap = unsafe { memmap2::Mmap::map(&file) }
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap error: {}", e)))?;
-            CsvBuffer::Mmap(mmap)
-        };
-        let data = buffer.as_slice();
-
-        let delimiter = options
-            .iter()
-            .find(|(k, _)| k == "delimiter" || k == "delim" || k == "sep")
-            .map(|(_, v)| {
-                if v.eq_ignore_ascii_case("auto") {
-                    Self::sniff_csv_delimiter(data)
-                } else {
-                    v.chars().next().map(|c| c as u8).unwrap_or(b',')
-                }
-            })
-            .unwrap_or(b',');
-
-        let schema = Self::infer_csv_schema_fast(data, has_header, delimiter, 100)?;
-        let mut scan_columns = columns.to_vec();
-        for (column, _, _) in predicates {
-            if !scan_columns.contains(column) {
-                scan_columns.push(column.clone());
-            }
-        }
-        let mut target_specs: Vec<(usize, usize, bool)> = Vec::with_capacity(scan_columns.len());
-        for (output_index, column) in scan_columns.iter().enumerate() {
-            let Some(field_index) = schema.fields().iter().position(|field| field.name() == column)
-            else {
-                return Ok(None);
-            };
-            let is_int = match schema.field(field_index).data_type() {
-                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => true,
-                DataType::Float64 | DataType::Float32 => false,
-                _ => return Ok(None),
-            };
-            target_specs.push((field_index, output_index, is_int));
-        }
-        target_specs.sort_unstable_by_key(|(field_index, _, _)| *field_index);
-        let predicate_specs = predicates
-            .iter()
-            .map(|(column, low, high)| {
-                scan_columns
-                    .iter()
-                    .position(|candidate| candidate == column)
-                    .map(|index| (index, *low, *high))
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(predicate_specs) = predicate_specs else {
-            return Ok(None);
-        };
 
         let data_start = if has_header {
             memchr::memchr(b'\n', data)
@@ -1619,7 +1566,7 @@ impl ApexExecutor {
             .map(|(_, output_index, is_int)| (*output_index, CsvNumericStats::new(*is_int)))
             .collect::<Vec<_>>();
         if data.is_empty() {
-            let mut stats = vec![CsvNumericStats::new(true); columns.len()];
+            let mut stats = vec![CsvNumericStats::new(true); columns];
             for (output_index, stat) in empty_stats {
                 stats[output_index] = stat;
             }
@@ -1639,7 +1586,7 @@ impl ApexExecutor {
             .find(|line| !line.is_empty())
             .unwrap_or(&[]);
         if first_line.is_empty() {
-            let mut stats = vec![CsvNumericStats::new(true); columns.len()];
+            let mut stats = vec![CsvNumericStats::new(true); columns];
             for (output_index, stat) in empty_stats {
                 stats[output_index] = stat;
             }
@@ -1687,8 +1634,8 @@ impl ApexExecutor {
                     n_cols,
                     bad_line_policy,
                     &target_specs,
-                    scan_columns.len(),
-                    columns.len(),
+                    scan_column_count,
+                    columns,
                     &predicate_specs,
                 )
             })
@@ -1702,7 +1649,7 @@ impl ApexExecutor {
             Err(_) => return Ok(None),
         };
         let mut row_count = 0i64;
-        let mut stats = vec![CsvNumericStats::new(true); columns.len()];
+        let mut stats = vec![CsvNumericStats::new(true); columns];
         for (partial_rows, partial_stats) in partials {
             row_count += partial_rows;
             for (output_index, stat) in partial_stats.into_iter().enumerate() {
@@ -1713,6 +1660,267 @@ impl ApexExecutor {
             }
         }
         Ok(Some((row_count, stats)))
+    }
+
+    /// Delimiter + column/aggregate specs for the quote-naive CSV numeric aggregation,
+    /// derived from a bounded prefix of the file so a huge CSV is never fully resident.
+    fn csv_numeric_agg_specs(
+        data: &[u8],
+        options: &[(String, String)],
+        columns: &[String],
+        predicates: &[(String, f64, f64)],
+        has_header: bool,
+    ) -> io::Result<
+        Option<(
+            u8,
+            Vec<String>,
+            Vec<(usize, usize, bool)>,
+            Vec<(usize, f64, f64)>,
+        )>,
+    > {
+        use arrow::datatypes::DataType;
+
+        let delimiter = options
+            .iter()
+            .find(|(k, _)| k == "delimiter" || k == "delim" || k == "sep")
+            .map(|(_, v)| {
+                if v.eq_ignore_ascii_case("auto") {
+                    Self::sniff_csv_delimiter(data)
+                } else {
+                    v.chars().next().map(|c| c as u8).unwrap_or(b',')
+                }
+            })
+            .unwrap_or(b',');
+
+        let schema = Self::infer_csv_schema_fast(data, has_header, delimiter, 100)?;
+        let mut scan_columns = columns.to_vec();
+        for (column, _, _) in predicates {
+            if !scan_columns.contains(column) {
+                scan_columns.push(column.clone());
+            }
+        }
+        let mut target_specs: Vec<(usize, usize, bool)> = Vec::with_capacity(scan_columns.len());
+        for (output_index, column) in scan_columns.iter().enumerate() {
+            let Some(field_index) = schema.fields().iter().position(|field| field.name() == column)
+            else {
+                return Ok(None);
+            };
+            let is_int = match schema.field(field_index).data_type() {
+                DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => true,
+                DataType::Float64 | DataType::Float32 => false,
+                _ => return Ok(None),
+            };
+            target_specs.push((field_index, output_index, is_int));
+        }
+        target_specs.sort_unstable_by_key(|(field_index, _, _)| *field_index);
+        let predicate_specs = predicates
+            .iter()
+            .map(|(column, low, high)| {
+                scan_columns
+                    .iter()
+                    .position(|candidate| candidate == column)
+                    .map(|index| (index, *low, *high))
+            })
+            .collect::<Option<Vec<_>>>();
+        Ok(predicate_specs
+            .map(|predicate_specs| (delimiter, scan_columns, target_specs, predicate_specs)))
+    }
+
+    /// Bytes per streaming window for the quote-naive CSV numeric aggregation, from
+    /// `APEX_CSV_WINDOW_MB` (default 32 MB; `0` keeps the whole-file path, which is also
+    /// what the A/B reference uses).
+    fn csv_scan_window_bytes() -> usize {
+        parse_csv_scan_window_bytes(std::env::var("APEX_CSV_WINDOW_MB").ok().as_deref())
+    }
+
+    /// Aggregate a CSV larger than one window: read bounded windows, run the same kernel on
+    /// each and merge the stats. Peak RSS is a window (plus its carry), not the file — the
+    /// whole-file path pinned 643 MB of file bytes plus the parse for a 20M-row scan.
+    fn csv_numeric_agg_windowed(
+        path: &str,
+        options: &[(String, String)],
+        columns: &[String],
+        predicates: &[(String, f64, f64)],
+        has_header: bool,
+        bad_line_policy: CsvBadLinePolicy,
+        window_bytes: usize,
+    ) -> io::Result<Option<(i64, Vec<CsvNumericStats>)>> {
+        use std::io::Read;
+
+        let mut file = std::fs::File::open(path).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Cannot open CSV file '{}': {}", path, e),
+            )
+        })?;
+        // One spare byte makes "buffer full" distinguishable from EOF.
+        let mut buf = vec![0u8; window_bytes.saturating_add(1)];
+        let mut carry: Vec<u8> = Vec::new();
+        let mut specs: Option<(
+            u8,
+            Vec<String>,
+            Vec<(usize, usize, bool)>,
+            Vec<(usize, f64, f64)>,
+        )> = None;
+        let mut totals: Option<(i64, Vec<CsvNumericStats>)> = None;
+        let mut first = true;
+
+        loop {
+            buf[..carry.len()].copy_from_slice(&carry);
+            let mut filled = carry.len();
+            while filled < buf.len() {
+                let read = file.read(&mut buf[filled..])?;
+                if read == 0 {
+                    break;
+                }
+                filled += read;
+            }
+            if filled == 0 {
+                break;
+            }
+            let eof = filled < buf.len();
+            // Windows must end on a line boundary; the last one may end anywhere.
+            let end = if eof {
+                filled
+            } else {
+                match buf[..filled].iter().rposition(|&byte| byte == b'\n') {
+                    Some(position) => position + 1,
+                    // A single line longer than the window: grow to fit it.
+                    None => {
+                        let grown = buf.len().saturating_mul(2);
+                        let mut bigger = vec![0u8; grown];
+                        bigger[..filled].copy_from_slice(&buf[..filled]);
+                        buf = bigger;
+                        carry.extend_from_slice(&[]);
+                        continue;
+                    }
+                }
+            };
+
+            let slice = &buf[..end];
+            if specs.is_none() {
+                match Self::csv_numeric_agg_specs(slice, options, columns, predicates, has_header)?
+                {
+                    Some(found) => specs = Some(found),
+                    None => return Ok(None),
+                }
+            }
+            let (delimiter, scan_columns, target_specs, predicate_specs) =
+                specs.as_ref().expect("specs are resolved on the first window");
+            let Some((rows, stats)) = Self::csv_numeric_agg_slice(
+                slice,
+                first && has_header,
+                *delimiter,
+                bad_line_policy,
+                target_specs,
+                scan_columns.len(),
+                columns.len(),
+                predicate_specs,
+            )?
+            else {
+                return Ok(None);
+            };
+
+            match totals.as_mut() {
+                None => totals = Some((rows, stats)),
+                Some((total_rows, total_stats)) => {
+                    *total_rows += rows;
+                    for (output_index, stat) in stats.into_iter().enumerate() {
+                        if total_stats[output_index].count == 0 {
+                            total_stats[output_index].is_int = stat.is_int;
+                        }
+                        total_stats[output_index].merge(stat);
+                    }
+                }
+            }
+
+            first = false;
+            if eof {
+                break;
+            }
+            carry.clear();
+            carry.extend_from_slice(&buf[end..filled]);
+        }
+
+        Ok(Some(totals.unwrap_or_else(|| {
+            (0, vec![CsvNumericStats::new(true); columns.len()])
+        })))
+    }
+
+    pub(in crate::query::executor) fn try_fast_csv_numeric_agg(
+        path: &str,
+        options: &[(String, String)],
+        columns: &[String],
+        predicates: &[(String, f64, f64)],
+    ) -> io::Result<Option<(i64, Vec<CsvNumericStats>)>> {
+        use arrow::datatypes::DataType;
+        use rayon::prelude::*;
+
+        if columns.is_empty() {
+            return Ok(None);
+        }
+
+        let has_header = options
+            .iter()
+            .find(|(k, _)| k == "header")
+            .map(|(_, v)| !matches!(v.to_lowercase().as_str(), "false" | "0"))
+            .unwrap_or(true);
+        let bad_line_policy = csv_bad_line_policy(options)?;
+        // The full parser emits one warning for every skipped malformed row.
+        // Keep that observable behaviour by letting it handle the `warn`
+        // policy instead of silently skipping rows in the parallel scanner.
+        if bad_line_policy == CsvBadLinePolicy::Warn {
+            return Ok(None);
+        }
+
+        let window_bytes = Self::csv_scan_window_bytes();
+        if window_bytes > 0 {
+            let length = std::fs::metadata(path)?.len() as usize;
+            if length > window_bytes {
+                return Self::csv_numeric_agg_windowed(
+                    path,
+                    options,
+                    columns,
+                    predicates,
+                    has_header,
+                    bad_line_policy,
+                    window_bytes,
+                );
+            }
+        }
+
+        let file = std::fs::File::open(path).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("Cannot open CSV file '{}': {}", path, e),
+            )
+        })?;
+        let buffer = if file.metadata()?.len() >= SEQUENTIAL_READ_THRESHOLD {
+            CsvBuffer::Owned(read_file_sequential(path)?)
+        } else {
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("mmap error: {}", e)))?;
+            CsvBuffer::Mmap(mmap)
+        };
+        let data = buffer.as_slice();
+
+        let Some((delimiter, scan_columns, target_specs, predicate_specs)) =
+            Self::csv_numeric_agg_specs(data, options, columns, predicates, has_header)?
+        else {
+            return Ok(None);
+        };
+
+
+        Self::csv_numeric_agg_slice(
+            data,
+            has_header,
+            delimiter,
+            bad_line_policy,
+            &target_specs,
+            scan_columns.len(),
+            columns.len(),
+            &predicate_specs,
+        )
     }
 
     /// Group a quote-free CSV by one string or integer column while aggregating only the
@@ -3707,6 +3915,10 @@ impl ApexExecutor {
     ) -> io::Result<ApexResult> {
         let _epoch_write = crate::storage::epoch::logical_write(storage_path);
         let mut num_rows = 0usize;
+        // Measured: this path is already memory-bounded (20M rows / 643 MB CSV added only
+        // 32.8 MB RSS, with or without an explicit mid-import flush), so no periodic flush
+        // is needed here. The out-of-core offender is the *direct file query* path
+        // (`SELECT ... FROM read_csv(...)`), which reads the whole file in one batch.
         Self::for_each_import_batch(file_path, format, options, |batch| {
             num_rows += Self::append_import_batch(storage_path, table_name, &batch)?;
             Ok(())
@@ -4060,5 +4272,71 @@ mod csv_fast_count_tests {
             ApexExecutor::parse_csv_i64_checked(b"9223372036854775808"),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod csv_scan_window_tests {
+    use super::*;
+
+    fn write_csv(name: &str, body: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("csv_window_{}_{}", std::process::id(), name));
+        std::fs::write(&dir, body).unwrap();
+        dir
+    }
+
+    #[test]
+    fn window_env_parsing() {
+        const MB: usize = 1024 * 1024;
+        assert_eq!(parse_csv_scan_window_bytes(None), 32 * MB, "default window");
+        assert_eq!(parse_csv_scan_window_bytes(Some("8")), 8 * MB);
+        assert_eq!(parse_csv_scan_window_bytes(Some(" 4 ")), 4 * MB);
+        assert_eq!(
+            parse_csv_scan_window_bytes(Some("0")),
+            0,
+            "0 keeps the whole-file reference path"
+        );
+        assert_eq!(
+            parse_csv_scan_window_bytes(Some("nonsense")),
+            32 * MB,
+            "an unparsable value keeps the default instead of disabling streaming"
+        );
+    }
+
+    #[test]
+    fn windowed_scan_matches_the_whole_file_scan() {
+        // The streaming window must not change a single aggregate: same rows, same sum.
+        let mut body = String::from("id,score\n");
+        for i in 0..5_000 {
+            body.push_str(&format!("{i},{}\n", (i % 100) as f64 / 10.0));
+        }
+        let path = write_csv("compare.csv", &body);
+        let path_str = path.to_str().unwrap();
+        let columns = vec!["score".to_string()];
+        let predicates = vec![("score".to_string(), 5.0, f64::INFINITY)];
+
+        let whole = ApexExecutor::try_fast_csv_numeric_agg(path_str, &[], &columns, &predicates)
+            .unwrap()
+            .expect("whole-file scan");
+        let windowed = ApexExecutor::csv_numeric_agg_windowed(
+            path_str,
+            &[],
+            &columns,
+            &predicates,
+            true,
+            CsvBadLinePolicy::Skip,
+            4 * 1024,
+        )
+        .unwrap()
+        .expect("windowed scan");
+
+        assert_eq!(whole.0, windowed.0, "matching row counts must agree");
+        assert_eq!(whole.1.len(), windowed.1.len());
+        for (left, right) in whole.1.iter().zip(windowed.1.iter()) {
+            assert_eq!(left.count, right.count, "per-column counts must agree");
+            assert!((left.sum - right.sum).abs() < 1e-9, "sums must agree");
+            assert_eq!(left.is_int, right.is_int);
+        }
+        let _ = std::fs::remove_file(&path);
     }
 }

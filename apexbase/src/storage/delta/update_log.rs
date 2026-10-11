@@ -323,6 +323,25 @@ impl DeltaStore {
         self.updates.contains_key(&row_id)
     }
 
+    /// Every pending cell update as `(row_id, column, new_value)`.
+    ///
+    /// Callers that fold these into an already-computed aggregate need the values
+    /// themselves, not just the set of touched columns.
+    pub fn updated_cells(&self) -> Vec<(u64, String, Value)> {
+        let mut cells: Vec<(u64, String, Value)> = self
+            .updates
+            .iter()
+            .flat_map(|(row_id, columns)| {
+                columns
+                    .values()
+                    .map(|record| (*row_id, record.column_name.clone(), record.new_value.clone()))
+            })
+            .collect();
+        // A stable order keeps the fold below deterministic.
+        cells.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        cells
+    }
+
     /// Number of pending deletes
     pub fn delete_count(&self) -> usize {
         self.delete_bitmap.count()
@@ -474,6 +493,30 @@ struct DeltaStorePersisted {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updated_cells_reports_every_pending_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = DeltaStore::new(&dir.path().join("t.apex"));
+        store.update_cell(7, "k", Value::Int64(11));
+        store.update_cell(7, "category", Value::String("x".into()));
+        store.update_cell(3, "k", Value::Float64(2.5));
+        store.delete_row(9);
+
+        let cells = store.updated_cells();
+        // Deterministic order: by row id, then column name.
+        assert_eq!(
+            cells
+                .iter()
+                .map(|(row, column, _)| (*row, column.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(3, "k"), (7, "category"), (7, "k")]
+        );
+        assert!(matches!(cells[0].2, Value::Float64(value) if value == 2.5));
+        assert!(matches!(cells[2].2, Value::Int64(value) if value == 11));
+        // Deletes are tracked separately and are not cell updates.
+        assert_eq!(store.delete_count(), 1);
+    }
 
     #[test]
     fn test_delete_bitmap() {

@@ -1188,6 +1188,18 @@ impl ApexExecutor {
     ) -> io::Result<BooleanArray> {
         use crate::query::sql_parser::BinaryOperator;
 
+        // Comparing with the NULL literal is UNKNOWN for every row, never an error:
+        // `WHERE s = NULL` selects nothing. It has to be all-NULL (not all-false) so
+        // `NOT (s = NULL)` stays UNKNOWN too, and the AND/OR paths propagate it with
+        // their Kleene kernels. Arrow refuses to compare a typed array with a
+        // NULL-typed one, which is how this used to surface as
+        // "Invalid comparison operation: Utf8 = ...".
+        if matches!(left, SqlExpr::Literal(Value::Null))
+            || matches!(right, SqlExpr::Literal(Value::Null))
+        {
+            return Ok(BooleanArray::new_null(batch.num_rows()));
+        }
+
         // OPTIMIZATION: Fast path for column vs literal comparisons using scalar ops
         // This avoids broadcasting the literal to a full array
         if let Some(result) = Self::try_scalar_comparison(batch, left, op, right)? {
@@ -6229,6 +6241,20 @@ impl ApexExecutor {
     /// Evaluate IN expression with Value list.
     /// Fast path for string columns: builds an AHashSet and does a single O(N) scan
     /// instead of K separate vectorized-eq passes (K = number of IN values).
+    /// `x IN (..., NULL)` is UNKNOWN wherever no non-null value matched.
+    ///
+    /// The non-null values decide membership and a NULL entry turns every miss into
+    /// UNKNOWN, so `x NOT IN (a, NULL)` matches nothing. Arrow refuses to compare an
+    /// array against a NULL-typed one, which is how a NULL in the list used to fail
+    /// with "Invalid comparison operation".
+    fn apply_in_null(result: BooleanArray, has_null: bool) -> io::Result<BooleanArray> {
+        if !has_null {
+            return Ok(result);
+        }
+        let unknown = BooleanArray::new_null(result.len());
+        compute::kernels::boolean::or_kleene(&result, &unknown).map_err(|e| err_data(e.to_string()))
+    }
+
     fn evaluate_in_values(
         batch: &RecordBatch,
         column: &str,
@@ -6244,8 +6270,14 @@ impl ApexExecutor {
             .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
         let num_rows = batch.num_rows();
 
+        // A NULL in the list is UNKNOWN rather than an error; it contributes no
+        // member and is applied to the misses at the end of each path.
+        let has_null = values.iter().any(|v| matches!(v, Value::Null));
+
         // Fast path: all IN values are strings → use AHashSet for O(1) lookup per row
-        let all_strings = values.iter().all(|v| matches!(v, Value::String(_)));
+        let all_strings = values
+            .iter()
+            .all(|v| matches!(v, Value::String(_) | Value::Null));
         if all_strings {
             let str_set: AHashSet<&str> = values
                 .iter()
@@ -6292,7 +6324,7 @@ impl ApexExecutor {
                 } else {
                     // Non-string column: fall back to generic path
                     let mut result = BooleanArray::from(vec![false; num_rows]);
-                    for val in values {
+                    for val in values.iter().filter(|v| !matches!(v, Value::Null)) {
                         let va = Self::value_to_array(val, num_rows)?;
                         result = compute::or(
                             &result,
@@ -6303,6 +6335,7 @@ impl ApexExecutor {
                     result
                 };
 
+            let result = Self::apply_in_null(result, has_null)?;
             return if negated {
                 compute::not(&result).map_err(|e| err_data(e.to_string()))
             } else {
@@ -6315,6 +6348,7 @@ impl ApexExecutor {
         if let Some(int_arr) = target.as_any().downcast_ref::<Int64Array>() {
             if let Some(int_set) = values
                 .iter()
+                .filter(|v| !matches!(v, Value::Null))
                 .map(Value::as_i64)
                 .collect::<Option<AHashSet<i64>>>()
             {
@@ -6322,6 +6356,7 @@ impl ApexExecutor {
                     .iter()
                     .map(|value| value.map(|value| int_set.contains(&value)))
                     .collect();
+                let result = Self::apply_in_null(result, has_null)?;
                 return if negated {
                     compute::not(&result).map_err(|e| err_data(e.to_string()))
                 } else {
@@ -6332,11 +6367,12 @@ impl ApexExecutor {
 
         // Generic path for other numeric IN values (vectorized eq + or)
         let mut result = BooleanArray::from(vec![false; num_rows]);
-        for val in values {
+        for val in values.iter().filter(|v| !matches!(v, Value::Null)) {
             let val_array = Self::value_to_array(val, num_rows)?;
             let eq_mask = cmp::eq(target, &val_array).map_err(|e| err_data(e.to_string()))?;
             result = compute::or(&result, &eq_mask).map_err(|e| err_data(e.to_string()))?;
         }
+        let result = Self::apply_in_null(result, has_null)?;
         if negated {
             compute::not(&result).map_err(|e| err_data(e.to_string()))
         } else {

@@ -21,6 +21,290 @@ impl Drop for GenericRouteGuard {
 }
 
 impl ApexExecutor {
+    /// Plain projected column names for an `_id = X` point read, or `None` when
+    /// the projection is anything but a bare column list (`SELECT *`, an
+    /// expression, an aggregate, a window function, ...).
+    ///
+    /// `_id` leads because every point-read lane reports it first and the
+    /// executor's projection step expects that scan shape; asking for it costs
+    /// nothing, it is derived from the row id rather than read from a column.
+    /// Names are deduplicated: the projected lanes answer by column name, so a
+    /// repeated projection would otherwise produce a batch with duplicate fields.
+    fn point_lookup_projection(stmt: &SelectStatement) -> Option<Vec<String>> {
+        let mut names: Vec<String> = Vec::with_capacity(stmt.columns.len() + 1);
+        names.push("_id".to_string());
+        for column in &stmt.columns {
+            let name = match column {
+                SelectColumn::Column(name) => name,
+                SelectColumn::ColumnAlias { column, .. } => column,
+                _ => return None,
+            };
+            if !names.iter().any(|existing| existing == name) {
+                names.push(name.clone());
+            }
+        }
+        Some(names)
+    }
+
+    /// Schema of the empty result for an `_id = X` filter whose row does not
+    /// exist. Replaces the full table scan the miss used to trigger just to prove
+    /// the absence of one id, and matches how the shared tail shapes an empty
+    /// relation (a pure `SELECT *` keeps the scan schema, a projection is
+    /// applied to it).
+    fn empty_point_lookup_schema(
+        backend: &crate::storage::backend::TableStorageBackend,
+        stmt: &SelectStatement,
+        storage_path: &Path,
+    ) -> io::Result<arrow::datatypes::SchemaRef> {
+        let empty = backend.read_columns_to_arrow(None, 0, Some(0))?;
+        if stmt.is_pure_star() {
+            return Ok(empty.schema());
+        }
+        Ok(Self::apply_projection_with_storage(&empty, &stmt.columns, Some(storage_path))?.schema())
+    }
+
+    /// First `MATCH()` bitmap reachable through top-level `AND`s, or `None`.
+    ///
+    /// Only `AND` may be split: under `OR` or `NOT` a `MATCH()` term does not
+    /// describe a superset of the result, so restricting the scan to it would
+    /// drop rows the predicate still accepts. The caller keeps the complete
+    /// predicate, so choosing one conjunct of several stays exact.
+    fn fts_conjunct_bitmap(expr: &SqlExpr) -> Option<Arc<roaring::RoaringTreemap>> {
+        match expr {
+            SqlExpr::FtsResolved { doc_ids } => Some(Arc::clone(doc_ids)),
+            SqlExpr::Paren(inner) => Self::fts_conjunct_bitmap(inner),
+            SqlExpr::BinaryOp {
+                left,
+                op: BinaryOperator::And,
+                right,
+            } => Self::fts_conjunct_bitmap(left).or_else(|| Self::fts_conjunct_bitmap(right)),
+            _ => None,
+        }
+    }
+
+    /// Whether the per-id batch reader represents every column of this table.
+    ///
+    /// That reader stages scalar column buffers only; a complex, blob or vector
+    /// column would come back as an all-NULL string, so such tables keep the
+    /// scan instead of silently losing a column. The storage's `ColumnType` is
+    /// the authority here: the backend's `DataType` view maps a fixed-size
+    /// vector list to `Binary`, which would wrongly pass a `DataType` allowlist.
+    fn row_selection_covers_schema(
+        backend: &crate::storage::backend::TableStorageBackend,
+    ) -> bool {
+        use crate::storage::on_demand::ColumnType;
+        backend.storage.get_schema().iter().all(|(_, column_type)| {
+            matches!(
+                column_type,
+                ColumnType::Bool
+                    | ColumnType::Int8
+                    | ColumnType::Int16
+                    | ColumnType::Int32
+                    | ColumnType::Int64
+                    | ColumnType::UInt8
+                    | ColumnType::UInt16
+                    | ColumnType::UInt32
+                    | ColumnType::UInt64
+                    | ColumnType::Float32
+                    | ColumnType::Float64
+                    | ColumnType::String
+                    | ColumnType::StringDict
+                    | ColumnType::Binary
+                    | ColumnType::Timestamp
+                    | ColumnType::Date
+            )
+        })
+    }
+
+    /// Positions of the rows an FTS bitmap selects, in active row order.
+    ///
+    /// The bitmap holds `_id`s. The row-group directory resolves them when the
+    /// persisted ids are dense and undeleted; otherwise the `_id` column is
+    /// walked (the only fallback that also handles gapped id layouts). `None`
+    /// means neither route can map the ids, and the caller keeps the scan.
+    ///
+    /// The positions index the *active* row space, so an indexed read may only
+    /// be paired with them while no deletion vector or overlay shifts the
+    /// physical row space (see `docs/READ_PATH_CAPABILITIES.md` §4 rule 8).
+    fn fts_row_positions(
+        backend: &crate::storage::backend::TableStorageBackend,
+        bitmap: &roaring::RoaringTreemap,
+        page: Option<usize>,
+    ) -> io::Result<Option<Vec<usize>>> {
+        use arrow::array::Int64Array;
+
+        // A paginated statement only needs the first `page` matches: the bitmap
+        // iterates in ascending id order and positions ascend with ids, so those
+        // ids are exactly the rows the page shows. Walking the whole bitmap kept
+        // the lane's cost proportional to the term's document frequency even after
+        // the staging itself was bounded (10-row page: 50k hits 0.47 ms against
+        // 25k hits 0.26 ms).
+        let ids: Vec<u64> = match page {
+            Some(page) => bitmap.iter().take(page).collect(),
+            None => bitmap.iter().collect(),
+        };
+        // The row-group directory resolves the positions without touching the
+        // data pages; reading the whole `_id` column would cost more than the
+        // row read it is meant to restrict.
+        if let Some(positions) = backend.storage.positions_for_ids(&ids)? {
+            return Ok(Some(positions));
+        }
+
+        let column = backend.read_columns_to_arrow(Some(&["_id"]), 0, None)?;
+        let Some(array) = column
+            .column_by_name("_id")
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+        else {
+            return Ok(None);
+        };
+        let mut positions = Vec::with_capacity(ids.len());
+        for (position, id) in array.iter().enumerate() {
+            if let Some(id) = id {
+                if id >= 0 && bitmap.contains(id as u64) {
+                    positions.push(position);
+                    if matches!(page, Some(page) if positions.len() >= page) {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(Some(positions))
+    }
+
+    /// Bitmap only when the whole predicate *is* a `MATCH()` term (possibly
+    /// parenthesized), as opposed to one conjunct of a larger `AND`.
+    ///
+    /// The difference decides whether the row-selection lane may stage just the
+    /// page being asked for: with another conjunct present, a row it returns can
+    /// still be rejected downstream, so truncating the selection would drop rows.
+    fn fts_exact_bitmap(expr: &SqlExpr) -> Option<Arc<roaring::RoaringTreemap>> {
+        match expr {
+            SqlExpr::FtsResolved { doc_ids } => Some(Arc::clone(doc_ids)),
+            SqlExpr::Paren(inner) => Self::fts_exact_bitmap(inner),
+            _ => None,
+        }
+    }
+
+    /// Rows selected by an FTS `MATCH()` term at the top of the WHERE clause.
+    ///
+    /// V5 §6.4 item 15 (row-selection pushdown): a `MATCH()` resolves to a row-id
+    /// bitmap, so the scan can read only the documents it selects while the
+    /// shared tail still applies the complete predicate, projection, aggregation
+    /// and ordering. `None` means "not this shape" and the caller scans as before.
+    fn try_fts_row_selection(
+        backend: &crate::storage::backend::TableStorageBackend,
+        stmt: &SelectStatement,
+    ) -> io::Result<Option<RecordBatch>> {
+        let Some(where_clause) = stmt.where_clause.as_ref() else {
+            return Ok(None);
+        };
+        let Some(bitmap) = Self::fts_conjunct_bitmap(where_clause) else {
+            return Ok(None);
+        };
+        // Overlay rows are not described by the persisted index snapshot.
+        if !backend.overlay_state().is_clean_view() {
+            return Ok(None);
+        }
+        let total = backend.active_row_count();
+        if total == 0 {
+            return Ok(None);
+        }
+        let hits = bitmap.len();
+        // Reading a minority by id beats materializing every row; a bitmap that
+        // covers most of the table keeps the sequential scan. A *page* bounds the
+        // lane's work to that page, so the guard only applies when every matching
+        // row has to be staged -- otherwise a 66k-hit term fell back to the scan
+        // (0.89 ms) while a 50k-hit term answered in 0.04 ms.
+        if hits.saturating_mul(3) > total {
+            let paged = stmt.limit.is_some()
+                && stmt.order_by.is_empty()
+                && stmt.group_by.is_empty()
+                && stmt.having.is_none()
+                && stmt.joins.is_empty()
+                && stmt.window_row_number_limit.is_none()
+                && !stmt.distinct
+                && !stmt
+                    .columns
+                    .iter()
+                    .any(|column| matches!(column, SelectColumn::Aggregate { .. }))
+                && matches!(where_clause, _ if Self::fts_exact_bitmap(where_clause).is_some());
+            if !paged {
+                return Ok(None);
+            }
+        }
+        // An empty bitmap is a *definite* answer, not a reason to scan: the
+        // selection is empty, so an empty batch carrying the table's columns is
+        // exactly what the scan would have produced (the shared tail still runs
+        // the predicate, projection, aggregation and ordering over it). It used
+        // to decline "to keep the scan's schema", which made an absent term cost
+        // a full column read: measured on 200k documents, `MATCH('zzzz')` took
+        // 1.24 ms against 0.01 ms here, while the same statement costs 0.48 ms
+        // when the term matches 25k rows -- i.e. *not* finding the term was the
+        // slow case.
+        if hits == 0 {
+            return Ok(Some(backend.read_columns_to_arrow(None, 0, Some(0))?));
+        }
+        // A simple `... WHERE MATCH('q') LIMIT k [OFFSET m]` only needs the first
+        // k + m selected rows: the lane staged *every* match, so its cost grew with
+        // the term's document frequency instead of with the page (200k documents,
+        // 10-row page: a 25k-hit term cost 0.88 ms and a 50k-hit term 1.77 ms,
+        // while the scan it replaces answers in 0.99 ms by exiting early).
+        let page: Option<usize> = match (stmt.limit, Self::fts_exact_bitmap(where_clause)) {
+            (Some(limit), Some(_))
+                if stmt.order_by.is_empty()
+                    && stmt.group_by.is_empty()
+                    && stmt.having.is_none()
+                    && stmt.joins.is_empty()
+                    && stmt.window_row_number_limit.is_none()
+                    && !stmt.distinct
+                    && !stmt
+                        .columns
+                        .iter()
+                        .any(|column| matches!(column, SelectColumn::Aggregate { .. })) =>
+            {
+                Some(limit.saturating_add(stmt.offset.unwrap_or(0)))
+            }
+            _ => None,
+        };
+        if page == Some(0) {
+            return Ok(Some(backend.read_columns_to_arrow(None, 0, Some(0))?));
+        }
+        // Without a deletion vector the active and physical row spaces coincide,
+        // so the selected rows can be staged by position: only the columns the
+        // statement needs are decoded, and vector/blob columns come back intact
+        // (the per-id reader below cannot represent them).
+        if backend.active_row_count() == backend.base_row_count() {
+            let Some(mut positions) = Self::fts_row_positions(backend, &bitmap, page)? else {
+                return Ok(None);
+            };
+            if let Some(page) = page {
+                // Positions are staged in scan order, which is the order the shared
+                // tail's LIMIT/OFFSET counts in.
+                positions.truncate(page);
+            }
+            if positions.is_empty() {
+                return Ok(None);
+            }
+            let col_refs = Self::get_col_refs(stmt);
+            let col_refs_vec: Option<Vec<&str>> = col_refs
+                .as_ref()
+                .map(|refs| refs.iter().map(|name| name.as_str()).collect());
+            return Ok(Some(
+                backend.read_columns_by_indices_to_arrow(&positions, col_refs_vec.as_deref())?,
+            ));
+        }
+        // A deletion vector shifts the spaces apart: the id reader is
+        // deletion-aware but can only stage scalar columns.
+        if !Self::row_selection_covers_schema(backend) {
+            return Ok(None);
+        }
+        let mut ids: Vec<u64> = bitmap.iter().collect();
+        if let Some(page) = page {
+            ids.truncate(page);
+        }
+        Ok(Some(backend.read_rows_by_ids_to_arrow(&ids)?))
+    }
+
     /// Execute SELECT statement with base_dir for proper subquery table resolution
     fn execute_select_with_base_dir(
         mut stmt: SelectStatement,
@@ -120,9 +404,50 @@ impl ApexExecutor {
         } else {
             None
         };
+        // FTS row-selection pushdown (V5 §6.4 item 15): when the predicate is a
+        // top-level conjunction carrying a MATCH() bitmap, restrict the scan to
+        // the documents it selects. The shared tail below still applies the whole
+        // predicate, projection, aggregation and ordering, so this only changes
+        // which rows the scan materializes.
+        let fts_selected = if cached_cte_batch.is_none()
+            && matches!(&stmt.from, Some(FromItem::Table { .. }))
+            && stmt
+                .where_clause
+                .as_ref()
+                .and_then(Self::fts_conjunct_bitmap)
+                .is_some()
+        {
+            match get_cached_backend(storage_path) {
+                Ok(backend) => Self::try_fts_row_selection(&backend, &stmt)?,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        // Fused distance TopK (V5 §6.4 item 16): `ORDER BY <distance>(col, [q])
+        // LIMIT k` over a plain scan runs the allocation-free SIMD distance plus
+        // bounded heap the exact vector TopK lane uses, instead of evaluating a
+        // distance per row (allocating a `Vec<f32>` each time) and fully sorting.
+        let ordered_distance = if cached_cte_batch.is_none()
+            && fts_selected.is_none()
+            && matches!(&stmt.from, Some(FromItem::Table { .. }))
+        {
+            match get_cached_backend(storage_path) {
+                Ok(backend) => Self::try_fast_order_by_distance(&backend, &stmt, storage_path)?,
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
         let batch = if let Some(batch) = cached_cte_batch {
             crate::query::executor::record_path("cte_batch");
             batch
+        } else if let Some(selected) = fts_selected {
+            crate::query::executor::record_path("fts_row_selection");
+            selected
+        } else if let Some(selected) = ordered_distance {
+            crate::query::executor::record_path("order_by_distance_topk");
+            selected
         } else {
             match &stmt.from {
                 Some(FromItem::TopkDistance {
@@ -299,7 +624,31 @@ impl ApexExecutor {
                             }
                         });
 
+                        // Check conditions for late materialization optimization
+                        let has_aggregation_check = stmt.columns.iter().any(|col| {
+                            matches!(col, SelectColumn::Aggregate { .. })
+                                || matches!(col, SelectColumn::Expression { expr, .. } if Self::expr_contains_aggregate(expr))
+                        });
+
                         if backend.pending_v4_in_memory_rows() > 0 {
+                            // Buffered appended rows do not change base rows, so
+                            // the fused filtered-aggregation lane can still scan
+                            // the file and fold the tail itself.
+                            if has_aggregation_check
+                                && stmt.where_clause.is_some()
+                                && stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && stmt.limit.is_none()
+                                && stmt.order_by.is_empty()
+                                && backend.appended_overlay_only()
+                            {
+                                if let Some(result) =
+                                    Self::try_fast_filtered_numeric_agg(&backend, &stmt)?
+                                {
+                                    crate::query::executor::record_path("fast_filtered_numeric_agg");
+                                    return Ok(result);
+                                }
+                            }
                             let col_refs = if has_scalar_subquery
                                 || stmt.where_clause.is_some()
                                 || backend.has_pending_deltas()
@@ -328,12 +677,6 @@ impl ApexExecutor {
                                 None,
                             )?
                         } else {
-                            // Check conditions for late materialization optimization
-                            let has_aggregation_check = stmt.columns.iter().any(|col| {
-                            matches!(col, SelectColumn::Aggregate { .. })
-                                || matches!(col, SelectColumn::Expression { expr, .. } if Self::expr_contains_aggregate(expr))
-                        });
-
                             let has_window_func = stmt
                                 .columns
                                 .iter()
@@ -408,6 +751,57 @@ return Ok(result);
                                 }
                             }
 
+                            // A string equality whose value appears in no row group's
+                            // dictionary cannot match anything, so the aggregate is
+                            // answered from an empty batch. Absence used to be the slow
+                            // case: on 200k rows `COUNT(*) WHERE s = 'absent'` cost
+                            // 1.16 ms against 0.14 ms for a value that exists, because
+                            // it fell through to a lane that materialized the column.
+                            if has_aggregation_check
+                                && stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && !backend.has_pending_deltas()
+                                && !backend.has_delta()
+                            {
+                                if let Some(where_clause) = &stmt.where_clause {
+                                    if let Some((filter_col, filter_value)) =
+                                        Self::extract_string_equality(where_clause)
+                                    {
+                                        // Two exact proofs of absence: the column's
+                                        // row-group dictionaries, and a single-column
+                                        // equality index that holds no such key.
+                                        let nothing_matches = backend
+                                            .string_eq_matches_nothing(&filter_col, &filter_value)?
+                                            || backend.string_eq_zone_excludes_all(
+                                                &filter_col,
+                                                &filter_value,
+                                            )?
+                                            || (!backend.requires_merged_read()
+                                                && Self::index_equality_matches_no_rows(
+                                                    storage_path,
+                                                    &filter_col,
+                                                    &crate::data::Value::String(
+                                                        filter_value.clone(),
+                                                    ),
+                                                ));
+                                        if nothing_matches {
+                                            // The whole schema, zero rows: an aggregate whose
+                                            // expression references a column the projection
+                                            // list does not name (`SUM(CASE WHEN k > 0 ...)`)
+                                            // still has to resolve that column, and
+                                            // `aggregate_input_columns` does not report columns
+                                            // inside CASE expressions.
+                                            let empty =
+                                                backend.read_columns_to_arrow(None, 0, Some(0))?;
+                                            crate::query::executor::record_path(
+                                                "empty_string_filter_agg",
+                                            );
+                                            return Self::execute_aggregation(&empty, &stmt);
+                                        }
+                                    }
+                                }
+                            }
+
                             // FAST PATH: Filtered aggregation with string equality
                             // SELECT COUNT(*), AVG(col), MAX(col) FROM table WHERE str_col = 'val'
                             if has_aggregation_check
@@ -473,6 +867,27 @@ return Ok(result);
                                     Self::try_fast_exists_count(&backend, &stmt)?
                                 {
                                                                         crate::query::executor::record_path("fast_exists_count");
+return Ok(result);
+                                }
+                            }
+
+                            // FAST PATH: the fused filtered numeric aggregation
+                            // over a table whose only overlay is appended rows.
+                            // The lane folds that tail itself, so the fast lane
+                            // stays available instead of falling back to a full
+                            // merged materialization for a few appended rows.
+                            if has_aggregation_check
+                                && stmt.where_clause.is_some()
+                                && stmt.group_by.is_empty()
+                                && stmt.joins.is_empty()
+                                && stmt.limit.is_none()
+                                && stmt.order_by.is_empty()
+                                && backend.appended_overlay_only()
+                            {
+                                if let Some(result) =
+                                    Self::try_fast_filtered_numeric_agg(&backend, &stmt)?
+                                {
+                                                                        crate::query::executor::record_path("fast_filtered_numeric_agg");
 return Ok(result);
                                 }
                             }
@@ -636,37 +1051,186 @@ return Ok(result);
                                 .columns
                                 .iter()
                                 .any(|col| matches!(col, SelectColumn::WindowFunction { .. }));
+                            // This lane projects the filtered rows and returns
+                            // them directly, so it can only serve statements
+                            // whose remaining work is exactly "project": a
+                            // DISTINCT has to deduplicate after the filter and
+                            // used to come back with one row per match.
                             let can_late_materialize_where = stmt.where_clause.is_some()
                                 && stmt.order_by.is_empty()
                                 && stmt.group_by.is_empty()
+                                && !stmt.distinct
+                                && stmt.distinct_on.is_none()
                                 && !has_aggregation_check
                                 && !has_window_func
                                 && !where_cols.is_empty();
 
                             // Late Materialization for ORDER BY: SELECT * with ORDER BY + LIMIT (no WHERE)
-                            let can_late_materialize_order = stmt.is_select_star()
-                                && stmt.where_clause.is_none()
+                            // An explicit projection is fine here -- the lane reads every
+                            // column of the k chosen rows and the SELECT list is applied
+                            // afterwards (`apply_projection_with_storage`) -- but only when
+                            // the single sort column is a dictionary string, i.e. when the
+                            // string top-k lane will actually serve it. Requiring SELECT *
+                            // left `SELECT city ... ORDER BY city LIMIT 5` on the general
+                            // path (15.7 ms against 0.287 ms), while routing *numeric*
+                            // projections here costs more than the path they used before
+                            // (4.8 ms against 1.13 ms).
+                            // A dictionary string is served in either direction; a plain
+                            // (high-cardinality) string only ascending, so a descending
+                            // query must stay on the path it used before this gate ever
+                            // admitted it (1M rows: 1.7 ms there against 8 ms once the
+                            // late-materialisation fallback takes over).
+                            let dict_string_order = stmt.order_by.len() == 1 && {
+                                let clause = &stmt.order_by[0];
+                                let name = clause.column.trim_matches('"');
+                                let name = name.rsplit('.').next().unwrap_or(name);
+                                backend.column_is_string_dict(name)
+                                    || (!clause.descending && backend.column_is_plain_string(name))
+                            };
+                            let can_late_materialize_order = stmt.where_clause.is_none()
                                 && !stmt.order_by.is_empty()
                                 && stmt.limit.is_some()
                                 && stmt.group_by.is_empty()
-                                && !has_aggregation_check;
+                                && !has_aggregation_check
+                                && (stmt.is_select_star() || dict_string_order);
+
+                            // BOUNDED PROJECTION with LIMIT/OFFSET and nothing else
+                            // to evaluate: read only the rows the page needs.
+                            //
+                            // Without this lane every `LIMIT n OFFSET m` with m > 0
+                            // fell through to the generic path, which materializes
+                            // the whole table and then slices: measured on 200k rows,
+                            // `SELECT c0 ... LIMIT 10 OFFSET 1` cost 0.599 ms against
+                            // 0.009 ms at OFFSET 0, and the 16-column projection
+                            // 9.20 ms against 0.017 ms -- i.e. one page cost a full
+                            // table read, and `LIMIT n OFFSET 1` is what every client
+                            // sends for the second page.
+                            if stmt.where_clause.is_none()
+                                && stmt.order_by.is_empty()
+                                && stmt.group_by.is_empty()
+                                && stmt.having.is_none()
+                                && stmt.joins.is_empty()
+                                && !stmt.distinct
+                                && !has_aggregation_check
+                                && !has_scalar_subquery
+                                && matches!(&stmt.from, Some(FromItem::Table { .. }))
+                                && matches!(stmt.limit, Some(limit) if limit > 0)
+                            {
+                                if let Ok(backend) = get_cached_backend(storage_path) {
+                                    let offset = stmt.offset.unwrap_or(0);
+                                    let want = stmt.limit.unwrap_or(0).saturating_add(offset);
+                                    let col_refs = Self::get_col_refs(&stmt);
+                                    let col_refs_vec: Option<Vec<&str>> = col_refs
+                                        .as_ref()
+                                        .map(|refs| refs.iter().map(String::as_str).collect());
+                                    let batch = backend.read_columns_to_arrow(
+                                        col_refs_vec.as_deref(),
+                                        0,
+                                        Some(want),
+                                    )?;
+                                    let limited =
+                                        Self::apply_limit_offset(&batch, stmt.limit, stmt.offset)?;
+                                    let projected = Self::apply_projection_with_storage(
+                                        &limited,
+                                        &stmt.columns,
+                                        Some(storage_path),
+                                    )?;
+                                    crate::query::executor::record_path("bounded_projection");
+                                    return Ok(ApexResult::Data(projected));
+                                }
+                            }
 
                             // EARLY FAST PATH: _id = X point lookup — skip CBO entirely
                             if !has_scalar_subquery
                                 && stmt.group_by.is_empty()
                                 && !has_aggregation_check
-                                && !backend.has_pending_deltas()
-                                && !backend.has_delta()
                             {
                                 if let Some(ref where_clause) = stmt.where_clause {
                                     if let Some(id) = Self::extract_id_equality_filter(where_clause)
                                     {
-                                        if let Some(row_batch) =
-                                            backend.read_row_by_id_to_arrow(id)?
-                                        {
-                                            crate::query::executor::record_path("id_point_lookup");
+                                        // A pending DeltaStore or a buffered appended row only
+                                        // changes the rows it names, so the point readers can
+                                        // still answer by id: they compose the base file with
+                                        // the buffer, and the DeltaStore is applied to this one
+                                        // row below. Only an appended delta *file* adds ids the
+                                        // base file does not describe, and that is the one case
+                                        // that still needs the scan.
+                                        if !backend.has_pending_deltas() && !backend.has_delta() {
+                                        let projected_columns =
+                                            Self::point_lookup_projection(&stmt);
+                                        let point_batch = match projected_columns.as_ref() {
+                                            Some(names) => {
+                                                let refs: Vec<&str> =
+                                                    names.iter().map(String::as_str).collect();
+                                                backend
+                                                    .read_row_by_id_projected_to_arrow(id, &refs)?
+                                            }
+                                            None => backend.read_row_by_id_to_arrow(id)?,
+                                        };
+                                        match point_batch {
+                                            Some(row_batch) => {
+                                                crate::query::executor::record_path(
+                                                    "id_point_lookup",
+                                                );
+                                                let projected =
+                                                    Self::apply_projection_with_storage(
+                                                        &row_batch,
+                                                        &stmt.columns,
+                                                        Some(storage_path),
+                                                    )?;
+                                                return Ok(ApexResult::Data(projected));
+                                            }
+                                            // The filter is exactly `_id = X`, so a
+                                            // missing row means an empty relation.
+                                            // Reading the id used to fall back to a
+                                            // full scan just to prove the absence.
+                                            None => {
+                                                let schema = Self::empty_point_lookup_schema(
+                                                    &backend,
+                                                    &stmt,
+                                                    storage_path,
+                                                )?;
+                                                return Ok(ApexResult::Empty(schema));
+                                            }
+                                        }
+                                        } else if !backend.has_delta() {
+                                            // Overlay-aware point read: without it a buffered
+                                            // row or a missing id cost a full scan -- measured
+                                            // 36.4 ms against 0.005 ms for a base row on a
+                                            // 200k-row table with five buffered rows, and
+                                            // 15.1-15.6 ms for a missing/deleted id when the
+                                            // deletion vector was persisted.
+                                            let row_batch =
+                                                backend.read_row_by_id_to_arrow(id)?;
+                                            let Some(base_batch) = row_batch else {
+                                                // Neither the base file nor the buffer holds the
+                                                // id, and no appended delta file exists, so the
+                                                // row is genuinely absent.
+                                                let schema = Self::empty_point_lookup_schema(
+                                                    &backend,
+                                                    &stmt,
+                                                    storage_path,
+                                                )?;
+                                                return Ok(ApexResult::Empty(schema));
+                                            };
+                                            let merged =
+                                                crate::storage::delta::DeltaMerger::merge(
+                                                    &base_batch,
+                                                    &backend.storage.delta_store(),
+                                                    &[id],
+                                                )?;
+                                            if merged.num_rows() == 0 {
+                                                return Ok(ApexResult::Empty(merged.schema()));
+                                            }
+                                            // Match the scan path's projection shape
+                                            // (`_id` first, schema order).
+                                            let merged =
+                                                backend.canonicalize_point_batch(id, merged)?;
+                                            crate::query::executor::record_path(
+                                                "id_point_lookup_overlay",
+                                            );
                                             let projected = Self::apply_projection_with_storage(
-                                                &row_batch,
+                                                &merged,
                                                 &stmt.columns,
                                                 Some(storage_path),
                                             )?;
@@ -741,6 +1305,13 @@ return Ok(result);
                             if let Some(where_clause) = &stmt.where_clause {
                                 if let Some(id) = Self::extract_id_equality_filter(where_clause) {
                                     if !backend.has_pending_deltas() && !backend.has_delta() {
+                                        // The non-aggregate fast path above already
+                                        // answered this shape through the projected
+                                        // point lane; what reaches here is an
+                                        // aggregate/group-by over `_id = X`, where a
+                                        // missing id keeps the repository's existing
+                                        // empty-result contract (see the V5 report's
+                                        // §9.6 open item) instead of a zero row.
                                         if let Some(batch) = backend.read_row_by_id_to_arrow(id)? {
                                             crate::query::executor::record_path("id_point_lookup");
                                             batch
@@ -771,8 +1342,61 @@ return Ok(result);
                                                 ));
                                             }
                                         }
+                                    } else if !backend.has_delta() {
+                                        // A pending DeltaStore only changes the rows it
+                                        // touches, so the base row can still be read by
+                                        // id and overlaid on its own; scanning the whole
+                                        // table for one row was the point-lookup cliff.
+                                        // Appended delta rows keep the general path: the
+                                        // id may not exist in the base file at all.
+                                        if let Some(base_batch) = backend.read_row_by_id_to_arrow(id)? {
+                                            let merged = crate::storage::delta::DeltaMerger::merge(
+                                                &base_batch,
+                                                &backend.storage.delta_store(),
+                                                &[id],
+                                            )?;
+                                            if merged.num_rows() == 0 {
+                                                return Ok(ApexResult::Empty(merged.schema()));
+                                            }
+                                            // Match the scan path's projection
+                                            // shape (`_id` first, schema order).
+                                            let merged =
+                                                backend.canonicalize_point_batch(id, merged)?;
+                                            crate::query::executor::record_path(
+                                                "id_point_lookup_overlay",
+                                            );
+                                            merged
+                                        } else {
+                                            // Keep the general filter path here: an
+                                            // aggregate over a missing id must keep
+                                            // returning the repository's existing
+                                            // empty-result contract (§9.6).
+                                            let batch =
+                                                backend.read_columns_to_arrow(None, 0, None)?;
+                                            if batch.num_rows() == 0 {
+                                                backend.read_columns_to_arrow(None, 0, Some(0))?
+                                            } else {
+                                                let filtered = Self::apply_filter_with_storage(
+                                                    &batch,
+                                                    where_clause,
+                                                    storage_path,
+                                                )?;
+                                                if filtered.num_rows() == 0 {
+                                                    return Ok(ApexResult::Empty(
+                                                        filtered.schema(),
+                                                    ));
+                                                }
+                                                return Ok(ApexResult::Data(
+                                                    Self::apply_projection_with_storage(
+                                                        &filtered,
+                                                        &stmt.columns,
+                                                        Some(storage_path),
+                                                    )?,
+                                                ));
+                                            }
+                                        }
                                     } else {
-                                        // Pending DeltaStore updates must be merged through the full scan path.
+                                        // Appended delta rows must be merged through the full scan path.
                                         let batch = backend.read_columns_to_arrow(None, 0, None)?;
                                         if batch.num_rows() == 0 {
                                             backend.read_columns_to_arrow(None, 0, Some(0))?
@@ -799,7 +1423,7 @@ return Ok(result);
                                 {
                                     // FAST PATH for Complex (Filter+Group+Order) - biggest optimization
                                     return Ok(result);
-                                } else if can_late_materialize_where {
+} else if can_late_materialize_where {
                                     // FAST PATH 1: Try dictionary-based filter for simple string equality (with LIMIT)
                                     if let Some(result) =
                                         Self::try_fast_string_filter(&backend, &stmt)?
@@ -1241,7 +1865,7 @@ return Ok(result);
                                         storage_path,
                                     )?
                                 }
-                            } else if stmt.where_clause.is_some() && stmt.limit.is_none() {
+} else if stmt.where_clause.is_some() && stmt.limit.is_none() {
                                 // FAST PATH: String filter without LIMIT (uses dictionary scan)
                                 if let Some(result) =
                                     Self::try_fast_string_filter_no_limit(&backend, &stmt)?
@@ -1277,7 +1901,7 @@ return Ok(result);
                                 let col_refs_vec: Option<Vec<&str>> = col_refs
                                     .as_ref()
                                     .map(|v| v.iter().map(|s| s.as_str()).collect());
-                                let can_pushdown_limit = stmt.where_clause.is_none()
+let can_pushdown_limit = stmt.where_clause.is_none()
                                     && stmt.order_by.is_empty()
                                     && stmt.group_by.is_empty()
                                     && !has_aggregation_check;
@@ -1438,7 +2062,24 @@ return Ok(result);
                     .map_err(|e| err_data(e.to_string()))?;
                 return Ok(ApexResult::Data(batch));
             }
-            Self::apply_filter_with_storage(&batch, where_clause, storage_path)?
+            // The storage-level fast paths above stage only the *post-filter*
+            // columns (SELECT / ORDER BY / GROUP BY), while this shared tail
+            // evaluates the WHERE again. When the predicate references a column
+            // that is neither projected nor an ordering key — `SELECT doc FROM t
+            // WHERE k < 100 ORDER BY <expression>` — the pruned batch has no `k`
+            // and the filter used to fail with "Column 'k' not found". Expanding
+            // the read is the only way to evaluate the predicate; the retry is
+            // limited to the not-found error, so working shapes pay nothing.
+            match Self::apply_filter_with_storage(&batch, where_clause, storage_path) {
+                Ok(filtered) => filtered,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    crate::query::executor::record_path("predicate_column_reread");
+                    let backend = get_cached_backend(storage_path)?;
+                    let full = backend.read_columns_to_arrow(None, 0, None)?;
+                    Self::apply_filter_with_storage(&full, where_clause, storage_path)?
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             batch
         };
@@ -1576,15 +2217,21 @@ return Ok(result);
                             SelectColumn::Column(_) | SelectColumn::ColumnAlias { .. }
                         )
                     });
-                let deduped = if can_dedup_raw {
-                    Self::deduplicate_batch(&filtered)?
+                // `can_dedup_raw` batches still carry the input columns, so the
+                // output projection has to run after the dedup. Any other batch
+                // is projected here (dedup needs the computed values) and the
+                // projection must NOT run again: an expression column resolves
+                // against its inputs (`UPPER(cat)` needs `cat`), and the
+                // projected batch only carries the outputs.
+                let (deduped, already_projected) = if can_dedup_raw {
+                    (Self::deduplicate_batch(&filtered)?, false)
                 } else {
                     let projected = Self::apply_projection_with_storage(
                         &filtered,
                         &stmt.columns,
                         Some(storage_path),
                     )?;
-                    Self::deduplicate_batch(&projected)?
+                    (Self::deduplicate_batch(&projected)?, true)
                 };
                 // ORDER BY must see plain values (dictionary key ids are not
                 // in value order); decoding after dedup touches few rows.
@@ -1595,11 +2242,15 @@ return Ok(result);
                     deduped
                 };
                 let limited = Self::apply_limit_offset(&sorted, stmt.limit, stmt.offset)?;
-                let projected = Self::apply_projection_with_storage(
-                    &limited,
-                    &stmt.columns,
-                    Some(storage_path),
-                )?;
+                let projected = if already_projected {
+                    limited
+                } else {
+                    Self::apply_projection_with_storage(
+                        &limited,
+                        &stmt.columns,
+                        Some(storage_path),
+                    )?
+                };
                 // The deduplicated input may still carry dictionary-encoded
                 // columns; decode them for the client.
                 Self::decode_dict_columns(&projected)
@@ -2010,6 +2661,7 @@ return Ok(result);
             &bounds,
             &aggregate_refs,
             &aggregate_ops,
+        crate::query::executor::memory::configured_query_memory_limit(),
         )? else {
             return Ok(None);
         };
@@ -2230,14 +2882,14 @@ return Ok(result);
             };
 
         if indices.is_empty() {
-            let empty = Self::read_matching_rows_adaptive(backend, stmt, &indices)?;
+            let empty = Self::read_matching_rows_for_tail(backend, stmt, &indices)?;
             return Ok(Some(empty));
         }
 
         let offset = stmt.offset.unwrap_or(0);
         if offset > 0 {
             if offset >= indices.len() {
-                let empty = Self::read_matching_rows_adaptive(backend, stmt, &[])?;
+                let empty = Self::read_matching_rows_for_tail(backend, stmt, &[])?;
                 return Ok(Some(empty));
             }
             indices = indices[offset..].to_vec();
@@ -2246,7 +2898,7 @@ return Ok(result);
             indices.truncate(lim);
         }
 
-        Ok(Some(Self::read_matching_rows_adaptive(
+        Ok(Some(Self::read_matching_rows_for_tail(
             backend, stmt, &indices,
         )?))
     }
@@ -2295,7 +2947,7 @@ return Ok(result);
                         Some(v) => v,
                         None => return Ok(None),
                     };
-                return Ok(Some(Self::read_matching_rows_adaptive(
+                return Ok(Some(Self::read_matching_rows_for_tail(
                     backend, stmt, &indices,
                 )?));
             }
@@ -2366,6 +3018,9 @@ return Ok(result);
                 let schema = backend.read_columns_to_arrow(None, 0, Some(0))?;
                 return Ok(Some(schema));
             }
+            // Both callers treat this batch as final (they project and return),
+            // so the predicate column stays pruned; only lanes whose batch goes
+            // back to the shared tail need `read_matching_rows_for_tail`.
             let batch = Self::read_matching_rows_adaptive(backend, stmt, &indices)?;
             return Ok(Some(batch));
         }
@@ -3003,14 +3658,51 @@ return Ok(result);
             return Ok(None);
         }
 
-        if Self::table_has_index_catalog(None, backend.path()) {
-            return Ok(None);
-        }
-
+        // NOTE: this lane used to stand down whenever the table had any index. It is
+        // index-independent -- it streams the persisted base under the overlay guards
+        // above -- and that gate made the *absence* of a string value the expensive
+        // case: on a 200k-row indexed table `COUNT(*) WHERE s = 'x'` cost 1.16 ms for
+        // a missing value against 0.14 ms for one that exists, because a missing value
+        // fell through to a lane that materializes the whole column.
         let where_clause = match &stmt.where_clause {
             Some(w) => w,
             None => return Ok(None),
         };
+
+        // A literal string IN list over a count-only statement is answered straight from
+        // the storage-level set count. Falling through to the generic executor cost 20 ms
+        // per 1M rows, and - because that path only becomes fast once some *other* query
+        // has warmed the column's dictionary - the same query measured 3.1 ms or 20 ms
+        // depending on query history. `count_string_in_set_mmap` is 0.44 ms.
+        if let Some((column, values)) = Self::extract_string_in_list(where_clause) {
+            let count_only = stmt.columns.iter().all(|c| {
+                matches!(
+                    c,
+                    SelectColumn::Aggregate {
+                        func: AggregateFunc::Count,
+                        ..
+                    }
+                )
+            });
+            if count_only && Self::column_is_string(backend, &column) {
+                if let Some(count) = backend.count_string_in_set_mmap(&column, &values)? {
+                    let mut fields: Vec<Field> = Vec::with_capacity(stmt.columns.len());
+                    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(stmt.columns.len());
+                    for c in &stmt.columns {
+                        if let SelectColumn::Aggregate { alias, column, .. } = c {
+                            let output = alias.clone().unwrap_or_else(|| {
+                                format!("COUNT({})", column.as_deref().unwrap_or("*"))
+                            });
+                            fields.push(Field::new(output, ArrowDataType::Int64, false));
+                            arrays.push(Arc::new(Int64Array::from(vec![count])) as ArrayRef);
+                        }
+                    }
+                    let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays)
+                        .map_err(|e| err_data(e.to_string()))?;
+                    return Ok(Some(ApexResult::Data(batch)));
+                }
+            }
+        }
 
         let (filter_col, filter_val, is_prefix) =
             if let Some((column, value)) = Self::extract_string_equality(where_clause) {
@@ -3898,16 +4590,124 @@ return Ok(result);
 
     /// V4 FAST PATH: Filtered aggregation with a numeric WHERE predicate.
     /// Handles: SELECT COUNT(*), AVG(col), MAX(col) FROM table WHERE num_col > value
+    /// Fold the appended-delta rows into fused aggregation stats.
+    ///
+    /// The fused lanes read only the persisted row groups, so a table whose only
+    /// overlay is appended rows contributes those rows here: the same predicate
+    /// runs over the tail batch and its per-column `(count, sum, min, max,
+    /// is_int)` stats are merged into the base stats. Returns `None` when the
+    /// tail cannot be evaluated, so the caller falls back to the generic merged
+    /// path instead of answering with the base rows alone.
+    /// Fold one tail batch (persisted delta rows or buffered appends) into the
+    /// fused aggregation stats under the same predicate.
+    fn fold_tail_batch(
+        tail: &arrow::record_batch::RecordBatch,
+        where_clause: &crate::query::sql_parser::SqlExpr,
+        agg_cols: &[&str],
+        mut stats: Vec<(i64, f64, f64, f64, bool)>,
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        let filtered = Self::apply_filter(tail, where_clause)?;
+        let tail_matches = filtered.num_rows() as i64;
+        for (index, name) in agg_cols.iter().enumerate() {
+            if index >= stats.len() {
+                break;
+            }
+            if *name == "*" || *name == "1" {
+                stats[index].0 += tail_matches;
+                continue;
+            }
+            let Some(column) = filtered.column_by_name(name) else {
+                return Ok(None);
+            };
+            let (mut count, mut sum) = (0i64, 0f64);
+            let (mut min_v, mut max_v) = (f64::INFINITY, f64::NEG_INFINITY);
+            if let Some(values) = column
+                .as_any()
+                .downcast_ref::<arrow::array::Int64Array>()
+            {
+                for value in values.iter().flatten() {
+                    let value = value as f64;
+                    count += 1;
+                    sum += value;
+                    min_v = min_v.min(value);
+                    max_v = max_v.max(value);
+                }
+            } else if let Some(values) = column
+                .as_any()
+                .downcast_ref::<arrow::array::Float64Array>()
+            {
+                for value in values.iter().flatten() {
+                    count += 1;
+                    sum += value;
+                    min_v = min_v.min(value);
+                    max_v = max_v.max(value);
+                }
+            } else {
+                return Ok(None);
+            }
+            if count == 0 {
+                continue;
+            }
+            let (base_count, base_sum, base_min, base_max, is_int) = stats[index];
+            let (min_merged, max_merged) = if base_count == 0 {
+                (min_v, max_v)
+            } else {
+                (base_min.min(min_v), base_max.max(max_v))
+            };
+            stats[index] = (
+                base_count + count,
+                base_sum + sum,
+                min_merged,
+                max_merged,
+                is_int,
+            );
+        }
+        Ok(Some(stats))
+    }
+
+    /// Fold the appended-delta rows into fused aggregation stats.
+    ///
+    /// The fused lanes read only the persisted row groups, so a table whose only
+    /// overlay is appended rows contributes those rows here: the same predicate
+    /// runs over the tail batch and its per-column `(count, sum, min, max,
+    /// is_int)` stats are merged into the base stats. Returns `None` when the
+    /// tail cannot be evaluated, so the caller falls back to the generic merged
+    /// path instead of answering with the base rows alone.
+    fn merge_appended_rows_into_stats(
+        backend: &TableStorageBackend,
+        where_clause: &crate::query::sql_parser::SqlExpr,
+        filter_cols: &[&str],
+        agg_cols: &[&str],
+        stats: Vec<(i64, f64, f64, f64, bool)>,
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        let mut names: Vec<&str> = agg_cols
+            .iter()
+            .copied()
+            .filter(|name| *name != "*" && *name != "1")
+            .collect();
+        for column in filter_cols {
+            if !names.contains(column) {
+                names.push(column);
+            }
+        }
+        // Only buffered appends reach this lane (see `appended_overlay_only`):
+        // their rows have a dedicated reader that carries the null bitmaps.
+        let Some(pending) = backend.storage.pending_tail_to_arrow(&names)? else {
+            return Ok(Some(stats));
+        };
+        Self::fold_tail_batch(&pending, where_clause, agg_cols, stats)
+    }
+
     fn try_fast_filtered_numeric_agg(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
         use crate::query::AggregateFunc;
 
-        if backend.pending_v4_in_memory_rows() > 0
-            || backend.has_pending_deltas()
-            || backend.has_delta()
-        {
+        // Appended rows are allowed (and folded below); pending cell updates and
+        // deletes are not, because they change base rows that the fused scan
+        // would read directly.
+        if backend.has_pending_deltas() {
             return Ok(None);
         }
 
@@ -4014,6 +4814,18 @@ return Ok(result);
                 None => return Ok(None),
             }
         } else {
+            return Ok(None);
+        };
+
+        let filter_columns: Vec<&str> =
+            predicate_refs.iter().map(|(column, _, _)| *column).collect();
+        let Some(agg_results) = Self::merge_appended_rows_into_stats(
+            backend,
+            where_clause,
+            &filter_columns,
+            &col_refs,
+            agg_results,
+        )? else {
             return Ok(None);
         };
 
@@ -5023,14 +5835,112 @@ return Ok(result);
     }
 
     /// V4 FAST PATH: Cached GROUP BY (builds dict cache on first call, reuses on subsequent calls)
+    /// Fold pending cell updates into a cached group-by aggregate.
+    ///
+    /// The cached aggregate reads the persisted base rows only, so a pending
+    /// DeltaStore update to an aggregated column is invisible to it. Returns
+    /// `(result row, aggregate index, delta)` triples for the caller to add, or
+    /// `None` when the update cannot be folded soundly (a NULL on either side, an
+    /// unknown group, an updated row hidden by a deletion vector, ...).
+    fn pending_cell_correction(
+        backend: &crate::storage::backend::TableStorageBackend,
+        raw: &[(String, Vec<(f64, i64)>)],
+        dict_strings: &[String],
+        group_ids: &[u16],
+        agg_info: &[(&str, bool, crate::query::AggregateFunc, Option<String>)],
+        physical_rows: u64,
+    ) -> io::Result<Option<Vec<(usize, usize, f64)>>> {
+        use crate::data::Value;
+
+        // An updated row that the deletion vectors hide is not in the aggregate, so
+        // the fold cannot be applied; require the row spaces to coincide.
+        if backend.active_row_count() != physical_rows || backend.pending_delta_delete_count() > 0 {
+            return Ok(None);
+        }
+        let touched: Vec<usize> = agg_info
+            .iter()
+            .enumerate()
+            .filter(|(_, (col, is_star, _, _))| {
+                !*is_star && backend.pending_delta_updates_column(col)
+            })
+            .map(|(index, _)| index)
+            .collect();
+        if touched.is_empty() {
+            return Ok(None);
+        }
+        let columns: Vec<&str> = touched.iter().map(|&index| agg_info[index].0).collect();
+        let cells: Vec<(u64, String, Value)> = backend
+            .pending_delta_updated_cells()
+            .into_iter()
+            .filter(|(_, column, _)| columns.iter().any(|name| name == column))
+            .collect();
+        if cells.is_empty() {
+            return Ok(None);
+        }
+
+        let ids: Vec<u64> = cells.iter().map(|(id, _, _)| *id).collect();
+        let Some(positions) = backend.storage.positions_for_ids(&ids)? else {
+            return Ok(None);
+        };
+        if positions.len() != cells.len() {
+            return Ok(None);
+        }
+        let batch = backend.read_columns_by_indices_to_arrow(&positions, Some(&columns))?;
+
+        // Result rows are keyed by group label; the dictionary maps a physical row to
+        // its label.
+        let row_of_label: std::collections::HashMap<&str, usize> = raw
+            .iter()
+            .enumerate()
+            .map(|(index, (label, _))| (label.as_str(), index))
+            .collect();
+
+        let mut corrections: Vec<(usize, usize, f64)> = Vec::with_capacity(cells.len());
+        for (cell_index, (_id, column, new_value)) in cells.iter().enumerate() {
+            let new_number = match new_value {
+                Value::Int64(value) => *value as f64,
+                Value::Float64(value) => *value,
+                _ => return Ok(None),
+            };
+            let position = positions[cell_index];
+            let Some(&group) = group_ids.get(position) else {
+                return Ok(None);
+            };
+            let Some(label) = dict_strings.get(group as usize) else {
+                return Ok(None);
+            };
+            let Some(&row) = row_of_label.get(label.as_str()) else {
+                return Ok(None);
+            };
+            let Some(column_array) = batch.column_by_name(column) else {
+                return Ok(None);
+            };
+            if column_array.is_null(cell_index) {
+                return Ok(None);
+            }
+            let old_number = match Self::arrow_value_at_col(column_array, cell_index) {
+                Value::Int64(value) => value as f64,
+                Value::Float64(value) => value,
+                _ => return Ok(None),
+            };
+            for (aggregate, (name, _, _, _)) in agg_info.iter().enumerate() {
+                if name == column {
+                    corrections.push((row, aggregate, new_number - old_number));
+                }
+            }
+        }
+        Ok(Some(corrections))
+    }
+
     fn try_fast_cached_group_by(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<ApexResult>> {
-        if backend.pending_v4_in_memory_rows() > 0
-            || backend.has_pending_deltas()
-            || backend.has_delta()
-        {
+        // Rows outside the persisted base -- buffered appends or a committed append
+        // delta -- are not in the cached dictionary, so they still refuse this lane.
+        // Pending DeltaStore *cell* updates are judged below, once the grouped and
+        // aggregated columns are known.
+        if backend.pending_v4_in_memory_rows() > 0 || backend.has_delta() {
             return Ok(None);
         }
 
@@ -5112,10 +6022,58 @@ return Ok(result);
         if group_has_nulls {
             return Ok(None);
         }
-        // The cached dictionary must cover the CURRENT active row set.  A
-        // stale entry (e.g. built before a later insert) has fewer group ids
-        // than rows and would silently aggregate only the prefix of the table.
-        if dict_arc.1.len() != backend.active_row_count() as usize {
+        // The cached dictionary must cover the CURRENT row set.  A stale entry
+        // (e.g. built before a later insert) has fewer group ids than rows and
+        // would silently aggregate only the prefix of the table.
+        //
+        // The dictionary is built from every *physical* row -- rows deleted through
+        // the deletion vectors included -- and the aggregation itself skips those
+        // deleted rows (`execute_group_agg_cached_mmap` consults each row group's
+        // bitmap). Comparing against the active count therefore dropped this lane
+        // the moment a single row was deleted: the generic route costs 4.8 ms
+        // against 0.30 ms here, so the presence of any deletion moved the same
+        // statement by 16x.
+        // The dictionary must cover the CURRENT active row set.  A stale entry
+        // (e.g. built before a later insert) has fewer group ids than rows and
+        // would silently aggregate only the prefix of the table.
+        //
+        // Two relaxations were tried and rejected, both because the cached
+        // dictionary can be stale in ways the deletion state does not reveal.
+        // Instrumented run of `TestDictionaryDropOnCompaction[5000-1-None]`:
+        // `dict_len=5000 physical=5000 active=1 base=1` -- the stale dictionary and
+        // the footer's physical count agreed with each other while the live table had
+        // one row, so *any* check built from those two numbers passes on stale data.
+        // A layout-based freshness signal (epoch/layout id carried by the dictionary
+        // entry) is required first:
+        // comparing against the physical row count (`row_groups[].row_count`) kept
+        // this lane on deleted tables -- 0.21 ms against the generic route's 8.4 ms
+        // -- but a compaction that rewrote the file left the cached dictionary
+        // describing the old layout, and `SELECT s, count(*) ... GROUP BY s` then
+        // returned 97 rows where the surviving data had 1
+        // (`TestDictionaryDropOnCompaction`). Comparing against `base_row_count`
+        // failed for the same reason one step later. The lane stays refused while
+        // anything but the active row set has to be trusted; see the round-110
+        // record for the constraint and the follow-up.
+        // The dictionary is built from the file's *physical* rows -- rows deleted
+        // through the deletion vectors included -- and the aggregation skips those
+        // deleted rows itself. `active_row_count` already excludes them, so comparing
+        // with it refused this lane the moment a single row had ever been deleted:
+        // 0.21 ms here against the generic route's 8.4 ms on 200k rows.
+        //
+        // An earlier attempt relaxed this check and blamed it for wrong results in
+        // `TestDictionaryDropOnCompaction`; instrumentation showed the check was
+        // right (`dict=5000 rgs=1 del_sum=4999 active=1`: 5000 physical rows with
+        // 4999 deleted) and the wrong result came from the aggregation's fallback,
+        // which read no deletion bitmap for a `COUNT(*)`-only group-by. That fallback
+        // is fixed in `execute_group_agg_cached_mmap`.
+        // The cached dictionary covers the *physical* rows, so the check has to use the
+        // persisted row count. It reads the cached footer in place rather than cloning
+        // it: the footer carries the zone maps and every group's column offsets, and
+        // rebuilding it on every cached group-by made the whole aggregation family
+        // measurably slower on 1M rows.
+        let physical_rows: u64 = backend.storage.persisted_physical_rows()?;
+
+        if physical_rows == 0 || dict_arc.1.len() != physical_rows as usize {
             return Ok(None);
         }
         let (dict_strings, group_ids) = (dict_arc.0.as_slice(), dict_arc.1.as_slice());
@@ -5125,10 +6083,62 @@ return Ok(result);
             .map(|(col, is_count, _, _)| (*col, *is_count))
             .collect();
 
-        let raw = match backend.execute_group_agg_cached(dict_strings, group_ids, &agg_cols)? {
+        // A pending cell update used to refuse this lane outright: after a single
+        // UPDATE the whole `GROUP BY ... ORDER BY count` family stayed on the generic
+        // route for good -- 7.3 ms against 0.21 ms here, a 35x cliff that survived
+        // reopens. It is safe to keep the lane when the update cannot change the
+        // answer: no row was added or removed, and neither the grouped column nor any
+        // aggregated column was touched. (`COUNT(*)` has no aggregated column, so an
+        // update to any other column leaves its counts alone.)
+        if backend.has_pending_deltas() {
+            let membership_changed = backend.pending_delta_delete_count() > 0
+                || backend.active_row_count() != backend.base_row_count();
+            let touches_grouped = backend.pending_delta_updates_column(group_col);
+            if membership_changed || touches_grouped {
+                return Ok(None);
+            }
+        }
+
+        let mut raw = match backend.execute_group_agg_cached(dict_strings, group_ids, &agg_cols)? {
             Some(r) if !r.is_empty() => r,
             _ => return Ok(None),
         };
+
+
+        // A pending cell update that touches an aggregated column was ignored by the
+        // base-only aggregate above. SUM and AVG are sum-based, so folding
+        // (new - old) for each updated row into its group repairs them; MIN/MAX cannot
+        // be repaired and a change of nullness would move a COUNT(col), so those
+        // decline. `physical_rows` has to equal the active count for this to be sound:
+        // an updated row that the deletion vectors hide is not in the aggregate.
+        if backend.has_pending_deltas()
+            && agg_info.iter().any(|(col, is_star, _, _)| {
+                !*is_star && backend.pending_delta_updates_column(col)
+            })
+        {
+            for (col, is_star, func, _) in &agg_info {
+                if *is_star || !backend.pending_delta_updates_column(col) {
+                    continue;
+                }
+                if !matches!(func, AggregateFunc::Sum | AggregateFunc::Avg) {
+                    return Ok(None);
+                }
+            }
+            let Some(corrections) = Self::pending_cell_correction(
+                backend,
+                &raw,
+                dict_strings,
+                group_ids,
+                &agg_info,
+                physical_rows,
+            )?
+            else {
+                return Ok(None);
+            };
+            for (row, aggregate, delta) in corrections {
+                raw[row].1[aggregate].0 += delta;
+            }
+        }
 
         // Build result
         let group_values: Vec<&str> = raw.iter().map(|(k, _)| k.as_str()).collect();
@@ -6019,10 +7029,34 @@ return Ok(result);
         row_indices: &[usize],
     ) -> io::Result<RecordBatch> {
         // Every caller reaches this with the WHERE already applied by a
-        // storage-level scan, so only the post-filter columns (SELECT /
-        // ORDER BY / GROUP BY) are needed — reading the filter columns again
-        // wastes a full-column scatter.
+        // storage-level scan *and* projects/orders/limits the result itself, so
+        // only the post-filter columns (SELECT / ORDER BY / GROUP BY) are
+        // needed — reading the filter columns again wastes a full-column
+        // scatter.
         let col_refs = Self::post_filter_col_refs(stmt);
+        Self::read_matching_rows_with(backend, row_indices, col_refs)
+    }
+
+    /// Rows for a caller that hands the batch to the shared tail.
+    ///
+    /// The tail re-applies the complete predicate, so the batch has to carry
+    /// the WHERE columns as well. Reading them for the matched rows is far
+    /// cheaper than the tail's fallback, which re-reads the whole relation when
+    /// a column is missing (path `predicate_column_reread`).
+    fn read_matching_rows_for_tail(
+        backend: &TableStorageBackend,
+        stmt: &SelectStatement,
+        row_indices: &[usize],
+    ) -> io::Result<RecordBatch> {
+        let col_refs = Self::get_col_refs(stmt);
+        Self::read_matching_rows_with(backend, row_indices, col_refs)
+    }
+
+    fn read_matching_rows_with(
+        backend: &TableStorageBackend,
+        row_indices: &[usize],
+        col_refs: Option<Vec<String>>,
+    ) -> io::Result<RecordBatch> {
         let col_refs_vec: Option<Vec<&str>> = col_refs
             .as_ref()
             .map(|v| v.iter().map(|s| s.as_str()).collect());
@@ -6223,7 +7257,7 @@ return Ok(result);
     /// and use storage-level filtered read instead of full table scan.
     /// Handles: col > N, col >= N, col < N, col <= N, col = N, col != N
     /// Returns Some(batch) if pushdown succeeded, None to fall through.
-    fn try_numeric_predicate_pushdown(
+fn try_numeric_predicate_pushdown(
         backend: &TableStorageBackend,
         stmt: &SelectStatement,
     ) -> io::Result<Option<RecordBatch>> {
@@ -6260,7 +7294,7 @@ return Ok(result);
                 let schema = backend.read_columns_to_arrow(None, 0, Some(0))?;
                 return Ok(Some(schema));
             }
-            let batch = Self::read_matching_rows_adaptive(backend, stmt, &indices)?;
+            let batch = Self::read_matching_rows_for_tail(backend, stmt, &indices)?;
             return Ok(Some(batch));
         }
 

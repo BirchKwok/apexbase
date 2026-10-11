@@ -744,10 +744,18 @@ impl IndexManager {
     }
 
     /// Rebuild all indexes from scratch (used after compaction)
-    pub fn rebuild_all(&mut self) {
-        for instance in self.instances.values_mut() {
-            instance.clear();
+    /// Drop every index's postings ahead of a full rebuild.
+    ///
+    /// Instances load lazily, so clearing only the already-loaded ones let an
+    /// unloaded index load its stale postings *during* the rebuild and insert
+    /// every row a second time — an indexed lookup then returned duplicate rows
+    /// until the next REINDEX. Every index is therefore loaded and cleared here.
+    pub fn rebuild_all(&mut self) -> io::Result<()> {
+        let names: Vec<String> = self.catalog.keys().cloned().collect();
+        for name in names {
+            self.ensure_loaded(&name)?.clear();
         }
+        Ok(())
     }
 
     // ========================================================================

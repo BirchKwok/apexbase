@@ -610,3 +610,101 @@ class TestCrossFeatureIntegration:
         # Violate PK uniqueness
         with pytest.raises(Exception):
             db.execute("INSERT INTO product (id, name, price) VALUES (1, 'Dup', 1.0)")
+
+
+class TestCompressedPointRead:
+    """Point reads on a compressed row group must decode every column kind.
+
+    A compressed row group is read by the sequential fallback, which used to
+    know only Int64/Float64/String. A dictionary-encoded string, a Bool, or a
+    binary column therefore read back as NULL through `retrieve()` and
+    `SELECT ... WHERE _id = N`, while the scan path returned the right values.
+    """
+
+    ROWS = 5000
+    DICT_VALUES = 17
+
+    @staticmethod
+    def _value(i):
+        """The fixture's string for row index `i` (`None` where it is NULL)."""
+        if i % 101 == 0:
+            return None
+        return f"value-{'pad' * (i % 3)}_{i % TestCompressedPointRead.DICT_VALUES}"
+
+    @staticmethod
+    def _flag(i):
+        if i % 53 == 0:
+            return None
+        return i % 3 == 0
+
+    def _fixture(self, tmp_path):
+        client = ApexClient(str(tmp_path / "db"), drop_if_exists=True, enable_cache=False)
+        client.create_table(
+            "t", {"n": "int64", "s": "string", "b": "bool", "score": "float32"}
+        )
+        client.use_table("t")
+        assert client.set_compression("zstd") is True
+        client.store(
+            {
+                "n": [i % 977 for i in range(self.ROWS)],
+                "s": [self._value(i) for i in range(self.ROWS)],
+                "b": [self._flag(i) for i in range(self.ROWS)],
+                "score": [i * 0.5 for i in range(self.ROWS)],
+            }
+        )
+        client.flush()
+        with open(tmp_path / "db" / "t.apex", "rb") as handle:
+            blob = handle.read(256 + 32)
+        assert blob[256 + 28] != 0, "fixture must actually compress its row group"
+        return client
+
+    def _expect(self, point_id):
+        index = point_id - 1
+        return {
+            "n": index % 977,
+            "s": self._value(index),
+            "b": self._flag(index),
+            "score": index * 0.5,
+        }
+
+    def test_retrieve_decodes_dict_strings_and_bools(self, tmp_path):
+        client = self._fixture(tmp_path)
+        try:
+            # A dictionary-encoded string and a Bool must survive the
+            # compressed sequential decode, not come back as NULL.
+            for point_id in (2, 3, 4, 100):
+                row = client.retrieve(point_id)
+                expected = self._expect(point_id)
+                assert row["s"] == expected["s"], point_id
+                assert row["b"] == expected["b"], point_id
+                assert row["n"] == expected["n"], point_id
+                assert row["score"] == expected["score"], point_id
+        finally:
+            client.close()
+
+    def test_id_point_lookup_decodes_the_same_row(self, tmp_path):
+        client = self._fixture(tmp_path)
+        try:
+            for point_id in (2, 3, 4, 100):
+                expected = self._expect(point_id)
+                got = client.execute(
+                    f"SELECT n, s, b, score FROM t WHERE _id = {point_id}"
+                ).to_dict()
+                assert got == [expected], point_id
+        finally:
+            client.close()
+
+    def test_null_values_stay_null(self, tmp_path):
+        client = self._fixture(tmp_path)
+        try:
+            # Every 101st string and every 53rd bool is NULL in the fixture.
+            assert client.retrieve(102)["s"] is None
+            assert client.retrieve(54)["b"] is None
+            # The scan and the point read must agree on the same rows.
+            for point_id in (102, 54):
+                expected = self._expect(point_id)
+                assert client.execute(
+                    f"SELECT n, s, b, score FROM t WHERE _id = {point_id}"
+                ).to_dict() == [expected]
+        finally:
+            client.close()

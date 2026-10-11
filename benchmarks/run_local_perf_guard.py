@@ -152,9 +152,46 @@ def one_wheel(directory):
 
 def benchmark_arguments(
     mode, rows, warmup, iterations, output, qps_only=False, quant_only=False,
-    index_only=False, parallel_only=False,
+    index_only=False, parallel_only=False, width_only=False, string_zones_only=False,
+    htap_only=False, wide_only=False, hybrid_only=False, pgwire_only=False,
 ):
-    if mode == "canary" or qps_only or quant_only or index_only or parallel_only:
+    if width_only:
+        # The width-fidelity phase builds its own tables (one V4 full-width
+        # file, one V5 narrow file) and emits its own metric rows, so it is its
+        # own script rather than a profile of the canary.
+        script = ROOT / "benchmarks" / "bench_width_fidelity.py"
+        defaults = (200_000, 2, 7)
+    elif string_zones_only:
+        # The string-zone phase builds its own table covering the zone shapes
+        # (equal-width shared-prefix values, bucket keys, unprovable probes) and
+        # asserts every row count, so it is its own script too.
+        script = ROOT / "benchmarks" / "bench_string_zone_shapes.py"
+        defaults = (200_000, 2, 7)
+    elif htap_only:
+        # The HTAP overlay phase writes its own table, appends 1% buffered rows
+        # and asserts every aggregate against an independent computation, so it
+        # is its own script as well.
+        script = ROOT / "benchmarks" / "bench_htap_overlay.py"
+        defaults = (200_000, 2, 7)
+    elif wide_only:
+        # The wide-table phase builds its own 16-column table (plus a zstd twin)
+        # over several row groups and asserts every shape, so it is its own
+        # script too.
+        script = ROOT / "benchmarks" / "bench_wide_table.py"
+        defaults = (200_000, 2, 7)
+    elif hybrid_only:
+        # The hybrid-retrieval phase builds its own text + vector table, asserts
+        # BM25 hit membership and exact vector recall, then times the fused
+        # pipeline; it is its own script as well.
+        script = ROOT / "benchmarks" / "bench_hybrid_retrieval.py"
+        defaults = (50_000, 2, 7)
+    elif pgwire_only:
+        # The PG wire phase starts a real server, drives it with concurrent
+        # simple-query connections and asserts every timed count, so it is its
+        # own script as well.
+        script = ROOT / "benchmarks" / "bench_pg_wire_concurrency.py"
+        defaults = (200_000, 2, 7)
+    elif mode == "canary" or qps_only or quant_only or index_only or parallel_only:
         script = ROOT / "benchmarks" / "bench_perf_canary.py"
         defaults = (200_000, 2, 7)
     else:
@@ -170,9 +207,17 @@ def benchmark_arguments(
         "--rows", str(resolved[0]),
         "--warmup", str(resolved[1]),
         "--iterations", str(resolved[2]),
-        "--output", output,
     ]
-    if mode == "full" and not qps_only and not quant_only:
+    if script.name == "bench_vs_sqlite_duckdb.py":
+        # Track per-case RSS as well. Out-of-core work is invisible to a wall-clock-only gate:
+        # scanning a 20M-row CSV used to add +1397 MB RSS while staying fast enough not to
+        # trip a timing threshold. The extra fields are informational (the comparison tool
+        # ignores them), so this cannot mask a timing regression.
+        command.append("--memory")
+    command += ["--output", output]
+    if mode == "full" and not qps_only and not quant_only and not width_only \
+            and not string_zones_only and not htap_only and not wide_only \
+            and not hybrid_only and not pgwire_only:
         # Quantized base/current metrics run in the dedicated interleaved phase.
         command.insert(1, "--skip-quantized-vector")
     if qps_only:
@@ -493,6 +538,132 @@ def execute_gate(args, output_dir, evidence):
                     collect_par, par_reports, "par-comparison"
                 )
                 comparison_status = max(comparison_status, par_status)
+
+                # V5 width fidelity: the same dataset written once in the V4
+                # full-width layout and once in the V5 narrow layout. The phase
+                # measures bytes on disk, warm latency, and first-touch page
+                # faults per shape, so the storage and read gain of a narrower
+                # physical encoding is quantified in every full-mode run instead
+                # of only being asserted. Latency rows are milliseconds; the
+                # bytes/pages rows are counts (larger is worse, which is the
+                # comparator's default direction).
+                wf_counts = {"base": 0, "current": 0}
+                wf_reports = {"base": [], "current": []}
+                collect_wf = make_collect(
+                    "wf",
+                    wf_counts,
+                    wf_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, width_only=True
+                    ),
+                )
+                collect_wf(SAMPLE_ORDER)
+                wf_status = run_comparison(collect_wf, wf_reports, "wf-comparison")
+                comparison_status = max(comparison_status, wf_status)
+
+                # V5 string zone maps: the shapes the value and tail ranges
+                # exist for. A build with only the length heuristic scans every
+                # row group on an equal-width shared-prefix column, so this
+                # phase quantifies the pruning gain directly instead of leaving
+                # it to the noisy scoreboard family.
+                zs_counts = {"base": 0, "current": 0}
+                zs_reports = {"base": [], "current": []}
+                collect_zs = make_collect(
+                    "zs",
+                    zs_counts,
+                    zs_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, string_zones_only=True
+                    ),
+                )
+                collect_zs(SAMPLE_ORDER)
+                zs_status = run_comparison(collect_zs, zs_reports, "zs-comparison")
+                comparison_status = max(comparison_status, zs_status)
+
+                # HTAP overlay: the same fused aggregations with 1% appended rows
+                # sitting in the write buffer. A read lane that stands down while
+                # an overlay exists pays a full merged materialization, so this
+                # phase quantifies the write-then-read amplification directly.
+                htap_counts = {"base": 0, "current": 0}
+                htap_reports = {"base": [], "current": []}
+                collect_htap = make_collect(
+                    "htap",
+                    htap_counts,
+                    htap_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, htap_only=True
+                    ),
+                )
+                collect_htap(SAMPLE_ORDER)
+                htap_status = run_comparison(
+                    collect_htap, htap_reports, "htap-comparison"
+                )
+                comparison_status = max(comparison_status, htap_status)
+
+                # Wide tables: 16 columns over seven row groups, plus a
+                # zstd-compressed twin. Projection bandwidth, per-row-group
+                # header work and decode cost all scale differently than in the
+                # narrow canary tables, so these shapes are sampled base/current
+                # like any other metric instead of being assumed.
+                wide_counts = {"base": 0, "current": 0}
+                wide_reports = {"base": [], "current": []}
+                collect_wide = make_collect(
+                    "wide",
+                    wide_counts,
+                    wide_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, wide_only=True
+                    ),
+                )
+                collect_wide(SAMPLE_ORDER)
+                wide_status = run_comparison(
+                    collect_wide, wide_reports, "wide-comparison"
+                )
+                comparison_status = max(comparison_status, wide_status)
+
+                # Mixed retrieval: one table carries both a text column and a
+                # 64-dimension vector column, and the phase times the BM25
+                # branch, the exact vector branch and their RRF fusion. It is the
+                # only coverage of V5's "mixed search" goal, and it asserts the
+                # branch results (membership, exhaustive recall) before timing.
+                hybrid_counts = {"base": 0, "current": 0}
+                hybrid_reports = {"base": [], "current": []}
+                collect_hybrid = make_collect(
+                    "hybrid",
+                    hybrid_counts,
+                    hybrid_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, hybrid_only=True
+                    ),
+                )
+                collect_hybrid(SAMPLE_ORDER)
+                hybrid_status = run_comparison(
+                    collect_hybrid, hybrid_reports, "hybrid-comparison"
+                )
+                comparison_status = max(comparison_status, hybrid_status)
+
+                # PG wire concurrency: a real server driven by concurrent
+                # simple-query connections. This is the only coverage of the
+                # server path, where a statement used to run on a tokio worker
+                # (capping execution at the worker count and stalling the
+                # connection loop). The phase times the 1/2/4/8-client curve and
+                # a metadata probe sent while 24 clients are busy, and asserts
+                # every timed count against the generated rows.
+                pgwire_counts = {"base": 0, "current": 0}
+                pgwire_reports = {"base": [], "current": []}
+                collect_pgwire = make_collect(
+                    "pgwire",
+                    pgwire_counts,
+                    pgwire_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, pgwire_only=True
+                    ),
+                )
+                collect_pgwire(SAMPLE_ORDER)
+                pgwire_status = run_comparison(
+                    collect_pgwire, pgwire_reports, "pgwire-comparison"
+                )
+                comparison_status = max(comparison_status, pgwire_status)
 
             print(f"Reports and comparison saved in {output_dir}")
         finally:
