@@ -1626,7 +1626,9 @@ return Ok(result);
                                                             0,
                                                             Some(0),
                                                         )?
-                                                    } else if backend.is_mmap_only()
+                                                    } else if !backend.has_persisted_deletions()
+                                                        && !backend.has_delta()
+                                                        && backend.is_mmap_only()
                                                         && !Self::should_use_scatter_read(
                                                             backend.row_count() as usize,
                                                             indices.len(),
@@ -7066,7 +7068,19 @@ let can_pushdown_limit = stmt.where_clause.is_none()
         }
 
         let total_rows = backend.row_count() as usize;
-        if backend.is_mmap_only() && !Self::should_use_scatter_read(total_rows, row_indices.len()) {
+        // `row_indices` come from a storage-level scan, which numbers the file's
+        // *physical* rows. The full batch is the *active* view, so the two agree
+        // only while nothing has been deleted: with a persisted deletion vector the
+        // surviving rows sit at different offsets, and taking physical indices out
+        // of the active batch returned the wrong rows (and panicked a `take` whose
+        // index reached past the active length). Keep the scatter read for the
+        // physical case and let the indexed reader (which addresses the file) answer
+        // the rest.
+        let physical_indices = !backend.has_persisted_deletions() && !backend.has_delta();
+        if physical_indices
+            && backend.is_mmap_only()
+            && !Self::should_use_scatter_read(total_rows, row_indices.len())
+        {
             let full_batch = backend.read_columns_to_arrow(col_refs_vec.as_deref(), 0, None)?;
             return Self::take_rows_from_full_batch(&full_batch, row_indices);
         }

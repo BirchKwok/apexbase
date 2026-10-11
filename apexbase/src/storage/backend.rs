@@ -2798,6 +2798,16 @@ impl TableStorageBackend {
     }
 
     /// Get active (non-deleted) row count
+    /// Whether the base file carries a persisted row-group deletion vector.
+    ///
+    /// `active_row_count() == row_count()` cannot answer this: the header's row
+    /// count is rewritten to the surviving rows when a delete is persisted, so
+    /// both read 19000 while the file still holds 20000 physical rows plus the
+    /// bitmap. Lanes that address physical rows must gate on this instead.
+    pub fn has_persisted_deletions(&self) -> bool {
+        matches!(self.storage.persisted_deletion_state(), Ok(Some(_)))
+    }
+
     pub fn active_row_count(&self) -> u64 {
         self.storage.active_row_count()
     }

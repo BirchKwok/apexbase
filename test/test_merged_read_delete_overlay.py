@@ -505,3 +505,70 @@ def test_pagination_reads_only_the_page():
             client.close()
     finally:
         shutil.rmtree(root, ignore_errors=True)
+
+
+def test_order_by_after_a_persisted_delete_reads_only_the_surviving_rows():
+    """`ORDER BY <string> LIMIT k` must rank the active view, not the file.
+
+    A persisted deletion vector rewrites the header's row count to the surviving
+    rows, so `active_row_count() == row_count()` even though the file still holds
+    the deleted rows *before* the surviving ones. The ORDER BY lane read the sort
+    column as the active view but addressed the chosen rows by physical position,
+    so a deleted prefix came back: after `DELETE FROM t WHERE k < 1000` + flush,
+    `ORDER BY s ASC LIMIT 5` answered with `u0000000..u0000004`. The lane now reads
+    the winners back by `_id`, and the full-batch scatter path is skipped whenever
+    a persisted deletion vector exists (its `take` indices are physical while the
+    batch is the active view, which also panicked once an index reached the active
+    length).
+    """
+    rows = 20_000
+    deleted = 1_000
+    root = tempfile.mkdtemp(prefix="apexbase_order_after_delete_")
+    client = ApexClient(root, drop_if_exists=True, enable_cache=False)
+    try:
+        client.create_table("t", schema={"k": "int64", "s": "string"})
+        client.use_table("t")
+        # A NULL makes the dictionary/plain string top-k lanes decline, which is what
+        # pushed the statement onto the late-materialization lane that mis-addressed
+        # the rows. A NULL-free column passed even before the fix.
+        client.store({
+            "k": list(range(rows)),
+            "s": [None if i == rows - 1 else f"u{i:07d}" for i in range(rows)],
+        })
+        client.flush()
+        client.execute(f"DELETE FROM t WHERE k < {deleted}")
+        client.flush()
+
+        assert client.execute("SELECT COUNT(*) AS n FROM t").scalar() == rows - deleted
+        survivor = f"u{deleted:07d}"
+
+        # The lane that regressed.
+        ascending = client.execute(
+            "SELECT k, s FROM t ORDER BY s ASC LIMIT 5"
+        ).to_dict()
+        assert [row["k"] for row in ascending] == list(range(deleted, deleted + 5))
+        assert ascending[0]["s"] == survivor
+
+        # The same statement with an explicit (always true) predicate took the
+        # scatter path and panicked on `take` instead.
+        filtered = client.execute(
+            "SELECT k, s FROM t WHERE k >= 0 ORDER BY s ASC LIMIT 5"
+        ).to_dict()
+        assert [row["k"] for row in filtered] == list(range(deleted, deleted + 5))
+
+        # A numeric sort column must agree.
+        numeric = client.execute("SELECT k FROM t ORDER BY k ASC LIMIT 5").to_dict()
+        assert [row["k"] for row in numeric] == list(range(deleted, deleted + 5))
+
+        # ORDER BY with an OFFSET/aggregate still sees only surviving rows.
+        offset = client.execute(
+            f"SELECT k FROM t ORDER BY k ASC LIMIT 5 OFFSET {deleted}"
+        ).to_dict()
+        assert [row["k"] for row in offset] == list(range(deleted * 2, deleted * 2 + 5))
+        expected_sum = sum(range(deleted, rows))
+        assert client.execute(
+            "SELECT SUM(k) AS s FROM t WHERE k >= 0"
+        ).scalar() == expected_sum
+    finally:
+        client.close()
+        shutil.rmtree(root, ignore_errors=True)

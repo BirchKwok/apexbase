@@ -296,7 +296,16 @@ impl ApexExecutor {
                 }
             })
             .collect();
-        if backend.has_delta() {
+        // The sort batch is the *active* view whenever a persisted deletion vector
+        // or a delta is present, so a position into it is not a physical row number.
+        // `read_columns_by_indices_to_arrow` interprets its indices as physical
+        // positions, so reading the chosen rows that way returned deleted rows:
+        // after `DELETE FROM t WHERE k < 1000` + flush, `ORDER BY <string> ASC
+        // LIMIT 5` answered with the first five deleted values. `active_row_count()
+        // == row_count()` cannot detect that (the header's row count is rewritten
+        // to the surviving rows), so ask the storage for the deletion vector.
+        let read_by_id = backend.has_delta() || backend.has_persisted_deletions();
+        if read_by_id {
             order_cols.push("_id");
         }
 
@@ -446,9 +455,9 @@ impl ApexExecutor {
         }
 
         // Step 3: Read ALL columns but only for top-k rows. Combined base +
-        // append-delta batches use logical IDs because their Arrow positions do
-        // not map one-to-one to physical base-file indices.
-        if backend.has_delta() {
+        // append-delta batches and a persisted deletion vector both make the Arrow
+        // positions differ from physical base-file indices, so those read by `_id`.
+        if read_by_id {
             let id_col = sort_batch
                 .column_by_name("_id")
                 .ok_or_else(|| err_data("ORDER BY delta batch missing _id"))?;

@@ -7216,3 +7216,110 @@ fn filtered_distance_lane_scores_only_the_predicate_rows() {
         assert_eq!(docs(&general_sql), vec![0, 1, 2], "{label}");
     }
 }
+
+/// `ORDER BY … LIMIT k` after a persisted DELETE must rank the active rows.
+///
+/// The persisted deletion vector rewrites the header's row count to the surviving
+/// rows, so `active_row_count() == row_count()` even though the file still holds the
+/// deleted rows in front of the survivors. Two lanes read the sort column as the
+/// *active view* and then addressed the chosen rows by *physical* position:
+///
+/// * the ORDER BY late-materialization lane read the winners through
+///   `read_columns_by_indices_to_arrow`, so `DELETE FROM t WHERE k < 1000` followed
+///   by `ORDER BY s ASC LIMIT 5` answered with the deleted `u0000000..u0000004`;
+/// * the filtered scatter path (`read_matching_rows_with`) took the physical scan
+///   indices out of the active full batch, which returned the same wrong rows and
+///   panicked once an index reached the active length
+///   (`index out of bounds: the len is 19000 but the index is 19000`).
+///
+/// A nullable sort column is what pushed the statement onto those lanes (the
+/// dictionary and plain string top-k lanes decline on NULLs), which is why this
+/// fixture carries one.
+#[test]
+fn order_by_reads_only_the_active_rows_after_a_persisted_delete() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("order_after_delete_t.apex");
+    let rows = 20_000usize;
+    let deleted = 1_000u64;
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &[
+                ("k".to_string(), crate::storage::ColumnType::Int64),
+                ("s".to_string(), crate::storage::ColumnType::String),
+            ],
+        )
+        .unwrap();
+        let mut int_columns = HashMap::new();
+        int_columns.insert("k".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        let mut string_columns = HashMap::new();
+        string_columns.insert(
+            "s".to_string(),
+            (0..rows).map(|i| format!("u{i:07}")).collect::<Vec<String>>(),
+        );
+        let mut null_positions = HashMap::new();
+        null_positions.insert(
+            "s".to_string(),
+            (0..rows).map(|i| i == rows - 1).collect::<Vec<bool>>(),
+        );
+        storage
+            .insert_typed_with_nulls(
+                int_columns,
+                HashMap::new(),
+                string_columns,
+                HashMap::new(),
+                HashMap::new(),
+                null_positions,
+            )
+            .unwrap();
+        storage.save().unwrap();
+        // Ids are 1-based, so deleting 1..=1000 removes the `k < 1000` prefix: the
+        // deleted rows sit *before* the survivors in physical order.
+        for id in 1..=deleted {
+            assert!(storage.delete(id), "id {id} must exist");
+        }
+        storage.save_delete_only().unwrap();
+    }
+
+    let session = crate::Session::new(dir.path(), &path);
+    let ints = |sql: &str| -> Vec<i64> {
+        let batch = session.execute(sql).unwrap().to_record_batch().unwrap();
+        batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap()
+            .values()
+            .to_vec()
+    };
+
+    let expected = vec![deleted as i64, deleted as i64 + 1, deleted as i64 + 2];
+    // The lane that returned the deleted prefix.
+    assert_eq!(
+        ints("SELECT k FROM order_after_delete_t ORDER BY s ASC LIMIT 3"),
+        expected,
+        "ORDER BY <string> must rank the active rows"
+    );
+    // The lane that also panicked (`take` index past the active length).
+    assert_eq!(
+        ints("SELECT k FROM order_after_delete_t WHERE k >= 0 ORDER BY s ASC LIMIT 3"),
+        expected,
+        "a filtered ORDER BY must not address physical rows in the active batch"
+    );
+    assert_eq!(
+        ints("SELECT k FROM order_after_delete_t WHERE k >= 0 ORDER BY k ASC LIMIT 3"),
+        expected,
+        "a numeric filtered ORDER BY must agree"
+    );
+    assert_eq!(
+        ints("SELECT COUNT(*) AS n FROM order_after_delete_t WHERE k >= 0"),
+        vec![rows as i64 - deleted as i64],
+        "the aggregate path must still see the active view"
+    );
+    assert_eq!(
+        ints("SELECT SUM(k) AS s FROM order_after_delete_t WHERE k >= 0"),
+        vec![(deleted as i64..rows as i64).sum::<i64>()],
+        "the filtered aggregate must sum only surviving rows"
+    );
+}
