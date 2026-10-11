@@ -405,13 +405,20 @@ impl V4Footer {
         // Schema
         let schema_len = u64::from_le_bytes(bytes[pos..pos+8].try_into().unwrap()) as usize;
         pos += 8;
-        if pos + schema_len > bytes.len() {
-            return Err(err_data("V4 footer: schema overflow"));
-        }
-        let schema = OnDemandSchema::from_bytes(&bytes[pos..pos+schema_len])?;
-        pos += schema_len;
+        // `schema_len` is read from the file, so `pos + schema_len` can wrap and pass
+        // the bound check, which then panics on a slice whose start is past its end
+        // (`slice index starts at 8 but ends at 7` under a corrupt footer).
+        let schema_end = match pos.checked_add(schema_len) {
+            Some(end) if end <= bytes.len() => end,
+            _ => return Err(err_data("V4 footer: schema overflow")),
+        };
+        let schema = OnDemandSchema::from_bytes(&bytes[pos..schema_end])?;
+        pos = schema_end;
         
         // Row Group directory
+        if pos + 4 > bytes.len() {
+            return Err(err_data("V4 footer: truncated row group directory"));
+        }
         let rg_count = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as usize;
         pos += 4;
         

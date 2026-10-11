@@ -88,6 +88,14 @@ a version-5 file.
   published generation and the row-id high-water mark, and document the naming
   rule as the single one that the SQL path, the Python bindings and the epoch
   tracker share
+- Bounds-check the V4 footer and WAL readers so a corrupt or truncated file is an
+  error instead of a panic: `FooterV4::from_bytes` computes the schema end with a
+  checked add (a corrupt length wrapped `pos + schema_len` past the bound check
+  and then panicked on a slice whose start was past its end), and
+  `WalRecord::from_bytes_versioned` checks the 13-byte header, the body and the
+  CRC (a record a crash left half-written aborted the process from
+  `SELECT COUNT(*)` via `fast_row_count`). Both add Rust regression tests that cut
+  a real record at every byte offset
 
 ### Read Lanes
 
@@ -164,7 +172,14 @@ a version-5 file.
   DESC` silently keep scan order and `GROUP BY ABS(score - 1.5)` collapse to a
   single group; use exact-name resolution first and the identifier-aware
   `strip_column_qualifier` otherwise
-- **Encoded columns**: keep the one-byte encoding tag in the slice handed to
+- **`ORDER BY … LIMIT n OFFSET m` applied the offset twice** on the top-k lane
+  that reads only the k chosen rows: its index list already skipped `m` and the
+  caller applied the page again, so `ORDER BY <plain string> LIMIT 10 OFFSET 7`
+  returned rows 14..24. `compute_topk_indices_generic` and the inlined streaming
+  heaps now return exactly the first `k` positions and no longer take an offset
+  argument, which removes the double application and the ambiguous convention
+  that allowed it
+- **Encoding tag**: keep the one-byte encoding tag in the slice handed to
   `read_column_encoded`, whose dispatch reads `bytes[0]` — a caller that skipped
   the null bitmap and the tag read `count=216172782113783808` from a BITPACK
   column and reported truncation

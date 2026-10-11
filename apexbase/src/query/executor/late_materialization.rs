@@ -331,7 +331,6 @@ impl ApexExecutor {
                         &sort_batch,
                         &stmt.order_by,
                         k_actual,
-                        stmt.offset,
                     )
                 } else if let Some(float_arr) = col.as_any().downcast_ref::<Float64Array>() {
                     let descending = clause.descending;
@@ -418,13 +417,17 @@ impl ApexExecutor {
                         }
                     }
 
-                    top_k.into_iter().skip(offset).map(|(_, idx)| idx).collect()
+                    // The caller applies LIMIT/OFFSET to the batch this lane reads
+                    // (`apply_limit_offset`), so these must be the first `k` rows of
+                    // the requested order with no offset skipped here. Skipping it in
+                    // both places dropped the first `offset` rows twice: `LIMIT 10
+                    // OFFSET 7` returned rows 14..24.
+                    top_k.into_iter().map(|(_, idx)| idx).collect()
                 } else {
                     Self::compute_topk_indices_generic(
                         &sort_batch,
                         &stmt.order_by,
                         k_actual,
-                        stmt.offset,
                     )
                 }
             } else {
@@ -432,11 +435,10 @@ impl ApexExecutor {
                     &sort_batch,
                     &stmt.order_by,
                     k_actual,
-                    stmt.offset,
                 )
             }
         } else {
-            Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual, stmt.offset)
+            Self::compute_topk_indices_generic(&sort_batch, &stmt.order_by, k_actual)
         };
 
         if final_indices.is_empty() {

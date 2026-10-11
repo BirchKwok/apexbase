@@ -196,14 +196,20 @@ def test_large_csv_scan_stays_memory_bounded(tmp_path):
     env["PYTHONPATH"] = os.pathsep.join(
         [p for p in [env.get("PYTHONPATH", ""), str(Path(__file__).resolve().parents[1] / "apexbase" / "python")] if p]
     )
-    completed = subprocess.run(
+    # `check=True` hides why the child failed; surface its stderr and faulthandler
+    # traceback instead, because this shape is the one that fails first on a new
+    # platform and the reason has to reach the log.
+    env["PYTHONFAULTHANDLER"] = "1"
+    process = subprocess.Popen(
         [sys.executable, "-c", CSV_SCAN_SNIPPET, str(database), str(source)],
         env=env,
-        capture_output=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        check=True,
     )
-    count, delta = completed.stdout.split()
+    out, err = process.communicate(timeout=600)
+    assert process.returncode == 0, (process.returncode, out, err)
+    count, delta = out.split()
     assert int(count) == sum(1 for i in range(rows) if (i % 1000) / 10.0 >= 50)
     # `ru_maxrss` is a peak resident set. Windows counts shared and file-backed
     # pages in the working set that Linux and macOS do not, and the engine maps the

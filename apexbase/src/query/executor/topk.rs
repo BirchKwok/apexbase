@@ -222,11 +222,15 @@ impl ApexExecutor {
     }
 
     /// Generic top-k computation using partial sort (fallback for complex cases)
+    /// Sorted positions of the first `k` rows of `order_by`.
+    ///
+    /// No LIMIT/OFFSET is applied here: the caller reads those `k` rows and then
+    /// slices the batch (`apply_limit_offset`). Skipping the offset here as well
+    /// dropped the first `offset` rows twice.
     fn compute_topk_indices_generic(
         sort_batch: &RecordBatch,
         order_by: &[crate::query::OrderByClause],
         k: usize,
-        offset: Option<usize>,
     ) -> Vec<usize> {
         let num_rows = sort_batch.num_rows();
 
@@ -317,12 +321,7 @@ impl ApexExecutor {
                         packed.truncate(k);
                     }
                     packed.sort_unstable_by_key(|&(a, b, _)| (a, b));
-                    let off = offset.unwrap_or(0);
-                    return packed
-                        .into_iter()
-                        .skip(off)
-                        .map(|(_, _, idx)| idx)
-                        .collect();
+                    return packed.into_iter().map(|(_, _, idx)| idx).collect();
                 }
             }
         }
@@ -383,10 +382,6 @@ impl ApexExecutor {
         }
         indices.sort_by(|&a, &b| compare_rows(a, b));
 
-        if let Some(off) = offset {
-            indices.into_iter().skip(off).collect()
-        } else {
-            indices
-        }
+        indices
     }
 }
