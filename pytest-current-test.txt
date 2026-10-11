@@ -1,0 +1,1 @@
+test/test_compressed_directory_point_read.py::test_partial_batch_lookup_never_drops_sidecar_rows[zstd]

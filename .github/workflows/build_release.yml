@@ -295,10 +295,14 @@ jobs:
         print(f"pandas={pandas.__version__}")
         print(f"polars={polars.__version__}")
         PY
-        python -X faulthandler -m pytest \
+        python -u -X faulthandler -m pytest \
           --timeout=30 \
           --durations=40 \
-          --junitxml=pytest-results.xml
+          --junitxml=pytest-results.xml || {
+            echo "=== pytest exited $? | last test in pytest-current-test.txt: ==="
+            cat pytest-current-test.txt || true
+            exit 1
+          }
         python - <<'PY'
         import sys
         import xml.etree.ElementTree as ET
