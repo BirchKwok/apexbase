@@ -310,6 +310,20 @@ jobs:
             grep -B 1 -A 14 "^\[failed\]" pytest-failures.txt || true
             echo "=== last 60 lines of pytest-failures.txt ==="
             tail -n 60 pytest-failures.txt || true
+            if [ "${RUNNER_OS:-}" = "Windows" ]; then
+              # A native abort leaves no Python traceback, so ask Windows for the
+              # faulting module and exception code: an access violation
+              # (0xC0000005) and a stack overflow (0xC00000FD) need different fixes.
+              echo "=== Windows application-error entries ==="
+              powershell -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='Application'} -MaxEvents 40 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'python|_core|apexbase' } | Select-Object -First 5 -ExpandProperty Message" || true
+              echo "=== rerun the recorded test alone, to confirm it reproduces ==="
+              recorded=$(cat pytest-current-test.txt 2>/dev/null || true)
+              echo "test: ${recorded}"
+              if [ -n "${recorded}" ]; then
+                python -u -X faulthandler -m pytest "${recorded}" -q -p no:cacheprovider || true
+                echo "isolated exit: $?"
+              fi
+            fi
             exit ${code}
           }
         python - <<'PY'
