@@ -146,7 +146,14 @@ def test_the_string_lane_beats_the_fallback_for_a_non_dictionary_column():
             # Sanity: both agree on the shape (5 rows), then the cost bound.
             assert len(client.execute(
                 "SELECT * FROM t ORDER BY city DESC LIMIT 5").to_dict()) == 5
-            assert lane < fallback / 4 + 0.5, (lane, fallback)
+            # Directional, not a fixed ratio: both sides are single-shot medians on
+            # a shared runner, and the general path has since been optimized to
+            # within a small factor of the lane at `LIMIT 5` (a release run measured
+            # 1.51 ms against 2.39 ms). The regression this guards against is the
+            # projected form falling back to the *full sort*, which makes the "lane"
+            # slower than the fallback by a wide margin, so a directional bound
+            # still catches it while surviving a loaded runner.
+            assert lane < fallback, (lane, fallback)
         finally:
             client.close()
 
@@ -171,7 +178,14 @@ def test_a_projected_order_by_uses_the_fast_lane():
         try:
             lane = _median_ms(client, "SELECT city FROM t ORDER BY city DESC LIMIT 5")
             fallback = _median_ms(client, "SELECT uniq FROM t ORDER BY uniq DESC LIMIT 5")
-            assert lane < fallback / 4 + 0.5, (lane, fallback)
+            # Directional, not a fixed ratio: both sides are single-shot medians on
+            # a shared runner, and the general path has since been optimized to
+            # within a small factor of the lane at `LIMIT 5` (a release run measured
+            # 1.51 ms against 2.39 ms). The regression this guards against is the
+            # projected form falling back to the *full sort*, which makes the "lane"
+            # slower than the fallback by a wide margin, so a directional bound
+            # still catches it while surviving a loaded runner.
+            assert lane < fallback, (lane, fallback)
             projected = client.execute(
                 "SELECT city FROM t ORDER BY city DESC LIMIT 5").to_dict()
             assert len(projected) == 5
