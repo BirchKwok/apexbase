@@ -1,1 +1,0 @@
-test/test_zone_map_metadata.py::TestAppendedRowGroupZoneMaps::test_appends_crossing_a_row_group_boundary_stay_correct
