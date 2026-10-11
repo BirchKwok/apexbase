@@ -1,0 +1,1990 @@
+
+<!doctype html>
+<html lang="en" class="no-js">
+  <head>
+    
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width,initial-scale=1">
+      
+        <meta name="description" content="High-performance HTAP embedded database with Rust core and Python API">
+      
+      
+        <meta name="author" content="Birch Kwok">
+      
+      
+        <link rel="canonical" href="https://birchkwok.github.io/apexbase/1.37.1/READ_PATH_CAPABILITIES/">
+      
+      
+        <link rel="prev" href="../SCAN_EXECUTION_ARCHITECTURE/">
+      
+      
+        <link rel="next" href="../RESOURCE_OWNERSHIP/">
+      
+      
+        
+      
+      
+      <link rel="icon" href="../img/favicon.svg">
+      <meta name="generator" content="mkdocs-1.6.1, mkdocs-material-9.7.7">
+    
+    
+      
+        <title>Read-Path Capabilities - ApexBase</title>
+      
+    
+    
+      <link rel="stylesheet" href="../assets/stylesheets/main.ec1eaa64.min.css">
+      
+        
+        <link rel="stylesheet" href="../assets/stylesheets/palette.ab4e12ef.min.css">
+      
+      
+
+
+    
+    
+      
+    
+    
+      
+        
+        
+        <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+        <link rel="stylesheet" href="https://fonts.googleapis.com/css?family=Roboto:300,300i,400,400i,700,700i%7CRoboto+Mono:400,400i,700,700i&display=fallback">
+        <style>:root{--md-text-font:"Roboto";--md-code-font:"Roboto Mono"}</style>
+      
+    
+    
+    <script>__md_scope=new URL("..",location),__md_hash=e=>[...e].reduce(((e,_)=>(e<<5)-e+_.charCodeAt(0)),0),__md_get=(e,_=localStorage,t=__md_scope)=>JSON.parse(_.getItem(t.pathname+"."+e)),__md_set=(e,_,t=localStorage,a=__md_scope)=>{try{t.setItem(a.pathname+"."+e,JSON.stringify(_))}catch(e){}}</script>
+    
+      
+
+    
+    
+  </head>
+  
+  
+    
+    
+      
+    
+    
+    
+    
+    <body dir="ltr" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo">
+  
+    
+    <input class="md-toggle" data-md-toggle="drawer" type="checkbox" id="__drawer" autocomplete="off">
+    <input class="md-toggle" data-md-toggle="search" type="checkbox" id="__search" autocomplete="off">
+    <label class="md-overlay" for="__drawer"></label>
+    <div data-md-component="skip">
+      
+        
+        <a href="#fallback" class="md-skip">
+          Skip to content
+        </a>
+      
+    </div>
+    <div data-md-component="announce">
+      
+    </div>
+    
+      <div data-md-color-scheme="default" data-md-component="outdated" hidden>
+        
+      </div>
+    
+    
+      
+
+  
+
+<header class="md-header md-header--shadow md-header--lifted" data-md-component="header">
+  <nav class="md-header__inner md-grid" aria-label="Header">
+    <a href=".." title="ApexBase" class="md-header__button md-logo" aria-label="ApexBase" data-md-component="logo">
+      
+  <img src="../img/logo.svg" alt="logo">
+
+    </a>
+    <label class="md-header__button md-icon" for="__drawer">
+      
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M3 6h18v2H3zm0 5h18v2H3zm0 5h18v2H3z"/></svg>
+    </label>
+    <div class="md-header__title" data-md-component="header-title">
+      <div class="md-header__ellipsis">
+        <div class="md-header__topic">
+          <span class="md-ellipsis">
+            ApexBase
+          </span>
+        </div>
+        <div class="md-header__topic" data-md-component="header-topic">
+          <span class="md-ellipsis">
+            
+              Read-Path Capabilities
+            
+          </span>
+        </div>
+      </div>
+    </div>
+    
+      
+        <form class="md-header__option" data-md-component="palette">
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to light mode"  type="radio" name="__palette" id="__palette_0">
+    
+      <label class="md-header__button md-icon" title="Switch to light mode" for="__palette_1" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="m14.3 16-.7-2h-3.2l-.7 2H7.8L11 7h2l3.2 9zM20 8.69V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12zm-9.15 3.96h2.3L12 9z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: light)" data-md-color-scheme="default" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to dark mode"  type="radio" name="__palette" id="__palette_1">
+    
+      <label class="md-header__button md-icon" title="Switch to dark mode" for="__palette_2" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 8a4 4 0 0 0-4 4 4 4 0 0 0 4 4 4 4 0 0 0 4-4 4 4 0 0 0-4-4m0 10a6 6 0 0 1-6-6 6 6 0 0 1 6-6 6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+    
+    
+    
+    <input class="md-option" data-md-color-media="(prefers-color-scheme: dark)" data-md-color-scheme="slate" data-md-color-primary="indigo" data-md-color-accent="indigo"  aria-label="Switch to system preference"  type="radio" name="__palette" id="__palette_2">
+    
+      <label class="md-header__button md-icon" title="Switch to system preference" for="__palette_0" hidden>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M12 18c-.89 0-1.74-.2-2.5-.55C11.56 16.5 13 14.42 13 12s-1.44-4.5-3.5-5.45C10.26 6.2 11.11 6 12 6a6 6 0 0 1 6 6 6 6 0 0 1-6 6m8-9.31V4h-4.69L12 .69 8.69 4H4v4.69L.69 12 4 15.31V20h4.69L12 23.31 15.31 20H20v-4.69L23.31 12z"/></svg>
+      </label>
+    
+  
+</form>
+      
+    
+    
+      <script>var palette=__md_get("__palette");if(palette&&palette.color){if("(prefers-color-scheme)"===palette.color.media){var media=matchMedia("(prefers-color-scheme: light)"),input=document.querySelector(media.matches?"[data-md-color-media='(prefers-color-scheme: light)']":"[data-md-color-media='(prefers-color-scheme: dark)']");palette.color.media=input.getAttribute("data-md-color-media"),palette.color.scheme=input.getAttribute("data-md-color-scheme"),palette.color.primary=input.getAttribute("data-md-color-primary"),palette.color.accent=input.getAttribute("data-md-color-accent")}for(var[key,value]of Object.entries(palette.color))document.body.setAttribute("data-md-color-"+key,value)}</script>
+    
+    
+    
+      
+      
+        <label class="md-header__button md-icon" for="__search">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        </label>
+        <div class="md-search" data-md-component="search" role="dialog">
+  <label class="md-search__overlay" for="__search"></label>
+  <div class="md-search__inner" role="search">
+    <form class="md-search__form" name="search">
+      <input type="text" class="md-search__input" name="query" aria-label="Search" placeholder="Search" autocapitalize="off" autocorrect="off" autocomplete="off" spellcheck="false" data-md-component="search-query" required>
+      <label class="md-search__icon md-icon" for="__search">
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M9.5 3A6.5 6.5 0 0 1 16 9.5c0 1.61-.59 3.09-1.56 4.23l.27.27h.79l5 5-1.5 1.5-5-5v-.79l-.27-.27A6.52 6.52 0 0 1 9.5 16 6.5 6.5 0 0 1 3 9.5 6.5 6.5 0 0 1 9.5 3m0 2C7 5 5 7 5 9.5S7 14 9.5 14 14 12 14 9.5 12 5 9.5 5"/></svg>
+        
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M20 11v2H8l5.5 5.5-1.42 1.42L4.16 12l7.92-7.92L13.5 5.5 8 11z"/></svg>
+      </label>
+      <nav class="md-search__options" aria-label="Search">
+        
+          <a href="javascript:void(0)" class="md-search__icon md-icon" title="Share" aria-label="Share" data-clipboard data-clipboard-text="" data-md-component="search-share" tabindex="-1">
+            
+            <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M18 16.08c-.76 0-1.44.3-1.96.77L8.91 12.7c.05-.23.09-.46.09-.7s-.04-.47-.09-.7l7.05-4.11c.54.5 1.25.81 2.04.81a3 3 0 0 0 3-3 3 3 0 0 0-3-3 3 3 0 0 0-3 3c0 .24.04.47.09.7L8.04 9.81C7.5 9.31 6.79 9 6 9a3 3 0 0 0-3 3 3 3 0 0 0 3 3c.79 0 1.5-.31 2.04-.81l7.12 4.15c-.05.21-.08.43-.08.66 0 1.61 1.31 2.91 2.92 2.91s2.92-1.3 2.92-2.91A2.92 2.92 0 0 0 18 16.08"/></svg>
+          </a>
+        
+        <button type="reset" class="md-search__icon md-icon" title="Clear" aria-label="Clear" tabindex="-1">
+          
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
+      </nav>
+      
+        <div class="md-search__suggest" data-md-component="search-suggest"></div>
+      
+    </form>
+    <div class="md-search__output">
+      <div class="md-search__scrollwrap" tabindex="0" data-md-scrollfix>
+        <div class="md-search-result" data-md-component="search-result">
+          <div class="md-search-result__meta">
+            Initializing search
+          </div>
+          <ol class="md-search-result__list" role="presentation"></ol>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+      
+    
+    
+      <div class="md-header__source">
+        <a href="https://github.com/BirchKwok/ApexBase" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    birchkwok/ApexBase
+  </div>
+</a>
+      </div>
+    
+  </nav>
+  
+    
+      
+<nav class="md-tabs" aria-label="Tabs" data-md-component="tabs">
+  <div class="md-grid">
+    <ul class="md-tabs__list">
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href=".." class="md-tabs__link">
+        
+  
+  
+    
+  
+  Home
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../installation/" class="md-tabs__link">
+          
+  
+  
+  Getting Started
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../user-guide/python-client/" class="md-tabs__link">
+          
+  
+  
+  User Guide
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../API_REFERENCE/" class="md-tabs__link">
+          
+  
+  
+  Reference
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../performance/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Performance
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    
+    
+      <li class="md-tabs__item">
+        <a href="../FTS_GUIDE/" class="md-tabs__link">
+          
+  
+  
+  Features
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+    
+  
+  
+    
+    
+      <li class="md-tabs__item md-tabs__item--active">
+        <a href="../STORAGE_ARCHITECTURE/" class="md-tabs__link">
+          
+  
+  
+  Internals
+
+        </a>
+      </li>
+    
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../release-notes/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Release Notes
+
+      </a>
+    </li>
+  
+
+      
+        
+  
+  
+  
+  
+    <li class="md-tabs__item">
+      <a href="../documentation-index/" class="md-tabs__link">
+        
+  
+  
+    
+  
+  Docs Index
+
+      </a>
+    </li>
+  
+
+      
+    </ul>
+  </div>
+</nav>
+    
+  
+</header>
+    
+    <div class="md-container" data-md-component="container">
+      
+      
+        
+      
+      <main class="md-main" data-md-component="main">
+        <div class="md-main__inner md-grid">
+          
+            
+              
+              <div class="md-sidebar md-sidebar--primary" data-md-component="sidebar" data-md-type="navigation" >
+                <div class="md-sidebar__scrollwrap">
+                  <div class="md-sidebar__inner">
+                    
+
+
+  
+
+
+  
+
+<nav class="md-nav md-nav--primary md-nav--lifted md-nav--integrated" aria-label="Navigation" data-md-level="0">
+  <label class="md-nav__title" for="__drawer">
+    <a href=".." title="ApexBase" class="md-nav__button md-logo" aria-label="ApexBase" data-md-component="logo">
+      
+  <img src="../img/logo.svg" alt="logo">
+
+    </a>
+    ApexBase
+  </label>
+  
+    <div class="md-nav__source">
+      <a href="https://github.com/BirchKwok/ApexBase" title="Go to repository" class="md-source" data-md-component="source">
+  <div class="md-source__icon md-icon">
+    
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 448 512"><!--! Font Awesome Free 7.1.0 by @fontawesome - https://fontawesome.com License - https://fontawesome.com/license/free (Icons: CC BY 4.0, Fonts: SIL OFL 1.1, Code: MIT License) Copyright 2025 Fonticons, Inc.--><path d="M439.6 236.1 244 40.5c-5.4-5.5-12.8-8.5-20.4-8.5s-15 3-20.4 8.4L162.5 81l51.5 51.5c27.1-9.1 52.7 16.8 43.4 43.7l49.7 49.7c34.2-11.8 61.2 31 35.5 56.7-26.5 26.5-70.2-2.9-56-37.3L240.3 199v121.9c25.3 12.5 22.3 41.8 9.1 55-6.4 6.4-15.2 10.1-24.3 10.1s-17.8-3.6-24.3-10.1c-17.6-17.6-11.1-46.9 11.2-56v-123c-20.8-8.5-24.6-30.7-18.6-45L142.6 101 8.5 235.1C3 240.6 0 247.9 0 255.5s3 15 8.5 20.4l195.6 195.7c5.4 5.4 12.7 8.4 20.4 8.4s15-3 20.4-8.4l194.7-194.7c5.4-5.4 8.4-12.8 8.4-20.4s-3-15-8.4-20.4"/></svg>
+  </div>
+  <div class="md-source__repository">
+    birchkwok/ApexBase
+  </div>
+</a>
+    </div>
+  
+  <ul class="md-nav__list" data-md-scrollfix>
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href=".." class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Home
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_2" >
+        
+          
+          <label class="md-nav__link" for="__nav_2" id="__nav_2_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Getting Started
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_2_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_2">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Getting Started
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../installation/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Installation
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../QUICK_START/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Quick Start
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../concepts/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Core Concepts
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_3" >
+        
+          
+          <label class="md-nav__link" for="__nav_3" id="__nav_3_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    User Guide
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_3_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_3">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    User Guide
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/python-client/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python Client
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/sql/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    SQL Guide
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/data-import/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Data Import
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../user-guide/server-protocols/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Server Protocols
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../EXAMPLES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Examples
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_4" >
+        
+          
+          <label class="md-nav__link" for="__nav_4" id="__nav_4_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Reference
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_4_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_4">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Reference
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../API_REFERENCE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Python API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RUST_EMBEDDED_API/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Rust Embedded API
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../performance/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Performance
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    
+    
+    
+    
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_6" >
+        
+          
+          <label class="md-nav__link" for="__nav_6" id="__nav_6_label" tabindex="0">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Features
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_6_label" aria-expanded="false">
+          <label class="md-nav__title" for="__nav_6">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Features
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FTS_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Full-Text Search
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FLOAT16_VECTOR_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Float16 Vectors
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../VECTOR_QUANTIZATION_GUIDE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Vector Quantization
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+    
+  
+  
+  
+    
+    
+    
+    
+      
+        
+        
+      
+      
+        
+      
+    
+    
+    <li class="md-nav__item md-nav__item--active md-nav__item--section md-nav__item--nested">
+      
+        
+        
+        <input class="md-nav__toggle md-toggle " type="checkbox" id="__nav_7" checked>
+        
+          
+          <label class="md-nav__link" for="__nav_7" id="__nav_7_label" tabindex="">
+            
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Internals
+  
+
+    
+  </span>
+  
+  
+
+            <span class="md-nav__icon md-icon"></span>
+          </label>
+        
+        <nav class="md-nav" data-md-level="1" aria-labelledby="__nav_7_label" aria-expanded="true">
+          <label class="md-nav__title" for="__nav_7">
+            <span class="md-nav__icon md-icon"></span>
+            
+  
+    Internals
+  
+
+          </label>
+          <ul class="md-nav__list" data-md-scrollfix>
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../STORAGE_ARCHITECTURE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Storage Architecture
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../SCAN_EXECUTION_ARCHITECTURE/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Scan & Physical Execution
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+    
+  
+  
+  
+    <li class="md-nav__item md-nav__item--active">
+      
+      <input class="md-nav__toggle md-toggle" type="checkbox" id="__toc">
+      
+      
+        
+      
+      
+        <label class="md-nav__link md-nav__link--active" for="__toc">
+          
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+          <span class="md-nav__icon md-icon"></span>
+        </label>
+      
+      <a href="./" class="md-nav__link md-nav__link--active">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Read-Path Capabilities
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+      
+        
+
+<nav class="md-nav md-nav--secondary" aria-label="Table of contents">
+  
+  
+  
+    
+  
+  
+    <label class="md-nav__title" for="__toc">
+      <span class="md-nav__icon md-icon"></span>
+      Table of contents
+    </label>
+    <ul class="md-nav__list" data-md-component="toc" data-md-scrollfix>
+      
+        <li class="md-nav__item">
+  <a href="#1-read-visibility" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        1. 可见状态分类（read visibility）
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#2-lane-fallback" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        2. lane × 支持 × 限制 × fallback
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#3-typed" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        3. typed 批次协议的类型边界（单源）
+      
+    </span>
+  </a>
+  
+</li>
+      
+        <li class="md-nav__item">
+  <a href="#4" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        4. 修改规则
+      
+    </span>
+  </a>
+  
+</li>
+      
+    </ul>
+  
+</nav>
+      
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../RESOURCE_OWNERSHIP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Resource Ownership
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../FUSED_GROUP_AGG_DESIGN/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Fused Filter + GROUP BY Design
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../ENGINEERING_GUIDELINES/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Engineering Guidelines
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../QUERY_OPTIMIZER_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Query Optimizer Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+              
+                
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../HTAP_ROADMAP/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    HTAP Roadmap
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+              
+            
+          </ul>
+        </nav>
+      
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../release-notes/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Release Notes
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+      
+      
+  
+  
+  
+  
+    <li class="md-nav__item">
+      <a href="../documentation-index/" class="md-nav__link">
+        
+  
+  
+  <span class="md-ellipsis">
+    
+  
+    Docs Index
+  
+
+    
+  </span>
+  
+  
+
+      </a>
+    </li>
+  
+
+    
+  </ul>
+</nav>
+                  </div>
+                </div>
+              </div>
+            
+            
+          
+          
+            <div class="md-content" data-md-component="content">
+              
+                
+
+
+
+  
+
+
+  <nav class="md-path" aria-label="Navigation" >
+    <ol class="md-path__list">
+      
+        
+  
+  
+    <li class="md-path__item">
+      <a href=".." class="md-path__link">
+        
+  <span class="md-ellipsis">
+    Home
+  </span>
+
+      </a>
+    </li>
+  
+
+      
+      
+        
+  
+  
+    
+    
+      <li class="md-path__item">
+        <a href="../STORAGE_ARCHITECTURE/" class="md-path__link">
+          
+  <span class="md-ellipsis">
+    Internals
+  </span>
+
+        </a>
+      </li>
+    
+  
+
+      
+    </ol>
+  </nav>
+
+              
+              <article class="md-content__inner md-typeset">
+                
+                  
+
+
+  
+  
+
+
+<h1 id="fallback">读取路径能力、限制与 fallback（单源）<a class="headerlink" href="#fallback" title="Permanent link">&para;</a></h1>
+<p>本文件是读取路径“能力表 / 限制 / fallback 目标”的唯一来源（M1）。
+新增读取 lane、修改 gate 或改变回退目标时，必须同步更新本表；lane 的 gate 处注释
+引用本文件与对应小节。判定所用的可见状态由
+<code>TableStorageBackend::overlay_state()</code> 单点探测，不要在调用方重新拼条件。</p>
+<h2 id="1-read-visibility">1. 可见状态分类（read visibility）<a class="headerlink" href="#1-read-visibility" title="Permanent link">&para;</a></h2>
+<p><code>apexbase/src/storage/backend.rs</code>：<code>OverlayState</code> / <code>overlay_state()</code> /
+<code>has_pending_writes()</code> / <code>requires_merged_read()</code> / <code>visible_rows_exceed_base()</code>。</p>
+<table>
+<thead>
+<tr>
+<th>状态</th>
+<th>判定</th>
+<th>含义</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>InMemory</td>
+<td><code>storage.is_in_memory()</code></td>
+<td>内存表；<code>columns</code> 缓冲区是权威视图，不存在持久化行组</td>
+</tr>
+<tr>
+<td>Clean</td>
+<td><code>overlay_state().is_clean_view()</code></td>
+<td>持久化行组即完整可见视图，且基础未复制到内存缓冲区</td>
+</tr>
+<tr>
+<td>AppendedRows</td>
+<td><code>overlay_state().appended_rows</code></td>
+<td><code>.delta</code> 文件存在完整追加行批次</td>
+</tr>
+<tr>
+<td>PendingCells</td>
+<td><code>overlay_state().pending_cells</code></td>
+<td>DeltaStore 存在单元更新/删除</td>
+</tr>
+<tr>
+<td>UnflushedRows</td>
+<td><code>overlay_state().unflushed_rows</code></td>
+<td>V4 追加行仍在内存缓冲区（<code>pending_v4_in_memory_rows() &gt; 0</code>）</td>
+</tr>
+<tr>
+<td>BaseInMemory</td>
+<td><code>overlay_state().base_in_memory</code></td>
+<td>基础数据已加载进内存缓冲区（<code>has_v4_in_memory_data()</code>）</td>
+</tr>
+</tbody>
+</table>
+<p>派生判定：</p>
+<ul>
+<li><code>has_pending_writes()</code> = PendingCells ∨ UnflushedRows（<strong>不探测</strong> delta 文件，
+  保持点查守卫既有成本）；</li>
+<li><code>requires_merged_read()</code> = AppendedRows ∨ PendingCells ∨ UnflushedRows；</li>
+<li><code>visible_rows_exceed_base(base_rows)</code> = <code>has_delta()</code> ∨ 逻辑行数 &gt; <code>base_rows</code>
+  ∨ 活跃行数 &gt; <code>base_rows</code>（覆盖“仅 DeltaStore”与“仅内存行”两种增量）。</li>
+</ul>
+<h2 id="2-lane-fallback">2. lane × 支持 × 限制 × fallback<a class="headerlink" href="#2-lane-fallback" title="Permanent link">&para;</a></h2>
+<table>
+<thead>
+<tr>
+<th>lane</th>
+<th>入口</th>
+<th>支持</th>
+<th>限制（gate）</th>
+<th>回退目标</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>内存表直读</td>
+<td><code>storage.to_arrow_batch</code> / <code>to_arrow_batch_with_limit</code></td>
+<td>内存表的投影/ LIMIT</td>
+<td><code>storage.is_in_memory()</code></td>
+<td>通用执行器</td>
+</tr>
+<tr>
+<td>V4 mmap 直读</td>
+<td><code>read_columns_to_arrow_physical</code> 的 <code>use_cache</code></td>
+<td>全表读；已应用持久化删除向量，并合并 DeltaStore</td>
+<td><code>start_row == 0 &amp;&amp; row_count.is_none() &amp;&amp; !has_delta</code>（<code>has_delta</code> 取 <code>visible_rows_exceed_base</code>）</td>
+<td>合并读（§2.4）</td>
+</tr>
+<tr>
+<td>V4 mmap LIMIT 读</td>
+<td><code>to_arrow_batch_with_limit</code></td>
+<td>前缀 LIMIT，RCIX O(1) 列定位</td>
+<td><code>start_row == 0 &amp;&amp; row_count.is_some() &amp;&amp; (in_memory \|\| !has_delta)</code></td>
+<td>合并读（§2.4）</td>
+</tr>
+<tr>
+<td>行式点读（RCIX）</td>
+<td><code>retrieve_rcix</code> / <code>retrieve_rcix_projected</code>，经 <code>read_row_by_id_to_arrow</code> / <code>read_row_by_id_projected_to_arrow</code>、以及 Python 绑定层的 <code>try_pk_read</code></td>
+<td>单行、按列定向解码（<code>_id</code> 由 id 推导，不读 ID 列）；行组目录按 id 二分（<code>find_row_group_for_id</code>）</td>
+<td>该 id 所在行组 <code>compress_flag == RG_COMPRESS_NONE</code>、<code>enc_ver == RG_ENCODING_VERSION</code> 且组内有 RCIX 目录</td>
+<td>解码兜底（本表下一行）</td>
+</tr>
+<tr>
+<td>行式点读（解码兜底）</td>
+<td><code>read_row_by_id_values</code> / <code>read_row_by_id_values_projected</code>（<code>read_row_by_id_to_arrow</code> / <code>read_row_by_id_projected_to_arrow</code> 的第二段）</td>
+<td>压缩行组或旧编码；解压体按 <code>(offset, compressed_len)</code> 缓存。写路径在压缩<strong>之前</strong>就记录了每列偏移，所以压缩行组同样<strong>带列目录</strong>，且该目录寻址"解压后"的逻辑布局——解压体一到手，这一 lane 与未压缩 lane 走<strong>同一份</strong> <code>decode_point_column_value</code>（<code>read_write.rs</code>）：PLAIN/BITPACK/RLE/字典/Binary/向量按值定向解码，仅未知编码整列解码；带投影时只解码被请求的列</td>
+<td>V4；<code>read_row_by_id</code> 仍用于内存表与写缓冲镜像基表</td>
+<td>通用读 / <code>read_row_by_id</code></td>
+</tr>
+<tr>
+<td>行组批次流（Clean）</td>
+<td><code>TableStorageBackend::scan_batches</code> → <code>RgBatchStream</code></td>
+<td>单表、typed 谓词、投影；逐行组 morsel；持久化删除向量已应用</td>
+<td>非 InMemory；无 UnflushedRows；<code>overlay_state().is_clean_view()</code>；投影列存在且谓词列类型受支持（§3）；V4 footer 存在</td>
+<td>单批 <code>scan()</code> / 通用执行器</td>
+</tr>
+<tr>
+<td>覆盖层批次流</td>
+<td><code>scan_batches</code> → <code>OverlayBatchStream</code></td>
+<td>同上，外加 AppendedRows / PendingCells；基础行组零拷贝直通，<code>_id</code> 命中批次才打补丁，追加行作为尾部批次</td>
+<td>非 InMemory；无 UnflushedRows；<code>overlay_state().needs_merged_read()</code>；V4</td>
+<td>单批 <code>scan()</code> / 通用执行器</td>
+</tr>
+<tr>
+<td>单批合并读</td>
+<td><code>read_columns_to_arrow</code> → <code>read_columns_to_arrow_physical</code></td>
+<td>任意投影；可见行空间按 <code>[持久基表][.delta 行][缓冲尾段]</code> 三段组合（<code>OnDemandStorage::visible_read_segments()</code>，<code>read_ids</code> 同源）；基表段仅在缓冲镜像基表（<code>v4_base_loaded &amp;&amp; has_v4_in_memory_data()</code>）时切缓冲，纯尾段缓冲改走 RG mmap；有持久化删除向量时先构造活跃视图再按活跃窗口 <code>slice</code>，删除向量直接从行组读取（<code>persisted_deletion_bitmap()</code>）</td>
+<td>无（通用入口）</td>
+<td>—（最终兜底为通用执行器）</td>
+</tr>
+<tr>
+<td>候选索引读</td>
+<td><code>scan()</code> → <code>scan_candidate_indices</code> + <code>read_columns_by_indices_to_arrow</code></td>
+<td>谓词命中率低的点查/范围查</td>
+<td><code>overlay_state().is_clean_view()</code>；命中数 × 4 ≤ 行数 × 3</td>
+<td>单批合并读</td>
+</tr>
+<tr>
+<td>执行器索引快路</td>
+<td><code>ApexExecutor::try_index_accelerated_read</code>（<code>index_accelerated_read</code>）</td>
+<td>规划器选中 <code>OltpIndexLookup</code> 的单列/复合等值与范围查；covering 时走 <code>try_index_only_scan</code>（完全不读表）</td>
+<td><code>!indexes_stale(path)</code>；<code>!backend.requires_merged_read()</code>（append delta / 缓冲追加行 / DeltaStore cells：索引只覆盖持久化行组，覆盖层行会静默丢失）；非 GROUP BY/JOIN/聚合；有可用索引</td>
+<td>扫描 lane（记录 plan divergence）；索引失效/覆盖层状态由 <code>flag_indexes_stale_after_failure</code> 或 gate 兜住</td>
+</tr>
+<tr>
+<td>缓存字典读</td>
+<td><code>read_columns_to_arrow_dict</code></td>
+<td>低基数 string 列 GROUP BY，复用全局字典</td>
+<td><code>!requires_merged_read()</code></td>
+<td><code>read_columns_to_arrow</code></td>
+</tr>
+<tr>
+<td>首值缓存</td>
+<td><code>build_first_string_row_id_cache</code></td>
+<td><code>col = 'x' LIMIT 1</code> 的常量时间点查</td>
+<td><code>!has_pending_deltas() &amp;&amp; delta_row_count() == 0 &amp;&amp; !(has_v4_in_memory_data() &amp;&amp; !v4_base_loaded)</code>（纯尾段缓冲下缓冲列与组合后的 ID 会错位）</td>
+<td>常规点查</td>
+</tr>
+<tr>
+<td>FTS/字符串列 mmap</td>
+<td><code>read_fts_string_columns_mmap</code></td>
+<td>FTS 字符串列直读</td>
+<td><code>!visible_rows_exceed_base(base_rows) &amp;&amp; !has_v4_in_memory_data()</code>，且 V4 footer 可加载（内存表无持久化 base，必须回退）</td>
+<td><code>None</code>（调用方走通用读）</td>
+</tr>
+<tr>
+<td>等值全匹配证明</td>
+<td><code>string_eq_matches_all</code></td>
+<td>证明 <code>col = 'x'</code> 保留全部行以跳过过滤</td>
+<td><code>!requires_merged_read()</code></td>
+<td><code>Ok(false)</code></td>
+</tr>
+<tr>
+<td>列窗口读</td>
+<td><code>read_columns_to_arrow_window</code></td>
+<td>CREATE INDEX 等流式消费者按活跃窗口读</td>
+<td><code>!visible_rows_exceed_base(base_rows)</code> 时走 <code>to_arrow_batch_mmap_range</code></td>
+<td><code>read_columns_to_arrow</code></td>
+</tr>
+</tbody>
+</table>
+<p>队列/执行器层的 lane（详见第 13 节与 10.1）：</p>
+<table>
+<thead>
+<tr>
+<th>lane</th>
+<th>入口</th>
+<th>限制</th>
+<th>fallback</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td>分批聚合管线</td>
+<td><code>try_batch_group_pipeline</code></td>
+<td>单表；<code>BatchGroupAggregator::new</code> 形状门 + <code>can_use_incremental_aggregation</code> + 列可解析；<code>scan_batches</code>/<code>scan_batches_ranges</code> 可用；并行折叠需 worker token 预算 ≥2，且 <code>APEX_PARALLEL_SCAN</code> 未显式关闭时由成本自动启用（预测串行 ≥2 ms 且并行历史更快）</td>
+<td>单批 <code>scan()</code> 聚合</td>
+</tr>
+<tr>
+<td>FTS 行选择下推</td>
+<td><code>ApexExecutor::try_fts_row_selection</code>（路径 <code>fts_row_selection</code>）</td>
+<td>WHERE 的顶层 <code>AND</code> 中含一个 <code>MATCH()</code>（已解析为 <code>FtsResolved</code> bitmap）时，只物化命中行：无删除向量时先把 bitmap 的 <code>_id</code> 解析成<strong>物理行号</strong>（优先用行组目录 <code>positions_for_ids</code>，否则回退扫 <code>_id</code> 列），再 <code>read_columns_by_indices_to_arrow(位置, required_columns)</code> —— 因此只读语句需要的列，<strong>向量/blob 列也能完整取回</strong>；有删除向量时退回按 <code>_id</code> 读的标量 reader。其余谓词、投影、聚合、排序、LIMIT 仍由共享尾部执行，因此结果与全扫逐值一致</td>
+<td>单表（<code>joins.is_empty()</code>）；<code>overlay_state().is_clean_view()</code>（覆盖层行不在持久化索引快照内）；<code>0 &lt; hits &amp;&amp; hits * 3 &lt;= active_row_count()</code>；<code>OR</code>/<code>NOT</code> 下的 <code>MATCH()</code> 不可拆分；位置版还需要 <code>active_row_count() == base_row_count()</code>（行组目录的稠密映射只在此成立），按 <code>_id</code> 的标量版还需要 schema 全为标量类型、无 <code>FixedList</code>/量化向量/复杂类型</td>
+</tr>
+<tr>
+<td>距离 TopK 融合</td>
+<td><code>ApexExecutor::try_fast_order_by_distance</code>（clean 视图走零拷贝 mmap：路径 <code>order_by_distance_topk_direct</code>；带选择性谓词时路径 <code>filtered_distance_topk</code>；否则 <code>order_by_distance_topk</code>）</td>
+<td><code>ORDER BY &lt;distance&gt;(col, [literal]) [ASC] LIMIT k</code>（含 <code>SELECT &lt;expr&gt; AS alias … ORDER BY alias</code> 写法）：clean 视图（无覆盖层、行组无删除向量、未压缩）时用 <code>topk_fixedlist_direct</code>/<code>topk_binary_direct</code> 直接在 mmap 上零拷贝打分，只 <code>read_columns_by_indices_to_arrow</code> 最近 k 行；有选择性谓词时先把谓词解析成候选行号（单列比较/<code>BETWEEN</code>/同列双区间、字符串等值），只对这些行打分后取堆（路径 <code>filtered_distance_topk</code>）；否则按 <code>required_columns()</code> 裁剪后跑无分配 SIMD 距离 + 有界堆并 <code>take</code>。三条路径都只读语句需要的列（<code>SELECT *</code> 除外），尾部仍执行 ORDER BY（k 行）、投影与 LIMIT。<strong>含 <code>MATCH()</code> 的形态由上一行的 FTS 行选择先接管</strong>（它同样按位置取行，随后由尾部排序）</td>
+<td>单表；无 GROUP BY / HAVING / DISTINCT / OFFSET&gt;0 / 聚合 / 窗口（这些必须先作用于整个关系，或会因只喂 k 行而改变语义）；<code>limit</code> 存在且 &gt; 0；升序；<code>order_by</code> 只有一项；距离函数名与 <code>expressions.rs</code> 的分发一致；第一个参数是列、第二个是 <code>[..]</code>/字符串字面量；度量不是"相似度值"型（<code>inner_product</code>/<code>cosine_similarity</code> 的有界堆返回"最相似"，与 <code>ASC</code> 相反）；向量列无 NULL（堆按平坦子数组打分，NULL 会被当 0）；维度匹配且是 FixedSizeList/Binary。<code>filtered_distance_topk</code> 额外要求：<code>WHERE</code> 是能被上述形态解析的合取（<code>OR</code>/<code>NOT</code>/多列混合不解析）、候选行数 <code>*4 &lt;= active_row_count()</code>（否则候选太少，全扫更省）、<code>overlay_state().is_clean_view()</code> 且 <code>active_row_count() == base_row_count()</code>（候选按物理行号读取，删除向量会错位）</td>
+</tr>
+<tr>
+<td>单批 scan 聚合</td>
+<td><code>try_scan_group_pipeline</code> → <code>backend.scan()</code></td>
+<td>单表、WHERE 可转 typed 谓词、无 JOIN/DISTINCT/window</td>
+<td>通用执行器</td>
+</tr>
+<tr>
+<td>S3 流式投影</td>
+<td><code>execute_streaming_select</code></td>
+<td>单表投影 SELECT：无 DISTINCT/JOIN/GROUP/HAVING/ORDER/LIMIT/window；投影为 SELECT 顺序的普通列；谓词与投影列均受 typed 协议支持</td>
+<td>物化执行（<code>execute</code>）</td>
+</tr>
+<tr>
+<td>Flight 交付</td>
+<td><code>flight::service</code></td>
+<td>有界通道 <code>STREAM_CHANNEL_CAPACITY</code>；每块 <code>DELIVERY_CHUNK_ROWS</code></td>
+<td>上一 lane 的 fallback 链</td>
+</tr>
+</tbody>
+</table>
+<h2 id="3-typed">3. typed 批次协议的类型边界（单源）<a class="headerlink" href="#3-typed" title="Permanent link">&para;</a></h2>
+<ul>
+<li>谓词列类型：<code>TableStorageBackend::scan_predicate_column_supported</code>
+  = <code>Bool / Int8 / Int16 / Int32 / Int64 / UInt8 / UInt16 / UInt32 / Float32 / Float64 / String</code>；
+  <strong>UInt64 明确排除</strong>（mmap 谓词 lane 以 i64 解码，&gt; i64::MAX 不安全）。</li>
+<li>谓词值：<code>ScanValue::{Int, UInt, Float, String, Bool}</code> + <code>ScanPredicate</code>
+  （<code>Compare / IsNull / Between / In / Like</code>）与 <code>And</code>/<code>Or</code> 树。</li>
+<li>分组键类型由 <code>BatchKeyView</code> 门控；<code>Morsel::select</code> 无法解析列/类型时返回
+  <code>BatchMorselOutcome::Unsupported</code>，调用方必须整体回退（已输出批次后不得回退，
+  见 <code>execute_streaming_select</code>）。</li>
+<li>覆盖层批次流的补丁需要 <code>_id</code>：调用方未投影时内部携带、补丁后剥离，因此对外
+  schema 与 Clean 流一致；仅追加行的覆盖层不携带 <code>_id</code>。</li>
+</ul>
+<h2 id="4">4. 修改规则<a class="headerlink" href="#4" title="Permanent link">&para;</a></h2>
+<ol>
+<li>新增/放宽 lane 前先在本表登记它的可见状态前提与回退目标。</li>
+<li>可见状态判定只能经 <code>overlay_state()</code> 及其派生方法；不要在各 lane 重新拼
+   <code>has_delta()/has_pending_deltas()/pending_v4_in_memory_rows()</code> 组合。<strong>行空间组合</strong>
+   同理只经 <code>OnDemandStorage::visible_read_segments()</code>（<code>[持久基表][.delta][缓冲尾段]</code>
+   三段，<code>buffer_base_rows</code> 区分"缓冲镜像基表"与"纯尾段缓冲"）——任何自行假设
+   "写缓冲就是整表"的读者都会在 <code>spill_pending_v4_rows_to_delta()</code> 之后静默漏掉基表行。</li>
+<li>每个 gate 至少一个“拒绝该状态并正确回退”的测试（存储层与 Python 层各一）。</li>
+<li><strong>点读的“行不存在”与“lane 不可用”必须分开</strong>：<code>retrieve_rcix*</code> 对两种情况都返回
+   <code>None</code>，因此只能由 <code>OnDemandStorage::point_read_lane_available(id)</code> 判定该 id 所在
+   行组是否走 RCIX lane。把不可用当成“行不存在”会让 <code>_id = X</code> 在压缩表上退化到通用
+   扫描（实测 23.6 ms / 行，见 <code>test/test_point_lookup_compressed_sql.py</code> 与 bench
+   <code>wide</code> 阶段的 executor 形状）。新增点读调用方时必须走这个判定，不要自行假设。</li>
+<li>回退目标必须与主路径结果逐值一致；不一致先修主路径，不允许降低断言。
+5b. <strong><code>None</code> 的两种含义必须经 <code>point_read_lane_available(id)</code> 区分</strong>，绑定层的 <code>try_pk_read</code>
+   （<code>python/bindings/sql.rs</code>）也不例外：它只查 lean RCIX 车道，曾把"车道不可用"当成
+   "快路不适用"，于是压缩表上的 <code>_id = X</code> 整条语句掉进 SQL 执行器（每次都重新解析、规划，
+   200k × 16 zstd 实测固定多 ~10 µs）。新增点读快路时必须接同一条判定，否则会静默失去
+   快路（功能仍正确，只是慢），并且没有任何断言会失败。</li>
+<li><strong>共享尾部的 WHERE 会再执行一次</strong>：存储层快路把批次<strong>交给共享尾部</strong>时，尾部仍会重新求值
+   WHERE，因此这种批次的列集必须包含 WHERE 列。两条 staged-read 辅助函数按用途分开：
+   <code>read_matching_rows_for_tail</code> 用 <code>get_col_refs</code>（= <code>required_columns()</code>，含 WHERE），
+   <code>read_matching_rows_adaptive</code>/<code>read_matching_rows_by_indices</code> 用 <code>post_filter_col_refs</code>
+   （= required − WHERE）且<strong>只有自行投影/排序/限流并直接返回的调用方</strong>能用。写错会让谓词列
+   缺失，过滤返回 <code>NotFound</code> 后共享尾部<strong>重读整表并重试</strong>（路径 <code>predicate_column_reread</code>，
+   该重试保留为兜底）—— 实测 <code>SELECT doc FROM t WHERE k &lt; 100 ORDER BY abs(doc) LIMIT 5</code>
+   在 20 万行上是 3.785 ms，改走 <code>for_tail</code> 后 0.959 ms（3.9×）。目标形态：
+   <code>ORDER BY &lt;表达式&gt;</code> + 谓词列未投影（含向量 rerank）。<strong>同一个 lane 的不同调用点可以不同</strong>：
+   <code>try_fast_numeric_range_filter</code> 的两个调用点都是 early-return（自行投影后返回），内部仍走
+   <code>read_matching_rows_adaptive</code>（谓词列保持裁剪）；<code>try_numeric_predicate_pushdown</code> 的批次回到
+   尾部，故走 <code>for_tail</code>。新增 staged-read 调用方时先判断"结果是否回到共享尾部"，再选辅助函数
+   —— 给 early-return 的调用点加谓词列会让它白读一列（实测 <code>String functions</code> 形状
+   0.735 → 0.862 ms，+17%）。</li>
+<li><strong>缓冲专用 reader 的前置条件</strong>：<code>read_columns_filtered</code> / <code>read_columns_filtered_string</code> /
+   <code>read_column_by_indices</code> 已在"纯尾段缓冲"（<code>!v4_base_loaded</code>）下改走
+   <code>visible_read_segments()</code> 组合（<code>read_columns</code> + 共享匹配器 + 基表段删除向量）。
+   <code>read_row_by_id</code> / <code>read_rows_by_ids</code> / <code>read_column_auto</code> / <code>read_column_scattered_auto</code>
+   仍要求"写缓冲镜像基表"（或缓冲为空）；其当前调用方都有 gate（索引快路在覆盖层下让位、
+   字符串 LIMIT 首值缓存拒绝纯尾段缓冲、late materialization 在 delta 态走 mmap 分支、
+   Python 点查走独立的 <code>read_row_by_id_values</code> 组合实现）。新增调用方前必须确认该前提，
+   否则先用 <code>visible_read_segments()</code> 组合或显式拒绝。</li>
+<li><strong>候选行号的空间必须与读取 reader 一致</strong>：<code>filtered_distance_topk</code> 与 <code>fts_row_selection</code>
+   的<strong>位置版</strong>都用候选行号直接调 <code>read_columns_by_indices_to_arrow</code>，而该 reader 把 V4 mmap
+   索引当<strong>物理</strong>行号（<code>read_rows_by_ids_to_arrow</code> 才按活动 <code>_id</code> 解释）。因此这两条 lane 都显式要求
+   <code>overlay_state().is_clean_view()</code> 且 <code>active_row_count() == base_row_count()</code>：一旦存在
+   覆盖层或删除向量，活动行号与物理行号会错位。<code>_id → 物理行号</code> 的解析优先走行组目录
+   （<code>OnDemandStorage::positions_for_ids</code>，要求每个行组 <code>max_id - min_id + 1 == row_count</code>
+   且 <code>deletion_count == 0</code>），目录无法证明稠密时回退扫 <code>_id</code> 列。新增"谓词 + 索引空间读取"的
+   快路时必须先确认这两个条件，否则候选行号会读到错误的行（静默错答，而非报错）。</li>
+<li><strong>渲染表达式的列名解析不得按最后一个 <code>.</code> 切分</strong>：解析器会把 <code>ORDER BY &lt;表达式&gt;</code> 与
+   <code>GROUP BY &lt;表达式&gt;</code> 的渲染文本当作列名（<code>cosine_distance(emb, [0.5, 0.25])</code>、
+   <code>ABS(score - 1.5)</code>）。按最后一个 <code>.</code> 剥限定符会切在<strong>浮点字面量</strong>里，得到一个任何列都不叫的
+   后缀，于是排序键为空（<strong>静默保留扫描顺序</strong>）或分组键取不到（<strong>静默塌缩成单组</strong>）——
+   两类都已实测：<code>ORDER BY abs(score - 2.5) DESC</code> 曾原样返回升序，<code>GROUP BY ABS(score - 1.5)</code>
+   曾在 200 个互不相同的取值上只返回 1 行。规则：</li>
+<li>先按<strong>精确名</strong>在批次里查（<code>ApexExecutor::resolve_order_col_name</code>）；</li>
+<li>需要剥离限定符时只用 <code>strip_column_qualifier</code>（<code>aggregation/pipeline.rs</code>）：仅当最后一个 <code>.</code>
+     的前缀是纯标识符段（<code>u</code>、<code>db.t</code>）且后缀也是纯标识符才剥，<code>grouped.rs</code> 的
+     <code>clean_name</code>/<code>clean_order_col</code> 都已委托它；</li>
+<li>新增任何"用列名字符串去批次里找列"的调用点，都必须走这两条，否则表达式名会被静默截断。</li>
+<li><strong>编码列的两段式读取：tag 必须留在前面</strong>：行组内一列的数据布局是 <code>[null bitmap][1 字节编码 tag][payload]</code>。<code>read_column_encoded(bytes, ty)</code> <strong>按 <code>bytes[0]</code> 分派编码</strong>，所以只跳过 null bitmap、把 <code>&amp;body[col_off + null_bitmap_len + 1..]</code>（免 tag 的 payload）交给它的调用点会把第一个数据字节当编码、把后续字节当长度前缀 —— 实测 BITPACK 的 int 列读出 <code>count=216172782113783808</code> 并报 <code>Int64 column data truncated</code>（第 51 轮）。需要免 tag 解析时用该编码的专用解析器（如 <code>bitpack_agg_i64</code>），需要整列解码时传含 tag 的切片。<strong>同理，用 <code>u64</code> 哈希做"分组身份"时必须给 NULL 与值加判别字节</strong>：<code>AHasher</code> 下 <code>write_u8(0)</code> 与 <code>write_u64(0)</code>/<code>write_i64(0)</code> 哈希完全相同，第 51 轮前它让 NULL 组与 0/0.0 组静默合并（hash join 之后还有等值比较所以无感，GROUP BY 的哈希就是身份）。</li>
+</ol>
+
+
+
+
+
+
+
+
+
+
+
+
+                
+              </article>
+            </div>
+          
+          
+  <script>var tabs=__md_get("__tabs");if(Array.isArray(tabs))e:for(var set of document.querySelectorAll(".tabbed-set")){var labels=set.querySelector(".tabbed-labels");for(var tab of tabs)for(var label of labels.getElementsByTagName("label"))if(label.innerText.trim()===tab){var input=document.getElementById(label.htmlFor);input.checked=!0;continue e}}</script>
+
+<script>var target=document.getElementById(location.hash.slice(1));target&&target.name&&(target.checked=target.name.startsWith("__tabbed_"))</script>
+        </div>
+        
+          <button type="button" class="md-top md-icon" data-md-component="top" hidden>
+  
+  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M13 20h-2V8l-5.5 5.5-1.42-1.42L12 4.16l7.92 7.92-1.42 1.42L13 8z"/></svg>
+  Back to top
+</button>
+        
+      </main>
+      
+        <footer class="md-footer">
+  
+  <div class="md-footer-meta md-typeset">
+    <div class="md-footer-meta__inner md-grid">
+      <div class="md-copyright">
+  
+  
+    Made with
+    <a href="https://squidfunk.github.io/mkdocs-material/" target="_blank" rel="noopener">
+      Material for MkDocs
+    </a>
+  
+</div>
+      
+    </div>
+  </div>
+</footer>
+      
+    </div>
+    <div class="md-dialog" data-md-component="dialog">
+      <div class="md-dialog__inner md-typeset"></div>
+    </div>
+    
+      <div class="md-progress" data-md-component="progress" role="progressbar"></div>
+    
+    
+    
+      
+      
+      <script id="__config" type="application/json">{"annotate": null, "base": "..", "features": ["navigation.instant", "navigation.instant.progress", "navigation.top", "navigation.tabs", "navigation.tabs.sticky", "navigation.sections", "navigation.path", "toc.integrate", "search.suggest", "search.highlight", "search.share", "content.code.copy", "content.code.select", "content.code.annotate", "content.tabs.link"], "search": "../assets/javascripts/workers/search.2c215733.min.js", "tags": null, "translations": {"clipboard.copied": "Copied to clipboard", "clipboard.copy": "Copy to clipboard", "search.result.more.one": "1 more on this page", "search.result.more.other": "# more on this page", "search.result.none": "No matching documents", "search.result.one": "1 matching document", "search.result.other": "# matching documents", "search.result.placeholder": "Type to start searching", "search.result.term.missing": "Missing", "select.version": "Select version"}, "version": {"current": "1.37.1", "default": "latest", "label": "v1.37.1", "provider": "mike"}}</script>
+    
+    
+      <script src="../assets/javascripts/bundle.d7400e89.min.js"></script>
+      
+    
+  </body>
+</html>
