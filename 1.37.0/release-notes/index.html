@@ -3000,6 +3000,21 @@ a version-5 file.</p>
   DESC</code> silently keep scan order and <code>GROUP BY ABS(score - 1.5)</code> collapse to a
   single group; use exact-name resolution first and the identifier-aware
   <code>strip_column_qualifier</code> otherwise</li>
+<li><strong>Deletes stayed visible through <code>ORDER BY … LIMIT k</code></strong>: a persisted deletion
+  vector rewrites the header's row count to the surviving rows, so
+  <code>active_row_count() == row_count()</code> even though the deleted rows are still
+  stored <em>before</em> the survivors. The ORDER BY late-materialization lane read the
+  sort column as the active view but addressed the chosen rows by physical
+  position, so <code>DELETE FROM t WHERE k &lt; 1000</code> + flush followed by
+  <code>SELECT k, s FROM t ORDER BY s ASC LIMIT 5</code> answered with the deleted
+  <code>u0000000..u0000004</code>; the filtered scatter path did the same and panicked a
+  <code>take</code> once an index reached the active length
+  (<code>index out of bounds: the len is 19000 but the index is 19000</code>). A nullable
+  sort column is what routes the statement onto those lanes — the dictionary and
+  plain string top-k lanes decline on NULLs. <code>TableStorageBackend</code> now exposes
+  <code>has_persisted_deletions()</code> (asking the storage for the vector instead of
+  comparing row counts), the lane reads winners back by <code>_id</code> in that state, and
+  the scatter shortcut is skipped so the indexed reader answers</li>
 <li><strong><code>ORDER BY … LIMIT n OFFSET m</code> applied the offset twice</strong> on the top-k lane
   that reads only the k chosen rows: its index list already skipped <code>m</code> and the
   caller applied the page again, so <code>ORDER BY &lt;plain string&gt; LIMIT 10 OFFSET 7</code>
@@ -3086,7 +3101,7 @@ a version-5 file.</p>
   budget allows, because both sides are wall-clock samples taken on a busy
   machine; the rejection must still be shorter than the statement that held the
   slot</li>
-<li>Release build, the complete serial Python suite (<strong>2342 passed, 0 failed,
+<li>Release build, the complete serial Python suite (<strong>2,343 passed, 0 failed,
   0 skipped</strong>), and the complete Rust suites pass on this tree: <strong>731 unit +
   6 documentation tests</strong> with the default features and again in the core-only
   (<code>--no-default-features</code>) configuration, <strong>737 + 6</strong> with <code>server</code> and
