@@ -172,6 +172,21 @@ a version-5 file.
   DESC` silently keep scan order and `GROUP BY ABS(score - 1.5)` collapse to a
   single group; use exact-name resolution first and the identifier-aware
   `strip_column_qualifier` otherwise
+- **Deletes stayed visible through `ORDER BY … LIMIT k`**: a persisted deletion
+  vector rewrites the header's row count to the surviving rows, so
+  `active_row_count() == row_count()` even though the deleted rows are still
+  stored *before* the survivors. The ORDER BY late-materialization lane read the
+  sort column as the active view but addressed the chosen rows by physical
+  position, so `DELETE FROM t WHERE k < 1000` + flush followed by
+  `SELECT k, s FROM t ORDER BY s ASC LIMIT 5` answered with the deleted
+  `u0000000..u0000004`; the filtered scatter path did the same and panicked a
+  `take` once an index reached the active length
+  (`index out of bounds: the len is 19000 but the index is 19000`). A nullable
+  sort column is what routes the statement onto those lanes — the dictionary and
+  plain string top-k lanes decline on NULLs. `TableStorageBackend` now exposes
+  `has_persisted_deletions()` (asking the storage for the vector instead of
+  comparing row counts), the lane reads winners back by `_id` in that state, and
+  the scatter shortcut is skipped so the indexed reader answers
 - **`ORDER BY … LIMIT n OFFSET m` applied the offset twice** on the top-k lane
   that reads only the k chosen rows: its index list already skipped `m` and the
   caller applied the page again, so `ORDER BY <plain string> LIMIT 10 OFFSET 7`
@@ -258,7 +273,7 @@ a version-5 file.
   budget allows, because both sides are wall-clock samples taken on a busy
   machine; the rejection must still be shorter than the statement that held the
   slot
-- Release build, the complete serial Python suite (**2342 passed, 0 failed,
+- Release build, the complete serial Python suite (**2,343 passed, 0 failed,
   0 skipped**), and the complete Rust suites pass on this tree: **731 unit +
   6 documentation tests** with the default features and again in the core-only
   (`--no-default-features`) configuration, **737 + 6** with `server` and
