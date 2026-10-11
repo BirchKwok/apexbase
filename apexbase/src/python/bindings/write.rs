@@ -2248,6 +2248,10 @@ impl ApexStorageImpl {
         {
             crate::Database::invalidate_dir(&base_dir);
             crate::Database::invalidate_query_cache_for_dir(&base_dir);
+            // Also drop this directory's idle cross-process lock descriptors: the
+            // cache keeps `<table>.apex.lock` open, and Windows cannot remove a
+            // directory while one of its files is open.
+            crate::storage::cross_process_lock::release(&base_dir);
         }
         Ok(())
     }

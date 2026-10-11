@@ -45,6 +45,27 @@ const MAX_WAIT: Duration = Duration::from_secs(30);
 const MIN_BACKOFF: Duration = Duration::from_micros(100);
 const MAX_BACKOFF: Duration = Duration::from_millis(5);
 
+/// Drop the cached lock descriptors under `base_dir` that nobody is holding.
+///
+/// The cache saves an `open`/`close` per write, but a cached descriptor keeps
+/// `<table>.apex.lock` open for the lifetime of the process. A client that closes
+/// a database calls this (next to `table_catalog::release`) so the directory stops
+/// holding file handles: Windows refuses to remove a directory while one of its
+/// files is open. An entry whose lock another thread still holds must stay
+/// cached — dropping its descriptor would release the `flock` out from under it.
+pub fn release(base_dir: &Path) {
+    EXCLUSIVE_LOCKS.retain(|path, entry| {
+        if !path.starts_with(base_dir) {
+            return true;
+        }
+        entry
+            .owner
+            .lock()
+            .map(|owner| owner.is_some())
+            .unwrap_or(true)
+    });
+}
+
 /// One cached exclusive-lock descriptor per table, plus the thread that owns it.
 ///
 /// The descriptor is cached because `open`/`close` cost far more than the `flock`
@@ -274,6 +295,45 @@ mod tests {
         // After the outermost guard drops, the lock is free again.
         let again = lock_write(&table).unwrap();
         assert!(again.holds_lock());
+    }
+
+    #[test]
+    fn release_drops_idle_descriptors_and_keeps_held_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let idle_table = dir.path().join("idle.apex");
+        let held_table = dir.path().join("held.apex");
+        let other_dir = tempfile::tempdir().unwrap();
+        let other_table = other_dir.path().join("other.apex");
+
+        // Populate the cache: one idle entry, one still held, one elsewhere.
+        // Other tests share this process-global cache and run in parallel, so only
+        // these three paths are asserted on, never the total entry count.
+        drop(lock_write(&idle_table).unwrap());
+        let held = lock_write(&held_table).unwrap();
+        drop(lock_write(&other_table).unwrap());
+        assert!(EXCLUSIVE_LOCKS.contains_key(&idle_table));
+
+        release(dir.path());
+
+        assert!(
+            !EXCLUSIVE_LOCKS.contains_key(&idle_table),
+            "an idle descriptor under the directory must be dropped"
+        );
+        assert!(
+            EXCLUSIVE_LOCKS.contains_key(&held_table),
+            "a held descriptor must stay cached or its flock would be released"
+        );
+        assert!(
+            EXCLUSIVE_LOCKS.contains_key(&other_table),
+            "a descriptor outside the directory must not be touched"
+        );
+        assert!(held.holds_lock());
+
+        drop(held);
+        release(dir.path());
+        assert!(!EXCLUSIVE_LOCKS.contains_key(&held_table));
+        release(other_dir.path());
+        assert!(!EXCLUSIVE_LOCKS.contains_key(&other_table));
     }
 
     #[test]

@@ -90,3 +90,6 @@ AGENTS.md
 
 # Architecture update ducumentation
 V5_*.md
+# Temporary release diagnostics (test/conftest.py)
+pytest-failures.txt
+pytest-current-test.txt
