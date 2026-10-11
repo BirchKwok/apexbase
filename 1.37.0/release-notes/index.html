@@ -3060,10 +3060,13 @@ a version-5 file.</p>
   failed on every Windows job. The probe now answers on every platform the release
   workflow tests, and the assertion (well below the ~48 MB a fully materializing
   server added) is unchanged</li>
-<li>Give the out-of-core CSV scan assertion Windows working-set headroom (400 MB
-  there, 100 MB elsewhere, still far below the +1397 MB the materializing path
-  added) and write its CSV fixture in batched byte chunks instead of one encode
-  per row, so the assertion sees less allocation noise</li>
+<li>Give the out-of-core CSV scan assertion Windows working-set headroom (1200 MB
+  there, 100 MB elsewhere, still below the +1397 MB the materializing path added)
+  and write its CSV fixture in batched byte chunks instead of one encode per row,
+  so the assertion sees less allocation noise</li>
+<li>Widen the bit-packed covering-aggregate cost band from 2x to 4x: both sides are
+  single-shot medians on a shared runner, and a release run failed it at 2.4x
+  while the per-row fallback it exists to catch was ~7.8x on the same shape</li>
 <li>Allow the saturated-statement timing comparison the same 10 ms the server's wait
   budget allows, because both sides are wall-clock samples taken on a busy
   machine; the rejection must still be shorter than the statement that held the
