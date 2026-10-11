@@ -329,6 +329,12 @@ jobs:
                 set -e
                 echo "isolated exit: ${isolated}"
               fi
+              echo "=== phase-by-phase repro (the last phase marker names the fault) ==="
+              set +e
+              python -u -X faulthandler benchmarks/diagnose_windows_zstd.py --rows 100000 200000 300000 2>&1 | tail -n 40
+              phase=${PIPESTATUS[0]}
+              set -e
+              echo "phase harness exit: ${phase}"
             fi
             exit ${code}
           }
