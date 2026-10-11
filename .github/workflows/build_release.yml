@@ -306,8 +306,10 @@ jobs:
             code=$?
             echo "=== pytest exited ${code} | last test in pytest-current-test.txt: ==="
             cat pytest-current-test.txt || true
-            echo "=== last 400 lines of pytest-failures.txt ==="
-            tail -n 400 pytest-failures.txt || true
+            echo "=== every failed test with its traceback ==="
+            grep -B 1 -A 14 "^\[failed\]" pytest-failures.txt || true
+            echo "=== last 60 lines of pytest-failures.txt ==="
+            tail -n 60 pytest-failures.txt || true
             exit ${code}
           }
         python - <<'PY'
