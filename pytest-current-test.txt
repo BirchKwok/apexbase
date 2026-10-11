@@ -1,1 +1,1 @@
-test/test_compressed_directory_point_read.py::test_partial_batch_lookup_never_drops_sidecar_rows[zstd]
+test/test_zone_map_metadata.py::TestAppendedRowGroupZoneMaps::test_appends_crossing_a_row_group_boundary_stay_correct
