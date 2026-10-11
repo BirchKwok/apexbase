@@ -11,8 +11,12 @@ on:
         required: true
         type: string
 
+# One release at a time, and only the group that is currently running may cancel
+# a queued run. Keying the group by the tag let a re-pushed tag hold a *newer* run
+# queued behind a stale one instead of replacing it, which left the release
+# cancelled without publishing.
 concurrency:
-  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: release-build-and-publish
   cancel-in-progress: false
 
 env:
@@ -299,9 +303,10 @@ jobs:
           --timeout=30 \
           --durations=40 \
           --junitxml=pytest-results.xml || {
-            echo "=== pytest exited $? | last test in pytest-current-test.txt: ==="
+            code=$?
+            echo "=== pytest exited ${code} | last test in pytest-current-test.txt: ==="
             cat pytest-current-test.txt || true
-            exit 1
+            exit ${code}
           }
         python - <<'PY'
         import sys
