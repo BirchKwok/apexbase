@@ -2916,6 +2916,14 @@ a version-5 file.</p>
   published generation and the row-id high-water mark, and document the naming
   rule as the single one that the SQL path, the Python bindings and the epoch
   tracker share</li>
+<li>Bounds-check the V4 footer and WAL readers so a corrupt or truncated file is an
+  error instead of a panic: <code>FooterV4::from_bytes</code> computes the schema end with a
+  checked add (a corrupt length wrapped <code>pos + schema_len</code> past the bound check
+  and then panicked on a slice whose start was past its end), and
+  <code>WalRecord::from_bytes_versioned</code> checks the 13-byte header, the body and the
+  CRC (a record a crash left half-written aborted the process from
+  <code>SELECT COUNT(*)</code> via <code>fast_row_count</code>). Both add Rust regression tests that cut
+  a real record at every byte offset</li>
 </ul>
 <h3 id="read-lanes">Read Lanes<a class="headerlink" href="#read-lanes" title="Permanent link">&para;</a></h3>
 <ul>
@@ -2992,7 +3000,14 @@ a version-5 file.</p>
   DESC</code> silently keep scan order and <code>GROUP BY ABS(score - 1.5)</code> collapse to a
   single group; use exact-name resolution first and the identifier-aware
   <code>strip_column_qualifier</code> otherwise</li>
-<li><strong>Encoded columns</strong>: keep the one-byte encoding tag in the slice handed to
+<li><strong><code>ORDER BY … LIMIT n OFFSET m</code> applied the offset twice</strong> on the top-k lane
+  that reads only the k chosen rows: its index list already skipped <code>m</code> and the
+  caller applied the page again, so <code>ORDER BY &lt;plain string&gt; LIMIT 10 OFFSET 7</code>
+  returned rows 14..24. <code>compute_topk_indices_generic</code> and the inlined streaming
+  heaps now return exactly the first <code>k</code> positions and no longer take an offset
+  argument, which removes the double application and the ambiguous convention
+  that allowed it</li>
+<li><strong>Encoding tag</strong>: keep the one-byte encoding tag in the slice handed to
   <code>read_column_encoded</code>, whose dispatch reads <code>bytes[0]</code> — a caller that skipped
   the null bitmap and the tag read <code>count=216172782113783808</code> from a BITPACK
   column and reported truncation</li>
