@@ -1514,6 +1514,17 @@
 </li>
         
           <li class="md-nav__item">
+  <a href="#platform-notes" class="md-nav__link">
+    <span class="md-ellipsis">
+      
+        Platform Notes
+      
+    </span>
+  </a>
+  
+</li>
+        
+          <li class="md-nav__item">
   <a href="#validation-and-performance" class="md-nav__link">
     <span class="md-ellipsis">
       
@@ -2959,6 +2970,18 @@ description and the compatibility rules.</p>
 <li>Allow the saturated-statement timing comparison the same 10 ms the server's wait
   budget allows, because both sides are wall-clock samples from a busy machine;
   the rejection must still be shorter than the statement that held the slot</li>
+</ul>
+<h3 id="platform-notes">Platform Notes<a class="headerlink" href="#platform-notes" title="Permanent link">&para;</a></h3>
+<ul>
+<li><code>ORDER BY &lt;plain string column&gt; LIMIT k</code> now declines its dedicated mmap lane on
+  Windows (<code>scan_top_k_plain_string_indices_mmap</code> returns <code>None</code> there under a
+  compile-time platform check). Every Windows job of the release workflow aborted
+  the process inside that walk while ordering 300k unique strings
+  (<code>test_a_high_cardinality_string_orders_correctly_in_both_directions</code>), and the
+  same test passes on Linux and macOS with the same binary layout. The walk's
+  slices are all bounds-checked, so this is a platform-specific fault that has not
+  been explained yet; Windows therefore takes the general path, which is slower
+  but returns the same values. The lane stays active everywhere else</li>
 </ul>
 <h3 id="validation-and-performance">Validation And Performance<a class="headerlink" href="#validation-and-performance" title="Permanent link">&para;</a></h3>
 <ul>
