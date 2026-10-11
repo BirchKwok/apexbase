@@ -139,7 +139,8 @@ streaming overlay reads, and a per-query aggregation memory budget on top of it.
 See [Scan & Physical Execution](https://birchkwok.github.io/apexbase/latest/SCAN_EXECUTION_ARCHITECTURE/)
 and [Resource Ownership](https://birchkwok.github.io/apexbase/latest/RESOURCE_OWNERSHIP/).
 
-v1.37.0 is the **V5 architecture preview**. Files may declare format version `5`
+v1.37.0 is the **V5 architecture preview** release. Files may declare format
+version `5`
 and carry V5-only column encodings, `_id` ranges are reserved against a shared
 on-disk high-water mark so several processes can write one table, and new read
 lanes cover direct point reads, executor index lookups, full-text row-selection

@@ -401,15 +401,38 @@ impl WalRecord {
 
     /// Deserialize record from bytes.
     /// `wal_version` controls CRC verification: v2+ records have a trailing CRC32.
+    ///
+    /// A record that a crash left half-written is an expected input, not an
+    /// error path: the reader stops at the first record it cannot parse
+    /// (`read_all_with_offsets`), so this returns `InvalidData` for a truncated
+    /// header, body or checksum instead of panicking on a slice that runs past
+    /// the end of the buffer.
     pub fn from_bytes_versioned(bytes: &[u8], wal_version: u32) -> io::Result<(Self, usize)> {
         if bytes.is_empty() {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "Empty record"));
+        }
+        if bytes.len() < 13 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "WAL record truncated (incomplete header)",
+            ));
         }
 
         let record_type = bytes[0];
         let _timestamp = i64::from_le_bytes(bytes[1..9].try_into().unwrap());
         let record_len = u32::from_le_bytes(bytes[9..13].try_into().unwrap()) as usize;
-        let data = &bytes[13..13 + record_len];
+        // `record_len` comes from the file, so the total must be computed without
+        // wrapping: a corrupt length must read as truncated, not as a short slice.
+        let total_len = match 13usize.checked_add(record_len) {
+            Some(total) if total <= bytes.len() => total,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "WAL record truncated (incomplete body)",
+                ))
+            }
+        };
+        let data = &bytes[13..total_len];
 
         let record = match record_type {
             RECORD_INSERT => {
@@ -724,8 +747,6 @@ impl WalRecord {
                 ))
             }
         };
-
-        let total_len = 13 + record_len;
 
         // WAL v2+: verify CRC32 checksum
         if wal_version >= WAL_VERSION {
@@ -1694,6 +1715,39 @@ mod tests {
         } else {
             panic!("Expected Insert record");
         }
+    }
+
+    #[test]
+    fn test_truncated_wal_record_parses_as_invalid_data_instead_of_panicking() {
+        // A crash during commit is expected to leave a half-written record at the
+        // tail of the WAL. `read_all_with_offsets` treats the first parse error as
+        // the end of the valid prefix, so every truncation here must be an
+        // `InvalidData` error and never a slice panic.
+        let bytes = WalRecord::Insert {
+            id: 7,
+            data: HashMap::from([("a".to_string(), ColumnValue::Int64(1))]),
+            txn_id: 0,
+        }
+        .to_bytes();
+
+        for cut in 0..bytes.len() {
+            let result = WalRecord::from_bytes_versioned(&bytes[..cut], WAL_VERSION);
+            assert!(
+                result.is_err(),
+                "a record cut to {cut} of {} bytes must not parse",
+                bytes.len()
+            );
+        }
+
+        // A corrupt length must not wrap into a slice inside the buffer.
+        let mut corrupt = bytes.clone();
+        corrupt[9..13].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(WalRecord::from_bytes_versioned(&corrupt, WAL_VERSION).is_err());
+
+        // The complete record still round-trips.
+        let (parsed, len) = WalRecord::from_bytes_versioned(&bytes, WAL_VERSION).unwrap();
+        assert_eq!(len, bytes.len());
+        assert!(matches!(parsed, WalRecord::Insert { id: 7, .. }));
     }
 
     #[test]

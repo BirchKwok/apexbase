@@ -19,6 +19,16 @@ impl OnDemandStorage {
         k: usize,
         descending: bool,
     ) -> io::Result<Option<Vec<usize>>> {
+        // Windows declines the lane outright: the release workflow's Windows jobs abort
+        // the process inside this walk (`test_a_high_cardinality_string_orders_correctly_
+        // in_both_directions`, 300k unique strings, before the first assertion), while
+        // the same test passes on Linux and macOS. Every slice below is bounds-checked,
+        // so this is a platform-specific fault the lane cannot yet explain, and a slower
+        // correct answer beats a crash: the caller falls through to the general path in
+        // `execute_with_order_late_materialization` until it can be reproduced and fixed.
+        if cfg!(windows) {
+            return Ok(None);
+        }
         // Ascending only. The bounded heap improves on every row when the values arrive
         // in the opposite order to the request, so `DESC` over ascending data degraded
         // to O(n*k) churn -- 1M rows: 43 ms against 1.7 ms on the general path. (The

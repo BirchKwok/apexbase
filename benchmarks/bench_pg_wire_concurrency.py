@@ -392,8 +392,49 @@ def measure_probe(host: str, port: int, rows: int, warmup: int, iterations: int)
 
 
 def server_rss_mb(pid: int) -> float | None:
-    """Resident set size of the server process, in MiB (macOS/Linux `ps`)."""
+    """Resident set size of the server process, in MiB.
+
+    Unix uses `ps`; Windows has no `ps`, so it reads the process working set through
+    `GetProcessMemoryInfo`. The probe is what the large-result memory assertion and the
+    gate's RSS sampling depend on, and it must answer on every platform the release
+    workflow tests. `sys` is imported at module scope.
+    """
     import subprocess
+
+    if sys.platform == "win32":
+        import ctypes
+        from ctypes import wintypes
+
+        class _ProcessMemoryCounters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        try:
+            process = ctypes.windll.kernel32.OpenProcess(0x0410, False, pid)
+            if not process:
+                return None
+            try:
+                counters = _ProcessMemoryCounters()
+                counters.cb = ctypes.sizeof(counters)
+                if not ctypes.windll.psapi.GetProcessMemoryInfo(
+                    process, ctypes.byref(counters), counters.cb
+                ):
+                    return None
+                return counters.WorkingSetSize / (1024.0 * 1024.0)
+            finally:
+                ctypes.windll.kernel32.CloseHandle(process)
+        except (AttributeError, OSError, ValueError):
+            return None
 
     try:
         out = subprocess.run(
