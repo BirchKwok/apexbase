@@ -31,7 +31,56 @@ import argparse
 import json
 import os
 import random
-import resource
+try:
+    import resource
+except ImportError:  # Windows has no `resource` module.
+    resource = None
+
+
+def page_faults():
+    """Cumulative page faults of this process, on every platform we test.
+
+    Windows has no `resource` module, so importing it at module scope made
+    `bench_width_fidelity` unloadable there (the manifest test loads it). Windows
+    reports the count through `GetProcessMemoryInfo` instead.
+    """
+    if resource is not None:
+        usage = resource.getrusage(resource.RUSAGE_SELF)
+        return usage.ru_minflt + usage.ru_majflt
+
+    import ctypes
+    from ctypes import wintypes
+
+    class _Counters(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    psapi = ctypes.WinDLL("psapi", use_last_error=True)
+    kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+    psapi.GetProcessMemoryInfo.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(_Counters),
+        wintypes.DWORD,
+    ]
+    counters = _Counters()
+    counters.cb = ctypes.sizeof(counters)
+    if not psapi.GetProcessMemoryInfo(
+        kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+    ):
+        raise ctypes.WinError(ctypes.get_last_error())
+    return counters.PageFaultCount
+
 import shutil
 import statistics
 import struct
@@ -161,13 +210,13 @@ def measure_first_touch(bench: WidthBench, sql: str, cycles: int) -> tuple[float
     for _ in range(cycles):
         bench.close()
         bench.open()
-        before = resource.getrusage(resource.RUSAGE_SELF)
+        before = page_faults()
         started = time.perf_counter()
         bench.query(sql)
         elapsed = (time.perf_counter() - started) * 1000.0
-        after = resource.getrusage(resource.RUSAGE_SELF)
+        after = page_faults()
         times.append(elapsed)
-        faults.append((after.ru_minflt - before.ru_minflt) + (after.ru_majflt - before.ru_majflt))
+        faults.append(after - before)
     return statistics.median(times), int(min(faults))
 
 

@@ -127,15 +127,59 @@ def test_import_persists_while_it_is_still_running(tmp_path):
 
 CSV_SCAN_SNIPPET = """
 import os
-import resource
 import sys
 
 from apexbase import ApexClient
 
 database, source = sys.argv[1], sys.argv[2]
 
-
+# Peak resident set of this process, in MB, on every platform we test. Windows
+# has no `resource` module, so the child used to die before measuring anything.
 def rss_mb():
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/self/status", encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmHWM:"):
+                        return int(line.split()[1]) / 1024
+        except OSError:
+            pass
+    try:
+        import resource
+    except ImportError:  # Windows
+        import ctypes
+        from ctypes import wintypes
+
+        class _Counters(ctypes.Structure):
+            _fields_ = [
+                ("cb", wintypes.DWORD),
+                ("PageFaultCount", wintypes.DWORD),
+                ("PeakWorkingSetSize", ctypes.c_size_t),
+                ("WorkingSetSize", ctypes.c_size_t),
+                ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                ("PagefileUsage", ctypes.c_size_t),
+                ("PeakPagefileUsage", ctypes.c_size_t),
+            ]
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        psapi = ctypes.WinDLL("psapi", use_last_error=True)
+        kernel32.GetCurrentProcess.restype = wintypes.HANDLE
+        psapi.GetProcessMemoryInfo.argtypes = [
+            wintypes.HANDLE,
+            ctypes.POINTER(_Counters),
+            wintypes.DWORD,
+        ]
+        counters = _Counters()
+        counters.cb = ctypes.sizeof(counters)
+        if not psapi.GetProcessMemoryInfo(
+            kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb
+        ):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return counters.PeakWorkingSetSize / (1024 * 1024)
+
     usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return usage / (1024 * 1024) if sys.platform == "darwin" else usage / 1024
 
