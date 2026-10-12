@@ -250,13 +250,16 @@ def test_saturated_statements_are_rejected_within_the_wait_budget(wire_bench, mo
                 args=(wire_bench, port, HEAVY_SQL, held, 0, threading.Barrier(1)),
             )
             hold.start()
-            # Wait long enough that the holder is inside its statement: the thread
-            # start, the connect and the send are the only variable part, and the
-            # holder's statement then runs for `single_ms` (asserted above to be at
-            # least 10 ms, and ~100 ms on this fixture). Retrying the probe does not
-            # work: an admitted probe takes the only slot, so the *holder* becomes
-            # the rejected statement and the probe never observes 53300.
-            time.sleep(0.05)
+            # Wait long enough that the holder is inside its statement, but a small
+            # fraction of that statement: the lead-in has to cover the thread start,
+            # the connect and the send, yet stay inside `single_ms` or the holder has
+            # already finished when the probe arrives and the probe is admitted. A
+            # fixed 50 ms was too long on the fast macOS runners (a release run failed
+            # with `DID NOT RAISE`), so scale it to the measured statement time.
+            # Retrying the probe does not work: an admitted probe takes the only slot,
+            # so the *holder* becomes the rejected statement and the probe never
+            # observes 53300.
+            time.sleep(min(0.05, max(0.005, single_ms / 4000.0)))
             client = wire_bench.MinimalPgClient("127.0.0.1", port)
             try:
                 started = time.perf_counter()
