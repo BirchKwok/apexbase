@@ -6152,3 +6152,33 @@ fn row_group_id_directory_stays_sorted_across_delete_and_append() {
 
 
 
+
+// ====== ZSTD Decompression ======
+
+/// A zstd body must decode without reserving a fixed 256 MB buffer.
+///
+/// The reader used to call `zstd::bulk::decompress(compressed, 256 * 1024 * 1024)`.
+/// That API allocates the capacity it is handed unless the frame declares its
+/// content size, and `bulk::compress` (this writer) does not declare one, so every
+/// row-group read reserved 256 MB. On Windows under load that allocation failed and
+/// Rust aborted the process (`memory allocation of 268435456 bytes failed`) before
+/// Python could raise, which is what the release workflow's Windows jobs hit in the
+/// compressed 300k-row string path. Bodies without a declared size now stream, so
+/// this pins the decode of a body far larger than a row group's usual few MB and of
+/// a small one, through the public helper the readers use.
+#[test]
+fn test_zstd_body_decodes_without_a_fixed_reservation() {
+    for rows in [1_000usize, 1_500_000] {
+        let body: Vec<u8> = (0..rows as u32).flat_map(|i| i.to_le_bytes()).collect();
+        let frame = zstd::bulk::compress(&body, 1).unwrap();
+        assert!(
+            frame.len() < body.len(),
+            "the fixture must actually compress ({rows} rows)"
+        );
+        let decoded = decompress_rg_body(RG_COMPRESS_ZSTD, &frame)
+            .unwrap()
+            .expect("a zstd frame must decompress");
+        assert_eq!(decoded.len(), body.len(), "size mismatch for {rows} rows");
+        assert!(decoded == body, "content mismatch for {rows} rows");
+    }
+}

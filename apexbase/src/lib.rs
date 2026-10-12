@@ -3,20 +3,8 @@
 //! A high-performance embedded database storage engine implemented in Rust.
 //! Provides Python bindings via PyO3 for seamless integration.
 
-// The crate owns its allocator instead of inheriting one from FTS (mimalloc
-// serves the bulk column reads and the morsel pipeline measurably better than
-// the system allocator).
-//
-// Windows is the exception: as a loadable extension there, mimalloc's
-// `local_dynamic_tls` resolves its per-thread heaps through Windows FLS slots,
-// and the release workflow's Windows jobs abort the process (exit 127, no Python
-// traceback and no WER entry) in the compressed 300k-row string path while the
-// uncompressed twin and the same table on Linux/macOS pass. The system allocator
-// is the safe choice for a `.pyd`; the Linux/macOS builds keep mimalloc.
-#[cfg(not(windows))]
 use mimalloc::MiMalloc;
 
-#[cfg(not(windows))]
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 

@@ -2074,8 +2074,24 @@ fn decompress_rg_body(compress_flag: u8, compressed: &[u8]) -> io::Result<Option
             Ok(Some(decompressed))
         }
         RG_COMPRESS_ZSTD => {
-            let decompressed = zstd::bulk::decompress(compressed, 256 * 1024 * 1024)
-                .map_err(|e| err_data(&format!("Zstd decompress failed: {}", e)))?;
+            // `bulk::decompress` allocates the capacity it is handed unless the
+            // frame declares its content size, and this writer's frames do not: the
+            // previous `256 * 1024 * 1024` therefore reserved 256 MB for every row
+            // group, which failed the allocation on Windows under load
+            // (`memory allocation of 268435456 bytes failed`) and aborted the process
+            // with no Python traceback. Ask the frame for its size first; when it
+            // does not carry one, stream the decode so the output grows with the frame
+            // instead of being reserved up front.
+            let decompressed = match zstd::zstd_safe::get_frame_content_size(compressed) {
+                Ok(Some(size)) => zstd::bulk::decompress(compressed, size as usize),
+                _ => {
+                    let mut decoder = zstd::stream::read::Decoder::new(compressed)?;
+                    let mut output = Vec::new();
+                    std::io::Read::read_to_end(&mut decoder, &mut output)?;
+                    Ok(output)
+                }
+            }
+            .map_err(|e| err_data(&format!("Zstd decompress failed: {}", e)))?;
             Ok(Some(decompressed))
         }
         _ => Err(err_data(&format!(
