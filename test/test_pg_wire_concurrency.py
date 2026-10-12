@@ -250,35 +250,28 @@ def test_saturated_statements_are_rejected_within_the_wait_budget(wire_bench, mo
                 args=(wire_bench, port, HEAVY_SQL, held, 0, threading.Barrier(1)),
             )
             hold.start()
-            # The holder has to be *inside* the server before the probe arrives:
-            # the thread start, the connect and the send can take tens of ms on a
-            # loaded runner, and a probe that arrives first is simply admitted (a
-            # release run then failed with `DID NOT RAISE`). Retry while the holder
-            # runs so the test observes the rejection the budget promises instead
-            # of racing the holder's start-up.
-            rejected_ms = None
-            deadline = time.time() + 10
-            while hold.is_alive() and time.time() < deadline and rejected_ms is None:
-                time.sleep(0.02)
-                client = wire_bench.MinimalPgClient("127.0.0.1", port)
-                try:
-                    started = time.perf_counter()
-                    try:
-                        client.query("SELECT COUNT(*) AS n FROM t")
-                    except wire_bench.PgWireError as exc:
-                        rejected_ms = (time.perf_counter() - started) * 1000.0
-                        assert exc.code == "53300", exc
-                        assert "slots" in str(exc), exc
-                        # Bounded by the budget, not by the other statement finishing.
-                        assert rejected_ms < single_ms, (rejected_ms, single_ms)
-                        # The connection survives the rejection and still serves probes.
-                        assert client.query("SELECT version()")[0][0]
-                finally:
-                    client.close()
-            assert rejected_ms is not None, (
-                "the probe must be rejected while the holder occupies the slot "
-                f"(holder ran {single_ms:.1f} ms per statement)"
-            )
+            # Wait long enough that the holder is inside its statement: the thread
+            # start, the connect and the send are the only variable part, and the
+            # holder's statement then runs for `single_ms` (asserted above to be at
+            # least 10 ms, and ~100 ms on this fixture). Retrying the probe does not
+            # work: an admitted probe takes the only slot, so the *holder* becomes
+            # the rejected statement and the probe never observes 53300.
+            time.sleep(0.05)
+            client = wire_bench.MinimalPgClient("127.0.0.1", port)
+            try:
+                started = time.perf_counter()
+                with pytest.raises(wire_bench.PgWireError) as caught:
+                    client.query("SELECT COUNT(*) AS n FROM t")
+                rejected_ms = (time.perf_counter() - started) * 1000.0
+                assert caught.value.code == "53300", caught.value
+                assert "slots" in str(caught.value), caught.value
+                # Bounded by the budget, not by the other statement finishing.
+                assert rejected_ms < single_ms, (rejected_ms, single_ms)
+
+                # The connection survives the rejection and still serves probes.
+                assert client.query("SELECT version()")[0][0]
+            finally:
+                client.close()
             hold.join(timeout=120)
             # Both sides are wall-clock samples taken on a busy machine, so the
             # comparison allows the rejection the same 10 ms the server's wait
