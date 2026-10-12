@@ -235,8 +235,11 @@ def test_saturated_statements_are_rejected_within_the_wait_budget(wire_bench, mo
     try:
         monkeypatch.setenv("APEX_SERVER_QUERY_CONCURRENCY", "1")
         # Far shorter than the statement below, so the rejection is driven by the
-        # budget and not by the holder finishing first.
-        monkeypatch.setenv("APEX_SERVER_QUERY_WAIT_MS", "10")
+        # budget and not by the holder finishing first. The fixture is asserted to
+        # take more than 10 ms, and the budget is 3 ms: on the fast macOS runners a
+        # 10 ms budget could expire after the holder had already finished, and the
+        # probe was then admitted (`DID NOT RAISE`).
+        monkeypatch.setenv("APEX_SERVER_QUERY_WAIT_MS", "3")
         port = wire_bench.free_port()
         process = wire_bench.start_server(str(db_dir), port)
         try:

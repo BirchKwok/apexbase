@@ -1067,40 +1067,68 @@ impl OnDemandStorage {
         // Create mmap cache and use it for initial reads
         let mut mmap_cache = MmapCache::new();
 
-        // Read header using mmap (zero-copy)
-        let mut header_bytes = [0u8; HEADER_SIZE];
-        mmap_cache.read_at(&file, &mut header_bytes, 0)?;
-        let header = OnDemandHeader::from_bytes(&header_bytes)?;
+        // A concurrent writer appends a Row Group and then publishes a new footer,
+        // so a header read before that publish and a footer read after it describe
+        // two different layouts: the footer then fails to parse ("V4 footer: schema
+        // overflow") or fails the id/layout check, and the caller saw a spurious
+        // error from `store()`. Re-read the header and the footer until they agree,
+        // which the file does as soon as the publish completes.
+        let (header, footer, id_count, file_len) = {
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                let mut header_bytes = [0u8; HEADER_SIZE];
+                mmap_cache.read_at(&file, &mut header_bytes, 0)?;
+                let header = OnDemandHeader::from_bytes(&header_bytes)?;
 
-        if header.footer_offset == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Unsupported legacy file format (V3). Please re-create the table.",
-            ));
-        }
+                if header.footer_offset == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unsupported legacy file format (V3). Please re-create the table.",
+                    ));
+                }
 
-        // V4 Row Group format: read schema from footer
-        let mut file_len = file.metadata()?.len();
-        // A concurrent writer appends a Row Group and then publishes a new
-        // footer, so the header can point past the length observed before it
-        // was read. Re-read the length once: the file grew, which is not
-        // corruption.
-        if header.footer_offset > file_len {
-            file_len = file.metadata()?.len();
-        }
-        if header.footer_offset < HEADER_SIZE as u64 || header.footer_offset > file_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Corrupt Apex file: invalid footer offset",
-            ));
-        }
-        let footer_byte_count = usize::try_from(file_len - header.footer_offset).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "Corrupt Apex file: footer is too large")
-        })?;
-        let mut footer_bytes = vec![0u8; footer_byte_count];
-        mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
-        let footer = V4Footer::from_bytes(&footer_bytes)?;
-        let id_count = Self::validate_v4_layout(&header, &footer, file_len)?;
+                let mut file_len = file.metadata()?.len();
+                if header.footer_offset > file_len {
+                    file_len = file.metadata()?.len();
+                }
+                let offset_is_usable =
+                    header.footer_offset >= HEADER_SIZE as u64 && header.footer_offset <= file_len;
+                if !offset_is_usable {
+                    if attempt >= 8 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Corrupt Apex file: invalid footer offset",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200 * attempt as u64));
+                    continue;
+                }
+                let footer_byte_count =
+                    usize::try_from(file_len - header.footer_offset).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Corrupt Apex file: footer is too large",
+                        )
+                    })?;
+                let mut footer_bytes = vec![0u8; footer_byte_count];
+                mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
+                let parsed = V4Footer::from_bytes(&footer_bytes)
+                    .and_then(|footer| {
+                        Self::validate_v4_layout(&header, &footer, file_len)
+                            .map(|id_count| (footer, id_count))
+                    });
+                match parsed {
+                    Ok((footer, id_count)) => break (header, footer, id_count, file_len),
+                    Err(error) if attempt < 8 => {
+                        std::thread::sleep(std::time::Duration::from_micros(200 * attempt as u64));
+                        let _ = error;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
         let schema = footer.schema.clone();
         let column_index: Vec<ColumnIndexEntry> = Vec::new();
         // Use max_id from non-empty RG metadata (row_count may be < max _id after deletes)
@@ -1264,37 +1292,68 @@ impl OnDemandStorage {
         let mut file_len = file_len;
         let mut mmap_cache = MmapCache::new();
 
-        let mut header_bytes = [0u8; HEADER_SIZE];
-        mmap_cache.read_at(&file, &mut header_bytes, 0)?;
-        let header = OnDemandHeader::from_bytes(&header_bytes)?;
+        // A concurrent writer appends a Row Group and then publishes a new footer,
+        // so a header read before that publish and a footer read after it describe
+        // two different layouts: the footer then fails to parse ("V4 footer: schema
+        // overflow") or fails the id/layout check, and the caller saw a spurious
+        // error from `store()`. Re-read the header and the footer until they agree,
+        // which the file does as soon as the publish completes.
+        let (header, footer, id_count, file_len) = {
+            let mut attempt = 0u32;
+            loop {
+                attempt += 1;
+                let mut header_bytes = [0u8; HEADER_SIZE];
+                mmap_cache.read_at(&file, &mut header_bytes, 0)?;
+                let header = OnDemandHeader::from_bytes(&header_bytes)?;
 
-        if header.footer_offset == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Unsupported legacy file format (V3). Please re-create the table.",
-            ));
-        }
+                if header.footer_offset == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "Unsupported legacy file format (V3). Please re-create the table.",
+                    ));
+                }
 
-        // A concurrent writer appends a Row Group and then publishes a new
-        // footer, so the header can point past the length observed before it
-        // was read. Re-read the length once: the file grew, which is not
-        // corruption.
-        if header.footer_offset > file_len {
-            file_len = file.metadata()?.len();
-        }
-        if header.footer_offset < HEADER_SIZE as u64 || header.footer_offset > file_len {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "Corrupt Apex file: invalid footer offset",
-            ));
-        }
-        let footer_byte_count = usize::try_from(file_len - header.footer_offset).map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "Corrupt Apex file: footer is too large")
-        })?;
-        let mut footer_bytes = vec![0u8; footer_byte_count];
-        mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
-        let footer = V4Footer::from_bytes(&footer_bytes)?;
-        let id_count = Self::validate_v4_layout(&header, &footer, file_len)?;
+                let mut file_len = file.metadata()?.len();
+                if header.footer_offset > file_len {
+                    file_len = file.metadata()?.len();
+                }
+                let offset_is_usable =
+                    header.footer_offset >= HEADER_SIZE as u64 && header.footer_offset <= file_len;
+                if !offset_is_usable {
+                    if attempt >= 8 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Corrupt Apex file: invalid footer offset",
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_micros(200 * attempt as u64));
+                    continue;
+                }
+                let footer_byte_count =
+                    usize::try_from(file_len - header.footer_offset).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Corrupt Apex file: footer is too large",
+                        )
+                    })?;
+                let mut footer_bytes = vec![0u8; footer_byte_count];
+                mmap_cache.read_at(&file, &mut footer_bytes, header.footer_offset)?;
+                let parsed = V4Footer::from_bytes(&footer_bytes)
+                    .and_then(|footer| {
+                        Self::validate_v4_layout(&header, &footer, file_len)
+                            .map(|id_count| (footer, id_count))
+                    });
+                match parsed {
+                    Ok((footer, id_count)) => break (header, footer, id_count, file_len),
+                    Err(error) if attempt < 8 => {
+                        std::thread::sleep(std::time::Duration::from_micros(200 * attempt as u64));
+                        let _ = error;
+                        continue;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+        };
         let schema = footer.schema.clone();
         let column_index: Vec<ColumnIndexEntry> = Vec::new();
         let next_id = footer

@@ -88,6 +88,13 @@ a version-5 file.
   published generation and the row-id high-water mark, and document the naming
   rule as the single one that the SQL path, the Python bindings and the epoch
   tracker share
+- Tolerate a concurrent publish in the table open path: a header read before a
+  writer appended a row group and a footer read after it describe two different
+  layouts, so the footer failed to parse (`V4 footer: schema overflow`) or failed
+  the id/layout check and surfaced as a spurious error from `store()` — the
+  cross-process writer test hit it as `OSError: V4 footer: schema overflow`. Both
+  open paths now re-read the header, length and footer until they agree, with a
+  bounded backoff; the read-side lane already did this by returning `None`
 - Bounds-check the V4 footer and WAL readers so a corrupt or truncated file is an
   error instead of a panic: `FooterV4::from_bytes` computes the schema end with a
   checked add (a corrupt length wrapped `pos + schema_len` past the bound check
