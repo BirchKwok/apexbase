@@ -1707,6 +1707,18 @@ impl OnDemandStorage {
         Ok(Some(body))
     }
 
+    /// Unmap this table's file.
+    ///
+    /// Windows refuses to truncate or replace a file while the calling process
+    /// still maps a section of it (`ERROR_USER_MAPPED_FILE`, os error 1224), which
+    /// Unix allows. A test that models "another writer rewrote the base underneath
+    /// this backend" must therefore unmap first; the mapping is re-established on
+    /// the next read, so the backend keeps its stale snapshot.
+    #[cfg(test)]
+    pub(crate) fn release_mmap_for_tests(&self) {
+        self.mmap_cache.write().invalidate();
+    }
+
     pub(crate) fn invalidate_page_cache(&self) {
         self.page_cache.write().clear();
         self.decompressed_rg_cache.write().clear();

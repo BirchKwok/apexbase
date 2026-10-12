@@ -8320,6 +8320,10 @@ mod tests {
         // writer on an empty table, a compaction or a full save all do, and it is
         // the change that makes this buffer's snapshot stale. (Appending to the
         // sidecar instead leaves the base — and therefore this buffer — valid.)
+        // Windows cannot truncate a file this process still maps (os error 1224),
+        // so unmap the buffer's view first: its snapshot is what must stay stale,
+        // not its mapping.
+        buffered.storage.release_mmap_for_tests();
         let other = TableStorageBackend::create(&path).unwrap();
         other.add_column("a", DataType::Int64).unwrap();
         other
