@@ -403,14 +403,24 @@ class TestConcurrentReadersWithWriter:
         assert errors == [], f"concurrent access must not raise: {errors}"
         assert read_counts, "the reader threads must actually run queries"
 
-        assert client.count_rows() == expected
-        counted = client.execute("SELECT COUNT(*) AS n FROM rw").to_dict()
-        assert counted[0]["n"] == expected
-
+        # A mismatch here is either a lost write or a count that has not caught up
+        # with the write buffer. All three views are collected before asserting so
+        # the failure says which one diverged: `count_rows()` reads the published
+        # row count, the scan merges the overlay, and the distinct set shows
+        # duplication. A release run failed on the first line with 290 of 300 rows
+        # and nothing else recorded, which is not enough to tell those apart.
+        published = client.count_rows()
+        counted = client.execute("SELECT COUNT(*) AS n FROM rw").to_dict()[0]["n"]
         rows = client.execute("SELECT worker, seq FROM rw").to_dict()
-        assert len({(r["worker"], r["seq"]) for r in rows}) == expected, (
-            "concurrent writers must not duplicate a row"
+        distinct = len({(r["worker"], r["seq"]) for r in rows})
+        context = (
+            f"published={published} scanned={counted} distinct={distinct} "
+            f"materialized={len(rows)} expected={expected}"
         )
+
+        assert published == expected, context
+        assert counted == expected, context
+        assert distinct == expected, "concurrent writers must not duplicate a row: " + context
 
 
 class TestWriteRoutesKeepValues:
