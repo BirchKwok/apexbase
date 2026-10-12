@@ -246,46 +246,59 @@ def test_saturated_statements_are_rejected_within_the_wait_budget(wire_bench, mo
             single_ms = _median_ms(wire_bench, port, HEAVY_SQL)
             assert single_ms > 10.0, f"fixture too fast to saturate: {single_ms}"
 
-            # Hold the only slot with a statement that outlives the wait budget.
+            # Keep the only slot continuously busy from another thread and probe
+            # until a probe is actually rejected. A one-shot probe raced the
+            # holder's start-up (thread start + connect + send), arrived before it
+            # held the slot, and was admitted -- `DID NOT RAISE` on the fast macOS
+            # runners -- while a longer fixed lead-in then overran a *short*
+            # statement. The holder retries when a probe takes the slot from it, so
+            # the slot is busy for all but the tiny gap between its statements and
+            # the retry loop observes the rejection the budget promises.
+            stop = threading.Event()
             held = [0.0]
-            hold = threading.Thread(
-                target=_run_pair,
-                args=(wire_bench, port, HEAVY_SQL, held, 0, threading.Barrier(1)),
-            )
-            hold.start()
-            # Wait long enough that the holder is inside its statement, but a small
-            # fraction of that statement: the lead-in has to cover the thread start,
-            # the connect and the send, yet stay inside `single_ms` or the holder has
-            # already finished when the probe arrives and the probe is admitted. A
-            # fixed 50 ms was too long on the fast macOS runners (a release run failed
-            # with `DID NOT RAISE`), so scale it to the measured statement time.
-            # Retrying the probe does not work: an admitted probe takes the only slot,
-            # so the *holder* becomes the rejected statement and the probe never
-            # observes 53300.
-            time.sleep(min(0.05, max(0.005, single_ms / 4000.0)))
-            client = wire_bench.MinimalPgClient("127.0.0.1", port)
-            try:
-                started = time.perf_counter()
-                with pytest.raises(wire_bench.PgWireError) as caught:
-                    client.query("SELECT COUNT(*) AS n FROM t")
-                rejected_ms = (time.perf_counter() - started) * 1000.0
-                assert caught.value.code == "53300", caught.value
-                assert "slots" in str(caught.value), caught.value
-                # Bounded by the budget, not by the other statement finishing.
-                assert rejected_ms < single_ms, (rejected_ms, single_ms)
 
-                # The connection survives the rejection and still serves probes.
-                assert client.query("SELECT version()")[0][0]
+            def keep_the_slot_busy() -> None:
+                while not stop.is_set():
+                    started = time.perf_counter()
+                    try:
+                        _median_ms(wire_bench, port, HEAVY_SQL, runs=1)
+                    except wire_bench.PgWireError:
+                        # An admitted probe took the slot from us; try again.
+                        continue
+                    held[0] = (time.perf_counter() - started) * 1000.0
+
+            hold = threading.Thread(target=keep_the_slot_busy, daemon=True)
+            hold.start()
+            rejected = None
+            try:
+                deadline = time.time() + 10
+                while time.time() < deadline and rejected is None:
+                    client = wire_bench.MinimalPgClient("127.0.0.1", port)
+                    try:
+                        started = time.perf_counter()
+                        try:
+                            client.query("SELECT COUNT(*) AS n FROM t")
+                        except wire_bench.PgWireError as exc:
+                            rejected_ms = (time.perf_counter() - started) * 1000.0
+                            assert exc.code == "53300", exc
+                            assert "slots" in str(exc), exc
+                            # Bounded by the budget, not by the holder finishing.
+                            assert rejected_ms < single_ms, (rejected_ms, single_ms)
+                            # The connection survives the rejection and still
+                            # serves probes.
+                            assert client.query("SELECT version()")[0][0]
+                            rejected = rejected_ms
+                    finally:
+                        client.close()
             finally:
-                client.close()
-            hold.join(timeout=120)
-            # Both sides are wall-clock samples taken on a busy machine, so the
-            # comparison allows the rejection the same 10 ms the server's wait
-            # budget allows; anything smaller than the holder still proves the
-            # rejection was not caused by the slot being free again.
-            assert held[0] > rejected_ms - 10.0, (
+                stop.set()
+                hold.join(timeout=120)
+            assert rejected is not None, (
+                "no probe was rejected while the only slot was continuously busy"
+            )
+            assert held[0] > rejected - 10.0, (
                 f"the holder must outlive the rejected statement: {held[0]:.1f} ms "
-                f"vs {rejected_ms:.1f} ms"
+                f"vs {rejected:.1f} ms"
             )
 
             # Once the slot is free the same statement succeeds.
