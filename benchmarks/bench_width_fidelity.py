@@ -123,7 +123,10 @@ LAYOUTS = (
     ("V5 narrow", None, 5),
 )
 
-PAGE_SIZE = os.sysconf("SC_PAGE_SIZE")
+# `os.sysconf` does not exist on Windows, and the module has to load there (the
+# release workflow's width-fidelity tests import it). The estimate only converts a
+# page count into a byte count, so the platform default is good enough.
+PAGE_SIZE = os.sysconf("SC_PAGE_SIZE") if hasattr(os, "sysconf") else 4096
 FIRST_TOUCH_CYCLES = 3
 
 
