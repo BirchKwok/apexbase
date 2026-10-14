@@ -170,18 +170,40 @@ impl ApexExecutor {
         // ── Fast scan path: simple numeric/string predicate, no FK, no indexes ──
         // Numeric: delete_where_numeric_range_inplace — single pass, no id_to_idx HashMap.
         // String:  scan_string_filter_mmap → get_ids → delete_batch + save_delete_only.
-        let predicate_delta_override = Self::extract_numeric_range_from_where(
-            where_clause.expect("DELETE predicate checked above"),
-        )
-        .is_some_and(|(column, _, _)| storage.pending_delta_updates_column(&column));
+        // `col >= a AND col < b` is one range on one column: without the
+        // two-sided form the extraction fails and the statement materializes the
+        // table (measured 11.6 ms at 1M rows against 1.4 ms for `col = v`).
+        let numeric_range = where_clause.and_then(|w| {
+            Self::extract_two_sided_same_col_range(w)
+                .or_else(|| Self::extract_numeric_range_from_where(w))
+        });
+        // `_id = X` addresses the physical row identifier directly. The read side
+        // resolves it through the row-group directory, but the delete path had no
+        // branch for it — unlike UPDATE, which has had its `_id` branch all along —
+        // so the numeric lane looked `_id` up in the schema, failed, and the
+        // statement fell through to materializing every column of the table
+        // (1M rows: 3.6 ms against 1.4 ms for the same shape on a user column).
+        let id_equality = where_clause.and_then(Self::extract_id_equality);
+        let predicate_delta_override = numeric_range
+            .clone()
+            .is_some_and(|(column, _, _)| storage.pending_delta_updates_column(&column));
         if fk_children.is_empty()
             && indexed_cols.is_empty()
             && !Self::table_fts_enabled(&base_dir, &this_table_name)
             && !predicate_delta_override
         {
-            if let Some((col, low, high)) =
-                Self::extract_numeric_range_from_where(where_clause.unwrap())
-            {
+            if let Some(row_id) = id_equality {
+                if let Some(deleted) = Self::try_delete_by_id(storage.as_ref(), row_id)? {
+                    if deleted > 0 {
+                        invalidate_storage_cache(storage_path);
+                        crate::storage::engine::engine().invalidate(storage_path);
+                        invalidate_table_stats(&storage_path.to_string_lossy());
+                    }
+                    return Ok(ApexResult::Scalar(deleted));
+                }
+            }
+            if let Some((col, low, high)) = numeric_range.clone() {
+
                 let pending_ids = if storage.pending_v4_in_memory_rows() > 0 {
                     storage.pending_numeric_range_ids(&col, low, high)
                 } else {
@@ -408,5 +430,63 @@ impl ApexExecutor {
         }
 
         Ok(ApexResult::Scalar(deleted))
+    }
+
+    /// `_id = <finite non-negative integer literal>` as a physical row id.
+    ///
+    /// Only the exact-equality form is accepted: `_id` is an unsigned row
+    /// identifier, so a range, a fractional literal or a negative one is left to
+    /// the general path's authoritative answer.
+    fn extract_id_equality(expr: &SqlExpr) -> Option<u64> {
+        let (column, low, high) = Self::extract_two_sided_same_col_range(expr)
+            .or_else(|| Self::extract_numeric_range_from_where(expr))?;
+        if column != "_id" || (low - high).abs() >= f64::EPSILON {
+            return None;
+        }
+        if !low.is_finite() || low < 0.0 || low.fract() != 0.0 {
+            return None;
+        }
+        Some(low as u64)
+    }
+
+    /// Delete one physical row id without materializing the table.
+    ///
+    /// Returns `Ok(None)` when the cheap lanes cannot answer, so the caller keeps
+    /// the general path: the base file's row groups must be uncompressed, because
+    /// the in-place deletion-vector writer declines on compressed bodies.
+    fn try_delete_by_id(storage: &TableStorageBackend, row_id: u64) -> io::Result<Option<i64>> {
+        // A row already deleted through the DeltaStore must stay a no-op: the base
+        // file's deletion vector does not know about that overlay, so without this
+        // guard running the same DELETE twice would report the row as deleted again.
+        let already_deleted = storage.storage.delta_store().is_deleted(row_id);
+        if already_deleted {
+            return Ok(Some(0));
+        }
+        // The base row goes through the same in-place deletion vector the
+        // numeric-range lane uses; `None` means the lane declined and nothing was
+        // written, so the general path below can still answer in full.
+        let base_deleted = match storage.delete_ids_inplace_v4(&[row_id])? {
+            Some(n) => n,
+            None => return Ok(None),
+        };
+        let mut deleted = base_deleted;
+        // Rows appended after the base file live only in the row delta, and the
+        // DeltaStore is what records their deletion.
+        let mut delta_deleted = 0usize;
+        if storage.has_delta() {
+            delta_deleted = storage.delta_delete_rows(&[row_id]);
+            deleted += delta_deleted as i64;
+        }
+        // Unflushed rows are never in the base file; this deletion is exact (it
+        // reports whether the id was actually pending).
+        if storage.pending_v4_in_memory_rows() > 0
+            && storage.delete_pending_v4_in_memory_row(row_id)
+        {
+            deleted += 1;
+        }
+        if delta_deleted > 0 {
+            storage.save_delta_store()?;
+        }
+        Ok(Some(deleted))
     }
 }

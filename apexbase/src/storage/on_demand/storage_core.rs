@@ -24,8 +24,9 @@ const DEFAULT_PAGE_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// `Batch quantized TopK L2 (float16)` **+1479%** in the full gate (1M x 128 f16 needs 256 MB).
 /// The cap is therefore opt-in: set `APEX_SCAN_BUFFER_MB` to bound a column (out-of-core runs
 /// do this from the process cap — the OOC harness passes limit/8), leaving the lane to decline
-/// and the caller to read a windowed batch instead. The principled fix, windowed scoring that
-/// bounds RSS without losing the lane, is still open (OOC-6).
+/// and the caller to read a windowed batch instead. Windowed scoring that bounds RSS
+/// without losing the lane is implemented for all six vector TopK lanes (OOC-6), so a
+/// deployment that must bound memory can set the cap instead of standing the lane down.
 const DEFAULT_SCAN_BUFFER_BUDGET_BYTES: usize = usize::MAX;
 
 /// `APEX_SCAN_BUFFER_MB` parsing, kept pure so it can be tested without mutating the

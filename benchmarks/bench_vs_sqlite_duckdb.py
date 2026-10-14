@@ -2427,6 +2427,73 @@ class ApexBaseBench:
             "SELECT * FROM default WHERE age BETWEEN 25 AND 35"
         )
 
+    def bench_string_cell_update(self):
+        """One literal UPDATE of a string cell, addressed by a unique key.
+
+        The in-place lane writes numeric cells only; a string assignment used to
+        fall back to materializing the table's columns (1M rows: 32 ms), so this
+        shape pins the cheap DeltaStore-override route.
+        """
+        row = self._next_id % 1000
+        result = self.client.execute(
+            f"UPDATE default SET name = 'user_{row}_updated' WHERE age = {18 + (row % 60)}"
+        )
+        return result.to_dict()
+
+    def bench_delete_by_id(self):
+        """One-row DELETE addressed by the physical row identifier.
+
+        `_id` is a synthetic column, so the in-place numeric-range lane could not
+        resolve it and the statement materialized the table's columns (1M rows:
+        3.58 ms). The id rotates so every timed call deletes a live row; repeating
+        one id would measure the already-deleted no-op path.
+        """
+        self._delete_id_window = getattr(self, "_delete_id_window", 0) + 1
+        target = 1 + (self._delete_id_window % max(1, self.n // 2))
+        return self._scalar(f"DELETE FROM default WHERE _id = {target}")
+
+    def bench_delete_bounded_range(self):
+        """A narrow two-sided range DELETE, rotating so each call deletes rows.
+
+        `col >= a AND col < b` used to miss the in-place deletion lane and
+        materialize the table; rotating the window keeps every timed call a real
+        delete (repeating one window would measure no-ops after the first).
+        """
+        self._delete_window = getattr(self, "_delete_window", 0) + 1
+        low = 20.0 + (self._delete_window % 50) * 0.01
+        high = low + 0.01
+        return self._scalar(
+            f"DELETE FROM default WHERE score >= {low} AND score < {high}"
+        )
+
+    def bench_bitpack_partial_range_count(self):
+        """COUNT(*) over a partially covering range of a narrow bit-packed column.
+
+        `age` spans 18..80, so it is stored as a 6-bit column and the predicate
+        matches a few percent of the rows: the storage lane decodes the packed
+        bits per row group without reading any other column. This is the shape
+        whose bulk counter once replaced the dispatcher's word-at-a-time 6-bit
+        decoder and made the public `CROSS JOIN COUNT` metric 45% slower, so it
+        is timed directly to keep that regression inside the canary.
+        """
+        return self._scalar("SELECT COUNT(*) FROM default WHERE age < 20")
+
+    def bench_float_range_count(self):
+        """Count-only aggregation over a partially covering float range.
+
+        `score` is plain-encoded across 0..100, so `BETWEEN 20 AND 30` matches
+        about a tenth of every row group and the storage lane decodes the filter
+        column row by row instead of using the bit-packed bulk counter. The shape
+        was once reported as a 152% regression (`V5_NEXT_STEPS.md` N-5: v1.36.2
+        1.07 ms against the V5 preview 2.69 ms), but the two samples behind that
+        number were a stalled one (3.92 ms) and a fast one (1.46 ms): seven
+        interleaved isolated-wheel rounds on this same fixture put both sides at
+        ~1.10 ms with fully overlapping 49-sample distributions (current
+        -1.29%; `--no-gc` -3.95%). It stays in the canary so that a real change
+        to the count-only float lane cannot hide behind that noise again.
+        """
+        return self._scalar("SELECT COUNT(*) FROM default WHERE score BETWEEN 20 AND 30")
+
     def bench_numeric_equality_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*) AS n, AVG(score) AS av FROM default WHERE age=25"

@@ -232,6 +232,25 @@ impl ApexExecutor {
                             invalidate_table_stats(&storage_path.to_string_lossy());
                             return Ok(ApexResult::Scalar(inplace_count));
                         }
+
+                        // The in-place lane writes numeric cells only. A literal
+                        // assignment to any other column still has a cheap route:
+                        // resolve the matching row ids with the zone-map-pruned
+                        // single-column read and record the overrides in the
+                        // DeltaStore, instead of materializing the table's needed
+                        // columns (1M rows: 32 ms against 0.3 ms in place).
+                        if (low - high).abs() < f64::EPSILON {
+                            if let Some(updated) = try_literal_cell_update(
+                                storage.as_ref(),
+                                &where_col,
+                                low,
+                                assignments,
+                            )? {
+                                invalidate_storage_cache(storage_path);
+                                invalidate_table_stats(&storage_path.to_string_lossy());
+                                return Ok(ApexResult::Scalar(updated));
+                            }
+                        }
                     }
                 }
             }
@@ -1032,4 +1051,84 @@ impl ApexExecutor {
             )),
         }
     }
+}
+
+/// Most cells one cheap literal UPDATE may override before it falls back to the
+/// general path.
+///
+/// The cheap route records one DeltaStore override per matched row, so a
+/// statement that matches most of the table would replace "one pass over the
+/// needed columns" with millions of small overlay inserts. Above this many
+/// matches the general path is both faster and less memory-hungry.
+const LITERAL_CELL_UPDATE_LIMIT: usize = 4_096;
+
+/// Record an all-literal UPDATE through the DeltaStore without materializing the
+/// table's columns.
+///
+/// The mmap in-place lane writes numeric cells in 8 bytes and nothing else: a
+/// literal assignment to a string/timestamp column used to abandon the resolved
+/// range and re-read the table's needed columns (1M rows: 32 ms for a one-row
+/// UPDATE, against 0.3 ms in place). The zone-map-pruned filtered read resolves
+/// the same rows by reading one column and only the matching row groups, and
+/// `delta_batch_update_rows` already exists as the persistence tail.
+///
+/// Returns `Ok(None)` whenever any precondition is not provable, so the caller
+/// keeps the general path (the conservative default).
+fn try_literal_cell_update(
+    storage: &TableStorageBackend,
+    where_col: &str,
+    value: f64,
+    assignments: &[(String, SqlExpr)],
+) -> io::Result<Option<i64>> {
+    let mut literals: Vec<(String, Value)> = Vec::with_capacity(assignments.len());
+    for (column, expr) in assignments {
+        match expr {
+            SqlExpr::Literal(v) => literals.push((column.clone(), v.clone())),
+            // A computed assignment (e.g. `s = s || 'x'`) needs the row values.
+            _ => return Ok(None),
+        }
+    }
+    if literals.is_empty() {
+        return Ok(None);
+    }
+
+    // The WHERE column must be a real column: the low-level filtered reader
+    // resolves names through the schema, and an unresolvable column yields an
+    // empty result that would look like "no rows matched".
+    if storage.get_column_type(where_col).is_none() {
+        return Ok(None);
+    }
+    // Only an equality is expressible through the single-comparison filtered read.
+    // Two steps keep the declining case cheap: the filtered scan yields the matching
+    // positions, and only a match set within the limit pays for reading its ids.
+    let (_filtered, indices) = storage
+        .storage
+        .read_columns_filtered(Some(&[where_col]), where_col, "=", value)?;
+    if indices.is_empty() {
+        return Ok(Some(0));
+    }
+    if indices.len() > LITERAL_CELL_UPDATE_LIMIT {
+        return Ok(None);
+    }
+    let ids: Vec<u64> = storage
+        .storage
+        .read_ids_by_indices(&indices)?
+        .into_iter()
+        .map(|id| id as u64)
+        .collect();
+    if ids.len() != indices.len() {
+        return Ok(None);
+    }
+
+    let flat: Vec<(u64, &str, Value)> = ids
+        .iter()
+        .flat_map(|id| {
+            literals
+                .iter()
+                .map(move |(column, value)| (*id, column.as_str(), value.clone()))
+        })
+        .collect();
+    storage.delta_batch_update_rows(&flat);
+    storage.save_delta_store()?;
+    Ok(Some(ids.len() as i64))
 }

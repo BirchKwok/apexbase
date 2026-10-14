@@ -37,6 +37,48 @@ fn should_parallel_filtered_agg(row_count: usize, row_group_count: usize, thread
             >= workers.saturating_mul(FILTERED_AGG_MIN_ROWS_PER_WORKER)
 }
 
+/// Widest bit-packed filter column the per-row dispatcher decodes without its
+/// generic arm.
+///
+/// `execute_filtered_numeric_agg_mmap` dispatches on the filter column's bit
+/// width: `0`, `1..=5`, `6` and `8` are decoded word-at-a-time, `7` and `9..=16`
+/// fall into a per-value loop, and every wider width re-parses the payload header
+/// for each row. The count-only bulk counter added for the slow case must only be
+/// taken above this width, because below it the dispatcher's 6-bit arm is faster
+/// (1M rows `WHERE age < 20` over a 6-bit column: 0.31 -> 0.54 ms, +74%).
+///
+/// Only the *count-only* shortcut is gated: the joint filter/aggregate stream is
+/// the fast path whenever the aggregate column also needs decoding, and gating it
+/// by the filter width alone made the HTAP filtered aggregation (per-row-group
+/// bit width 16) **+77%** slower.
+const BITPACK_SPECIALISED_MAX_WIDTH: usize = 16;
+
+/// True when the count-only bulk counter beats the per-row decoder for this
+/// payload, i.e. when the dispatcher would need a per-value loop for it.
+#[inline]
+fn bitpack_bulk_shortcut_applies(payload: &[u8]) -> bool {
+    crate::storage::on_demand::bitpack_header(payload)
+        .is_some_and(|(_, bit_width, _, _)| bit_width > BITPACK_SPECIALISED_MAX_WIDTH)
+}
+
+/// True when the row group's *own* value range sits inside the queried range,
+/// so every live row of the group matches and `COUNT(*)` can come from metadata.
+///
+/// The float and integer arms must ask the same question. The float arm once
+/// asked the opposite one ("is the queried range inside the group range?"), which
+/// made every equality over a float column whose zone contained the value look
+/// fully covering: `COUNT(*)` returned the whole row group, so
+/// `SELECT COUNT(*) FROM bench b CROSS JOIN meta m WHERE b.score = 50.0 AND
+/// m.pop > 0` counted 10,000,000 rows where 940 match.
+#[inline]
+fn zone_map_covers_range(zm: &crate::storage::on_demand::RgColumnZoneMap, low: f64, high: f64) -> bool {
+    if zm.is_float {
+        f64::from_bits(zm.min_bits as u64) >= low && f64::from_bits(zm.max_bits as u64) <= high
+    } else {
+        (zm.min_bits as f64) >= low && (zm.max_bits as f64) <= high
+    }
+}
+
 #[inline(never)]
 unsafe fn aggregate_validated_2col_count_f64(
     group_ids1: &[u16],
@@ -3422,13 +3464,17 @@ impl OnDemandStorage {
                             // matches and the filter column never has to be read. NULLs
                             // never match a range, so a nullable column keeps the
                             // per-row path.
-                            fully_covered = !zm.has_nulls
-                                && if zm.is_float {
-                                    f64::from_bits(zm.min_bits as u64) <= low
-                                        && f64::from_bits(zm.max_bits as u64) >= high
-                                } else {
-                                    (zm.min_bits as f64) >= low && (zm.max_bits as f64) <= high
-                                };
+                            //
+                            // Both arms use the same direction as the zone-map overlap
+                            // test: the group's *own* range must sit inside the queried
+                            // range. The float arm used to test the opposite inclusion
+                            // (`min <= low && max >= high`), so any equality over a column
+                            // whose zone contains the value looked "fully covering" and
+                            // `COUNT(*)` returned the whole row group instead of the
+                            // matching rows (`score = 50.0` across a CROSS JOIN counted
+                            // 10,000,000 rows where 940 match).
+                            fully_covered =
+                                !zm.has_nulls && zone_map_covers_range(zm, low, high);
                         }
                     }
 
@@ -3645,6 +3691,7 @@ impl OnDemandStorage {
                         && !filter_has_nulls
                         && rg_meta.deletion_count == 0
                         && filter_encoding == COL_ENCODING_BITPACK
+                        && bitpack_bulk_shortcut_applies(filter_payload)
                     {
                         if let Some(matched) = crate::storage::on_demand::bitpack_count_in_range(
                             filter_payload,
@@ -9110,5 +9157,94 @@ impl Drop for OnDemandStorage {
             }
             // File handle will be dropped automatically after mmap is released
         }));
+    }
+}
+
+#[cfg(test)]
+mod bulk_shortcut_tests {
+    use super::{bitpack_bulk_shortcut_applies, BITPACK_SPECIALISED_MAX_WIDTH};
+
+    fn payload(bit_width: usize) -> Vec<u8> {
+        let count = 8usize;
+        let mut out = Vec::new();
+        out.extend_from_slice(&(count as u64).to_le_bytes());
+        out.push(bit_width as u8);
+        out.extend_from_slice(&0i64.to_le_bytes());
+        out.extend_from_slice(&vec![0u8; (count * bit_width + 7) / 8]);
+        out
+    }
+
+    #[test]
+    fn bulk_shortcuts_only_replace_the_generic_decoder() {
+        // The dispatcher specialises 0, 1..=5, 6, 8 and ..=16; the bulk shortcuts
+        // must decline every one of those widths, because replacing them made a
+        // partial-range count 74% slower. The bound is spelled out instead of
+        // reading the constant, so that raising the constant fails here.
+        for bit_width in 0..=16usize {
+            assert!(
+                !bitpack_bulk_shortcut_applies(&payload(bit_width)),
+                "width {bit_width} has a specialised per-row decoder"
+            );
+        }
+        for bit_width in [17usize, 20, 32, 63] {
+            assert!(
+                bitpack_bulk_shortcut_applies(&payload(bit_width)),
+                "width {bit_width} falls through to the generic decoder"
+            );
+        }
+        assert_eq!(BITPACK_SPECIALISED_MAX_WIDTH, 16);
+    }
+
+    fn zone(is_float: bool, min: i64, max: i64, has_nulls: bool) -> crate::storage::on_demand::RgColumnZoneMap {
+        crate::storage::on_demand::RgColumnZoneMap {
+            col_idx: 0,
+            min_bits: min,
+            max_bits: max,
+            has_nulls,
+            is_float,
+            is_string_prefix: false,
+            is_string_tail: false,
+        }
+    }
+
+    #[test]
+    fn a_covered_value_is_not_a_covered_range() {
+        use super::zone_map_covers_range;
+        let float_zone = zone(true, 0.0f64.to_bits() as i64, 100.0f64.to_bits() as i64, false);
+        let int_zone = zone(false, 0, 100, false);
+
+        // The group's range must sit *inside* the queried range. An equality over a
+        // zone that merely contains the value is not a covering range: this is the
+        // direction that used to be inverted for floats, and it reported the whole
+        // row group as matching.
+        assert!(!zone_map_covers_range(&float_zone, 50.0, 50.0));
+        assert!(!zone_map_covers_range(&int_zone, 50.0, 50.0));
+        assert!(!zone_map_covers_range(&float_zone, 20.0, 30.0));
+        assert!(!zone_map_covers_range(&int_zone, 20.0, 30.0));
+
+        // Genuinely covering ranges stay covered, for both arms.
+        assert!(zone_map_covers_range(&float_zone, f64::NEG_INFINITY, f64::INFINITY));
+        assert!(zone_map_covers_range(&int_zone, f64::NEG_INFINITY, f64::INFINITY));
+        assert!(zone_map_covers_range(&float_zone, -1.0, 101.0));
+        assert!(zone_map_covers_range(&int_zone, -1.0, 101.0));
+        assert!(zone_map_covers_range(&float_zone, 0.0, 100.0));
+        assert!(zone_map_covers_range(&int_zone, 0.0, 100.0));
+
+        // A group whose range sticks out on either side is never covered.
+        assert!(!zone_map_covers_range(&float_zone, 0.0, 99.0));
+        assert!(!zone_map_covers_range(&int_zone, 1.0, 100.0));
+        // The null flag is handled by the caller, which must keep it.
+        let nullable = zone(true, 0.0f64.to_bits() as i64, 100.0f64.to_bits() as i64, true);
+        assert!(zone_map_covers_range(&nullable, f64::NEG_INFINITY, f64::INFINITY));
+    }
+
+    #[test]
+    fn a_malformed_payload_never_enables_a_bulk_shortcut() {
+        assert!(!bitpack_bulk_shortcut_applies(&[]));
+        assert!(!bitpack_bulk_shortcut_applies(&[0u8; 8]));
+        // A width above what the packed-bits layout can express is rejected too.
+        let mut invalid = payload(20);
+        invalid[8] = 64;
+        assert!(!bitpack_bulk_shortcut_applies(&invalid));
     }
 }
