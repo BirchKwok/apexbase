@@ -4283,6 +4283,14 @@ def benchmark_specs_for_profile(profile: str):
     return [spec for spec in BENCHMARKS if spec[0] in selected]
 
 
+def filter_benchmark_specs(specs, names):
+    """Keep only the named metrics, preserving the profile order."""
+    if not names:
+        return list(specs)
+    wanted = set(names)
+    return [spec for spec in specs if spec[0] in wanted]
+
+
 def selected_benchmarks_need_files(benchmark_specs):
     return any(spec[1] in FILE_BACKED_METHODS for spec in benchmark_specs)
 
@@ -5915,6 +5923,15 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     parser.add_argument("--full", action="store_true",
                         help="Alias for --profile extended")
     parser.add_argument("--memory", action="store_true", help="Track RSS memory delta per query")
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help="Run only the named fair metric(s), loading the default table "
+        "untimed first; used by the guard to recheck a marked metric in a "
+        "fresh process",
+    )
     parser.add_argument("--low-memory", action="store_true",
                         help="Disable ApexBase arrow_batch_cache (simulate low-memory mode like SQLite/DuckDB)")
     parser.add_argument("--no-result-cache", action="store_true",
@@ -5966,6 +5983,18 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     if VECTOR_K > QUANT_CANDIDATE_K:
         parser.error("--vector-k must be <= --quantized-vector-candidate-k")
     selected_benchmarks = benchmark_specs_for_profile(profile)
+    if args.only:
+        known = {spec[0] for spec in selected_benchmarks}
+        unknown = [name for name in args.only if name not in known]
+        if unknown:
+            parser.error(
+                "--only metric(s) not in this profile: " + ", ".join(unknown)
+            )
+        selected_benchmarks = filter_benchmark_specs(selected_benchmarks, args.only)
+        # A single-metric run must not spend minutes on the vector modules or
+        # emit metrics other than the requested one.
+        args.skip_vector = True
+        args.skip_quantized_vector = True
 
     print("=" * 80)
     print(f" ApexBase vs SQLite vs DuckDB — Performance Benchmark")
@@ -6051,6 +6080,17 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
     for name, bench in engines:
         bench.shared_inputs = shared_inputs
         bench.setup()
+
+    # `--only` filters out the Bulk Insert metric that normally loads the data,
+    # so load the default table untimed before the requested metric runs.
+    if args.only and not any(spec[1] == "bench_insert" for spec in selected_benchmarks):
+        for name, bench in engines:
+            insert = getattr(bench, "bench_insert", None)
+            if insert is None:
+                continue
+            insert()
+            if HAS_APEXBASE and isinstance(bench, ApexBaseBench):
+                bench.client.flush()
 
     mem_results = {}  # bench_name -> {eng_name: rss_delta_mb}
 
@@ -6140,6 +6180,18 @@ def main(argv=None, default_profile=PROFILE_PUBLIC):
 
     json_results = []
     olap_sections, oltp_sections = benchmark_sections_for_profile(profile)
+    if args.only:
+        wanted = {spec[0] for spec in selected_benchmarks}
+
+        def keep_only(sections):
+            return [
+                (title, description, [spec for spec in specs if spec[0] in wanted])
+                for title, description, specs in sections
+                if any(spec[0] in wanted for spec in specs)
+            ]
+
+        olap_sections = keep_only(olap_sections)
+        oltp_sections = keep_only(oltp_sections)
     benchmark_sections = olap_sections + oltp_sections
     grouped_names = {spec[0] for _, _, specs in benchmark_sections for spec in specs}
     ungrouped_specs = [spec for spec in selected_benchmarks if spec[0] not in grouped_names]

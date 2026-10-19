@@ -339,6 +339,76 @@ def test_local_guard_full_mode_runs_every_dedicated_phase(local_guard):
     assert "hot_shapes_only=True" in source
 
 
+def test_local_guard_only_metric_recheck_arguments(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json",
+        only_metric="Window ROW_NUMBER PARTITION BY city",
+    )
+
+    assert "--only" in command
+    assert command[command.index("--only") + 1] == "Window ROW_NUMBER PARTITION BY city"
+    # The recheck needs only the wall-clock; RSS sampling adds noise.
+    assert "--memory" not in command
+
+
+def test_local_guard_parses_marked_metrics(local_guard):
+    text = """Metric                                       Baseline        Current     Change     Status
+----------------------------------------------------------------------------------------
+Window ROW_NUMBER PARTITION BY city           0.430 ms         0.599 ms     +39.37%  REGRESSED
+COUNT WHERE category                          0.244 ms         0.291 ms     +19.37%         ok
+"""
+    names = ["COUNT WHERE category", "Window ROW_NUMBER PARTITION BY city"]
+
+    assert local_guard.marked_metrics(text, names) == [
+        "Window ROW_NUMBER PARTITION BY city"
+    ]
+
+
+def test_local_guard_full_mode_rechecks_marked_metrics(local_guard):
+    source = Path(local_guard.__file__).read_text(encoding="utf-8")
+
+    # M-22: a full-sequence marker is re-measured alone before it fails the gate.
+    assert 'args.mode == "full"' in source
+    assert "perf-recheck.txt" in source
+    assert "only_metric=metric" in source
+
+
+def test_benchmark_only_filter_keeps_the_requested_metric():
+    path = ROOT / "benchmarks" / "bench_vs_sqlite_duckdb.py"
+    spec = importlib.util.spec_from_file_location("bench_only", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    specs = [
+        ("A", "bench_a", False, False, False, None),
+        ("B", "bench_b", False, False, False, None),
+    ]
+    assert module.filter_benchmark_specs(specs, ["B"]) == [specs[1]]
+    assert module.filter_benchmark_specs(specs, []) == specs
+
+
+def test_benchmark_only_runs_one_metric(tmp_path):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "benchmarks" / "bench_vs_sqlite_duckdb.py"),
+            "--rows", "2000",
+            "--warmup", "1",
+            "--iterations", "1",
+            "--only", "COUNT(*)",
+            "--output", str(tmp_path / "only.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads((tmp_path / "only.json").read_text(encoding="utf-8"))
+    assert [row["query"] for row in report["results"]] == ["COUNT(*)"]
+    assert report["results"][0]["ApexBase"] is not None
+
+
 def test_local_guard_hot_phase_uses_the_canary_hot_profile(local_guard):
     command = local_guard.benchmark_arguments(
         "canary", None, None, None, "report.json", hot_shapes_only=True

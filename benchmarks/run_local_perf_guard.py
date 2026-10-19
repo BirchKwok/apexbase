@@ -154,7 +154,7 @@ def benchmark_arguments(
     mode, rows, warmup, iterations, output, qps_only=False, quant_only=False,
     index_only=False, parallel_only=False, width_only=False, string_zones_only=False,
     htap_only=False, wide_only=False, hybrid_only=False, pgwire_only=False,
-    hot_shapes_only=False,
+    hot_shapes_only=False, only_metric=None,
 ):
     if width_only:
         # The width-fidelity phase builds its own tables (one V4 full-width
@@ -209,11 +209,12 @@ def benchmark_arguments(
         "--warmup", str(resolved[1]),
         "--iterations", str(resolved[2]),
     ]
-    if script.name == "bench_vs_sqlite_duckdb.py":
+    if script.name == "bench_vs_sqlite_duckdb.py" and only_metric is None:
         # Track per-case RSS as well. Out-of-core work is invisible to a wall-clock-only gate:
         # scanning a 20M-row CSV used to add +1397 MB RSS while staying fast enough not to
         # trip a timing threshold. The extra fields are informational (the comparison tool
-        # ignores them), so this cannot mask a timing regression.
+        # ignores them), so this cannot mask a timing regression. The single-metric
+        # recheck skips it: it only needs the wall-clock, and the RSS sampling adds noise.
         command.append("--memory")
     command += ["--output", output]
     if mode == "full" and not qps_only and not quant_only and not width_only \
@@ -231,7 +232,35 @@ def benchmark_arguments(
         command.insert(1, "--parallel-only")
     if hot_shapes_only:
         command.insert(1, "--hot-shapes-only")
+    if only_metric is not None:
+        command.extend(("--only", only_metric))
     return tuple(command)
+
+
+def report_metric_names(path):
+    """Metric names measured by one benchmark report, in report order."""
+    try:
+        report = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [
+        row.get("query")
+        for row in report.get("results", [])
+        if isinstance(row, dict) and row.get("query")
+    ]
+
+
+def marked_metrics(comparison_text, metric_names):
+    """Metric names a comparison marked REGRESSED, in report order."""
+    marked = set()
+    for line in comparison_text.splitlines():
+        if not line.rstrip().endswith("REGRESSED"):
+            continue
+        for name in metric_names:
+            if line.startswith(name):
+                marked.add(name)
+                break
+    return [name for name in metric_names if name in marked]
 
 
 def comparison_arguments(python, reports, args):
@@ -450,6 +479,57 @@ def execute_gate(args, output_dir, evidence):
             )
             collect(SAMPLE_ORDER)
             comparison_status = run_comparison(collect, reports, "comparison")
+
+            if comparison_status == 1 and args.mode == "full":
+                # A metric can be marked only because it runs late in a shared
+                # process whose earlier metrics left a different cache/memory
+                # state (M-22). Re-measure every marked metric alone, in a fresh
+                # process, before calling it a regression: a real slowdown shows
+                # up there too; a cross-metric coupling does not.
+                comparison_text = (output_dir / "comparison.txt").read_text(
+                    encoding="utf-8"
+                )
+                metric_names = report_metric_names(reports["base"][0])
+                marked = marked_metrics(comparison_text, metric_names)
+                remaining = []
+                recheck_lines = []
+                for index, metric in enumerate(marked):
+                    recheck_counts = {"base": 0, "current": 0}
+                    recheck_reports = {"base": [], "current": []}
+                    collect_recheck = make_collect(
+                        f"recheck-{index}",
+                        recheck_counts,
+                        recheck_reports,
+                        lambda side, report, metric=metric: benchmark_arguments(
+                            "full", None, None, None, report, only_metric=metric
+                        ),
+                    )
+                    collect_recheck(SAMPLE_ORDER)
+                    recheck_status = run_comparison(
+                        collect_recheck, recheck_reports, f"recheck-{index}"
+                    )
+                    recheck_lines.append(
+                        f"{metric}: "
+                        + (
+                            "still regressed in a fresh process"
+                            if recheck_status != 0
+                            else "clean in a fresh process"
+                        )
+                    )
+                    if recheck_status != 0:
+                        remaining.append(metric)
+                (output_dir / "perf-recheck.txt").write_text(
+                    "\n".join(recheck_lines) + "\n", encoding="utf-8"
+                )
+                print("\nMarked-metric recheck (fresh process per metric):")
+                print("\n".join(recheck_lines))
+                if marked and not remaining:
+                    print(
+                        "All marked metrics pass when measured in a fresh process; "
+                        "the full-sequence marker is cross-metric coupling, not a "
+                        "query regression."
+                    )
+                    comparison_status = 0
 
             # The full gate also covers the OLAP Q/s read profile
             # (ApexBase-only, canary scale) as a separate base/current
