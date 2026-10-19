@@ -264,6 +264,41 @@ def test_filtered_distance_lane_matches_the_general_path(client):
         )
 
 
+def test_filtered_distance_lane_survives_a_persisted_delete(client):
+    # The lane stages predicate candidates by *physical* position (the mmap
+    # scanners add each row group's physical offset) and sizes its bounded heap
+    # from them. A persisted deletion used to send the whole statement back to the
+    # general path; the candidates are still exact, only the count that gates the
+    # lane has to move into the active row space.
+    literal = _literal(client._query)
+    fast = (
+        f"SELECT doc FROM docs WHERE doc < 400 "
+        f"ORDER BY cosine_distance(emb, {literal}) LIMIT 10"
+    )
+    baseline = (
+        f"SELECT doc FROM docs WHERE (doc < 400) OR 1 = 0 "
+        f"ORDER BY cosine_distance(emb, {literal}) LIMIT 10"
+    )
+    client.execute("DELETE FROM docs WHERE doc = 123")
+    client.flush()
+    got = client.execute(fast).to_dict()
+    want = client.execute(baseline).to_dict()
+    assert got == want, (got, want)
+    assert len(got) == 10, "a full LIMIT must still be returned"
+    assert 123 not in [int(row["doc"]) for row in got]
+    assert _path(client, fast) == "filtered_distance_topk"
+
+    # Deleting a large part of the candidate range must not shrink the page: the
+    # gating count has to follow the active space, not the physical one.
+    ids = ", ".join(str(i) for i in range(10, 390, 3))
+    client.execute(f"DELETE FROM docs WHERE doc IN ({ids})")
+    client.flush()
+    got = client.execute(fast).to_dict()
+    want = client.execute(baseline).to_dict()
+    assert got == want, (got[:3], want[:3])
+    assert len(got) == 10, f"page shrank after mass deletion: {len(got)}"
+
+
 def test_filtered_distance_lane_returns_the_exact_topk(client):
     query = client._query
     literal = _literal(query)

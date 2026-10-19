@@ -79,6 +79,27 @@ fn zone_map_covers_range(zm: &crate::storage::on_demand::RgColumnZoneMap, low: f
     }
 }
 
+/// Number of set bits in the first `rows` bits of a validity bitmap.
+///
+/// `rows` is not necessarily a multiple of eight, so the padding bits of the
+/// last byte must not count. Used by the count-only covered shortcut, which
+/// derives `COUNT(col)` from the live row count minus the NULL rows instead of
+/// decoding the value column.
+#[inline]
+fn count_set_bits(bitmap: &[u8], rows: usize) -> usize {
+    let full = rows / 8;
+    let mut set: usize = bitmap
+        .iter()
+        .take(full)
+        .map(|byte| byte.count_ones() as usize)
+        .sum();
+    if rows % 8 != 0 {
+        let mask = (1u8 << (rows % 8)) - 1;
+        set += (bitmap.get(full).copied().unwrap_or(0) & mask).count_ones() as usize;
+    }
+    set
+}
+
 #[inline(never)]
 unsafe fn aggregate_validated_2col_count_f64(
     group_ids1: &[u16],
@@ -3297,6 +3318,31 @@ impl OnDemandStorage {
         high: f64,
         agg_cols: &[&str],
     ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.execute_filtered_numeric_agg_mmap_planned(filter_col, low, high, agg_cols, &[])
+    }
+
+    /// As [`Self::execute_filtered_numeric_agg_mmap`], but `value_needed[i]`
+    /// tells the lane whether `agg_cols[i]` is used by a value aggregate
+    /// (`SUM`/`AVG`/`MIN`/`MAX`).
+    ///
+    /// `COUNT(col)` only needs the number of matched non-NULL values: the value
+    /// payload is never decoded, so a covering `COUNT(v)` costs the same as
+    /// `COUNT(*)` instead of scanning (and, for bit-packed columns, decoding)
+    /// the whole value column. An empty slice means every named column needs
+    /// its values, which is the historical behaviour.
+    pub fn execute_filtered_numeric_agg_mmap_planned(
+        &self,
+        filter_col: &str,
+        low: f64,
+        high: f64,
+        agg_cols: &[&str],
+        value_needed: &[bool],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        #[inline]
+        fn needs_value(value_needed: &[bool], index: usize) -> bool {
+            value_needed.get(index).copied().unwrap_or(true)
+        }
+
         let footer = match self.get_or_load_footer()? {
             Some(f) => f,
             None => return Ok(None),
@@ -3331,11 +3377,19 @@ impl OnDemandStorage {
             .filter(|&&n| n != "*" && n != "1")
             .filter_map(|&n| schema.get_index(n))
             .collect();
-        let non_star_count = agg_cols.iter().filter(|&&n| n != "*" && n != "1").count();
+        // `value_needed` is indexed like `agg_cols` (including `*`/`1` entries),
+        // while `agg_indices` only covers the named columns; keep the mapping.
+        let value_positions: Vec<usize> = agg_cols
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| **name != "*" && **name != "1")
+            .map(|(position, _)| position)
+            .collect();
+        let non_star_count = value_positions.len();
         if agg_indices.len() != non_star_count {
             return Ok(None);
         }
-        for &idx in &agg_indices {
+        for (ci, &idx) in agg_indices.iter().enumerate() {
             let ct = schema.columns[idx].1;
             let is_numeric = matches!(
                 ct,
@@ -3353,7 +3407,7 @@ impl OnDemandStorage {
                     | ColumnType::Float32
                     | ColumnType::Bool
             );
-            if !is_numeric {
+            if !is_numeric && needs_value(value_needed, value_positions[ci]) {
                 return Ok(None);
             }
         }
@@ -3534,9 +3588,41 @@ impl OnDemandStorage {
                         has_nulls && (bitmap[row_idx / 8] >> (row_idx % 8)) & 1 == 1
                     }
 
+                    // `COUNT(col)` needs the number of matched non-NULL values,
+                    // never the values themselves.
+                    let count_only = nc == 1 && !needs_value(value_needed, value_positions[0]);
                     let mut agg_nulls: &[u8] = &[];
                     let mut agg_has_nulls = false;
-                    let agg_view = if nc == 0 {
+                    if nc > 0 {
+                        let agg_off = rcix[agg_indices[0]] as usize;
+                        if agg_off + null_bitmap_len > body.len() {
+                            return None;
+                        }
+                        agg_nulls = &body[agg_off..agg_off + null_bitmap_len];
+                        agg_has_nulls = agg_nulls.iter().any(|&byte| byte != 0);
+                    }
+
+                    // Covering count-only: the live row count minus the NULL rows.
+                    // `deletion_count == 0` is required for the NULL arm because the
+                    // validity bitmap cannot distinguish a deleted NULL from a live
+                    // one; that combination keeps the per-row loop below.
+                    if count_only && fully_covered {
+                        let live = rg_meta.active_rows() as i64;
+                        let counted = if !agg_has_nulls {
+                            Some(live)
+                        } else if rg_meta.deletion_count == 0 {
+                            Some(rg_rows.saturating_sub(count_set_bits(agg_nulls, rg_rows)) as i64)
+                        } else {
+                            None
+                        };
+                        if let Some(counted) = counted {
+                            part.matches += live;
+                            part.count += counted;
+                            return Some(part);
+                        }
+                    }
+
+                    let agg_view = if nc == 0 || count_only {
                         AggView::None
                     } else {
                         let agg_idx = agg_indices[0];
@@ -3544,8 +3630,6 @@ impl OnDemandStorage {
                         if agg_off + null_bitmap_len >= body.len() {
                             return None;
                         }
-                        agg_nulls = &body[agg_off..agg_off + null_bitmap_len];
-                        agg_has_nulls = agg_nulls.iter().any(|&byte| byte != 0);
                         let agg_encoding = body[agg_off + null_bitmap_len];
                         let agg_payload = &body[agg_off + null_bitmap_len + 1..];
                         if agg_payload.len() < 8 {
@@ -3703,6 +3787,32 @@ impl OnDemandStorage {
                         }
                     }
 
+                    // A count-only aggregate over a partially covering bit-packed
+                    // filter needs neither column's values: count the packed values
+                    // inside the range. Same width gate as the COUNT(*) shortcut,
+                    // because the specialised per-width decoders below are faster
+                    // for narrow columns.
+                    if count_only
+                        && !fully_covered
+                        && !filter_has_nulls
+                        && !agg_has_nulls
+                        && rg_meta.deletion_count == 0
+                        && filter_encoding == COL_ENCODING_BITPACK
+                        && bitpack_bulk_shortcut_applies(filter_payload)
+                    {
+                        if let Some(matched) =
+                            crate::storage::on_demand::bitpack_count_in_range(
+                                filter_payload,
+                                low,
+                                high,
+                            )
+                        {
+                            part.matches += matched as i64;
+                            part.count += matched as i64;
+                            return Some(part);
+                        }
+                    }
+
                     let low_i = low.ceil() as i64;
                     let high_i = high.floor() as i64;
 
@@ -3758,34 +3868,39 @@ impl OnDemandStorage {
                                 // A NULL value column still counts towards
                                 // COUNT(*) but not towards the value aggregate.
                                 if !agg_null_at(agg_nulls, agg_has_nulls, row_idx) {
-                                    match agg_view {
-                                    AggView::None => {}
-                                    AggView::F64(values, n) => {
-                                        if row_idx < n {
-                                            let off = row_idx * 8;
-                                            let v = f64::from_le_bytes(
-                                                values[off..off + 8].try_into().ok()?,
-                                            );
-                                            part.add_f64(v);
+                                    if count_only {
+                                        part.count += 1;
+                                    } else {
+                                        match agg_view {
+                                            AggView::None => {}
+                                            AggView::F64(values, n) => {
+                                                if row_idx < n {
+                                                    let off = row_idx * 8;
+                                                    let v = f64::from_le_bytes(
+                                                        values[off..off + 8].try_into().ok()?,
+                                                    );
+                                                    part.add_f64(v);
+                                                }
+                                            }
+                                            AggView::I64(values, n) => {
+                                                if row_idx < n {
+                                                    let off = row_idx * 8;
+                                                    let v = i64::from_le_bytes(
+                                                        values[off..off + 8].try_into().ok()?,
+                                                    ) as f64;
+                                                    part.add_f64(v);
+                                                }
+                                            }
+                                            AggView::Bitpack(values) => {
+                                                let value =
+                                                    crate::storage::on_demand::bitpack_decode_at_idx(
+                                                        values,
+                                                        row_idx,
+                                                    )?;
+                                                part.add_f64(value as f64);
+                                            }
                                         }
                                     }
-                                    AggView::I64(values, n) => {
-                                        if row_idx < n {
-                                            let off = row_idx * 8;
-                                            let v = i64::from_le_bytes(
-                                                values[off..off + 8].try_into().ok()?,
-                                            ) as f64;
-                                            part.add_f64(v);
-                                        }
-                                    }
-                                    AggView::Bitpack(values) => {
-                                        let value = crate::storage::on_demand::bitpack_decode_at_idx(
-                                            values,
-                                            row_idx,
-                                        )?;
-                                        part.add_f64(value as f64);
-                                    }
-                                }
                                 }
                             }
                         }};
@@ -3800,34 +3915,39 @@ impl OnDemandStorage {
                                 // A NULL value column still counts towards
                                 // COUNT(*) but not towards the value aggregate.
                                 if !agg_null_at(agg_nulls, agg_has_nulls, row_idx) {
-                                    match agg_view {
-                                    AggView::None => {}
-                                    AggView::F64(values, n) => {
-                                        if row_idx < n {
-                                            let off = row_idx * 8;
-                                            let v = f64::from_le_bytes(
-                                                values[off..off + 8].try_into().ok()?,
-                                            );
-                                            part.add_f64(v);
+                                    if count_only {
+                                        part.count += 1;
+                                    } else {
+                                        match agg_view {
+                                            AggView::None => {}
+                                            AggView::F64(values, n) => {
+                                                if row_idx < n {
+                                                    let off = row_idx * 8;
+                                                    let v = f64::from_le_bytes(
+                                                        values[off..off + 8].try_into().ok()?,
+                                                    );
+                                                    part.add_f64(v);
+                                                }
+                                            }
+                                            AggView::I64(values, n) => {
+                                                if row_idx < n {
+                                                    let off = row_idx * 8;
+                                                    let v = i64::from_le_bytes(
+                                                        values[off..off + 8].try_into().ok()?,
+                                                    ) as f64;
+                                                    part.add_f64(v);
+                                                }
+                                            }
+                                            AggView::Bitpack(values) => {
+                                                let value =
+                                                    crate::storage::on_demand::bitpack_decode_at_idx(
+                                                        values,
+                                                        row_idx,
+                                                    )?;
+                                                part.add_f64(value as f64);
+                                            }
                                         }
                                     }
-                                    AggView::I64(values, n) => {
-                                        if row_idx < n {
-                                            let off = row_idx * 8;
-                                            let v = i64::from_le_bytes(
-                                                values[off..off + 8].try_into().ok()?,
-                                            ) as f64;
-                                            part.add_f64(v);
-                                        }
-                                    }
-                                    AggView::Bitpack(values) => {
-                                        let value = crate::storage::on_demand::bitpack_decode_at_idx(
-                                            values,
-                                            row_idx,
-                                        )?;
-                                        part.add_f64(value as f64);
-                                    }
-                                }
                                 }
                             }
                         }};
@@ -4419,16 +4539,26 @@ impl OnDemandStorage {
                 return Ok(None);
             };
 
-            let mut agg_views = Vec::with_capacity(nc);
-            for &agg_idx in &agg_indices {
-                let Some(view) = build_numeric_view!(agg_idx) else {
+            let mut agg_views: Vec<Option<NumView>> = Vec::with_capacity(nc);
+            let mut agg_nulls: Vec<&[u8]> = Vec::with_capacity(nc);
+            for (ai, &agg_idx) in agg_indices.iter().enumerate() {
+                let col_off = rcix[agg_idx] as usize;
+                if col_off + null_bitmap_len > body.len() {
                     return Ok(None);
-                };
-                agg_views.push(view);
-            }
-            for (ai, (_, _, is_int)) in agg_views.iter().enumerate() {
-                if *is_int {
-                    col_is_int[ai] = true;
+                }
+                agg_nulls.push(&body[col_off..col_off + null_bitmap_len]);
+                if needs_value(value_needed, value_positions[ai]) {
+                    let Some((_, view, is_int)) = build_numeric_view!(agg_idx) else {
+                        return Ok(None);
+                    };
+                    if is_int {
+                        col_is_int[ai] = true;
+                    }
+                    agg_views.push(Some(view));
+                } else {
+                    // `COUNT(col)`: only the validity bitmap is read; the value
+                    // payload is never decoded.
+                    agg_views.push(None);
                 }
             }
 
@@ -4448,10 +4578,14 @@ impl OnDemandStorage {
                 }
                 match_count += 1;
 
-                for (ai, (null_bytes, view, _)) in agg_views.iter().enumerate() {
-                    if (null_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                for (ai, view) in agg_views.iter().enumerate() {
+                    if (agg_nulls[ai][i / 8] >> (i % 8)) & 1 == 1 {
                         continue;
                     }
+                    let Some(view) = view else {
+                        col_counts[ai] += 1;
+                        continue;
+                    };
                     let Some(av) = num_at!(view, i) else {
                         continue;
                     };
@@ -6246,7 +6380,45 @@ impl OnDemandStorage {
         predicates: &[(&str, f64, f64)],
         agg_cols: &[&str],
     ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.execute_filtered_numeric_agg_cached_planned(predicates, agg_cols, &[])
+    }
+
+    /// As [`Self::execute_filtered_numeric_agg_cached`], but `value_needed[i]`
+    /// marks whether `agg_cols[i]` is used by a value aggregate. A column that
+    /// only feeds `COUNT(col)` is not decoded: its validity bitmap (already
+    /// scanned as part of the footer check) is enough to count non-NULL rows.
+    pub fn execute_filtered_numeric_agg_cached_planned(
+        &self,
+        predicates: &[(&str, f64, f64)],
+        agg_cols: &[&str],
+        value_needed: &[bool],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
         use rayon::prelude::*;
+
+        #[inline]
+        fn needs_value(value_needed: &[bool], index: usize) -> bool {
+            value_needed.get(index).copied().unwrap_or(true)
+        }
+
+        #[inline]
+        fn intern(unique: &mut Vec<usize>, index: usize) -> usize {
+            unique
+                .iter()
+                .position(|&existing| existing == index)
+                .unwrap_or_else(|| {
+                    unique.push(index);
+                    unique.len() - 1
+                })
+        }
+
+        /// A column the aggregate result needs. `Star`/`Count` need only the
+        /// match count; `Value` additionally needs sum/min/max.
+        #[derive(Clone, Copy)]
+        enum AggSource {
+            Star,
+            Count,
+            Value(usize),
+        }
 
         if predicates.is_empty() || agg_cols.is_empty() || self.has_pending_deltas() {
             return Ok(None);
@@ -6255,8 +6427,7 @@ impl OnDemandStorage {
             Some(footer) => footer,
             None => return Ok(None),
         };
-        let mut unique_indices = Vec::new();
-        let mut position_for = |column: &str| -> Option<usize> {
+        let numeric_index = |column: &str| -> Option<usize> {
             let index = footer.schema.get_index(column)?;
             if self.column_has_nulls(column)
                 || !matches!(
@@ -6277,38 +6448,43 @@ impl OnDemandStorage {
             {
                 return None;
             }
-            Some(
-                unique_indices
-                    .iter()
-                    .position(|&existing| existing == index)
-                    .unwrap_or_else(|| {
-                        unique_indices.push(index);
-                        unique_indices.len() - 1
-                    }),
-            )
+            Some(index)
         };
-        let predicate_sources = predicates
-            .iter()
-            .map(|(column, low, high)| {
-                position_for(column).map(|source| (source, *low, *high))
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(predicate_sources) = predicate_sources else {
-            return Ok(None);
-        };
-        let aggregate_sources = agg_cols
-            .iter()
-            .map(|column| {
-                if *column == "*" || *column == "1" {
-                    Some(None)
-                } else {
-                    position_for(column).map(Some)
+        let mut unique_indices = Vec::new();
+        let mut predicate_sources = Vec::with_capacity(predicates.len());
+        for (column, low, high) in predicates {
+            let Some(index) = numeric_index(column) else {
+                return Ok(None);
+            };
+            predicate_sources.push((intern(&mut unique_indices, index), *low, *high));
+        }
+        let mut aggregate_sources = Vec::with_capacity(agg_cols.len());
+        for (ci, column) in agg_cols.iter().enumerate() {
+            if *column == "*" || *column == "1" {
+                aggregate_sources.push(AggSource::Star);
+            } else if !needs_value(value_needed, ci) {
+                // `COUNT(col)`: the column must exist and be NULL-free (the
+                // match count is then the value count), but its payload is
+                // never decoded or registered.
+                if footer.schema.get_index(column).is_none()
+                    || self.column_has_nulls(column)
+                {
+                    return Ok(None);
                 }
-            })
-            .collect::<Option<Vec<_>>>();
-        let Some(aggregate_sources) = aggregate_sources else {
+                aggregate_sources.push(AggSource::Count);
+            } else {
+                let Some(index) = numeric_index(column) else {
+                    return Ok(None);
+                };
+                aggregate_sources.push(AggSource::Value(intern(
+                    &mut unique_indices,
+                    index,
+                )));
+            }
+        }
+        if unique_indices.is_empty() {
             return Ok(None);
-        };
+        }
         let Some(columns) = self.scan_numeric_columns_mmap_parallel(&unique_indices, &footer)? else {
             return Ok(None);
         };
@@ -6348,18 +6524,21 @@ impl OnDemandStorage {
                     }
                 }
                 for (aggregate, source) in aggregate_sources.iter().enumerate() {
-                    let value = match source {
-                        None => Some(0.0),
-                        Some(source) => value_at(*source, row),
-                    };
-                    let Some(value) = value else {
-                        part.valid = false;
-                        continue;
-                    };
-                    part.counts[aggregate] += 1;
-                    part.sums[aggregate] += value;
-                    part.mins[aggregate] = part.mins[aggregate].min(value);
-                    part.maxs[aggregate] = part.maxs[aggregate].max(value);
+                    match source {
+                        AggSource::Star | AggSource::Count => {
+                            part.counts[aggregate] += 1;
+                        }
+                        AggSource::Value(source) => {
+                            let Some(value) = value_at(*source, row) else {
+                                part.valid = false;
+                                continue;
+                            };
+                            part.counts[aggregate] += 1;
+                            part.sums[aggregate] += value;
+                            part.mins[aggregate] = part.mins[aggregate].min(value);
+                            part.maxs[aggregate] = part.maxs[aggregate].max(value);
+                        }
+                    }
                 }
                 part
             })
@@ -6384,10 +6563,12 @@ impl OnDemandStorage {
                 .enumerate()
                 .map(|(aggregate, source)| {
                     let count = merged.counts[aggregate];
-                    let is_int = source.is_none()
-                        || source.is_some_and(|source| {
-                            matches!(columns[source].as_ref(), ColumnData::Int64(_))
-                        });
+                    let is_int = match source {
+                        AggSource::Star | AggSource::Count => true,
+                        AggSource::Value(source) => {
+                            matches!(columns[*source].as_ref(), ColumnData::Int64(_))
+                        }
+                    };
                     (
                         count,
                         merged.sums[aggregate],

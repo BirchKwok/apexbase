@@ -165,6 +165,72 @@ def test_overlay_falls_back_and_observes_the_update(client):
     assert client.execute(push).to_dict() == client.execute(scan).to_dict()
 
 
+def test_persisted_delete_keeps_the_row_selection(client):
+    # A persisted deletion vector used to send the statement to the
+    # deletion-aware *id* reader: slower, and unable to carry vector/blob
+    # columns. The deleted row keeps its bytes, so the directory still places the
+    # matches; the lane stages them by position and drops the hidden one.
+    client.execute("DELETE FROM t WHERE _id = 98")
+    client.flush()
+    push = f"SELECT doc, k FROM t WHERE MATCH('{NEEDLE}')"
+    scan = push + " OR 1 = 0"
+    selected = {int(row["doc"]) for row in client.execute(push).to_dict()}
+    # `_id` 98 is row 97, which is the first needle document (0, 97, 194, ...).
+    assert selected == _needle_docs() - {97}
+    assert client.execute(push).to_dict() == client.execute(scan).to_dict()
+    assert _path(client, push) == "fts_row_selection"
+
+    # The page is counted over the surviving matches, so the deleted row cannot
+    # consume one of its slots (the survivor that follows it moves up).
+    paged = push + " LIMIT 5"
+    docs = [int(row["doc"]) for row in client.execute(paged).to_dict()]
+    assert docs == sorted(selected)[:5], docs
+
+    # Ids and payloads must agree: the shared tail re-checks `MATCH()` against
+    # `_id`, so a mismatch would silently drop every row after the deletion.
+    ids = [
+        int(row["_id"])
+        for row in client.execute(f"SELECT _id FROM t WHERE MATCH('{NEEDLE}')").to_dict()
+    ]
+    assert ids == [doc + 1 for doc in sorted(selected)], ids
+
+
+def test_persisted_delete_keeps_a_vector_column(client):
+    # The per-id reader cannot stage a vector column, so a table with both a
+    # deletion vector and a vector column used to fall all the way back to the
+    # scan. The position reader carries it, and the dropped row must not shift
+    # the vectors it returns.
+    rows = 2_000
+    vectors = [[float(i), float(i) + 1.0] for i in range(rows)]
+    client.create_table("v", {"doc": "int64", "body": "string", "emb": "float32_vector"})
+    client.use_table("v")
+    for start in range(0, rows, 500):
+        end = min(start + 500, rows)
+        client.store(
+            {
+                "doc": list(range(start, end)),
+                "body": [
+                    f"alpha {NEEDLE} v{i}" if i % NEEDLE_EVERY == 0 else f"alpha v{i}"
+                    for i in range(start, end)
+                ],
+                "emb": vectors[start:end],
+            }
+        )
+    client.flush()
+    client.init_fts(index_fields=["body"])
+    client.execute("DELETE FROM v WHERE _id = 98")
+    client.flush()
+
+    selected = sorted(i for i in range(rows) if i % NEEDLE_EVERY == 0 and i != 97)
+    push = f"SELECT doc, emb FROM v WHERE MATCH('{NEEDLE}')"
+    got = client.execute(push).to_dict()
+    assert [int(row["doc"]) for row in got] == selected, "deleted row leaked"
+    for row in got:
+        assert row["emb"] == pytest.approx(vectors[int(row["doc"])]), row
+    assert client.execute(push + " OR 1 = 0").to_dict() == got
+    assert _path(client, push) == "fts_row_selection"
+
+
 def test_vector_tables_use_the_position_reader(client):
     # The scalar per-id reader cannot stage a vector column, which used to keep
     # every vector-bearing table on the scan. Row positions plus the indexed

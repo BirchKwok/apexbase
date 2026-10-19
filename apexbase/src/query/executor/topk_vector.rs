@@ -691,12 +691,15 @@ impl ApexExecutor {
         };
         use arrow::array::{BinaryArray, FixedSizeListArray, UInt32Array};
 
-        // The row selection indexes the *active* row space while the indexed
-        // extraction reads *physical* positions, so the two may only be used
-        // together when no deletion vector shifts them apart. Overlays change
-        // visibility after the scan as well.
-        if !backend.overlay_state().is_clean_view()
-            || backend.active_row_count() != backend.base_row_count()
+        // The candidate scanners answer in physical positions (they add each row
+        // group's physical offset), and `read_columns_by_indices_to_arrow` groups
+        // its indices the same way, so the two agree. Overlays still change
+        // visibility after the scan, which this lane cannot merge.
+        let overlay = backend.overlay_state();
+        if overlay.pending_cells
+            || overlay.appended_rows
+            || overlay.unflushed_rows
+            || overlay.base_in_memory
         {
             return Ok(None);
         }
@@ -704,12 +707,23 @@ impl ApexExecutor {
         if total == 0 {
             return Ok(None);
         }
-        let Some(indices) = Self::distance_lane_candidates(backend, where_clause)? else {
+        let Some(mut indices) = Self::distance_lane_candidates(backend, where_clause)? else {
             return Ok(None);
         };
+        // A persisted deletion vector leaves the candidate set physical, but the
+        // count that gates this lane and sizes its heap must be the *active* one:
+        // `total` above is active, and the shared tail counts its LIMIT the same
+        // way. The reader still wants physical indices, so only the gating copy
+        // is converted.
+        let mut active_count = indices.len();
+        if !overlay.is_clean_view() {
+            let mut active = indices.clone();
+            backend.storage.activate_positions(&mut active)?;
+            active_count = active.len();
+        }
         // Reading by index has a per-row cost, so a predicate that keeps most of
         // the table is cheaper to serve by the full scan.
-        if indices.is_empty() || (indices.len() as u64).saturating_mul(4) > total {
+        if indices.is_empty() || (active_count as u64).saturating_mul(4) > total {
             return Ok(None);
         }
 

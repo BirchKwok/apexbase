@@ -52,8 +52,9 @@
 | lane | 入口 | 限制 | fallback |
 | --- | --- | --- | --- |
 | 分批聚合管线 | `try_batch_group_pipeline` | 单表；`BatchGroupAggregator::new` 形状门 + `can_use_incremental_aggregation` + 列可解析；`scan_batches`/`scan_batches_ranges` 可用；并行折叠需 worker token 预算 ≥2，且 `APEX_PARALLEL_SCAN` 未显式关闭时由成本自动启用（预测串行 ≥2 ms 且并行历史更快） | 单批 `scan()` 聚合 |
-| FTS 行选择下推 | `ApexExecutor::try_fts_row_selection`（路径 `fts_row_selection`） | WHERE 的顶层 `AND` 中含一个 `MATCH()`（已解析为 `FtsResolved` bitmap）时，只物化命中行：无删除向量时先把 bitmap 的 `_id` 解析成**物理行号**（优先用行组目录 `positions_for_ids`，否则回退扫 `_id` 列），再 `read_columns_by_indices_to_arrow(位置, required_columns)` —— 因此只读语句需要的列，**向量/blob 列也能完整取回**；有删除向量时退回按 `_id` 读的标量 reader。其余谓词、投影、聚合、排序、LIMIT 仍由共享尾部执行，因此结果与全扫逐值一致 | 单表（`joins.is_empty()`）；`overlay_state().is_clean_view()`（覆盖层行不在持久化索引快照内）；`0 < hits && hits * 3 <= active_row_count()`；`OR`/`NOT` 下的 `MATCH()` 不可拆分；位置版还需要 `active_row_count() == base_row_count()`（行组目录的稠密映射只在此成立），按 `_id` 的标量版还需要 schema 全为标量类型、无 `FixedList`/量化向量/复杂类型 | 单批合并读 / 通用执行器 |
-| 距离 TopK 融合 | `ApexExecutor::try_fast_order_by_distance`（clean 视图走零拷贝 mmap：路径 `order_by_distance_topk_direct`；带选择性谓词时路径 `filtered_distance_topk`；否则 `order_by_distance_topk`） | `ORDER BY <distance>(col, [literal]) [ASC] LIMIT k`（含 `SELECT <expr> AS alias … ORDER BY alias` 写法）：clean 视图（无覆盖层、行组无删除向量、未压缩）时用 `topk_fixedlist_direct`/`topk_binary_direct` 直接在 mmap 上零拷贝打分，只 `read_columns_by_indices_to_arrow` 最近 k 行；有选择性谓词时先把谓词解析成候选行号（单列比较/`BETWEEN`/同列双区间、字符串等值），只对这些行打分后取堆（路径 `filtered_distance_topk`）；否则按 `required_columns()` 裁剪后跑无分配 SIMD 距离 + 有界堆并 `take`。三条路径都只读语句需要的列（`SELECT *` 除外），尾部仍执行 ORDER BY（k 行）、投影与 LIMIT。**含 `MATCH()` 的形态由上一行的 FTS 行选择先接管**（它同样按位置取行，随后由尾部排序） | 单表；无 GROUP BY / HAVING / DISTINCT / OFFSET>0 / 聚合 / 窗口（这些必须先作用于整个关系，或会因只喂 k 行而改变语义）；`limit` 存在且 > 0；升序；`order_by` 只有一项；距离函数名与 `expressions.rs` 的分发一致；第一个参数是列、第二个是 `[..]`/字符串字面量；度量不是"相似度值"型（`inner_product`/`cosine_similarity` 的有界堆返回"最相似"，与 `ASC` 相反）；向量列无 NULL（堆按平坦子数组打分，NULL 会被当 0）；维度匹配且是 FixedSizeList/Binary。`filtered_distance_topk` 额外要求：`WHERE` 是能被上述形态解析的合取（`OR`/`NOT`/多列混合不解析）、候选行数 `*4 <= active_row_count()`（否则候选太少，全扫更省）、`overlay_state().is_clean_view()` 且 `active_row_count() == base_row_count()`（候选按物理行号读取，删除向量会错位） | 通用执行器（`ORDER BY` 逐行求值 + 全排序） |
+| FTS 行选择下推 | `ApexExecutor::try_fts_row_selection`（路径 `fts_row_selection`） | WHERE 的顶层 `AND` 中含一个 `MATCH()`（已解析为 `FtsResolved` bitmap）时，只物化命中行：把 bitmap 的 `_id` 解析成**物理行号**（优先用行组目录 `positions_for_ids`，**有删除向量时用 `positions_for_ids_including_deleted`**，否则回退扫 `_id` 列），再 `read_columns_by_indices_to_arrow(位置, required_columns)` —— 因此只读语句需要的列，**向量/blob 列也能完整取回**；有删除向量时用 `drop_deleted_rows` 按 `_id ∈ bitmap` 丢掉被删行（`arrow::compute::take` 一次 pass）。其余谓词、投影、聚合、排序、LIMIT 仍由共享尾部执行，因此结果与全扫逐值一致 | 单表（`joins.is_empty()`）；**排除** `pending_cells` / `appended_rows` / `unflushed_rows` / `base_in_memory`（覆盖层行不在持久化索引快照内，且单格覆盖按物理位置合并）；**持久删除向量不再让位**（第 217 轮）；`0 < hits && hits * 3 <= active_row_count()`；`OR`/`NOT` 下的 `MATCH()` 不可拆分；目录无法证明稠密或写缓冲遮蔽删除向量时，退回按 `_id` 的标量 reader（要求 schema 全为标量类型） | 单批合并读 / 通用执行器 |
+| 距离 TopK 融合 | `ApexExecutor::try_fast_order_by_distance`（clean 视图走零拷贝 mmap：路径 `order_by_distance_topk_direct`；带选择性谓词时路径 `filtered_distance_topk`；否则 `order_by_distance_topk`） | `ORDER BY <distance>(col, [literal]) [ASC] LIMIT k`（含 `SELECT <expr> AS alias … ORDER BY alias` 写法）：clean 视图（无覆盖层、行组无删除向量、未压缩）时用 `topk_fixedlist_direct`/`topk_binary_direct` 直接在 mmap 上零拷贝打分，只 `read_columns_by_indices_to_arrow` 最近 k 行；有选择性谓词时先把谓词解析成候选行号（单列比较/`BETWEEN`/同列双区间、字符串等值），只对这些行打分后取堆（路径 `filtered_distance_topk`）；否则按 `required_columns()` 裁剪后跑无分配 SIMD 距离 + 有界堆并 `take`。三条路径都只读语句需要的列（`SELECT *` 除外），尾部仍执行 ORDER BY（k 行）、投影与 LIMIT。**含 `MATCH()` 的形态由上一行的 FTS 行选择先接管**（它同样按位置取行，随后由尾部排序） | 单表；无 GROUP BY / HAVING / DISTINCT / OFFSET>0 / 聚合 / 窗口（这些必须先作用于整个关系，或会因只喂 k 行而改变语义）；`limit` 存在且 > 0；升序；`order_by` 只有一项；距离函数名与 `expressions.rs` 的分发一致；第一个参数是列、第二个是 `[..]`/字符串字面量；度量不是"相似度值"型（`inner_product`/`cosine_similarity` 的有界堆返回"最相似"，与 `ASC` 相反）；向量列无 NULL（堆按平坦子数组打分，NULL 会被当 0）；维度匹配且是 FixedSizeList/Binary。`filtered_distance_topk` 额外要求：`WHERE` 是能被上述形态解析的合取（`OR`/`NOT`/多列混合不解析）、**活动**候选行数 `*4 <= active_row_count()`（否则候选太少，全扫更省）；只排除 `pending_cells`/`appended_rows`/`unflushed_rows`/`base_in_memory`（候选按**物理**行号读取，与 `read_columns_by_indices_to_arrow` 的分组空间一致；**持久删除向量不再让位**（第 218 轮）——门控计数经 `OnDemandStorage::activate_positions` 换算到活动空间后判断） | 通用执行器（`ORDER BY` 逐行求值 + 全排序） |
+| 融合过滤聚合（count-only 计划） | `ApexExecutor::try_fast_filtered_numeric_agg`、`python/bindings/read.rs::execute_filtered_numeric_agg` → `execute_filtered_numeric_agg_{mmap,cached}_planned` | 单表数值范围过滤上的 `COUNT/SUM/AVG/MIN/MAX`；调用方传入与列逐位对齐的 `value_needed`：**只被 `COUNT` 引用的列不解码值负载**（覆盖式取活跃行数或"行数 − NULL 位"；部分覆盖逐行只递增计数，位压缩过滤列走 `bitpack_count_in_range`；值列有 NULL 且有删除时退回逐行），非数值值列（如 `COUNT(string_col)`）也可 count-only | `has_pending_deltas()`；过滤列必须数值/浮点；`cached` 车道要求谓词列与值聚合列无 NULL；仅 `appended_overlay_only()` 的尾部（由 `merge_appended_rows_into_stats` 折叠）；无 GROUP BY/JOIN/LIMIT/ORDER BY | 通用执行器 |
 | 单批 scan 聚合 | `try_scan_group_pipeline` → `backend.scan()` | 单表、WHERE 可转 typed 谓词、无 JOIN/DISTINCT/window | 通用执行器 |
 | S3 流式投影 | `execute_streaming_select` | 单表投影 SELECT：无 DISTINCT/JOIN/GROUP/HAVING/ORDER/LIMIT/window；投影为 SELECT 顺序的普通列；谓词与投影列均受 typed 协议支持 | 物化执行（`execute`） |
 | Flight 交付 | `flight::service` | 有界通道 `STREAM_CHANNEL_CAPACITY`；每块 `DELIVERY_CHUNK_ROWS` | 上一 lane 的 fallback 链 |
@@ -114,14 +115,42 @@
    Python 点查走独立的 `read_row_by_id_values` 组合实现）。新增调用方前必须确认该前提，
    否则先用 `visible_read_segments()` 组合或显式拒绝。
 8. **候选行号的空间必须与读取 reader 一致**：`filtered_distance_topk` 与 `fts_row_selection`
-   的**位置版**都用候选行号直接调 `read_columns_by_indices_to_arrow`，而该 reader 把 V4 mmap
-   索引当**物理**行号（`read_rows_by_ids_to_arrow` 才按活动 `_id` 解释）。因此这两条 lane 都显式要求
+   的**位置版**都用候选行号直接调 `read_columns_by_indices_to_arrow`，该 reader **内部并存两套
+   索引语义**，解除本节的 gate 前必须先统一（第 215 轮实测，见下）。因此这两条 lane 目前都显式要求
    `overlay_state().is_clean_view()` 且 `active_row_count() == base_row_count()`：一旦存在
    覆盖层或删除向量，活动行号与物理行号会错位。`_id → 物理行号` 的解析优先走行组目录
    （`OnDemandStorage::positions_for_ids`，要求每个行组 `max_id - min_id + 1 == row_count`
    且 `deletion_count == 0`），目录无法证明稠密时回退扫 `_id` 列。新增"谓词 + 索引空间读取"的
    快路时必须先确认这两个条件，否则候选行号会读到错误的行（静默错答，而非报错）。
-9. **渲染表达式的列名解析不得按最后一个 `.` 切分**：解析器会把 `ORDER BY <表达式>` 与
+
+   **8b. `read_columns_by_indices_to_arrow` 的物理索引空间（第 216 轮定稿）**：
+   该 reader **整体工作在物理行空间**——
+   - `extract_rows_by_indices_to_arrow` 按 `rg_bounds` 的**物理**边界把索引分组，列负载按物理位置解码；
+   - 全局字符串字典（`GLOBAL_DICT_CACHE`）由 `build_string_dict_cache` 扫**整个物理列**建成，
+     故 `dict.1[i]` 是物理行 `i` 的 group id；
+   - `read_ids_by_indices` 用入参直接下标 `self.ids`，而该数组由 `read_base_ids_and_deletions`
+     建成、**包含已删除行**，所以它也是物理的。
+
+   三条一致 ⇒ **给该 reader 传物理位置时，列负载、字典键与 `_id` 三者对齐**。
+   第 216 轮曾据"字典 lane 返回活动 id"推断出两套空间并尝试统一为活动空间，
+   **完整 pytest 出现 12 处失败**（`test_merge*`、`test_string_order_by_topk_lane`、
+   `test_wide_table_benchmark` 的 `sum(k)` 少算 3 行等），说明现有调用者依赖物理语义。
+   同日改用"只补 `_id` 列"的补丁也失败：列负载整体前移一行
+   （测得 lane `doc [0,194,291,388,485,581]` 对真值 `…582`）。**两条路都作废**，
+   结论就是本条：不要试图把该 reader 改成活动空间，而是让调用方传物理位置。
+
+   由此解除了 `fts_row_selection` 的删除向量 gate（第 216 轮落地）：
+   - `OnDemandStorage::positions_for_ids_including_deleted`（物理位置，**保留**被删行）；
+   - lane 用物理位置 `read_columns_by_indices_to_arrow` 取数，再用 `drop_deleted_rows`
+     按 `_id ∈ bitmap` 丢掉被删行（`arrow::compute::take`，一次 pass）；
+   - 共享尾部的 `MATCH()` 复检因此看到恰好存活的行。
+   **20 万 × 16 列、1 处删除实测：`MATCH()` pushdown 0.289 → 0.082 ms（3.5×）**，
+   与 clean 路径（0.083 ms）持平；行数与扫描逐值一致。
+   `active_positions_for_ids`（物理 → 活动）保留为已测构件，当前无调用者。
+   **约束**：`pending_cells` 必须继续让位 —— 单格覆盖层按**物理**位置合并，
+   而本 lane 现在也传物理位置，二者虽一致，但覆盖层行的合并由
+   `read_rows_by_ids_to_arrow` 负责，故维持原让位行为不变。
+9. **渲染表达式的列名解析不得按最后一个 `.` 切分**9. **渲染表达式的列名解析不得按最后一个 `.` 切分**：解析器会把 `ORDER BY <表达式>` 与
    `GROUP BY <表达式>` 的渲染文本当作列名（`cosine_distance(emb, [0.5, 0.25])`、
    `ABS(score - 1.5)`）。按最后一个 `.` 剥限定符会切在**浮点字面量**里，得到一个任何列都不叫的
    后缀，于是排序键为空（**静默保留扫描顺序**）或分组键取不到（**静默塌缩成单组**）——

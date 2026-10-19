@@ -6409,6 +6409,25 @@ impl TableStorageBackend {
             .execute_filtered_numeric_agg_mmap(filter_col, low, high, agg_cols)
     }
 
+    /// As [`Self::execute_filtered_numeric_agg_mmap`], with a per-column
+    /// "value aggregate needed" plan so `COUNT(col)` never decodes values.
+    pub fn execute_filtered_numeric_agg_mmap_planned(
+        &self,
+        filter_col: &str,
+        low: f64,
+        high: f64,
+        agg_cols: &[&str],
+        value_needed: &[bool],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.storage.execute_filtered_numeric_agg_mmap_planned(
+            filter_col,
+            low,
+            high,
+            agg_cols,
+            value_needed,
+        )
+    }
+
     /// Build cached string dictionary indices for a column
     pub fn build_string_dict_cache(
         &self,
@@ -6550,6 +6569,18 @@ impl TableStorageBackend {
     ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
         self.storage
             .execute_filtered_numeric_agg_cached(predicates, agg_cols)
+    }
+
+    /// As [`Self::execute_filtered_numeric_agg_cached`], with a per-column
+    /// "value aggregate needed" plan so `COUNT(col)` never decodes values.
+    pub fn execute_filtered_numeric_agg_cached_planned(
+        &self,
+        predicates: &[(&str, f64, f64)],
+        agg_cols: &[&str],
+        value_needed: &[bool],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.storage
+            .execute_filtered_numeric_agg_cached_planned(predicates, agg_cols, value_needed)
     }
 
     pub fn scan_filtered_numeric_top_k_cached(

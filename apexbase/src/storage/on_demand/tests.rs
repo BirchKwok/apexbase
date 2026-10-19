@@ -4077,6 +4077,131 @@ fn covering_range_count_reads_no_payload() {
 }
 
 #[test]
+fn count_column_plan_skips_the_value_payload() {
+    // `COUNT(col)` only needs the number of matched non-NULL values, so the fused
+    // lane must answer from the validity bitmap instead of decoding the value
+    // column. A covering `COUNT(v)` used to decode the whole bit-packed column
+    // (1M rows: 2.2 ms against 0.07 ms for `COUNT(*)`).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("count_column_plan.apex");
+    let schema = [
+        ("k".to_string(), ColumnType::Int64),
+        ("v".to_string(), ColumnType::Int64),
+        ("n".to_string(), ColumnType::Int64),
+    ];
+    let rows = 200_000usize;
+    // Every fifth `n` is NULL, so a count-only plan still has to consult the bitmap.
+    let is_null = |row: usize| row % 5 == 0;
+    let non_null_n = |from: usize| (from..rows).filter(|&row| !is_null(row)).count() as i64;
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("k".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        int_cols.insert(
+            "v".to_string(),
+            (0..rows).map(|row| row as i64 * 3).collect::<Vec<i64>>(),
+        );
+        int_cols.insert(
+            "n".to_string(),
+            (0..rows).map(|row| row as i64 * 7).collect::<Vec<i64>>(),
+        );
+        let mut nulls = HashMap::new();
+        nulls.insert(
+            "n".to_string(),
+            (0..rows).map(is_null).collect::<Vec<bool>>(),
+        );
+        storage
+            .insert_typed_with_nulls_full(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                nulls,
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let agg = |cols: &[&str], value_needed: &[bool], low: f64, high: f64| {
+        storage
+            .execute_filtered_numeric_agg_mmap_planned("k", low, high, cols, value_needed)
+            .unwrap()
+            .expect("fused aggregation")
+    };
+
+    // Covering, NULL-free, bit-packed value column: the count is the live rows and
+    // the value statistics are left empty because no value aggregate asked for them.
+    let counted_v = agg(&["v"], &[false], 0.0, f64::INFINITY);
+    assert_eq!(counted_v[0].0, rows as i64);
+    assert_eq!((counted_v[0].1, counted_v[0].2, counted_v[0].3), (0.0, 0.0, 0.0));
+
+    // Covering with NULLs: the bitmap is subtracted from the live row count.
+    let counted_n = agg(&["n"], &[false], 0.0, f64::INFINITY);
+    assert_eq!(counted_n[0].0, non_null_n(0));
+
+    // A value aggregate still gets exact values.
+    let summed_v = agg(&["v"], &[true], 0.0, f64::INFINITY);
+    assert_eq!(summed_v[0].0, rows as i64);
+    assert_eq!(
+        summed_v[0].1,
+        (0..rows as i64).map(|row| row * 3).sum::<i64>() as f64
+    );
+
+    // The plan is indexed like `cols`, so a leading `COUNT(*)` must not shift the
+    // flag that belongs to `v`: this used to make the SUM return the match count.
+    let sum_after_star = agg(&["*", "v"], &[false, true], 0.0, f64::INFINITY);
+    assert_eq!(sum_after_star[0].0, rows as i64);
+    assert_eq!(
+        sum_after_star[1].1,
+        (0..rows as i64).map(|row| row * 3).sum::<i64>() as f64,
+        "SUM(v) after COUNT(*)"
+    );
+    let count_after_star = agg(&["*", "v"], &[false, false], 0.0, f64::INFINITY);
+    assert_eq!(count_after_star[1].0, rows as i64, "COUNT(v) after COUNT(*)");
+    assert_eq!(count_after_star[1].1, 0.0, "no SUM was requested");
+
+    // Partially covering with NULLs keeps the per-row loop but still skips values.
+    let partial_n = agg(&["n"], &[false], 100_000.0, f64::INFINITY);
+    assert_eq!(partial_n[0].0, non_null_n(100_000));
+
+    // Deletions: a deleted NULL does not change COUNT(n), a deleted non-NULL does,
+    // and the covered NULL arm exercises the NULL+delete fallback in the row loop.
+    assert!(storage.delete(5_000)); // n is NULL here
+    assert!(storage.delete(5_001)); // n is 5001 * 7
+    storage.save_delete_only().unwrap();
+
+    let live_rows = rows as i64 - 2;
+    let counted_v_after = agg(&["v"], &[false], 0.0, f64::INFINITY);
+    assert_eq!(counted_v_after[0].0, live_rows);
+    let counted_n_after = agg(&["n"], &[false], 0.0, f64::INFINITY);
+    assert_eq!(counted_n_after[0].0, non_null_n(0) - 1);
+    let partial_n_after = agg(&["n"], &[false], 100_000.0, f64::INFINITY);
+    assert_eq!(partial_n_after[0].0, non_null_n(100_000));
+
+    // Two columns take the serial path; mixing a value and a count-only column
+    // there must keep both answers exact.
+    let mixed = agg(&["v", "n"], &[true, false], 0.0, f64::INFINITY);
+    assert_eq!(mixed[0].0, live_rows, "COUNT(v)");
+    assert_eq!(
+        mixed[0].1,
+        (0..rows as i64)
+            .filter(|row| *row != 4_999 && *row != 5_000)
+            .map(|row| row * 3)
+            .sum::<i64>() as f64,
+        "SUM(v)"
+    );
+    assert_eq!(mixed[1].0, non_null_n(0) - 1, "COUNT(n)");
+}
+
+#[test]
 fn string_tail_zone_prunes_equal_length_shared_prefix_rows() {
     // Timestamp/UUID-shaped values are all the same length and share their
     // first eight bytes, so neither the byte-length zone nor the first-eight
@@ -4521,6 +4646,7 @@ fn legacy_length_string_zones_never_prune_by_order() {
             is_string_tail: false,
         }]],
         col_offsets: Vec::new(),
+        chunk_tables: Vec::new(),
     };
     let disjoint = |op: ScanComparison, value: &str| {
         let predicate = ScanPredicate::Compare {
@@ -5673,6 +5799,230 @@ fn positions_for_ids_requires_dense_undeleted_row_groups() {
     storage.save_v4().unwrap();
     let reopened = OnDemandStorage::open(&path).unwrap();
     assert_eq!(reopened.positions_for_ids(&[0]).unwrap(), None);
+}
+
+#[test]
+fn chunked_row_group_round_trips_through_the_flat_layout() {
+    // The chunked layout stores each column as its own compressed frame and is
+    // reassembled into the revision-1 flat body before any reader touches a
+    // column. Exercise the codec directly: compress a body both ways and require
+    // the reassembly to reproduce the flat bytes exactly. The table-wide size
+    // gate may refuse the layout on a real fixture, so this is what keeps the
+    // format honest.
+    let ints: Vec<i64> = (0..4096).collect();
+    let floats: Vec<f64> = (0..4096).map(|i| i as f64 * 0.5).collect();
+    let int_col = ColumnData::Int64(ints.clone());
+    let float_col = ColumnData::Float64(floats.clone());
+
+    let mut flat = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    for col in [&int_col, &float_col] {
+        let start = flat.len();
+        let mut cursor = std::io::Cursor::new(&mut flat);
+        write_column_encoded(col, ColumnType::Int64, &mut cursor, ColumnEncodingOptions::default())
+            .unwrap();
+        ranges.push((start, flat.len()));
+    }
+    let columns: Vec<&[u8]> = ranges.iter().map(|&(s, e)| &flat[s..e]).collect();
+    let (payload, chunks) = chunk_rg_body(&columns, CompressionType::Zstd)
+        .unwrap()
+        .expect("two columns of this size must produce frames");
+    assert!(payload.len() < flat.len(), "frames should be smaller than the raw columns");
+
+    // Reassemble exactly what `decompress_column_frame` would hand a reader.
+    let mut rebuilt = vec![0u8; flat.len()];
+    let mut pos = 0usize;
+    for col in chunks.iter() {
+        assert_eq!(col.flat_len as usize, flat.len());
+        let mut acc: Vec<u8> = Vec::new();
+        let mut frame_pos = pos;
+        for chunk in &col.chunks {
+            let end = frame_pos + CHUNK_FRAME_HEADER_LEN + chunk.len as usize;
+            acc.extend_from_slice(&decompress_column_frame(&payload[frame_pos..end]).unwrap());
+            frame_pos = end;
+        }
+        let start = col.flat_off as usize;
+        rebuilt[start..start + acc.len()].copy_from_slice(&acc);
+        pos = frame_pos;
+    }
+    assert_eq!(pos, payload.len(), "the frames must consume the payload exactly");
+    assert_eq!(rebuilt, flat, "reassembly must reproduce the flat body byte for byte");
+
+    // The bytes are the contract: the assembler reproduced `flat` exactly (above)
+    // and the frames consumed the payload exactly, so every reader that worked on
+    // the old layout works unchanged on a chunked group.
+}
+
+#[test]
+fn active_positions_for_ids_filters_and_shifts_deleted_rows() {
+    // The FTS row selection needs *active* row numbers on a table whose file
+    // carries a deletion vector. `positions_for_ids` declines such a file
+    // outright (its dense-id arithmetic would hand back a deleted row), which is
+    // why every position-based lane used to be gated on the clean view. The
+    // active resolver must drop the deleted positions and shift the survivors
+    // down by the number of deletions before them, because the indexed readers
+    // address rows the way a scan does.
+    //
+    // An in-place deletion keeps every row's bytes (it only sets a bit), so
+    // positions *below* a deleted row are unchanged and positions above shift.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("active_positions.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let ints: Vec<i64> = (0..4096).collect();
+        storage
+            .insert_typed(
+                HashMap::from([("a".to_string(), ints)]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save_v4().unwrap();
+        // `_id`s start at 1, so id N is physical row N - 1.
+        assert_eq!(
+            storage.positions_for_ids(&[1, 6, 11]).unwrap(),
+            Some(vec![0, 5, 10])
+        );
+        // `flush` (not `save_v4`) so the delete takes the low-ratio in-place
+        // deletion-vector lane: a full rewrite compacts the row away entirely,
+        // which is a different on-disk state from the one this test is about.
+        storage.flush().unwrap();
+        assert!(storage.delete(2));
+        assert!(storage.delete(6));
+        storage.flush().unwrap();
+    }
+
+    // A fresh open reads the deletion vector back from the file, which is the
+    // state the FTS lane actually meets (the overlay state is clean, because only
+    // persisted deletions are present).
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(
+        reopened.positions_for_ids(&[1]).unwrap(),
+        None,
+        "the clean-only resolver must keep declining a deleted row group"
+    );
+    assert_eq!(
+        reopened.active_positions_for_ids(&[1]).unwrap(),
+        Some(vec![0]),
+        "id 1 is below both deletions, so it keeps active row 0"
+    );
+    assert_eq!(
+        reopened.active_positions_for_ids(&[2]).unwrap(),
+        Some(Vec::new()),
+        "id 2 is deleted and contributes no position"
+    );
+    assert_eq!(
+        reopened.active_positions_for_ids(&[6]).unwrap(),
+        Some(Vec::new()),
+        "id 6 is deleted and contributes no position"
+    );
+    // Ids 11 and 12 are physical rows 10 and 11; both deletions (physical 1 and
+    // 5) sit below them, so they become active rows 8 and 9.
+    assert_eq!(
+        reopened.active_positions_for_ids(&[6, 11, 12]).unwrap(),
+        Some(vec![8, 9]),
+        "id 6 is deleted; ids 11 and 12 sit above both deletions"
+    );
+    assert_eq!(
+        reopened.active_positions_for_ids(&[1, 5_000]).unwrap(),
+        Some(vec![0]),
+        "an id no group covers is skipped, like the id reader does"
+    );
+}
+
+#[test]
+fn positions_for_ids_including_deleted_keeps_the_physical_answer() {
+    // The FTS row selection now stages rows in the *physical* space, because
+    // every reader behind `read_columns_by_indices_to_arrow` speaks it: the
+    // payload lanes group indices by physical `rg_bounds`, the global dictionary
+    // is built over physical rows, and `read_ids_by_indices` indexes the physical
+    // `ids` array. The deleted rows are filtered afterwards.
+    //
+    // `positions_for_ids` declines a file with deletions, so the physical
+    // resolver has to answer even though some positions name a deleted row.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("physical_positions.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let ints: Vec<i64> = (0..4096).collect();
+        storage
+            .insert_typed(
+                HashMap::from([("a".to_string(), ints)]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.flush().unwrap();
+        assert!(storage.delete(2));
+        assert!(storage.delete(6));
+        storage.flush().unwrap();
+    }
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    // `_id` N sits at physical row N - 1, and the deletion does not move anyone.
+    assert_eq!(
+        reopened.positions_for_ids_including_deleted(&[1, 2, 6, 12]).unwrap(),
+        Some(vec![0, 1, 5, 11]),
+        "the physical answer keeps the deleted rows"
+    );
+    // The same ids in the active space skip the two deleted rows: only ids 1 and
+    // 12 survive, and id 12 is the survivor at physical 11.
+    assert_eq!(
+        reopened.active_positions_for_ids(&[1, 2, 6, 12]).unwrap(),
+        Some(vec![0, 9]),
+        "ids 1/2/6/12 resolve to physical 0/1/5/11; ids 2 and 6 are deleted, \
+         and id 12 sits above both of them"
+    );
+    // An id no group covers is skipped by both.
+    assert_eq!(
+        reopened.positions_for_ids_including_deleted(&[1, 9_999]).unwrap(),
+        Some(vec![0])
+    );
+}
+
+#[test]
+fn activate_positions_moves_physical_positions_into_the_active_space() {
+    // The mmap predicate scanners answer in physical positions, which is also the
+    // space `read_columns_by_indices_to_arrow` groups its indices in. A caller
+    // that sizes a page or compares against `active_row_count()` needs the active
+    // space instead, and must not count the hidden rows.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("activate_positions.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let ints: Vec<i64> = (0..4096).collect();
+        storage
+            .insert_typed(
+                HashMap::from([("a".to_string(), ints)]),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save_v4().unwrap();
+        storage.flush().unwrap();
+        // A clean in-memory view is left alone.
+        let mut positions = vec![0, 5, 10];
+        storage.activate_positions(&mut positions).unwrap();
+        assert_eq!(positions, vec![0, 5, 10]);
+        assert!(storage.delete(2));
+        assert!(storage.delete(6));
+        storage.flush().unwrap();
+    }
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    let mut positions = vec![0, 1, 5, 11];
+    reopened.activate_positions(&mut positions).unwrap();
+    assert_eq!(
+        positions,
+        vec![0, 9],
+        "physical 1 and 5 are hidden; physical 0 and 11 become active 0 and 9"
+    );
 }
 
 #[test]

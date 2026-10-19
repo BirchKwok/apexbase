@@ -441,6 +441,11 @@ fn supported_file_version(version: u32) -> bool {
 /// writer emits this value today; a reader that meets a newer revision must
 /// refuse the Row Group rather than interpret its bytes with older rules.
 const RG_ENCODING_VERSION: u8 = 1;
+/// Revision 2: a *compressed* row group stores every column as an independently
+/// compressed frame, so a reader can decode only the columns it touches.
+/// Selected only when `APEX_CHUNK_INDEX` is on and the layout does not cost more
+/// than `CHUNK_LAYOUT_MAX_GROWTH` in bytes.
+const RG_CHUNKED_ENCODING_VERSION: u8 = 2;
 const HEADER_SIZE: usize = 256;
 const COLUMN_INDEX_ENTRY_SIZE: usize = 32;
 const DEFAULT_ROW_GROUP_SIZE: u32 = 65536;
@@ -2098,6 +2103,163 @@ fn decompress_rg_body(compress_flag: u8, compressed: &[u8]) -> io::Result<Option
             "Unknown compression flag: {}",
             compress_flag
         ))),
+    }
+}
+
+/// Per-column frame header of a chunked (`encoding_version == 2`) column body:
+/// `[frame_len: u32][compress_flag: u8]`.
+pub(crate) const CHUNK_FRAME_HEADER_LEN: usize = 5;
+
+/// Whether new compressed row groups may use the chunked (per-column frame)
+/// layout. **Off by default**: the layout is a format extension whose payoff and
+/// compression cost are still being measured (see `V5_NEXT_STEPS.md` §20/§21).
+pub(crate) fn chunk_index_enabled() -> bool {
+    matches!(
+        std::env::var("APEX_CHUNK_INDEX").ok().as_deref(),
+        Some("1") | Some("true") | Some("on")
+    )
+}
+
+/// Encode one row-group body for disk.
+///
+/// `ranges` are the body-relative `[start, end)` byte ranges of every column in a
+/// flat body. The returned column offsets are **flat-body offsets** for both
+/// layouts: readers address the decompressed body, and a chunked group is
+/// reassembled into exactly that flat layout before anyone touches a column.
+///
+/// The chunked layout is only selected when it is enabled *and* it does not cost
+/// more than [`CHUNK_LAYOUT_MAX_GROWTH`] in bytes, so opting in can never blow
+/// the compression budget.
+pub(crate) fn encode_rg_body(
+    flat: Vec<u8>,
+    ranges: &[(usize, usize)],
+    compression: CompressionType,
+) -> io::Result<(u8, Vec<u8>, Option<Vec<ChunkedColumn>>, Vec<u32>)> {
+    encode_rg_body_with_layout(flat, ranges, compression, None)
+}
+
+/// Encode one row-group body, forcing (or forbidding) the chunked layout.
+///
+/// The layout is a **table-wide** decision: mixing chunked and flat groups in one
+/// file would make every reader branch per group, and a file that started flat
+/// must stay flat (a reader of the older layout would otherwise meet frames it
+/// cannot parse). `force` is `Some(true)` once the table's first group was
+/// written chunked, `Some(false)` once it was written flat, and `None` while the
+/// decision is still open — then the 8% size gate decides.
+pub(crate) fn encode_rg_body_with_layout(
+    flat: Vec<u8>,
+    ranges: &[(usize, usize)],
+    compression: CompressionType,
+    force: Option<bool>,
+) -> io::Result<(u8, Vec<u8>, Option<Vec<ChunkedColumn>>, Vec<u32>)> {
+    let flat_offsets: Vec<u32> = ranges.iter().map(|&(start, _)| start as u32).collect();
+    let chunkable = !matches!(compression, CompressionType::None)
+        && flat.len() >= COMPRESS_MIN_BODY_SIZE
+        && !ranges.is_empty()
+        && chunk_index_enabled();
+    if chunkable && force != Some(false) {
+        let (flag, flat_frame) = compress_rg_body(flat.clone(), compression);
+        if flag != RG_COMPRESS_NONE {
+            let columns: Vec<&[u8]> =
+                ranges.iter().map(|&(start, end)| &flat[start..end]).collect();
+            if let Some((payload, chunks)) = chunk_rg_body(&columns, compression)? {
+                let growth = payload.len() as f64 / flat_frame.len() as f64;
+                if force == Some(true) || growth <= 1.0 + CHUNK_LAYOUT_MAX_GROWTH {
+                    return Ok((flag, payload, Some(chunks), flat_offsets));
+                }
+            }
+        }
+    }
+    let (flag, body) = compress_rg_body(flat, compression);
+    Ok((flag, body, None, flat_offsets))
+}
+
+/// Whether a table already stores any row group in the chunked layout.
+pub(crate) fn table_uses_chunk_layout(chunk_tables: &RgChunkTables) -> Option<bool> {
+    if chunk_tables.iter().any(|cols| cols.iter().any(Option::is_some)) {
+        Some(true)
+    } else if !chunk_tables.is_empty() {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Largest relative size growth the chunked layout may cost before it is
+/// rejected in favour of the flat frame.
+pub(crate) const CHUNK_LAYOUT_MAX_GROWTH: f64 = 0.08;
+
+/// Split assembled row-group columns into independently compressed frames.
+///
+/// The unit is one column, so a statement that touches one column of a wide
+/// compressed group decodes that column and nothing else.
+pub(crate) fn chunk_rg_body(
+    columns: &[&[u8]],
+    compression: CompressionType,
+) -> io::Result<Option<(Vec<u8>, Vec<ChunkedColumn>)>> {
+    if matches!(compression, CompressionType::None) || columns.is_empty() {
+        return Ok(None);
+    }
+    let flat_len: usize = columns.iter().map(|col| col.len()).sum();
+    let mut payload: Vec<u8> = Vec::with_capacity(flat_len / 2 + 64);
+    let mut chunks: Vec<ChunkedColumn> = Vec::with_capacity(columns.len());
+    let mut flat_off = 0u32;
+    for col in columns {
+        if col.is_empty() {
+            return Ok(None);
+        }
+        let (flag, compressed) = compress_frame(col, compression);
+        if compressed.len() > u32::MAX as usize || payload.len() > u32::MAX as usize {
+            return Ok(None);
+        }
+        chunks.push(ChunkedColumn {
+            chunks: vec![ChunkRef {
+                len: compressed.len() as u32,
+            }],
+            flat_len: 0,
+            flat_off,
+        });
+        payload.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        payload.push(flag);
+        payload.extend_from_slice(&compressed);
+        flat_off += col.len() as u32;
+    }
+    let flat_len = flat_len as u32;
+    for column in chunks.iter_mut() {
+        column.flat_len = flat_len;
+    }
+    Ok(Some((payload, chunks)))
+}
+
+/// Decompress one column frame written by `chunk_rg_body`.
+pub(crate) fn decompress_column_frame(frame: &[u8]) -> io::Result<Vec<u8>> {
+    if frame.len() < CHUNK_FRAME_HEADER_LEN {
+        return Err(err_data("chunked column frame truncated"));
+    }
+    let len = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
+    if CHUNK_FRAME_HEADER_LEN + len > frame.len() {
+        return Err(err_data("chunked column frame truncated"));
+    }
+    decompress_rg_body(frame[4], &frame[CHUNK_FRAME_HEADER_LEN..CHUNK_FRAME_HEADER_LEN + len])?
+        .ok_or_else(|| err_data("chunked column frame is not compressed"))
+}
+
+/// Compress one column body, falling back to raw bytes when it does not help.
+fn compress_frame(chunk: &[u8], compression: CompressionType) -> (u8, Vec<u8>) {
+    match compression {
+        CompressionType::None => (RG_COMPRESS_NONE, chunk.to_vec()),
+        CompressionType::Zstd => match zstd::bulk::compress(chunk, 1) {
+            Ok(compressed) if compressed.len() < chunk.len() => (RG_COMPRESS_ZSTD, compressed),
+            _ => (RG_COMPRESS_NONE, chunk.to_vec()),
+        },
+        CompressionType::Lz4 => {
+            let compressed = lz4_flex::compress_prepend_size(chunk);
+            if compressed.len() < chunk.len() {
+                (RG_COMPRESS_LZ4, compressed)
+            } else {
+                (RG_COMPRESS_NONE, chunk.to_vec())
+            }
+        }
     }
 }
 

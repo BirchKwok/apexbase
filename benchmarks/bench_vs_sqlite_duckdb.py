@@ -2402,6 +2402,24 @@ class ApexBaseBench:
     def bench_count(self):
         return self._scalar("SELECT COUNT(*) FROM default")
 
+    def bench_count_column_covered(self):
+        """`COUNT(col)` over a range that covers every row group.
+
+        Count-only must be answered from the validity bitmap: this used to decode
+        the whole bit-packed value column (1M rows: 2.2 ms against 0.07 ms for
+        `COUNT(*)`). `age` is bit-packed, so a regression to value decoding shows
+        up here even though the statement only asks for a count.
+        """
+        return self._scalar("SELECT COUNT(age) FROM default WHERE age >= 0")
+
+    def bench_count_column_partial(self):
+        """`COUNT(col)` with a range that only partly covers the groups.
+
+        The filter column (`age`) still has to be evaluated, but the value column
+        (`score`) must not be decoded.
+        """
+        return self._scalar("SELECT COUNT(score) FROM default WHERE age >= 50")
+
     def bench_select_limit(self, limit=100):
         return self._query_all(f"SELECT * FROM default LIMIT {limit}")
 

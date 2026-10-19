@@ -323,8 +323,32 @@ pub type RgZoneMaps = Vec<Vec<RgColumnZoneMap>>;
 /// Enables O(1) direct seeks for cold-start LIMIT reads without sequential scan.
 pub type RgColumnOffsets = Vec<Vec<u32>>;
 
+/// One independently compressed frame of a chunked column body.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ChunkRef {
+    pub len: u32,
+}
+
+/// Per-column chunk directory of one compressed row group (CHNK footer section).
+///
+/// A chunked column body is `[frame_len: u32][compress_flag: u8][frame bytes]`
+/// repeated once per frame. Row groups carry this layout only when
+/// `encoding_version == 2`; version 1 keeps the single-frame whole-body layout.
+#[derive(Debug, Clone, Default)]
+pub struct ChunkedColumn {
+    pub chunks: Vec<ChunkRef>,
+    /// Uncompressed length of the whole flat row-group body.
+    pub flat_len: u32,
+    /// Offset of this column inside that flat body (what readers need).
+    pub flat_off: u32,
+}
+
+/// Per-RG, per-column chunk directories. `None` for a column that is not chunked.
+pub type RgChunkTables = Vec<Vec<Option<ChunkedColumn>>>;
+
 const ZONE_MAP_MAGIC: &[u8; 4] = b"ZMAP";
 const RCIX_MAGIC: &[u8; 4] = b"RCIX";
+const CHUNK_MAGIC: &[u8; 4] = b"CHNK";
 
 #[derive(Debug, Clone)]
 pub struct V4Footer {
@@ -335,6 +359,9 @@ pub struct V4Footer {
     /// Per-RG per-column byte offsets of null bitmaps within the uncompressed RG body.
     /// Empty when not present (backward compat with older files).
     pub col_offsets: RgColumnOffsets,
+    /// Per-RG per-column chunk directories of chunked row groups.
+    /// Empty unless a table opted into the chunked layout.
+    pub chunk_tables: RgChunkTables,
 }
 
 impl V4Footer {
@@ -381,6 +408,32 @@ impl V4Footer {
                 buf.extend_from_slice(&(rg_offsets.len() as u16).to_le_bytes());
                 for &off in rg_offsets {
                     buf.extend_from_slice(&off.to_le_bytes());
+                }
+            }
+        }
+
+        // CHNK section: per-RG per-column chunk directories.
+        if !self.chunk_tables.is_empty() {
+            buf.extend_from_slice(CHUNK_MAGIC);
+            buf.extend_from_slice(&(self.chunk_tables.len() as u32).to_le_bytes());
+            for rg_cols in &self.chunk_tables {
+                buf.extend_from_slice(&(rg_cols.len() as u16).to_le_bytes());
+                for col in rg_cols {
+                    match col {
+                        Some(chunked) => {
+                            buf.extend_from_slice(&chunked.flat_len.to_le_bytes());
+                            buf.extend_from_slice(&chunked.flat_off.to_le_bytes());
+                            buf.extend_from_slice(&(chunked.chunks.len() as u32).to_le_bytes());
+                            for chunk in &chunked.chunks {
+                                buf.extend_from_slice(&chunk.len.to_le_bytes());
+                            }
+                        }
+                        None => {
+                            buf.extend_from_slice(&0u32.to_le_bytes());
+                            buf.extend_from_slice(&0u32.to_le_bytes());
+                            buf.extend_from_slice(&0u32.to_le_bytes());
+                        }
+                    }
                 }
             }
         }
@@ -488,7 +541,55 @@ impl V4Footer {
             }
         }
 
-        Ok(Self { schema, row_groups, zone_maps, col_offsets })
+        // Try reading the CHNK section (backward compat: may not exist).
+        let mut chunk_tables: RgChunkTables = Vec::new();
+        if pos + 4 <= bytes.len() && &bytes[pos..pos+4] == CHUNK_MAGIC {
+            pos += 4;
+            if pos + 4 <= bytes.len() {
+                let rg_count = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap()) as usize;
+                pos += 4;
+                for _ in 0..rg_count {
+                    if pos + 2 > bytes.len() {
+                        break;
+                    }
+                    let ncols = u16::from_le_bytes(bytes[pos..pos+2].try_into().unwrap()) as usize;
+                    pos += 2;
+                    let mut rg_cols: Vec<Option<ChunkedColumn>> = Vec::with_capacity(ncols);
+                    for _ in 0..ncols {
+                        if pos + 12 > bytes.len() {
+                            break;
+                        }
+                        let flat_len = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+                        let flat_off = u32::from_le_bytes(bytes[pos+4..pos+8].try_into().unwrap());
+                        let count = u32::from_le_bytes(bytes[pos+8..pos+12].try_into().unwrap());
+                        pos += 12;
+                        if count == 0 {
+                            rg_cols.push(None);
+                            continue;
+                        }
+                        if (count as usize).saturating_mul(4) > bytes.len().saturating_sub(pos) {
+                            break;
+                        }
+                        let mut chunks = Vec::with_capacity(count as usize);
+                        for _ in 0..count {
+                            let len = u32::from_le_bytes(bytes[pos..pos+4].try_into().unwrap());
+                            pos += 4;
+                            chunks.push(ChunkRef { len });
+                        }
+                        rg_cols.push(Some(ChunkedColumn { chunks, flat_len, flat_off }));
+                    }
+                    chunk_tables.push(rg_cols);
+                }
+            }
+        }
+
+        Ok(Self {
+            schema,
+            row_groups,
+            zone_maps,
+            col_offsets,
+            chunk_tables,
+        })
     }
     
     /// Total active rows across all Row Groups

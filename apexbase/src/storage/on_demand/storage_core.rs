@@ -665,6 +665,7 @@ fn flush_streamed_out_rg<W: std::io::Write + std::io::Seek>(
     rg_metas: &mut Vec<RowGroupMeta>,
     all_zone_maps: &mut RgZoneMaps,
     all_rg_col_offsets: &mut Vec<Vec<u32>>,
+    all_chunk_tables: &mut RgChunkTables,
     compression: CompressionType,
     written_rows: &mut u64,
     stats: &mut [StreamingColumnStats],
@@ -689,6 +690,7 @@ fn flush_streamed_out_rg<W: std::io::Write + std::io::Seek>(
         rg_metas,
         all_zone_maps,
         all_rg_col_offsets,
+        all_chunk_tables,
         compression,
         implicit_ids_ok,
         encoding_options,
@@ -941,7 +943,7 @@ impl OnDemandStorage {
                 header.version = FORMAT_VERSION_V5;
             }
         }
-        let columns = schema
+        let columns: Vec<ColumnData> = schema
             .columns
             .iter()
             .map(|(_, dtype)| ColumnData::new(*dtype))
@@ -1701,11 +1703,93 @@ impl OnDemandStorage {
         if let Some(body) = self.decompressed_rg_cache.read().get(key) {
             return Ok(Some(body));
         }
-        let decompressed = decompress_rg_body(compress_flag, raw)?.unwrap_or_default();
+        // A chunked body is shorter than the flat body its directory describes,
+        // which is what tells the two layouts apart. It is reassembled into that
+        // flat layout before anyone touches a column, so every reader keeps using
+        // the same offsets, id section and skip helpers.
+        // Only a row group with an actual chunk directory can be chunked: the
+        // directory is written together with the layout, so a non-empty entry *is*
+        // the version marker. A group written as a flat frame carries an empty
+        // entry, and inferring from sizes alone would misread it (a compressed
+        // flat body is smaller than the flat body it stands for too). The table is
+        // also padded up to the row-group count, so the index always lines up.
+        let chunk_entry = self.v4_footer.read().as_ref().and_then(|footer| {
+            let rg_idx = footer
+                .row_groups
+                .iter()
+                .position(|meta| meta.offset == rg_offset)?;
+            footer
+                .chunk_tables
+                .get(rg_idx)
+                .filter(|cols| cols.iter().any(Option::is_some))
+                .cloned()
+        });
+        let chunked = chunk_entry.is_some();
+        let declared = chunk_entry
+            .as_ref()
+            .and_then(|cols| cols.iter().flatten().map(|col| col.flat_len).max())
+            .unwrap_or(0) as usize;
+        let decompressed = if chunked {
+            self.assemble_chunked_rg_body(rg_offset, raw, declared, &chunk_entry)?
+        } else {
+            decompress_rg_body(compress_flag, raw)?.unwrap_or_default()
+        };
         let body = std::sync::Arc::new(decompressed);
         let mut cache = self.decompressed_rg_cache.write();
         cache.insert(key, std::sync::Arc::clone(&body));
         Ok(Some(body))
+    }
+
+    /// Rebuild a chunked row group body in the flat layout.
+    ///
+    /// The id section and the deletion vector are uncompressed and lead the body
+    /// in both layouts, so they are carried over byte for byte; every column is
+    /// decompressed frame by frame and placed at its recorded flat offset.
+    fn assemble_chunked_rg_body(
+        &self,
+        rg_offset: u64,
+        raw: &[u8],
+        declared: usize,
+        chunk_entry: &Option<Vec<Option<ChunkedColumn>>>,
+    ) -> io::Result<Vec<u8>> {
+        let columns = chunk_entry
+            .as_ref()
+            .ok_or_else(|| err_data("chunked row group has no chunk directory"))?;
+        let footer = self
+            .v4_footer
+            .read()
+            .clone()
+            .ok_or_else(|| err_data("chunked row group read before its footer was loaded"))?;
+        let rg_idx = footer
+            .row_groups
+            .iter()
+            .position(|meta| meta.offset == rg_offset)
+            .ok_or_else(|| err_data("chunked row group is not in the footer directory"))?;
+        let rg_rows = footer.row_groups[rg_idx].row_count as usize;
+        let id_len = rg_id_section_len(rg_rows, RG_IDS_PLAIN);
+        let mut out = vec![0u8; declared];
+        let prefix = (id_len + rg_rows.div_ceil(8)).min(raw.len()).min(declared);
+        out[..prefix].copy_from_slice(&raw[..prefix]);
+        let mut pos = 0usize;
+        for col in columns.iter().flatten() {
+            let mut frame_pos = pos;
+            for chunk in &col.chunks {
+                let frame_end = frame_pos + CHUNK_FRAME_HEADER_LEN + chunk.len as usize;
+                if frame_end > raw.len() {
+                    return Err(err_data("chunked column frame runs past the row group"));
+                }
+                let bytes = decompress_column_frame(&raw[frame_pos..frame_end])?;
+                let start = col.flat_off as usize;
+                let end = start + bytes.len();
+                if end > out.len() {
+                    return Err(err_data("chunked column frame exceeds the flat body"));
+                }
+                out[start..end].copy_from_slice(&bytes);
+                frame_pos = frame_end;
+            }
+            pos = frame_pos;
+        }
+        Ok(out)
     }
 
     /// Unmap this table's file.
@@ -4818,6 +4902,7 @@ impl OnDemandStorage {
         let mut rg_metas: Vec<RowGroupMeta> = Vec::new();
         let mut all_zone_maps: RgZoneMaps = Vec::new();
         let mut all_rg_col_offsets: Vec<Vec<u32>> = Vec::new();
+        let mut all_chunk_tables: RgChunkTables = Vec::new();
         let mut actual_col_types: Vec<ColumnType> = Vec::new();
         let mut max_id_seen: u64 = 0;
         let mut written_rows: u64 = 0;
@@ -4845,6 +4930,7 @@ impl OnDemandStorage {
                     &mut rg_metas,
                     &mut all_zone_maps,
                     &mut all_rg_col_offsets,
+                    &mut all_chunk_tables,
                     compression,
                     &mut written_rows,
                     &mut column_stats,
@@ -4995,6 +5081,7 @@ impl OnDemandStorage {
                 &mut rg_metas,
                 &mut all_zone_maps,
                 &mut all_rg_col_offsets,
+                &mut all_chunk_tables,
                 compression,
                 implicit_ids_ok,
                 encoding_options,
@@ -5021,6 +5108,7 @@ impl OnDemandStorage {
             row_groups: rg_metas.clone(),
             zone_maps: all_zone_maps,
             col_offsets: all_rg_col_offsets,
+            chunk_tables: all_chunk_tables,
         };
         writer.write_all(&final_footer.to_bytes())?;
         writer.flush()?;
@@ -5148,6 +5236,7 @@ impl OnDemandStorage {
         rg_metas: &mut Vec<RowGroupMeta>,
         all_zone_maps: &mut RgZoneMaps,
         all_rg_col_offsets: &mut Vec<Vec<u32>>,
+        all_chunk_tables: &mut RgChunkTables,
         compression: CompressionType,
         implicit_ids_ok: bool,
         encoding_options: ColumnEncodingOptions,
@@ -5183,6 +5272,7 @@ impl OnDemandStorage {
         let id_section_len = rg_id_section_len(chunk_rows, id_encoding);
         let null_bitmap_len = (chunk_rows + 7) / 8;
         let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + chunk_rows * col_count);
+        let mut col_ranges: Vec<(usize, usize)> = Vec::with_capacity(col_count);
         {
             let mut bw = std::io::Cursor::new(&mut body_buf);
             if id_encoding == RG_IDS_PLAIN {
@@ -5197,6 +5287,7 @@ impl OnDemandStorage {
             // Fresh compaction output has no deleted rows.
             bw.write_all(&vec![0u8; null_bitmap_len])?;
             let mut rg_col_offsets: Vec<u32> = Vec::with_capacity(col_count);
+            let mut col_ends: Vec<usize> = Vec::with_capacity(col_count);
             for col_idx in 0..col_count {
                 let chunk_col = columns[col_idx].slice_range(chunk_start, chunk_end);
                 let dict_encoded = if is_first_rg {
@@ -5227,17 +5318,32 @@ impl OnDemandStorage {
                     Self::slice_null_bitmap(&nulls[col_idx], chunk_start, chunk_end);
                 bw.write_all(&chunk_nulls)?;
                 write_column_encoded(processed, schema_cols[col_idx].1, &mut bw, encoding_options)?;
+                col_ends.push(bw.position() as usize);
             }
-            all_rg_col_offsets.push(rg_col_offsets);
+            for idx in 0..col_count {
+                col_ranges.push((rg_col_offsets[idx] as usize, col_ends[idx]));
+            }
         }
 
-        let (compress_flag, disk_body) = compress_rg_body(body_buf, compression);
+        let layout = table_uses_chunk_layout(all_chunk_tables);
+        let (compress_flag, disk_body, body_chunks, rg_col_offsets) =
+            encode_rg_body_with_layout(body_buf, &col_ranges, compression, layout)?;
+        all_rg_col_offsets.push(rg_col_offsets);
+        let encoding_version = if body_chunks.is_some() {
+            RG_CHUNKED_ENCODING_VERSION
+        } else {
+            RG_ENCODING_VERSION
+        };
+        all_chunk_tables.push(match body_chunks {
+            Some(cols) => cols.into_iter().map(Some).collect(),
+            None => Vec::new(),
+        });
         writer.write_all(MAGIC_ROW_GROUP)?;
         writer.write_all(&(chunk_rows as u32).to_le_bytes())?;
         writer.write_all(&(col_count as u32).to_le_bytes())?;
         writer.write_all(&min_id.to_le_bytes())?;
         writer.write_all(&max_id.to_le_bytes())?;
-        writer.write_all(&[compress_flag, 1, id_encoding, 0])?;
+        writer.write_all(&[compress_flag, encoding_version, id_encoding, 0])?;
         writer.write_all(&disk_body)?;
 
         // Per-RG zone maps (numeric min/max; string length + value + tail
@@ -5371,6 +5477,7 @@ impl OnDemandStorage {
         let mut rg_metas: Vec<RowGroupMeta> = Vec::new();
         let mut all_zone_maps: RgZoneMaps = Vec::new();
         let mut all_rg_col_offsets: Vec<Vec<u32>> = Vec::new();
+        let mut all_chunk_tables: RgChunkTables = Vec::new();
         let mut actual_col_types: Vec<ColumnType> = Vec::new();
         let mut max_id_seen: u64 = 0;
         let mut written_rows: u64 = 0;
@@ -5398,6 +5505,7 @@ impl OnDemandStorage {
                     &mut rg_metas,
                     &mut all_zone_maps,
                     &mut all_rg_col_offsets,
+                    &mut all_chunk_tables,
                     compression,
                     &mut written_rows,
                     &mut column_stats,
@@ -5477,6 +5585,7 @@ impl OnDemandStorage {
                 &mut rg_metas,
                 &mut all_zone_maps,
                 &mut all_rg_col_offsets,
+                &mut all_chunk_tables,
                 compression,
                 implicit_ids_ok,
                 encoding_options,
@@ -5501,6 +5610,7 @@ impl OnDemandStorage {
             row_groups: rg_metas.clone(),
             zone_maps: all_zone_maps,
             col_offsets: all_rg_col_offsets,
+            chunk_tables: all_chunk_tables,
         };
         writer.write_all(&final_footer.to_bytes())?;
         writer.flush()?;

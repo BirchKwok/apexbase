@@ -711,6 +711,27 @@ fn sorted_keys<V>(bucket: &HashMap<String, V>) -> Vec<&String> {
 /// group whose `min_id <= id` is the only candidate. This is the point-read
 /// directory lookup; the linear walk it replaces cost one footer comparison per
 /// row group on every `_id = X` access.
+/// The bit vector is what a scan actually reads, so counting it is the authority
+/// for how far the active row space has been compacted — a per-group
+/// `deletion_count` summary can lag a partially rewritten footer, and a
+/// per-group prefix cannot express a deletion *inside* the row's own group.
+fn count_deleted_bits(deletions: &[u8], end: usize) -> usize {
+    let whole_bytes = end / 8;
+    let mut total: usize = deletions
+        .iter()
+        .take(whole_bytes.min(deletions.len()))
+        .map(|byte| byte.count_ones() as usize)
+        .sum();
+    // The trailing partial byte must not count bits past `end`.
+    if whole_bytes < deletions.len() {
+        let remaining = end % 8;
+        if remaining > 0 {
+            total += (deletions[whole_bytes] & ((1u8 << remaining) - 1)).count_ones() as usize;
+        }
+    }
+    total
+}
+
 fn find_row_group_for_id(row_groups: &[RowGroupMeta], id: u64) -> Option<usize> {
     let end = row_groups.partition_point(|rg| rg.min_id <= id);
     if end == 0 {
@@ -1070,6 +1091,120 @@ impl OnDemandStorage {
         Ok(Some(positions))
     }
 
+    /// `positions_for_ids` declines as soon as a group carries deletions, because
+    /// its dense-id arithmetic would otherwise return a position for a deleted
+    /// row. A deletion does not disturb that arithmetic — the deleted row's bytes
+    /// are still on disk — so the positions stay exact and the *caller* decides
+    /// what to do with the hidden ones. Groups whose ids are not dense still
+    /// decline: only the deletion case has an exact directory answer.
+    pub fn positions_for_ids_including_deleted(
+        &self,
+        ids: &[u64],
+    ) -> io::Result<Option<Vec<usize>>> {
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        let mut starts: Vec<usize> = Vec::with_capacity(footer.row_groups.len());
+        let mut cumulative = 0usize;
+        for rg in &footer.row_groups {
+            if rg.row_count > 0
+                && (rg.max_id < rg.min_id || rg.max_id - rg.min_id + 1 != u64::from(rg.row_count))
+            {
+                return Ok(None);
+            }
+            starts.push(cumulative);
+            cumulative += rg.row_count as usize;
+        }
+        let mut positions = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some(rg_i) = find_row_group_for_id(&footer.row_groups, id) else {
+                continue;
+            };
+            positions.push(starts[rg_i] + (id - footer.row_groups[rg_i].min_id) as usize);
+        }
+        Ok(Some(positions))
+    }
+    /// Returns `None` when the directory cannot place the ids (non-dense groups),
+    /// exactly like `positions_for_ids`, and when the group holds no deletions it
+    /// defers to `positions_for_ids` so the clean path keeps its exact behaviour.
+    pub fn active_positions_for_ids(&self, ids: &[u64]) -> io::Result<Option<Vec<usize>>> {
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        if !footer.row_groups.iter().any(|rg| rg.deletion_count > 0) {
+            return self.positions_for_ids(ids);
+        }
+        // The persisted vector is only the whole answer while no *unpersisted*
+        // deletion shadows it. `self.deleted` is indexed over the write buffer
+        // (base mirror plus appended tail), so its bits cannot be compared with
+        // the on-disk byte positions, and a buffer that mirrors the base (or an
+        // appended tail) makes the on-disk index name the wrong row. The id
+        // reader the caller falls back to merges both overlays correctly.
+        if self.pending_v4_in_memory_rows() > 0
+            || self.buffered_row_count() as u64 > self.persisted_row_count.load(Ordering::SeqCst)
+            || self.deleted.read().iter().any(|byte| *byte != 0)
+        {
+            return Ok(None);
+        }
+        let mut starts: Vec<usize> = Vec::with_capacity(footer.row_groups.len());
+        let mut cumulative = 0usize;
+        for rg in &footer.row_groups {
+            if rg.row_count > 0
+                && (rg.max_id < rg.min_id || rg.max_id - rg.min_id + 1 != u64::from(rg.row_count))
+            {
+                return Ok(None);
+            }
+            starts.push(cumulative);
+            cumulative += rg.row_count as usize;
+        }
+        let deletions = self.persisted_deletion_bitmap()?;
+        let mut positions = Vec::with_capacity(ids.len());
+        for &id in ids {
+            let Some(rg_i) = find_row_group_for_id(&footer.row_groups, id) else {
+                continue;
+            };
+            let physical = starts[rg_i] + (id - footer.row_groups[rg_i].min_id) as usize;
+            // The *bit* is authoritative, not the footer's `deletion_count`: the
+            // counter is a summary that a partially rewritten footer can lag, and
+            // treating a stale zero as "row alive" would hand the caller a
+            // position for a row the scan refuses to return.
+            if !deletions.is_empty() {
+                let byte = physical / 8;
+                if byte >= deletions.len() || (deletions[byte] >> (physical % 8)) & 1 == 1 {
+                    continue;
+                }
+            }
+            // The active row number is the physical one minus every deletion at
+            // or before it — including the ones *inside* this group, which a
+            // per-group prefix cannot express. Counting the bits directly also
+            // keeps this in step with what the scan reads.
+            positions.push(physical - count_deleted_bits(&deletions, physical));
+        }
+        Ok(Some(positions))
+    }
+    /// Returns the untouched positions when no deletion is set, so a clean table
+    /// pays one footer walk.
+    pub fn activate_positions(&self, positions: &mut Vec<usize>) -> io::Result<()> {
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(());
+        };
+        if !footer.row_groups.iter().any(|rg| rg.deletion_count > 0) {
+            return Ok(());
+        }
+        let deletions = self.persisted_deletion_bitmap()?;
+        if deletions.is_empty() {
+            return Ok(());
+        }
+        positions.retain_mut(|position| {
+            let byte = *position / 8;
+            if byte >= deletions.len() || (deletions[byte] >> (*position % 8)) & 1 == 1 {
+                return false;
+            }
+            *position -= count_deleted_bits(&deletions, *position);
+            true
+        });
+        Ok(())
+    }
     /// Append one borrowed row to an existing schema without allocating ColumnValue objects.
     pub fn insert_one_schema_stable_borrowed(
         &self,
@@ -2390,6 +2525,11 @@ impl OnDemandStorage {
                         },
                         col_offsets: if rg_i < footer.col_offsets.len() {
                             vec![footer.col_offsets[rg_i].clone()]
+                        } else {
+                            vec![]
+                        },
+                        chunk_tables: if rg_i < footer.chunk_tables.len() {
+                            vec![footer.chunk_tables[rg_i].clone()]
                         } else {
                             vec![]
                         },
@@ -5264,6 +5404,7 @@ impl OnDemandStorage {
         let mut rg_metas: Vec<RowGroupMeta> = Vec::new();
         let mut all_zone_maps: RgZoneMaps = Vec::new();
         let mut all_rg_col_offsets: Vec<Vec<u32>> = Vec::new();
+        let mut all_chunk_tables: RgChunkTables = Vec::new();
         let mut actual_col_types: Vec<ColumnType> = Vec::new();
         let mut chunk_start = 0;
 
@@ -5305,6 +5446,8 @@ impl OnDemandStorage {
             let is_single_rg = chunk_start == 0 && chunk_end == active_count;
             let null_bitmap_len = (chunk_rows + 7) / 8;
             let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + chunk_rows * col_count);
+            let mut col_ends: Vec<usize> = Vec::with_capacity(col_count);
+            let mut col_ranges: Vec<(usize, usize)> = Vec::with_capacity(col_count);
             {
                 let mut body_writer = std::io::Cursor::new(&mut body_buf);
 
@@ -5379,13 +5522,31 @@ impl OnDemandStorage {
                         schema_clone.columns[col_idx].1,
                         &mut body_writer,
                         encoding_options,
-                    )?
+                    )?;
+                    col_ends.push(body_writer.position() as usize);
                 }
-                all_rg_col_offsets.push(rg_col_offsets);
+                for idx in 0..col_count {
+                    col_ranges.push((rg_col_offsets[idx] as usize, col_ends[idx]));
+                }
             }
 
-            // Compress body using configured compression algorithm
-            let (compress_flag, disk_body) = compress_rg_body(body_buf, self.compression());
+            // A compressed group may store each column as its own frame (see
+            // `encode_rg_body`); the returned offsets always describe the flat
+            // body, which is what readers address. The layout is table-wide: the
+            // first group decides and every later group follows.
+            let layout = table_uses_chunk_layout(&all_chunk_tables);
+            let (compress_flag, disk_body, body_chunks, rg_col_offsets) =
+                encode_rg_body_with_layout(body_buf, &col_ranges, self.compression(), layout)?;
+            all_rg_col_offsets.push(rg_col_offsets);
+            let encoding_version = if body_chunks.is_some() {
+                RG_CHUNKED_ENCODING_VERSION
+            } else {
+                RG_ENCODING_VERSION
+            };
+            all_chunk_tables.push(match body_chunks {
+                Some(cols) => cols.into_iter().map(Some).collect(),
+                None => Vec::new(),
+            });
 
             // RG header (32 bytes) — byte 28 = compression flag, byte 29 = encoding version
             writer.write_all(MAGIC_ROW_GROUP)?;
@@ -5393,7 +5554,7 @@ impl OnDemandStorage {
             writer.write_all(&(col_count as u32).to_le_bytes())?;
             writer.write_all(&min_id.to_le_bytes())?;
             writer.write_all(&max_id.to_le_bytes())?;
-            writer.write_all(&[compress_flag, 1, id_encoding, 0])?;
+            writer.write_all(&[compress_flag, encoding_version, id_encoding, 0])?;
 
             // RG body (possibly compressed)
             writer.write_all(&disk_body)?;
@@ -5442,6 +5603,7 @@ impl OnDemandStorage {
             row_groups: rg_metas.clone(),
             zone_maps: all_zone_maps,
             col_offsets: all_rg_col_offsets,
+            chunk_tables: all_chunk_tables,
         };
         writer.write_all(&footer.to_bytes())?;
         writer.flush()?;
@@ -5650,6 +5812,7 @@ impl OnDemandStorage {
             }],
             zone_maps: Vec::new(),
             col_offsets: Vec::new(),
+            chunk_tables: Vec::new(),
         };
         let footer_bytes = footer.to_bytes();
 
@@ -7052,6 +7215,8 @@ impl OnDemandStorage {
                 (vec![0u8; null_bitmap_len], 0)
             };
             let mut body_buf: Vec<u8> = Vec::with_capacity(id_section_len + rg_rows * col_count);
+            let mut col_ends: Vec<usize> = Vec::with_capacity(col_count);
+            let mut col_ranges: Vec<(usize, usize)> = Vec::with_capacity(col_count);
             {
                 let mut body_writer = std::io::Cursor::new(&mut body_buf);
 
@@ -7108,8 +7273,11 @@ impl OnDemandStorage {
                             write_column_encoded(col, col_type, &mut body_writer, encoding_options)?;
                         }
                     }
+                    col_ends.push(body_writer.position() as usize);
                 }
-                footer.col_offsets.push(new_rg_col_offsets);
+                for idx in 0..col_count {
+                    col_ranges.push((new_rg_col_offsets[idx] as usize, col_ends[idx]));
+                }
 
                 // The ZMAP section is positional per Row Group, so the section
                 // has to be padded up to this group's index before ours can be
@@ -7127,8 +7295,22 @@ impl OnDemandStorage {
                 ));
             }
 
-            // Compress body using configured compression algorithm
-            let (compress_flag, disk_body) = compress_rg_body(body_buf, self.compression());
+            let layout = table_uses_chunk_layout(&footer.chunk_tables);
+            let (compress_flag, disk_body, body_chunks, new_rg_col_offsets) =
+                encode_rg_body_with_layout(body_buf, &col_ranges, self.compression(), layout)?;
+            footer.col_offsets.push(new_rg_col_offsets);
+            let encoding_version = if body_chunks.is_some() {
+                RG_CHUNKED_ENCODING_VERSION
+            } else {
+                RG_ENCODING_VERSION
+            };
+            while footer.chunk_tables.len() < footer.row_groups.len() {
+                footer.chunk_tables.push(Vec::new());
+            }
+            footer.chunk_tables.push(match body_chunks {
+                Some(cols) => cols.into_iter().map(Some).collect(),
+                None => Vec::new(),
+            });
 
             // Write RG header (32 bytes) — byte 28 = compression flag
             writer.write_all(MAGIC_ROW_GROUP)?;
@@ -7136,7 +7318,7 @@ impl OnDemandStorage {
             writer.write_all(&(col_count as u32).to_le_bytes())?;
             writer.write_all(&min_id.to_le_bytes())?;
             writer.write_all(&max_id.to_le_bytes())?;
-            writer.write_all(&[compress_flag, 1, id_encoding, 0])?;
+            writer.write_all(&[compress_flag, encoding_version, id_encoding, 0])?;
 
             // RG body (possibly compressed)
             writer.write_all(&disk_body)?;

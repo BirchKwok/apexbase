@@ -171,6 +171,108 @@ impl ApexExecutor {
         Ok(Some(positions))
     }
 
+    /// Physical row positions of the matches on a table whose file carries a
+    /// persisted deletion vector, together with the ids to answer with.
+    ///
+    /// Every reader behind `read_columns_by_indices_to_arrow` speaks the
+    /// **physical** row space: its payload lanes decode a column positionally
+    /// (`extract_rows_by_indices_to_arrow` groups indices by physical
+    /// `rg_bounds`), the global string dictionary is built over the physical
+    /// rows, and `read_ids_by_indices` indexes the physical `ids` array. A scan,
+    /// on the other hand, never shows a deleted row, so the ids the statement
+    /// must report are only the ones that survive.
+    ///
+    /// `positions_for_ids` refuses a file with deletions, which used to send the
+    /// whole statement to the deletion-aware *id* reader: slower, and unable to
+    /// carry vector/blob columns. The physical positions are still exact (a
+    /// deleted row keeps its bytes), so this resolves them and filters the
+    /// deleted ones out; the caller drops the matching ids so the shared tail's
+    /// `MATCH()` re-check sees exactly the surviving rows.
+    ///
+    /// Returns `None` when the directory cannot place the ids (non-dense groups)
+    /// or the write buffer shadows the vector; the caller then keeps the id
+    /// reader.
+    fn fts_row_positions_physical(
+        backend: &crate::storage::backend::TableStorageBackend,
+        bitmap: &roaring::RoaringTreemap,
+        page: Option<usize>,
+    ) -> io::Result<Option<(Vec<usize>, Vec<i64>)>> {
+        let wanted = match page {
+            Some(page) => page,
+            None => bitmap.len() as usize,
+        };
+        if wanted == 0 {
+            return Ok(Some((Vec::new(), Vec::new())));
+        }
+        // A page counts *surviving* matches, so ask for a little more than the
+        // page and drop the deleted ones; a shortfall falls back to the whole
+        // bitmap so a page can never come back silently short.
+        let window = wanted.saturating_add(wanted / 4).saturating_add(16);
+        let ids: Vec<u64> = bitmap.iter().take(window).collect();
+        let Some(positions) = backend.storage.positions_for_ids_including_deleted(&ids)? else {
+            return Ok(None);
+        };
+        if positions.len() >= wanted || ids.len() < window {
+            let mut positions = positions;
+            let mut ids: Vec<i64> = ids.iter().map(|&id| id as i64).collect();
+            positions.truncate(wanted);
+            ids.truncate(wanted);
+            return Ok(Some((positions, ids)));
+        }
+        let all: Vec<u64> = bitmap.iter().collect();
+        let Some(positions) = backend
+            .storage
+            .positions_for_ids_including_deleted(&all)?
+        else {
+            return Ok(None);
+        };
+        let mut positions = positions;
+        let mut ids: Vec<i64> = all.iter().map(|&id| id as i64).collect();
+        positions.truncate(wanted);
+        ids.truncate(wanted);
+        Ok(Some((positions, ids)))
+    }
+
+    /// Keep only the rows in `batch` whose `_id` is in `keep`.
+    ///
+    /// The physical staging hands back every row the directory placed, including
+    /// the deleted ones. Dropping them with an Arrow `take` keeps the payload
+    /// arrays untouched, so vector and blob columns come through unmodified.
+    fn drop_deleted_rows(
+        batch: RecordBatch,
+        keep: &roaring::RoaringTreemap,
+    ) -> io::Result<RecordBatch> {
+        let Some(ids) = batch
+            .column_by_name("_id")
+            .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+        else {
+            return Err(err_data("row selection staged a batch without `_id`"));
+        };
+        let take = arrow::array::UInt32Array::from(
+            (0..ids.len())
+                .filter(|&index| {
+                    !ids.is_null(index)
+                        && ids.value(index) >= 0
+                        && keep.contains(ids.value(index) as u64)
+                })
+                .map(|index| index as u32)
+                .collect::<Vec<_>>(),
+        );
+        if take.len() == ids.len() {
+            return Ok(batch);
+        }
+        let columns: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .map(|column| {
+                arrow::compute::take(column.as_ref(), &take, None)
+                    .map_err(|error| err_data(error.to_string()))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        RecordBatch::try_new(batch.schema(), columns)
+            .map_err(|error| err_data(error.to_string()))
+    }
+
     /// Bitmap only when the whole predicate *is* a `MATCH()` term (possibly
     /// parenthesized), as opposed to one conjunct of a larger `AND`.
     ///
@@ -201,8 +303,16 @@ impl ApexExecutor {
         let Some(bitmap) = Self::fts_conjunct_bitmap(where_clause) else {
             return Ok(None);
         };
-        // Overlay rows are not described by the persisted index snapshot.
-        if !backend.overlay_state().is_clean_view() {
+        // Overlay rows are not described by the persisted index snapshot, so an
+        // appended delta, an unflushed row or a pending cell needs the merged
+        // readers. A persisted deletion vector only *hides* rows: the directory
+        // still places them, and the hidden ones are dropped after staging.
+        let overlay = backend.overlay_state();
+        if overlay.pending_cells
+            || overlay.appended_rows
+            || overlay.unflushed_rows
+            || overlay.base_in_memory
+        {
             return Ok(None);
         }
         let total = backend.active_row_count();
@@ -269,19 +379,19 @@ impl ApexExecutor {
         if page == Some(0) {
             return Ok(Some(backend.read_columns_to_arrow(None, 0, Some(0))?));
         }
-        // Without a deletion vector the active and physical row spaces coincide,
-        // so the selected rows can be staged by position: only the columns the
-        // statement needs are decoded, and vector/blob columns come back intact
-        // (the per-id reader below cannot represent them).
-        if backend.active_row_count() == backend.base_row_count() {
-            let Some(mut positions) = Self::fts_row_positions(backend, &bitmap, page)? else {
-                return Ok(None);
-            };
-            if let Some(page) = page {
-                // Positions are staged in scan order, which is the order the shared
-                // tail's LIMIT/OFFSET counts in.
-                positions.truncate(page);
-            }
+        // Stage the selected rows by position: only the columns the statement
+        // needs are decoded, and vector/blob columns come back intact (the
+        // per-id reader below cannot represent them). The lane always works in
+        // the *physical* row space, which is the space every reader behind
+        // `read_columns_by_indices_to_arrow` speaks; a persisted deletion vector
+        // only means some of the staged rows have to be dropped afterwards.
+        let staged = Self::fts_row_positions_physical(backend, &bitmap, page)?.or_else(|| {
+            Self::fts_row_positions(backend, &bitmap, page)
+                .ok()
+                .flatten()
+                .map(|positions| (positions, Vec::new()))
+        });
+        if let Some((positions, ids)) = staged {
             if positions.is_empty() {
                 return Ok(None);
             }
@@ -289,12 +399,20 @@ impl ApexExecutor {
             let col_refs_vec: Option<Vec<&str>> = col_refs
                 .as_ref()
                 .map(|refs| refs.iter().map(|name| name.as_str()).collect());
-            return Ok(Some(
-                backend.read_columns_by_indices_to_arrow(&positions, col_refs_vec.as_deref())?,
-            ));
+            let batch =
+                backend.read_columns_by_indices_to_arrow(&positions, col_refs_vec.as_deref())?;
+            if ids.is_empty() {
+                return Ok(Some(batch));
+            }
+            // The staged rows include the deleted ones; the tail re-runs the
+            // `MATCH()` predicate against `_id` from the original bitmap, so
+            // dropping exactly those rows both filters and re-checks in one pass.
+            let keep: roaring::RoaringTreemap =
+                ids.iter().filter(|&&id| id >= 0).map(|&id| id as u64).collect();
+            return Ok(Some(Self::drop_deleted_rows(batch, &keep)?));
         }
-        // A deletion vector shifts the spaces apart: the id reader is
-        // deletion-aware but can only stage scalar columns.
+        // Only the id reader can place the matches now (the directory could not
+        // prove density), and it can only stage scalar columns.
         if !Self::row_selection_covers_schema(backend) {
             return Ok(None);
         }
@@ -4723,6 +4841,23 @@ let can_pushdown_limit = stmt.where_clause.is_none()
         let single_filter = (predicates.len() == 1).then(|| predicates[0].clone());
 
         let mut unique_cols: Vec<String> = Vec::new();
+        // `value_needed[i]` is false when `unique_cols[i]` only feeds `COUNT(col)`,
+        // so the fused lanes can answer from the validity bitmap instead of
+        // decoding the value column.
+        let mut value_needed: Vec<bool> = Vec::new();
+        fn note_column(
+            unique_cols: &mut Vec<String>,
+            value_needed: &mut Vec<bool>,
+            name: &str,
+            needs_value: bool,
+        ) {
+            if let Some(position) = unique_cols.iter().position(|c| c == name) {
+                value_needed[position] |= needs_value;
+            } else {
+                unique_cols.push(name.to_string());
+                value_needed.push(needs_value);
+            }
+        }
         for col in &stmt.columns {
             if let SelectColumn::Aggregate {
                 func,
@@ -4734,6 +4869,7 @@ let can_pushdown_limit = stmt.where_clause.is_none()
                 if *distinct {
                     return Ok(None);
                 }
+                let needs_value = !matches!(func, AggregateFunc::Count);
                 if let Some(col_name) = column {
                     let is_count_star = matches!(func, AggregateFunc::Count)
                         && (col_name.as_str() == "*"
@@ -4743,16 +4879,14 @@ let can_pushdown_limit = stmt.where_clause.is_none()
                                 .map(|c| c.is_ascii_digit())
                                 .unwrap_or(false));
                     if is_count_star {
-                        if !unique_cols.iter().any(|c| c == "*") {
-                            unique_cols.push("*".to_string());
-                        }
-                    } else if !unique_cols.contains(col_name) {
-                        unique_cols.push(col_name.clone());
+                        note_column(&mut unique_cols, &mut value_needed, "*", false);
+                    } else {
+                        note_column(&mut unique_cols, &mut value_needed, col_name, needs_value);
                     }
                 } else if !matches!(func, AggregateFunc::Count) {
                     return Ok(None);
-                } else if !unique_cols.iter().any(|c| c == "*") {
-                    unique_cols.push("*".to_string());
+                } else {
+                    note_column(&mut unique_cols, &mut value_needed, "*", false);
                 }
             } else {
                 return Ok(None);
@@ -4767,9 +4901,10 @@ let can_pushdown_limit = stmt.where_clause.is_none()
             .iter()
             .map(|(column, low, high)| (column.as_str(), *low, *high))
             .collect::<Vec<_>>();
-        let cached_results = backend.execute_filtered_numeric_agg_cached(
+        let cached_results = backend.execute_filtered_numeric_agg_cached_planned(
             &predicate_refs,
             &col_refs,
+            &value_needed,
         )?;
         let agg_results = if let Some(results) = cached_results {
             results
@@ -4790,28 +4925,36 @@ let can_pushdown_limit = stmt.where_clause.is_none()
                     &col_refs,
                 )? {
                     Some(results) => results,
-                    None => match backend.execute_filtered_numeric_agg_mmap(
+                    None => match backend.execute_filtered_numeric_agg_mmap_planned(
                         &filter_col,
                         low,
                         high,
                         &col_refs,
+                        &value_needed,
                     )? {
                         Some(results) => results,
                         None => return Ok(None),
                     },
                 },
-                None => match backend.execute_filtered_numeric_agg_mmap(
+                None => match backend.execute_filtered_numeric_agg_mmap_planned(
                     &filter_col,
                     low,
                     high,
                     &col_refs,
+                    &value_needed,
                 )? {
                     Some(results) => results,
                     None => return Ok(None),
                 },
             }
         } else if let Some((filter_col, low, high)) = single_filter {
-            match backend.execute_filtered_numeric_agg_mmap(&filter_col, low, high, &col_refs)? {
+            match backend.execute_filtered_numeric_agg_mmap_planned(
+                &filter_col,
+                low,
+                high,
+                &col_refs,
+                &value_needed,
+            )? {
                 Some(results) => results,
                 None => return Ok(None),
             }

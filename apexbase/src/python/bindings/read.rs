@@ -840,6 +840,10 @@ impl ApexStorageImpl {
         }
 
         let mut unique_cols: Vec<String> = Vec::new();
+        // `value_needed[i]` is false when `unique_cols[i]` is only referenced by
+        // `COUNT(col)`: the fused lane then counts matched non-NULL rows without
+        // decoding the value column.
+        let mut value_needed: Vec<bool> = Vec::new();
         for (func, col, _) in &agg_exprs {
             let is_count_star = func == "COUNT"
                 && col
@@ -855,10 +859,15 @@ impl ApexStorageImpl {
             if is_count_star {
                 if !unique_cols.iter().any(|c| c == "*") {
                     unique_cols.push("*".to_string());
+                    value_needed.push(false);
                 }
             } else if let Some(c) = col {
-                if !unique_cols.contains(c) {
+                let needs_value = func != "COUNT";
+                if let Some(position) = unique_cols.iter().position(|existing| existing == c) {
+                    value_needed[position] |= needs_value;
+                } else {
                     unique_cols.push(c.clone());
+                    value_needed.push(needs_value);
                 }
             }
         }
@@ -868,7 +877,13 @@ impl ApexStorageImpl {
 
         let col_refs: Vec<&str> = unique_cols.iter().map(String::as_str).collect();
         let agg_result = py.allow_threads(|| {
-            backend.execute_filtered_numeric_agg_mmap(&filter_column, low, high, &col_refs)
+            backend.execute_filtered_numeric_agg_mmap_planned(
+                &filter_column,
+                low,
+                high,
+                &col_refs,
+                &value_needed,
+            )
         });
         let Some(stats) = agg_result.map_err(|e| PyIOError::new_err(e.to_string()))? else {
             return Ok(None);
