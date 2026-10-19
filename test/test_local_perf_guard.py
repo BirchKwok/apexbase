@@ -366,18 +366,17 @@ def test_hot_shape_specs_cover_the_scoreboard_gaps():
         "COUNT(col) partial",
         "COUNT(col) string filter",
         "Numeric range LIMIT (delta overlay)",
+        "Numeric range LIMIT (filter-column update)",
         "String cell UPDATE (single row)",
         "DELETE by _id",
         "DELETE bounded range",
     ):
         assert expected in names
-    # M-13: the shapes that mutate `default` run after the reads; the overlay
-    # shape then switches to its own table.
-    assert names[-4:] == [
+    # M-13: the shapes that mutate `default` run after the reads.
+    assert names[-3:] == [
         "String cell UPDATE (single row)",
         "DELETE by _id",
         "DELETE bounded range",
-        "Numeric range LIMIT (delta overlay)",
     ]
 
 

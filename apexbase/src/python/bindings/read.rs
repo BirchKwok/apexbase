@@ -732,17 +732,25 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        // A persisted DeltaStore overlay is visible on top of the base. The
-        // bounded scan stays exact while the overlay touches no filter column and
-        // appends no rows; the index reader below merges the updated cells and
-        // drops the rows a pending delete hides. Appended rows keep the merged
-        // executor route because they extend the visible row space.
+        // A persisted DeltaStore overlay is visible on top of the base. Appended
+        // rows extend the visible row space and keep the merged executor route.
         let pending_cells = backend.has_pending_deltas();
-        if backend.has_delta()
-            || backend.pending_v4_in_memory_rows() > 0
-            || (pending_cells && backend.pending_delta_updates_column(&filter_column))
-        {
+        if backend.has_delta() || backend.pending_v4_in_memory_rows() > 0 {
             return Ok(None);
+        }
+        // An update to the filter column changes range membership, so the base
+        // scan alone is not authoritative; re-evaluate only the touched rows and
+        // merge their positions with the bounded base scan.
+        if pending_cells && backend.pending_delta_updates_column(&filter_column) {
+            return Self::numeric_range_limit_after_filter_update(
+                py,
+                &backend,
+                &filter_column,
+                low,
+                high,
+                limit,
+                offset,
+            );
         }
         // Every pending delete can remove one base match, so fetch that many
         // extra candidates; the merge below then yields the requested window.
@@ -1543,5 +1551,145 @@ impl ApexStorageImpl {
         } else {
             Ok(None)
         }
+    }
+}
+
+impl ApexStorageImpl {
+    /// Bounded numeric-range read when the overlay updates the filter column.
+    ///
+    /// The base scan cannot decide membership: an updated filter value may enter
+    /// or leave the range, and the generic merged executor would materialize the
+    /// whole table (1M rows: >1 s). Re-evaluate only the rows the DeltaStore
+    /// touched and merge their positions with the bounded base scan:
+    ///
+    /// - a changed row that leaves the range is dropped from the candidates;
+    /// - a changed row that enters it is inserted in row order;
+    /// - every other row keeps the base scan's (already bounded) result.
+    ///
+    /// The scan over-fetches by `leaves + enters` so the first `offset + limit`
+    /// visible rows are always covered: each removal shifts the window by one and
+    /// each insertion before the window consumes one slot.
+    fn numeric_range_limit_after_filter_update(
+        py: Python<'_>,
+        backend: &TableStorageBackend,
+        filter_column: &str,
+        low: f64,
+        high: f64,
+        limit: usize,
+        offset: usize,
+    ) -> PyResult<Option<PyObject>> {
+        // Deletions and appended rows would change the row space; the generic
+        // merged path stays exact for those combinations.
+        if backend.has_delta()
+            || backend.pending_v4_in_memory_rows() > 0
+            || backend.pending_delta_delete_count() > 0
+        {
+            return Ok(None);
+        }
+
+        let mut changed: Vec<(u64, Option<f64>)> = Vec::new();
+        for (row_id, column, value) in backend.pending_delta_updated_cells() {
+            if !column.eq_ignore_ascii_case(filter_column) {
+                continue;
+            }
+            let numeric = match value {
+                crate::data::Value::Null => None,
+                other => match other.as_f64() {
+                    Some(value) => Some(value),
+                    // A non-numeric assignment to a numeric filter column has
+                    // no defined range semantics here; let the generic path
+                    // decide instead of guessing.
+                    None => return Ok(None),
+                },
+            };
+            changed.push((row_id, numeric));
+        }
+        if changed.is_empty() {
+            return Ok(None);
+        }
+        let ids: Vec<u64> = changed.iter().map(|(row_id, _)| *row_id).collect();
+        let Some(positions) = backend.storage.positions_for_ids(&ids)? else {
+            return Ok(None);
+        };
+        if positions.len() != ids.len() {
+            return Ok(None);
+        }
+
+        // Base (pre-overlay) filter values at the touched rows. This must be
+        // the physical Arrow extractor, not `read_column_by_indices`: the latter
+        // serves the in-memory buffer and returns zeros for an mmap-only table.
+        let Some(base_batch) = backend
+            .storage
+            .extract_rows_by_indices_to_arrow(&positions, Some(&[filter_column]))?
+        else {
+            return Ok(None);
+        };
+        let Some(base_array) = base_batch.column_by_name(filter_column) else {
+            return Ok(None);
+        };
+        let base_value = |index: usize| -> Option<f64> {
+            use arrow::array::{Array, Float64Array, Int64Array};
+            if let Some(values) = base_array.as_any().downcast_ref::<Int64Array>() {
+                values.is_valid(index).then(|| values.value(index) as f64)
+            } else if let Some(values) = base_array.as_any().downcast_ref::<Float64Array>() {
+                values.is_valid(index).then(|| values.value(index))
+            } else {
+                None
+            }
+        };
+
+        let mut leaves: Vec<usize> = Vec::new();
+        let mut enters: Vec<usize> = Vec::new();
+        for (index, &(_, updated)) in changed.iter().enumerate() {
+            let Some(base) = base_value(index) else {
+                return Ok(None);
+            };
+            let base_matches = base >= low && base <= high;
+            let new_matches = updated.is_some_and(|value| value >= low && value <= high);
+            if base_matches && !new_matches {
+                leaves.push(positions[index]);
+            } else if !base_matches && new_matches {
+                enters.push(positions[index]);
+            }
+        }
+
+        let needed = offset
+            .saturating_add(limit)
+            .saturating_add(leaves.len())
+            .saturating_add(enters.len());
+        let selected = py.allow_threads(|| -> io::Result<Option<Vec<usize>>> {
+            let Some(mut indices) =
+                backend.scan_numeric_range_mmap(filter_column, low, high, Some(needed))?
+            else {
+                return Ok(None);
+            };
+            if !leaves.is_empty() {
+                let leaving: std::collections::HashSet<usize> = leaves.iter().copied().collect();
+                indices.retain(|position| !leaving.contains(position));
+            }
+            indices.extend(enters.iter().copied());
+            indices.sort_unstable();
+            indices.dedup();
+            let start = offset.min(indices.len());
+            let end = offset.saturating_add(limit).min(indices.len());
+            Ok(Some(indices[start..end].to_vec()))
+        });
+        let Some(window) = selected.map_err(|e| PyIOError::new_err(e.to_string()))? else {
+            return Ok(None);
+        };
+
+        let batch = py
+            .allow_threads(|| backend.read_columns_by_indices_to_arrow(&window, None))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let out = PyDict::new_bound(py);
+        let columns_dict = PyDict::new_bound(py);
+        let schema = batch.schema();
+        for col_idx in 0..batch.num_columns() {
+            let col_name = schema.field(col_idx).name();
+            columns_dict.set_item(col_name, arrow_col_to_pylist(py, batch.column(col_idx))?)?;
+        }
+        out.set_item("columns_dict", columns_dict)?;
+        out.set_item("rows_affected", 0i64)?;
+        Ok(Some(out.into()))
     }
 }

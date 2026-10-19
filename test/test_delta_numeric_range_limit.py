@@ -6,10 +6,12 @@ existed (even an update to an unrelated projected column), so the generic merged
 executor materialized the whole table: 1M rows went from 0.12 ms to ~1.6 s after
 a single `UPDATE ... WHERE _id = ...`.
 
-The lane now stays available while the overlay touches no filter column, hides no
-rows and appends none; the selected window is read through the index reader,
-which merges the updated cells. Updates to the filter column and deletes keep the
-merged executor route, which must still produce exact rows.
+The lane now stays available under cell overlays: unrelated updates are merged
+into the selected window, pending deletes are dropped while one extra candidate
+per delete fills the page, and filter-column updates re-evaluate only the touched
+rows (a row that leaves the range is removed, one that enters is inserted in row
+order). Appended rows keep the merged executor route, which must still produce
+exact rows.
 """
 from __future__ import annotations
 
@@ -93,22 +95,39 @@ def test_a_pending_delete_keeps_the_bounded_lane_fast():
             client.close()
 
 
-def test_a_filter_column_update_stays_exact():
+def test_a_filter_column_update_re_evaluates_only_the_touched_rows():
+    sql = "SELECT * FROM t WHERE k >= 100000 LIMIT 100"
     with tempfile.TemporaryDirectory() as tmp:
         client = _client(tmp)
         try:
-            # Moving the filter column needs a re-evaluation of the predicate,
-            # so this shape keeps the merged executor route; it must still see
-            # the new value in both directions.
+            clean = _median_ms(client, sql)
+            # One row leaves the range (100002: 100001 -> 1), one enters it
+            # from below (100: 99 -> 999999999), one stays inside.
             client.execute("UPDATE t SET k = 1 WHERE _id = 100002")
-            client.execute("UPDATE t SET k = 999999999 WHERE _id = 100004")
+            client.execute("UPDATE t SET k = 999999999 WHERE _id = 100")
+            client.execute("UPDATE t SET k = 150001 WHERE _id = 175000")
             client.flush()
-            rows = _rows(client, "SELECT * FROM t WHERE k >= 100000 LIMIT 1000000")
-            ids = {row["_id"]: row["k"] for row in rows}
-            assert ids.get(100002) is None, "row moved below the range leaked"
-            assert ids.get(100004) == 999999999, "row moved above the range missing"
-            assert len(rows) == ROWS - 100_001, len(rows)
+
+            page = _rows(client, sql)
+            ids = [row["_id"] for row in page]
+            assert len(page) == 100, len(page)
+            assert 100002 not in ids, "row moved below the range leaked"
+            assert ids[0] == 100, "row moved into the range is missing"
+            assert ids[1:4] == [100001, 100003, 100004], ids[:5]
+            assert page[0]["k"] == 999999999
+
+            # The entered row shifts the page boundary, so OFFSET must still
+            # skip visible rows (not raw base candidates).
+            offset = _rows(client, "SELECT * FROM t WHERE k >= 100000 LIMIT 20 OFFSET 50")
+            assert [row["_id"] for row in offset[:2]] == [100051, 100052]
+
+            # The moved-out row is visible on the other side of the predicate.
             below = _rows(client, "SELECT * FROM t WHERE k < 100000 LIMIT 1000000")
             assert any(row["_id"] == 100002 for row in below)
+
+            # Re-evaluating only the touched rows must not fall back to the
+            # full-table merged executor.
+            overlay = _median_ms(client, sql)
+            assert overlay < clean * 8 + 1.0, (overlay, clean)
         finally:
             client.close()

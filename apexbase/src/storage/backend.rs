@@ -7888,6 +7888,56 @@ mod tests {
         assert_eq!(values, vec![0, 20, 3]);
     }
 
+    #[test]
+    fn physical_extract_keeps_base_values_under_a_cell_overlay() {
+        // The bounded filter-column-update lane classifies leaving/entering rows
+        // from the physical extractor (base values) and only then merges the
+        // overlay. `read_column_by_indices` serves the in-memory buffer and
+        // returns zeros for an mmap-only table, so this pins the distinction.
+        use arrow::array::Int64Array;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("physical_extract_overlay.apex");
+        let backend = TableStorageBackend::create(&path).unwrap();
+        backend.add_column("k", DataType::Int64).unwrap();
+        let rows: Vec<HashMap<String, Value>> = (0..3i64)
+            .map(|i| HashMap::from([("k".to_string(), Value::Int64(i))]))
+            .collect();
+        backend.insert_rows(&rows).unwrap();
+        backend.save_full().unwrap();
+        drop(backend);
+
+        let backend = TableStorageBackend::open(&path).unwrap();
+        backend.delta_batch_update_rows(&[(2u64, "k", Value::Int64(99))]);
+
+        let base = backend
+            .storage
+            .extract_rows_by_indices_to_arrow(&[0, 1, 2], Some(&["k"]))
+            .unwrap()
+            .unwrap();
+        let base_values: Vec<i64> = base
+            .column_by_name("k")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("base batch must contain k")
+            .values()
+            .to_vec();
+        assert_eq!(base_values, vec![0, 1, 2]);
+
+        // The merged reader needs the `_id` column to map rows onto the
+        // DeltaStore, so the full projection is used here (the bounded lane
+        // reads its final window the same way).
+        let merged = backend
+            .read_columns_by_indices_to_arrow(&[0, 1, 2], None)
+            .unwrap();
+        let merged_values: Vec<i64> = merged
+            .column_by_name("k")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("merged batch must contain k")
+            .values()
+            .to_vec();
+        assert_eq!(merged_values, vec![0, 99, 2]);
+    }
+
     fn logical_scan_rows(batch: &RecordBatch) -> Vec<(i64, i64, Option<f64>, Option<String>)> {
         use arrow::array::{Array, Float64Array, Int64Array, StringArray};
         use arrow::datatypes::DataType as ArrowDataType;

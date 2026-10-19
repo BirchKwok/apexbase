@@ -102,6 +102,12 @@ CANARY_SPECS = (
         "setup",
         "setup_delta_numeric_range_limit",
     ),
+    (
+        "Numeric range LIMIT (filter-column update)",
+        "bench_delta_filter_update_numeric_range_limit",
+        "setup",
+        "setup_delta_filter_update_numeric_range_limit",
+    ),
 )
 
 # Full-mode par phase (R5.7 phase A): the 8-thread shape exists only in the
@@ -130,14 +136,15 @@ HOT_SHAPE_NAMES = (
     "COUNT(col) covered",
     "COUNT(col) partial",
     "COUNT(col) string filter",
+    # Both overlay shapes build their own tables, so they can run before the
+    # `default` mutations below.
+    "Numeric range LIMIT (delta overlay)",
+    "Numeric range LIMIT (filter-column update)",
     # Mutating shapes run after the reads (M-13): they change the shared
     # `default` fixture.
     "String cell UPDATE (single row)",
     "DELETE by _id",
     "DELETE bounded range",
-    # Builds and switches to its own `deltacan` table, so it runs last and the
-    # deletions above keep measuring `default`.
-    "Numeric range LIMIT (delta overlay)",
 )
 HOT_SHAPE_SPECS = tuple(_canary_spec(name) for name in HOT_SHAPE_NAMES)
 

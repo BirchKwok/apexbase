@@ -3765,6 +3765,39 @@ class ApexBaseBench:
             "SELECT * FROM deltacan WHERE k >= 100000 LIMIT 100"
         )
 
+    def setup_delta_filter_update_numeric_range_limit(self):
+        """Bounded-read fixture where the overlay updates the filter column.
+
+        One row leaves the probed range and one enters it from below, both
+        persisted, so the lane must re-evaluate the touched rows instead of
+        trusting the base scan or materializing the table.
+        """
+        if getattr(self, "_delta_filter_canary_ready", False):
+            return
+        rows = 200_000
+        self.client.execute("CREATE TABLE deltafilter (k INT, v INT)")
+        self.client.use_table("deltafilter")
+        for start in range(0, rows, 50_000):
+            end = min(rows, start + 50_000)
+            self.client.store({"k": list(range(start, end)),
+                               "v": list(range(start, end))})
+        self.client.flush()
+        self.client.execute("UPDATE deltafilter SET k = 1 WHERE _id = 100002")
+        self.client.execute("UPDATE deltafilter SET k = 999999999 WHERE _id = 100")
+        self.client.flush()
+        self._delta_filter_canary_ready = True
+
+    def bench_delta_filter_update_numeric_range_limit(self):
+        rows = self._query_all(
+            "SELECT * FROM deltafilter WHERE k >= 100000 LIMIT 100"
+        )
+        if len(rows) != 100:
+            raise AssertionError(f"expected 100 rows, got {len(rows)}")
+        ids = [row["_id"] for row in rows]
+        if ids[0] != 100 or 100002 in ids:
+            raise AssertionError(f"filter-update membership wrong: {ids[:4]}")
+        return rows
+
     def bench_index_range(self):
         return self._query_all(
             "SELECT * FROM idxcan WHERE amount BETWEEN 20 AND 29"
