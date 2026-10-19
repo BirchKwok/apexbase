@@ -3845,6 +3845,21 @@ let can_pushdown_limit = stmt.where_clause.is_none()
         // Collect unique aggregation columns. Add "*" when COUNT(*)/COUNT(1)
         // is present so the storage path returns the real match count.
         let mut unique_cols: Vec<String> = Vec::new();
+        // `value_needed[i]` is false when `unique_cols[i]` only feeds `COUNT(col)`.
+        let mut value_needed: Vec<bool> = Vec::new();
+        fn note_string_agg_column(
+            unique_cols: &mut Vec<String>,
+            value_needed: &mut Vec<bool>,
+            name: &str,
+            needs_value: bool,
+        ) {
+            if let Some(position) = unique_cols.iter().position(|c| c == name) {
+                value_needed[position] |= needs_value;
+            } else {
+                unique_cols.push(name.to_string());
+                value_needed.push(needs_value);
+            }
+        }
         for col in &stmt.columns {
             if let SelectColumn::Aggregate {
                 func,
@@ -3865,22 +3880,40 @@ let can_pushdown_limit = stmt.where_clause.is_none()
                                 .map(|c| c.is_ascii_digit())
                                 .unwrap_or(false));
                     if is_count_star {
-                        if !unique_cols.iter().any(|c| c == "*") {
-                            unique_cols.push("*".to_string());
-                        }
+                        note_string_agg_column(
+                            &mut unique_cols,
+                            &mut value_needed,
+                            "*",
+                            false,
+                        );
                     } else if matches!(func, AggregateFunc::Count)
                         && !backend.storage.column_has_nulls(col_name)
                     {
-                        if !unique_cols.iter().any(|c| c == "*") {
-                            unique_cols.push("*".to_string());
-                        }
-                    } else if !unique_cols.contains(col_name) {
-                        unique_cols.push(col_name.clone());
+                        // A NULL-free column's COUNT is the match count; asking
+                        // for `*` also lets the cached lane skip the column scan.
+                        note_string_agg_column(
+                            &mut unique_cols,
+                            &mut value_needed,
+                            "*",
+                            false,
+                        );
+                    } else {
+                        note_string_agg_column(
+                            &mut unique_cols,
+                            &mut value_needed,
+                            col_name,
+                            !matches!(func, AggregateFunc::Count),
+                        );
                     }
                 } else if !matches!(func, AggregateFunc::Count) {
                     return Ok(None);
-                } else if !unique_cols.iter().any(|c| c == "*") {
-                    unique_cols.push("*".to_string());
+                } else {
+                    note_string_agg_column(
+                        &mut unique_cols,
+                        &mut value_needed,
+                        "*",
+                        false,
+                    );
                 }
             } else {
                 return Ok(None);
@@ -3912,12 +3945,13 @@ let can_pushdown_limit = stmt.where_clause.is_none()
                     &col_refs,
                 )?
             } else {
-                backend.storage.execute_filtered_string_agg_cached(
+                backend.storage.execute_filtered_string_agg_cached_planned(
                     &filter_col,
                     &dict_arc.0,
                     &dict_arc.1,
                     &filter_val,
                     &col_refs,
+                    &value_needed,
                 )?
             };
             match cached {
@@ -3928,17 +3962,23 @@ let can_pushdown_limit = stmt.where_clause.is_none()
                 }
                 Some(_) => return Ok(None),
                 None if is_prefix => return Ok(None),
-                None => match backend.execute_filtered_string_agg_mmap(
+                None => match backend.execute_filtered_string_agg_mmap_planned(
                     &filter_col,
                     &filter_val,
                     &col_refs,
+                    &value_needed,
                 )? {
                     Some(results) => results,
                     None => return Ok(None),
                 },
             }
         } else {
-            match backend.execute_filtered_string_agg_mmap(&filter_col, &filter_val, &col_refs)? {
+            match backend.execute_filtered_string_agg_mmap_planned(
+                &filter_col,
+                &filter_val,
+                &col_refs,
+                &value_needed,
+            )? {
                 Some(results) => results,
                 None => return Ok(None),
             }
@@ -4917,12 +4957,13 @@ let can_pushdown_limit = stmt.where_clause.is_none()
                 &filter_col,
                 &backend.storage,
             )? {
-                Some((dict, _, _)) => match backend.storage.execute_filtered_string_agg_cached(
+                Some((dict, _, _)) => match backend.storage.execute_filtered_string_agg_cached_planned(
                     &filter_col,
                     &dict.0,
                     &dict.1,
                     &target,
                     &col_refs,
+                    &value_needed,
                 )? {
                     Some(results) => results,
                     None => match backend.execute_filtered_numeric_agg_mmap_planned(

@@ -23,6 +23,7 @@ CANARY_SPECS = (
     ("COUNT(*)", "bench_count", "mean"),
     ("COUNT(col) covered", "bench_count_column_covered", "mean"),
     ("COUNT(col) partial", "bench_count_column_partial", "mean"),
+    ("COUNT(col) string filter", "bench_count_column_string_filter", "mean"),
     ("SELECT * LIMIT 100", "bench_select_limit", "median"),
     ("Projection full scan (3 cols)", "bench_projected_full_scan", "mean"),
     ("String equality filter", "bench_filter_string", "mean"),

@@ -1657,6 +1657,30 @@ impl OnDemandStorage {
         target: &str,
         agg_cols: &[&str],
     ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.execute_filtered_string_agg_mmap_planned(filter_col, target, agg_cols, &[])
+    }
+
+    /// As [`Self::execute_filtered_string_agg_mmap`], but `value_needed[i]`
+    /// marks whether `agg_cols[i]` feeds a value aggregate. A column used only
+    /// by `COUNT(col)` never has its payload decoded: the lane counts matched
+    /// non-NULL rows instead.
+    pub fn execute_filtered_string_agg_mmap_planned(
+        &self,
+        filter_col: &str,
+        target: &str,
+        agg_cols: &[&str],
+        value_needed: &[bool],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        #[inline]
+        fn needs_value(value_needed: &[bool], index: usize) -> bool {
+            value_needed.get(index).copied().unwrap_or(true)
+        }
+        let value_positions: Vec<usize> = agg_cols
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| **name != "*" && **name != "1")
+            .map(|(position, _)| position)
+            .collect();
         let footer = match self.get_or_load_footer()? {
             Some(f) => f,
             None => return Ok(None),
@@ -1823,10 +1847,36 @@ impl OnDemandStorage {
 
                     let (agg_col_idx, _) = agg_indices[0];
                     let agg_col_off = rcix[agg_col_idx] as usize;
-                    if agg_col_off + null_bitmap_len >= body.len() {
+                    if agg_col_off + null_bitmap_len > body.len() {
                         return None;
                     }
                     let agg_nulls = &body[agg_col_off..agg_col_off + null_bitmap_len];
+                    let agg_has_nulls = agg_nulls.iter().any(|&b| b != 0);
+                    // `COUNT(col)`: only the validity bitmap is read. The value
+                    // payload may use any encoding, including the bit-packed one
+                    // this branch does not decode.
+                    if !needs_value(value_needed, value_positions[0]) {
+                        view.for_each_index_eq(tdi, n, |i| {
+                            if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
+                                return true;
+                            }
+                            if filter_has_nulls && (filter_nulls[i / 8] >> (i % 8)) & 1 == 1 {
+                                return true;
+                            }
+                            part.matches += 1;
+                            if !(agg_has_nulls && (agg_nulls[i / 8] >> (i % 8)) & 1 == 1) {
+                                part.count += 1;
+                            }
+                            true
+                        });
+                        return Some(part);
+                    }
+                    // The value branch also reads the encoding byte: keep the
+                    // stricter bound for it (the count-only branch above only
+                    // needs the validity bitmap).
+                    if agg_col_off + null_bitmap_len >= body.len() {
+                        return None;
+                    }
                     let agg_encoding = body[agg_col_off + null_bitmap_len];
                     if agg_encoding != COL_ENCODING_PLAIN {
                         return None;
@@ -1840,7 +1890,6 @@ impl OnDemandStorage {
                     let agg_n = agg_count.min(rg_rows).min((agg_payload.len() - 8) / 8);
                     let scan_n = n.min(agg_n);
                     let agg_values = &agg_payload[8..];
-                    let agg_has_nulls = agg_nulls.iter().any(|&b| b != 0);
                     let agg_type = schema.columns[agg_col_idx].1;
 
                     match agg_type {
@@ -2063,6 +2112,34 @@ impl OnDemandStorage {
                                     if agg_col_off + null_bitmap_len <= body.len() {
                                         let agg_null =
                                             &body[agg_col_off..agg_col_off + null_bitmap_len];
+                                        if !needs_value(value_needed, value_positions[0]) {
+                                            // Count-only: the value payload is irrelevant.
+                                            for i in 0..n {
+                                                if view.index(i) != Some(tdi) {
+                                                    continue;
+                                                }
+                                                if has_deletes
+                                                    && (body[del_start_body + i / 8]
+                                                        >> (i % 8))
+                                                        & 1
+                                                        == 1
+                                                {
+                                                    continue;
+                                                }
+                                                let filter_null = body
+                                                    .get(filter_col_off + i / 8)
+                                                    .copied()
+                                                    .unwrap_or(0);
+                                                if (filter_null >> (i % 8)) & 1 == 1 {
+                                                    continue;
+                                                }
+                                                match_count += 1;
+                                                if (agg_null[i / 8] >> (i % 8)) & 1 == 0 {
+                                                    col_counts[0] += 1;
+                                                }
+                                            }
+                                            continue;
+                                        }
                                         let agg_data_start = agg_col_off + null_bitmap_len + 1;
                                         if agg_data_start <= body.len() {
                                             let agg_encoding = body[agg_col_off + null_bitmap_len];
@@ -2202,6 +2279,17 @@ impl OnDemandStorage {
                     let col_off = rcix[col_idx] as usize;
                     if col_off + null_bitmap_len > body.len() { continue; }
                     let null_bm = &body[col_off..col_off + null_bitmap_len];
+                    if !needs_value(value_needed, value_positions[ci]) {
+                        // `COUNT(col)`: matching non-NULL rows, no payload decode.
+                        for &local_i in &matching_local {
+                            if local_i / 8 < null_bm.len()
+                                && (null_bm[local_i / 8] >> (local_i % 8)) & 1 == 0
+                            {
+                                col_counts[ci] += 1;
+                            }
+                        }
+                        continue;
+                    }
                     let col_type = schema.columns[col_idx].1;
                     let data_start = col_off + null_bitmap_len + 1;
                     if data_start > body.len() { continue; }
@@ -2437,6 +2525,18 @@ impl OnDemandStorage {
 
                             if cii == col_idx {
                                 let null_bm = null_bytes;
+                                if !needs_value(value_needed, value_positions[ci]) {
+                                    for &local_i in &matching_local {
+                                        if local_i < rg_rows
+                                            && local_i / 8 < null_bm.len()
+                                            && (null_bm[local_i / 8] >> (local_i % 8)) & 1 == 0
+                                        {
+                                            col_counts[ci] += 1;
+                                        }
+                                    }
+                                    found = Some(());
+                                    break;
+                                }
                                 if encoding == COL_ENCODING_PLAIN && data.len() >= 8 {
                                     let count = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0;8])) as usize;
                                     let raw = &data[8..];
@@ -2585,6 +2685,34 @@ impl OnDemandStorage {
         target: &str,
         agg_cols: &[&str],
     ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.execute_filtered_string_agg_cached_planned(
+            filter_col,
+            dict_strings,
+            group_ids,
+            target,
+            agg_cols,
+            &[],
+        )
+    }
+
+    /// As [`Self::execute_filtered_string_agg_cached`], with the per-column
+    /// `value_needed` plan. When every requested column is count-only the lane
+    /// never scans a value column: it counts the rows whose dictionary id is
+    /// the target (all requested columns are NULL-free by the gate above).
+    pub fn execute_filtered_string_agg_cached_planned(
+        &self,
+        filter_col: &str,
+        dict_strings: &[String],
+        group_ids: &[u16],
+        target: &str,
+        agg_cols: &[&str],
+        value_needed: &[bool],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        #[inline]
+        fn needs_value(value_needed: &[bool], index: usize) -> bool {
+            value_needed.get(index).copied().unwrap_or(true)
+        }
+
         if dict_strings.is_empty() || group_ids.is_empty() || self.column_has_nulls(filter_col) {
             return Ok(None);
         }
@@ -2609,6 +2737,47 @@ impl OnDemandStorage {
             if self.column_has_nulls(col_name) {
                 return Ok(None);
             }
+        }
+
+        let value_positions: Vec<usize> = agg_cols
+            .iter()
+            .enumerate()
+            .filter(|(_, name)| **name != "*" && **name != "1")
+            .map(|(position, _)| position)
+            .collect();
+        let counting_only = !real_cols.is_empty()
+            && real_cols
+                .iter()
+                .enumerate()
+                .all(|(ci, _)| !needs_value(value_needed, value_positions[ci]));
+        if counting_only {
+            let footer = match self.get_or_load_footer()? {
+                Some(footer) => footer,
+                None => return Ok(None),
+            };
+            // The dictionary cache already spans the active row space; a
+            // deletion vector would make the group-id length disagree with it,
+            // so let the mmap lane (which reads the bitmap) answer instead.
+            if footer.row_groups.iter().any(|rg| rg.deletion_count > 0) {
+                return Ok(None);
+            }
+            let total_rows: usize = footer
+                .row_groups
+                .iter()
+                .map(|rg| rg.row_count as usize)
+                .sum();
+            let mut match_count = 0i64;
+            for &group_id in group_ids.iter().take(total_rows) {
+                if group_id == target_gid {
+                    match_count += 1;
+                }
+            }
+            return Ok(Some(
+                agg_cols
+                    .iter()
+                    .map(|_| (match_count, 0.0, 0.0, 0.0, false))
+                    .collect(),
+            ));
         }
 
         if real_cols.len() == 1 && !self.has_pending_deltas() {

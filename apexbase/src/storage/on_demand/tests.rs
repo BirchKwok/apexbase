@@ -4201,6 +4201,244 @@ fn count_column_plan_skips_the_value_payload() {
     assert_eq!(mixed[1].0, non_null_n(0) - 1, "COUNT(n)");
 }
 
+/// Build a table whose string filter column is dictionary-encoded (10 distinct
+/// values) and whose value columns are `v = i * 3` (no NULLs) and
+/// `n = i * 7` (every fifth row NULL). The string column is last on purpose:
+/// `insert_typed_with_nulls_full` materializes columns by sorted integer name
+/// first, so a string column below a later integer index would be padded as an
+/// integer (see the fresh-table column layout).
+fn string_filter_fixture(
+    path: &std::path::Path,
+    rows: usize,
+    distinct: usize,
+    compress: bool,
+) {
+    let schema = [
+        ("k".to_string(), ColumnType::Int64),
+        ("v".to_string(), ColumnType::Int64),
+        ("n".to_string(), ColumnType::Int64),
+        ("s".to_string(), ColumnType::String),
+    ];
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        path,
+        crate::storage::DurabilityLevel::Fast,
+        &schema,
+    )
+    .unwrap();
+    let mut int_cols = HashMap::new();
+    int_cols.insert("k".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+    int_cols.insert(
+        "v".to_string(),
+        (0..rows).map(|row| row as i64 * 3).collect::<Vec<i64>>(),
+    );
+    int_cols.insert(
+        "n".to_string(),
+        (0..rows).map(|row| row as i64 * 7).collect::<Vec<i64>>(),
+    );
+    let mut string_cols = HashMap::new();
+    string_cols.insert(
+        "s".to_string(),
+        if distinct >= rows {
+            (0..rows).map(|row| format!("s{row}")).collect::<Vec<String>>()
+        } else {
+            (0..rows)
+                .map(|row| format!("c{}", row % distinct))
+                .collect::<Vec<String>>()
+        },
+    );
+    let mut nulls = HashMap::new();
+    nulls.insert(
+        "n".to_string(),
+        (0..rows).map(|row| row % 5 == 0).collect::<Vec<bool>>(),
+    );
+    storage
+        .insert_typed_with_nulls_full(
+            int_cols,
+            HashMap::new(),
+            string_cols,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            nulls,
+        )
+        .unwrap();
+    if compress {
+        storage.set_compression(crate::storage::CompressionType::Zstd).unwrap();
+    }
+    storage.save().unwrap();
+}
+
+#[test]
+fn string_filter_count_plan_skips_the_value_payload() {
+    // `COUNT(v) WHERE s = 'c3'` used to decode every matching value (and the
+    // lane also required a PLAIN value column). The plan now counts matched
+    // non-NULL rows from the validity bitmap, so any encoding works.
+    let dir = tempdir().unwrap();
+    let rows = 200_000usize;
+    let path = dir.path().join("string_count_plan.apex");
+    string_filter_fixture(&path, rows, 10, false);
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let agg = |cols: &[&str], plan: &[bool]| {
+        storage
+            .execute_filtered_string_agg_mmap_planned("s", "c3", cols, plan)
+            .unwrap()
+            .expect("string filtered aggregation")
+    };
+    let matching = (0..rows).filter(|row| row % 10 == 3).collect::<Vec<_>>();
+    let null_n = matching.iter().filter(|&&row| row % 5 == 0).count();
+    let expected_sum = matching.iter().map(|&row| row as i64 * 3).sum::<i64>() as f64;
+
+    let counted = agg(&["v"], &[false]);
+    assert_eq!(counted[0].0, matching.len() as i64);
+    assert_eq!((counted[0].1, counted[0].2, counted[0].3), (0.0, 0.0, 0.0));
+
+    // NULLs in the value column are excluded without touching values.
+    let counted_n = agg(&["n"], &[false]);
+    assert_eq!(counted_n[0].0, (matching.len() - null_n) as i64);
+
+    // A value aggregate still gets exact values.
+    let summed = agg(&["v"], &[true]);
+    assert_eq!(summed[0].0, matching.len() as i64);
+    assert_eq!(summed[0].1, expected_sum);
+    assert_eq!(summed[0].2, 9.0);
+    assert_eq!(summed[0].3, (rows as f64 - 7.0) * 3.0);
+
+    // The plan is indexed like `cols`: a leading `COUNT(*)` must not shift it.
+    let mixed = agg(&["*", "v"], &[false, true]);
+    assert_eq!(mixed[0].0, matching.len() as i64);
+    assert_eq!(mixed[1].1, expected_sum, "SUM(v) after COUNT(*)");
+    let counted_mixed = agg(&["*", "v"], &[false, false]);
+    assert_eq!(counted_mixed[1].0, matching.len() as i64);
+
+    // A persisted deletion is skipped by the count-only loop.
+    assert!(storage.delete(4)); // row 3 -> s = 'c3', v = 9
+    storage.save_delete_only().unwrap();
+    let after = agg(&["v"], &[false]);
+    assert_eq!(after[0].0, matching.len() as i64 - 1);
+    let summed_after = agg(&["v"], &[true]);
+    assert_eq!(summed_after[0].1, expected_sum - 9.0);
+}
+
+#[test]
+fn string_filter_count_plan_handles_plain_and_compressed_filters() {
+    // A high-cardinality filter column is stored as plain strings (sequential
+    // lane), and a compressed row group takes the decode fallback; both must
+    // still answer a count-only aggregate without decoding the value column.
+    let rows = 200_000usize;
+    for (distinct, compress, target, expected) in [
+        (usize::MAX, false, "s200", 1i64),
+        (10, true, "c3", (rows / 10) as i64),
+    ] {
+        let dir = tempdir().unwrap();
+        let path = dir
+            .path()
+            .join(format!("string_count_plan_{distinct}_{compress}.apex"));
+        string_filter_fixture(&path, rows, distinct, compress);
+        let storage = OnDemandStorage::open(&path).unwrap();
+        let counted = storage
+            .execute_filtered_string_agg_mmap_planned("s", target, &["v"], &[false])
+            .unwrap()
+            .expect("string filtered aggregation");
+        assert_eq!(
+            counted[0].0, expected,
+            "target {target} distinct {distinct} compress {compress}"
+        );
+        let summed = storage
+            .execute_filtered_string_agg_mmap_planned("s", target, &["v"], &[true])
+            .unwrap()
+            .expect("string filtered aggregation");
+        if distinct >= rows {
+            assert_eq!(summed[0].1, 200.0 * 3.0);
+        } else {
+            let want = (3..rows).step_by(10).map(|row| row as i64 * 3).sum::<i64>() as f64;
+            assert_eq!(summed[0].1, want);
+        }
+    }
+}
+
+#[test]
+fn cached_string_filter_count_plan_scans_no_value_column() {
+    // The cached lane gets an already-built group-id array. When every
+    // aggregate is count-only it must not scan any value column at all.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cached_string_count_plan.apex");
+    let rows = 100_000usize;
+    let schema = [
+        ("k".to_string(), ColumnType::Int64),
+        ("v".to_string(), ColumnType::Int64),
+        ("n".to_string(), ColumnType::Int64),
+    ];
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("k".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        int_cols.insert(
+            "v".to_string(),
+            (0..rows).map(|row| row as i64 * 2).collect::<Vec<i64>>(),
+        );
+        int_cols.insert(
+            "n".to_string(),
+            (0..rows).map(|row| row as i64).collect::<Vec<i64>>(),
+        );
+        let mut nulls = HashMap::new();
+        nulls.insert(
+            "n".to_string(),
+            (0..rows).map(|row| row % 4 == 0).collect::<Vec<bool>>(),
+        );
+        storage
+            .insert_typed_with_nulls_full(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                nulls,
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let dict_strings = vec!["a".to_string(), "b".to_string()];
+    let group_ids: Vec<u16> = (0..rows).map(|row| (row % 2) as u16).collect();
+    let cached = |cols: &[&str], plan: &[bool]| {
+        storage
+            .execute_filtered_string_agg_cached_planned(
+                "k",
+                &dict_strings,
+                &group_ids,
+                "a",
+                cols,
+                plan,
+            )
+            .unwrap()
+    };
+    let counted = cached(&["v"], &[false]).expect("count-only cached lane");
+    assert_eq!(counted[0].0, 50_000);
+    assert_eq!((counted[0].1, counted[0].2, counted[0].3), (0.0, 0.0, 0.0));
+    let mixed = cached(&["*", "v"], &[false, false]).expect("count-only cached lane");
+    assert_eq!(mixed[0].0, 50_000);
+    assert_eq!(mixed[1].0, 50_000);
+    // A value aggregate still decodes and is exact.
+    let summed = cached(&["v"], &[true]).expect("value cached lane");
+    assert_eq!(summed[0].0, 50_000);
+    assert_eq!(
+        summed[0].1,
+        (0..rows).filter(|row| row % 2 == 0).map(|row| (row * 2) as f64).sum::<f64>()
+    );
+    // Nullable columns are rejected by the cached gate (the mmap lane handles
+    // them), and a deletion vector makes the cached counting path decline.
+    assert!(cached(&["n"], &[false]).is_none());
+    assert!(storage.delete(1));
+    storage.save_delete_only().unwrap();
+    assert!(cached(&["v"], &[false]).is_none());
+}
+
 #[test]
 fn string_tail_zone_prunes_equal_length_shared_prefix_rows() {
     // Timestamp/UUID-shaped values are all the same length and share their

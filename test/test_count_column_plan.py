@@ -25,15 +25,27 @@ ROWS = 300_000
 
 
 def _median_ms(client, sql, iterations=5):
+    """Best of three per-run medians.
+
+    These guards compare a count against a value aggregate; a single median can
+    land on a busy slice of the host (the suite runs on shared machines) and
+    invert the order. Taking the best of three medians still catches a structural
+    decode (the two shapes then cost the same in every group) while ignoring a
+    transient scheduler stall.
+    """
     run = lambda: client.execute(sql)  # noqa: E731
     for _ in range(2):
         run()
-    samples = []
-    for _ in range(iterations):
-        start = time.perf_counter()
-        run()
-        samples.append((time.perf_counter() - start) * 1000.0)
-    return statistics.median(samples)
+    best = None
+    for _ in range(3):
+        samples = []
+        for _ in range(iterations):
+            start = time.perf_counter()
+            run()
+            samples.append((time.perf_counter() - start) * 1000.0)
+        median = statistics.median(samples)
+        best = median if best is None else min(best, median)
+    return best
 
 
 def _value(client, sql, key="n"):
@@ -168,5 +180,76 @@ def test_a_multi_predicate_count_does_not_decode_the_value_column():
             # The cached lane materializes the predicate column either way; a count
             # must still stay far below the value aggregate's band.
             assert counted < summed / 2 + 0.5, (counted, summed)
+        finally:
+            client.close()
+
+
+def test_a_string_filter_count_column_skips_the_value_payload():
+    """The string-equality lane has the same count-only plan as the numeric one."""
+    rows = 200_000
+    with tempfile.TemporaryDirectory() as tmp:
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("t", schema={"k": "int64", "v": "int64", "s": "string"})
+        client.use_table("t")
+        client.store({"k": list(range(rows)), "v": list(range(rows)),
+                      "s": [f"c{i % 10}" for i in range(rows)]})
+        client.flush()
+        try:
+            matching = len([i for i in range(rows) if i % 10 == 3])
+            assert _value(client, "SELECT COUNT(v) AS n FROM t WHERE s = 'c3'") == matching
+            # The Python client's pre-parse string-filter path.
+            star = _median_ms(client, "SELECT COUNT(*) AS n FROM t WHERE s = 'c3'")
+            counted = _median_ms(client, "SELECT COUNT(v) AS n FROM t WHERE s = 'c3'")
+            summed = _median_ms(client, "SELECT SUM(v) AS n FROM t WHERE s = 'c3'")
+            assert counted < star * 4 + 0.2, (counted, star)
+            assert counted < summed / 2 + 0.2, (counted, summed)
+            # The executor lane (a quoted identifier bypasses the Python
+            # classifier) keeps its `*` rewrite for a NULL-free column.
+            assert _value(
+                client, "SELECT COUNT(v) AS n FROM t WHERE \"s\" = 'c3'") == matching
+        finally:
+            client.close()
+
+
+def test_a_string_filter_count_column_stays_exact_with_nulls_and_deletes():
+    rows = 120_000
+    with tempfile.TemporaryDirectory() as tmp:
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("t", schema={"k": "int64", "v": "int64", "s": "string"})
+        client.use_table("t")
+        client.store({"k": list(range(rows)),
+                      "v": [None if i % 3 == 0 else i for i in range(rows)],
+                      "s": [f"c{i % 10}" for i in range(rows)]})
+        client.flush()
+        live = lambda start: len([i for i in range(start, rows)  # noqa: E731
+                                  if i % 10 == 3 and i % 3 != 0])
+        try:
+            # The plain client path is served by the storage string lane.
+            assert _value(client, "SELECT COUNT(v) AS n FROM t WHERE s = 'c3'") == live(0)
+            # The executor lane also has to exclude the NULLs (nullable column).
+            assert _value(
+                client, "SELECT COUNT(v) AS n FROM t WHERE \"s\" = 'c3'") == live(0)
+            # Mixed aggregates: the plan stays aligned like the columns.
+            row = client.execute(
+                "SELECT COUNT(*) AS c, COUNT(v) AS cv FROM t WHERE s = 'c3'"
+            ).to_dict()[0]
+            assert row["c"] == len([i for i in range(rows) if i % 10 == 3]), row
+            assert row["cv"] == live(0), row
+            # Value aggregates beside count-only ones stay exact.
+            row = client.execute(
+                "SELECT COUNT(v) AS c, SUM(v) AS s, MIN(v) AS mn, MAX(v) AS mx "
+                "FROM t WHERE s = 'c3'").to_dict()[0]
+            values = [i for i in range(rows) if i % 10 == 3 and i % 3 != 0]
+            assert row["c"] == len(values), row
+            assert row["s"] == sum(values), row
+            assert (row["mn"], row["mx"]) == (min(values), max(values)), row
+
+            client.execute("DELETE FROM t WHERE k < 100")
+            client.flush()
+            expected = [i for i in range(100, rows) if i % 10 == 3 and i % 3 != 0]
+            row = client.execute(
+                "SELECT COUNT(v) AS c, SUM(v) AS s FROM t WHERE s = 'c3'").to_dict()[0]
+            assert row["c"] == len(expected), row
+            assert row["s"] == sum(expected), row
         finally:
             client.close()

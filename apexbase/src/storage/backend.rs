@@ -6396,6 +6396,19 @@ impl TableStorageBackend {
             .execute_filtered_string_agg_mmap(filter_col, target, agg_cols)
     }
 
+    /// As [`Self::execute_filtered_string_agg_mmap`], with a per-column
+    /// "value aggregate needed" plan so `COUNT(col)` never decodes values.
+    pub fn execute_filtered_string_agg_mmap_planned(
+        &self,
+        filter_col: &str,
+        target: &str,
+        agg_cols: &[&str],
+        value_needed: &[bool],
+    ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
+        self.storage
+            .execute_filtered_string_agg_mmap_planned(filter_col, target, agg_cols, value_needed)
+    }
+
     /// Single-pass filtered numeric aggregation: scan numeric predicate column and
     /// aggregate numeric columns without materializing matching rows.
     pub fn execute_filtered_numeric_agg_mmap(

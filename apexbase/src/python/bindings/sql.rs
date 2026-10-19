@@ -666,6 +666,10 @@ impl ApexStorageImpl {
                             // Add "*" when COUNT(*) / COUNT(1) is present so the storage
                             // layer returns the true match count without an extra scan.
                             let mut unique_cols: Vec<String> = Vec::new();
+                            // `value_needed[i]` is false when `unique_cols[i]` only
+                            // feeds `COUNT(col)`: the lane then counts matched
+                            // non-NULL rows without decoding the value payload.
+                            let mut value_needed: Vec<bool> = Vec::new();
                             for (func, col, _alias) in &agg_exprs {
                                 let is_count_star = func == "COUNT"
                                     && col
@@ -681,10 +685,17 @@ impl ApexStorageImpl {
                                 if is_count_star {
                                     if !unique_cols.iter().any(|c| c == "*") {
                                         unique_cols.push("*".to_string());
+                                        value_needed.push(false);
                                     }
                                 } else if let Some(c) = col {
-                                    if !unique_cols.contains(c) {
+                                    let needs_value = func != "COUNT";
+                                    if let Some(position) =
+                                        unique_cols.iter().position(|existing| existing == c)
+                                    {
+                                        value_needed[position] |= needs_value;
+                                    } else {
                                         unique_cols.push(c.clone());
+                                        value_needed.push(needs_value);
                                     }
                                 }
                             }
@@ -692,10 +703,11 @@ impl ApexStorageImpl {
                                 unique_cols.iter().map(|s| s.as_str()).collect();
                             // Single-pass: scan string filter + aggregate in one sequential pass
                             let agg_result = py.allow_threads(|| {
-                                backend.execute_filtered_string_agg_mmap(
+                                backend.execute_filtered_string_agg_mmap_planned(
                                     &filter_col,
                                     &filter_val,
                                     &col_refs,
+                                    &value_needed,
                                 )
                             });
                             if let Ok(Some(stats)) = agg_result {

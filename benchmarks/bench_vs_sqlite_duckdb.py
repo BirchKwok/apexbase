@@ -2420,6 +2420,17 @@ class ApexBaseBench:
         """
         return self._scalar("SELECT COUNT(score) FROM default WHERE age >= 50")
 
+    def bench_count_column_string_filter(self):
+        """`COUNT(col)` behind a string-equality filter.
+
+        `city` is dictionary-encoded, so the string lane walks its group ids.
+        The value column is `age`, which is bit-packed: the lane's value branch
+        only decodes PLAIN columns, so a count used to full-decode the bit-packed
+        column for the matching rows. The count-only plan reads the validity
+        bitmap instead and works for any value encoding.
+        """
+        return self._scalar("SELECT COUNT(age) FROM default WHERE city = 'Beijing'")
+
     def bench_select_limit(self, limit=100):
         return self._query_all(f"SELECT * FROM default LIMIT {limit}")
 
