@@ -732,37 +732,82 @@ impl ApexStorageImpl {
         let Some(backend) = backend_opt else {
             return Ok(None);
         };
-        if backend.has_pending_deltas()
-            || backend.has_delta()
+        // A persisted DeltaStore overlay is visible on top of the base. The
+        // bounded scan stays exact while the overlay touches no filter column and
+        // appends no rows; the index reader below merges the updated cells and
+        // drops the rows a pending delete hides. Appended rows keep the merged
+        // executor route because they extend the visible row space.
+        let pending_cells = backend.has_pending_deltas();
+        if backend.has_delta()
             || backend.pending_v4_in_memory_rows() > 0
+            || (pending_cells && backend.pending_delta_updates_column(&filter_column))
         {
             return Ok(None);
         }
+        // Every pending delete can remove one base match, so fetch that many
+        // extra candidates; the merge below then yields the requested window.
+        let deleted = if pending_cells {
+            backend.pending_delta_delete_count()
+        } else {
+            0
+        };
+        let needed = offset.saturating_add(limit).saturating_add(deleted);
 
-        let needed = offset.saturating_add(limit);
-        let cols_result = py.allow_threads(
-            || -> io::Result<Option<crate::storage::on_demand::MmapBatchColumns>> {
-                let Some(mut indices) =
+        if pending_cells {
+            let selected = py.allow_threads(|| -> io::Result<Option<Vec<usize>>> {
+                let Some(indices) =
                     backend.scan_numeric_range_mmap(&filter_column, low, high, Some(needed))?
                 else {
                     return Ok(None);
                 };
-                if offset == 0 {
-                    indices.truncate(limit);
-                    backend
-                        .storage
-                        .extract_rows_by_indices_mmap_columns(&indices, None)
-                } else {
-                    let final_indices: Vec<usize> =
-                        indices.into_iter().skip(offset).take(limit).collect();
-                    backend
-                        .storage
-                        .extract_rows_by_indices_mmap_columns(&final_indices, None)
-                }
-            },
-        );
+                Ok(Some(indices))
+            });
+            let Some(indices) = selected.map_err(|e| PyIOError::new_err(e.to_string()))? else {
+                return Ok(None);
+            };
+            // This reader applies the DeltaStore overlay (deletes filtered out,
+            // updated cells merged) and reports `_id` first, matching the fast
+            // path's shape. Offset/Limit apply to the merged window.
+            let batch = py
+                .allow_threads(|| backend.read_columns_by_indices_to_arrow(&indices, None))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            let start = offset.min(batch.num_rows());
+            let length = limit.min(batch.num_rows() - start);
+            let batch = batch.slice(start, length);
+            let out = PyDict::new_bound(py);
+            let columns_dict = PyDict::new_bound(py);
+            let schema = batch.schema();
+            for col_idx in 0..batch.num_columns() {
+                let col_name = schema.field(col_idx).name();
+                let arr = batch.column(col_idx);
+                columns_dict.set_item(col_name, arrow_col_to_pylist(py, arr)?)?;
+            }
+            out.set_item("columns_dict", columns_dict)?;
+            out.set_item("rows_affected", 0i64)?;
+            return Ok(Some(out.into()));
+        }
 
-        let Some(batch_cols) = cols_result.map_err(|e| PyIOError::new_err(e.to_string()))? else {
+        let selected = py.allow_threads(|| -> io::Result<Option<Vec<usize>>> {
+            let Some(mut indices) =
+                backend.scan_numeric_range_mmap(&filter_column, low, high, Some(needed))?
+            else {
+                return Ok(None);
+            };
+            if offset == 0 {
+                indices.truncate(limit);
+            } else {
+                indices = indices.into_iter().skip(offset).take(limit).collect();
+            }
+            Ok(Some(indices))
+        });
+        let Some(indices) = selected.map_err(|e| PyIOError::new_err(e.to_string()))? else {
+            return Ok(None);
+        };
+
+        let batch_cols = py
+            .allow_threads(|| backend.storage.extract_rows_by_indices_mmap_columns(&indices, None))
+            .map_err(|e| PyIOError::new_err(e.to_string()))?;
+        let Some(batch_cols) = batch_cols else {
             return Ok(None);
         };
         let Some(columns_dict) = mmap_batch_columns_to_pydict(py, batch_cols, None)? else {

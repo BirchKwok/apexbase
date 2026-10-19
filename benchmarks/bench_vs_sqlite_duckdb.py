@@ -3733,6 +3733,38 @@ class ApexBaseBench:
     def bench_index_eq_skewed(self):
         return self._query_all("SELECT * FROM idxcan WHERE tag = 'heavy'")
 
+    def setup_delta_numeric_range_limit(self):
+        """One-time fixture for the persisted-cell-overlay bounded-read guard.
+
+        The table is separate from `default` so the overlay cannot disturb the
+        other canary shapes; the update (to a projected, non-filter column) is
+        flushed so the DeltaStore is on disk.
+        """
+        if getattr(self, "_delta_canary_ready", False):
+            return
+        rows = 200_000
+        self.client.execute("CREATE TABLE deltacan (k INT, v INT)")
+        self.client.use_table("deltacan")
+        for start in range(0, rows, 50_000):
+            end = min(rows, start + 50_000)
+            self.client.store({"k": list(range(start, end)),
+                               "v": list(range(start, end))})
+        self.client.flush()
+        self.client.execute(f"UPDATE deltacan SET v = 5 WHERE _id = {rows // 2 + 1}")
+        self.client.flush()
+        self._delta_canary_ready = True
+
+    def bench_delta_numeric_range_limit(self):
+        """Bounded numeric range read with a persisted cell overlay present.
+
+        The lane used to stand down for any DeltaStore cell, so the generic
+        merged executor materialized the whole table (1M rows: 0.12 ms clean,
+        ~1.6 s with the overlay).
+        """
+        return self._query_all(
+            "SELECT * FROM deltacan WHERE k >= 100000 LIMIT 100"
+        )
+
     def bench_index_range(self):
         return self._query_all(
             "SELECT * FROM idxcan WHERE amount BETWEEN 20 AND 29"

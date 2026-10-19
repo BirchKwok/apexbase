@@ -7841,6 +7841,53 @@ mod tests {
         assert_eq!(ids.values(), &[1, 3]);
     }
 
+    #[test]
+    fn indexed_read_merges_cell_updates_and_drops_pending_deletes() {
+        // The bounded numeric-range lane reads its window through this reader
+        // when a DeltaStore overlay exists. It must merge updated cells and drop
+        // deleted rows while preserving the requested row order.
+        use arrow::array::Int64Array;
+
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("indexed_delta_overlay.apex");
+        let backend = TableStorageBackend::create(&path).unwrap();
+        backend.add_column("k", DataType::Int64).unwrap();
+        backend.add_column("v", DataType::Int64).unwrap();
+        let rows: Vec<HashMap<String, Value>> = (0..4i64)
+            .map(|i| {
+                HashMap::from([
+                    ("k".to_string(), Value::Int64(i)),
+                    ("v".to_string(), Value::Int64(i)),
+                ])
+            })
+            .collect();
+        backend.insert_rows(&rows).unwrap();
+        backend.save_full().unwrap();
+        drop(backend);
+
+        let backend = TableStorageBackend::open(&path).unwrap();
+        backend.delta_batch_update_rows(&[(2u64, "v", Value::Int64(20))]);
+        assert!(backend.delta_delete_row(3).unwrap());
+
+        let batch = backend
+            .read_columns_by_indices_to_arrow(&[0, 1, 2, 3], None)
+            .unwrap();
+        let ids: Vec<i64> = batch
+            .column_by_name("_id")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("batch must contain _id")
+            .values()
+            .to_vec();
+        let values: Vec<i64> = batch
+            .column_by_name("v")
+            .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
+            .expect("batch must contain v")
+            .values()
+            .to_vec();
+        assert_eq!(ids, vec![1, 2, 4]);
+        assert_eq!(values, vec![0, 20, 3]);
+    }
+
     fn logical_scan_rows(batch: &RecordBatch) -> Vec<(i64, i64, Option<f64>, Option<String>)> {
         use arrow::array::{Array, Float64Array, Int64Array, StringArray};
         use arrow::datatypes::DataType as ArrowDataType;

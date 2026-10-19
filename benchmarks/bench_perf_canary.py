@@ -96,6 +96,12 @@ CANARY_SPECS = (
     ("Parallel batch scan (2 threads)", "bench_parallel_batch_scan_t2", "mean"),
     ("Parallel batch scan (4 threads)", "bench_parallel_batch_scan_t4", "mean"),
     ("Parallel batch scan (auto)", "bench_parallel_batch_scan_auto", "mean"),
+    (
+        "Numeric range LIMIT (delta overlay)",
+        "bench_delta_numeric_range_limit",
+        "setup",
+        "setup_delta_numeric_range_limit",
+    ),
 )
 
 # Full-mode par phase (R5.7 phase A): the 8-thread shape exists only in the
