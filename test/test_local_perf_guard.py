@@ -325,7 +325,7 @@ def test_local_guard_full_mode_runs_every_dedicated_phase(local_guard):
 
     # Every dedicated base/current phase of --mode full must stay wired: the
     # guard's coverage is the union of these interleaved comparisons.
-    for phase in ("qps", "quant", "idx", "par", "wf", "zs", "htap", "wide", "hybrid", "pgwire"):
+    for phase in ("qps", "quant", "idx", "par", "wf", "zs", "htap", "wide", "hybrid", "pgwire", "hot"):
         assert f"collect_{phase} = make_collect(" in source
         assert f'"{phase}-comparison"' in source
     assert "width_only=True" in source
@@ -334,6 +334,69 @@ def test_local_guard_full_mode_runs_every_dedicated_phase(local_guard):
     assert "wide_only=True" in source
     assert "hybrid_only=True" in source
     assert "pgwire_only=True" in source
+    # M-21: the full perf phase is the frozen 103-metric public scoreboard, so
+    # the DELETE/UPDATE/count-only/overlay shapes run as their own phase.
+    assert "hot_shapes_only=True" in source
+
+
+def test_local_guard_hot_phase_uses_the_canary_hot_profile(local_guard):
+    command = local_guard.benchmark_arguments(
+        "canary", None, None, None, "report.json", hot_shapes_only=True
+    )
+
+    assert Path(command[0]).name == "bench_perf_canary.py"
+    assert "--hot-shapes-only" in command
+    assert tuple(command[command.index(flag) + 1] for flag in (
+        "--rows", "--warmup", "--iterations"
+    )) == ("200000", "2", "7")
+
+
+def test_hot_shape_specs_cover_the_scoreboard_gaps():
+    path = ROOT / "benchmarks" / "bench_perf_canary.py"
+    spec = importlib.util.spec_from_file_location("bench_perf_canary", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    names = [item[0] for item in module.HOT_SHAPE_SPECS]
+    assert names == list(module.HOT_SHAPE_NAMES)
+    for expected in (
+        "Bitpack partial range COUNT",
+        "COUNT(col) covered",
+        "COUNT(col) partial",
+        "COUNT(col) string filter",
+        "Numeric range LIMIT (delta overlay)",
+        "String cell UPDATE (single row)",
+        "DELETE by _id",
+        "DELETE bounded range",
+    ):
+        assert expected in names
+    # M-13: the shapes that mutate `default` run after the reads; the overlay
+    # shape then switches to its own table.
+    assert names[-4:] == [
+        "String cell UPDATE (single row)",
+        "DELETE by _id",
+        "DELETE bounded range",
+        "Numeric range LIMIT (delta overlay)",
+    ]
+
+
+def test_canary_hot_profile_rejects_other_profiles(tmp_path):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "benchmarks" / "bench_perf_canary.py"),
+            "--hot-shapes-only",
+            "--index-only",
+            "--output",
+            str(tmp_path / "report.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 2
+    assert "mutually exclusive" in completed.stderr
 
 
 def test_local_guard_pgwire_phase_uses_the_concurrency_script(local_guard):

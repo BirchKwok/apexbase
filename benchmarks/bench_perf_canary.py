@@ -113,6 +113,34 @@ PARALLEL_ONLY_SPECS = (
     ("Parallel batch scan (auto)", "bench_parallel_batch_scan_auto", "mean"),
 )
 
+def _canary_spec(name):
+    for spec in CANARY_SPECS:
+        if spec[0] == name:
+            return spec
+    raise KeyError(f"unknown canary spec: {name}")
+
+
+# Shapes the `--mode full` perf phase cannot sample: the public scoreboard is
+# frozen at 103 tabular metrics (D12), so DELETE / single-cell UPDATE /
+# count-only / persisted-overlay shapes live only in this canary. Full mode
+# runs this subset as its own base/current phase (M-21) instead of widening the
+# public scoreboard.
+HOT_SHAPE_NAMES = (
+    "Bitpack partial range COUNT",
+    "COUNT(col) covered",
+    "COUNT(col) partial",
+    "COUNT(col) string filter",
+    # Mutating shapes run after the reads (M-13): they change the shared
+    # `default` fixture.
+    "String cell UPDATE (single row)",
+    "DELETE by _id",
+    "DELETE bounded range",
+    # Builds and switches to its own `deltacan` table, so it runs last and the
+    # deletions above keep measuring `default`.
+    "Numeric range LIMIT (delta overlay)",
+)
+HOT_SHAPE_SPECS = tuple(_canary_spec(name) for name in HOT_SHAPE_NAMES)
+
 QUANTIZED_CODECS = (
     "float16",
     "bfloat16",
@@ -312,7 +340,15 @@ def run_commit_canary(rows, warmup, iterations):
             client.close()
 
 
-def run_canary(rows, warmup, iterations, qps_only=False, index_only=False, parallel_only=False):
+def run_canary(
+    rows,
+    warmup,
+    iterations,
+    qps_only=False,
+    index_only=False,
+    parallel_only=False,
+    hot_shapes_only=False,
+):
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -336,7 +372,12 @@ def run_canary(rows, warmup, iterations, qps_only=False, index_only=False, paral
     results = []
     try:
         bench.setup()
-        if parallel_only:
+        if hot_shapes_only:
+            specs = HOT_SHAPE_SPECS
+            # This profile skips the Bulk Insert spec that loads `default`;
+            # load it unmeasured so the hot shapes have a table to read.
+            bench.bench_insert()
+        elif parallel_only:
             specs = PARALLEL_ONLY_SPECS
             # Standalone profile: the batch pipeline setup copies the
             # persisted default table, which only exists once the data
@@ -390,11 +431,11 @@ def run_canary(rows, warmup, iterations, qps_only=False, index_only=False, paral
                     "ApexBase": round(elapsed_ms, 6),
                 })
                 print(f"{name:<34} {elapsed_ms:>12.6f} ms")
-        if not index_only and not parallel_only:
+        if not index_only and not parallel_only and not hot_shapes_only:
             quant_results, _quant_recall = run_quantized_canary(rows, warmup, iterations)
             results.extend(quant_results)
 
-        if not index_only and not parallel_only:
+        if not index_only and not parallel_only and not hot_shapes_only:
             # OLAP Q/s read profile (ApexBase-only). The harness recreates the
             # engine on a clean loaded copy, so the measurement is independent
             # of the delta-heavy state left by the DML canary metrics. Every
@@ -417,7 +458,12 @@ def run_canary(rows, warmup, iterations, qps_only=False, index_only=False, paral
                     "ApexBase": round(qps.get(key, 0.0), 3),
                 })
                 print(f"{label:<34} {qps.get(key, 0.0):>12.3f} Q/s")
-        if not qps_only and not index_only and not parallel_only:
+        if (
+            not qps_only
+            and not index_only
+            and not parallel_only
+            and not hot_shapes_only
+        ):
             results.extend(run_commit_canary(rows, warmup, iterations))
         return results
     finally:
@@ -451,22 +497,42 @@ def main(argv=None):
         action="store_true",
         help="Run only the parallel batch-scan metrics (R5.7 guard phase)",
     )
+    parser.add_argument(
+        "--hot-shapes-only",
+        action="store_true",
+        help="Run only the DML/count-only/overlay shapes the full perf "
+        "scoreboard cannot sample (M-21 phase)",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
 
     if args.qps_only and (
-        args.quant_only or args.index_only or args.parallel_only
+        args.quant_only
+        or args.index_only
+        or args.parallel_only
+        or args.hot_shapes_only
     ):
         parser.error(
             "--qps-only is mutually exclusive with the other profile flags"
         )
-    if args.quant_only and (args.index_only or args.parallel_only):
+    if args.quant_only and (
+        args.index_only or args.parallel_only or args.hot_shapes_only
+    ):
         parser.error(
             "--quant-only is mutually exclusive with the other profile flags"
         )
-    if args.index_only and args.parallel_only:
-        parser.error("--index-only and --parallel-only are mutually exclusive")
+    if sum(
+        (
+            args.index_only,
+            args.parallel_only,
+            args.hot_shapes_only,
+        )
+    ) > 1:
+        parser.error(
+            "--index-only, --parallel-only and --hot-shapes-only are "
+            "mutually exclusive"
+        )
     quantized_recall = None
     if args.quant_only:
         results, quantized_recall = run_quantized_canary(
@@ -479,6 +545,10 @@ def main(argv=None):
     elif args.parallel_only:
         results = run_canary(
             args.rows, args.warmup, args.iterations, parallel_only=True
+        )
+    elif args.hot_shapes_only:
+        results = run_canary(
+            args.rows, args.warmup, args.iterations, hot_shapes_only=True
         )
     else:
         results = run_canary(

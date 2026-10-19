@@ -154,6 +154,7 @@ def benchmark_arguments(
     mode, rows, warmup, iterations, output, qps_only=False, quant_only=False,
     index_only=False, parallel_only=False, width_only=False, string_zones_only=False,
     htap_only=False, wide_only=False, hybrid_only=False, pgwire_only=False,
+    hot_shapes_only=False,
 ):
     if width_only:
         # The width-fidelity phase builds its own tables (one V4 full-width
@@ -217,7 +218,7 @@ def benchmark_arguments(
     command += ["--output", output]
     if mode == "full" and not qps_only and not quant_only and not width_only \
             and not string_zones_only and not htap_only and not wide_only \
-            and not hybrid_only and not pgwire_only:
+            and not hybrid_only and not pgwire_only and not hot_shapes_only:
         # Quantized base/current metrics run in the dedicated interleaved phase.
         command.insert(1, "--skip-quantized-vector")
     if qps_only:
@@ -228,6 +229,8 @@ def benchmark_arguments(
         command.insert(1, "--index-only")
     if parallel_only:
         command.insert(1, "--parallel-only")
+    if hot_shapes_only:
+        command.insert(1, "--hot-shapes-only")
     return tuple(command)
 
 
@@ -664,6 +667,28 @@ def execute_gate(args, output_dir, evidence):
                     collect_pgwire, pgwire_reports, "pgwire-comparison"
                 )
                 comparison_status = max(comparison_status, pgwire_status)
+
+                # Hot shapes the public scoreboard cannot carry (M-21): DELETE,
+                # single-cell UPDATE, count-only and persisted-overlay reads are
+                # only in CANARY_SPECS, so the full `perf` phase (the 103-metric
+                # public scoreboard, D12-frozen) never samples them. Run that
+                # subset as its own interleaved base/current phase here instead
+                # of widening the scoreboard and its fixed invariants.
+                hot_counts = {"base": 0, "current": 0}
+                hot_reports = {"base": [], "current": []}
+                collect_hot = make_collect(
+                    "hot",
+                    hot_counts,
+                    hot_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, hot_shapes_only=True
+                    ),
+                )
+                collect_hot(SAMPLE_ORDER)
+                hot_status = run_comparison(
+                    collect_hot, hot_reports, "hot-comparison"
+                )
+                comparison_status = max(comparison_status, hot_status)
 
             print(f"Reports and comparison saved in {output_dir}")
         finally:
