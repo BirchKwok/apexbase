@@ -6040,6 +6040,53 @@ fn positions_for_ids_requires_dense_undeleted_row_groups() {
 }
 
 #[test]
+fn ids_at_active_positions_reads_only_the_requested_ids() {
+    // The direct vector TopK used to decode the whole `_id` column to recover k
+    // ids (8 MB at 1M rows). The ID section starts each row group's body, so the
+    // helper resolves a position with one 8-byte read; deletions keep the column
+    // read because an active index would have to be mapped through the bitmap.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("ids_by_position.apex");
+    let rows = 200_000usize;
+    let storage = OnDemandStorage::create(&path).unwrap();
+    storage
+        .insert_typed(
+            HashMap::from([(
+                "a".to_string(),
+                (0..rows as i64).collect::<Vec<i64>>(),
+            )]),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save_v4().unwrap();
+
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    // First row of each row group, the last row, and the partial tail group.
+    let positions = vec![0usize, 1, 65_535, 65_536, 196_607, 196_608, rows - 1];
+    let ids = reopened
+        .ids_at_active_positions(&positions)
+        .unwrap()
+        .expect("dense undeleted ids");
+    assert_eq!(
+        ids,
+        positions.iter().map(|&position| position as i64 + 1).collect::<Vec<_>>()
+    );
+    assert_eq!(ids, reopened.read_ids_by_indices(&positions).unwrap());
+    assert_eq!(reopened.ids_at_active_positions(&[]).unwrap(), Some(Vec::new()));
+    assert!(reopened.ids_at_active_positions(&[rows]).unwrap().is_none());
+    drop(reopened);
+
+    // A persisted deletion vector makes active row indices ambiguous.
+    assert!(storage.delete(5));
+    storage.save_delete_only().unwrap();
+    let after = OnDemandStorage::open(&path).unwrap();
+    assert!(after.ids_at_active_positions(&[0]).unwrap().is_none());
+}
+
+#[test]
 fn chunked_row_group_round_trips_through_the_flat_layout() {
     // The chunked layout stores each column as its own compressed frame and is
     // reassembled into the revision-1 flat body before any reader touches a

@@ -510,20 +510,29 @@ impl ApexStorageImpl {
                     )
                     .map_err(|e| PyRuntimeError::new_err(e.to_string()));
                 }
-                // Read only the _id column (8MB) to map row indices → IDs
-                let id_batch = backend
-                    .read_columns_to_arrow(Some(&["_id"]), 0, None)
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                let id_col = id_batch.column_by_name("_id");
-                let ids: Vec<i64> = topk
-                    .iter()
-                    .map(|(row_idx, _)| {
-                        id_col
-                            .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                            .map(|a| a.value(*row_idx))
-                            .unwrap_or(*row_idx as i64)
-                    })
-                    .collect();
+                // Resolve only the k winning ids: the ID section starts each row
+                // group's body, so this is O(k) instead of decoding the whole
+                // `_id` column (W1-5: 8 MB at 1M rows to recover 10 ids).
+                let positions: Vec<usize> =
+                    topk.iter().map(|(row_idx, _)| *row_idx).collect();
+                let ids: Vec<i64> = match backend.storage.ids_at_active_positions(&positions) {
+                    Ok(Some(ids)) => ids,
+                    _ => {
+                        let id_batch = backend
+                            .read_columns_to_arrow(Some(&["_id"]), 0, None)
+                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                        let id_col = id_batch.column_by_name("_id");
+                        positions
+                            .iter()
+                            .map(|&row_idx| {
+                                id_col
+                                    .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
+                                    .map(|a| a.value(row_idx))
+                                    .unwrap_or(row_idx as i64)
+                            })
+                            .collect()
+                    }
+                };
                 let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
                 return RecordBatch::try_new(
                     out_schema,

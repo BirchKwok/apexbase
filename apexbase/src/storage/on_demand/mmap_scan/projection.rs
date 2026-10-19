@@ -2076,6 +2076,79 @@ impl OnDemandStorage {
         Ok(result)
     }
 
+    /// Resolve `_id` values for a small set of **active** row positions without
+    /// materializing the whole ID column.
+    ///
+    /// The direct vector TopK returns active row indices; mapping them through
+    /// `read_columns_to_arrow(Some(&["_id"]), ..)` decoded 8 bytes per table row
+    /// (8 MB at 1M rows) just to recover k ids, which was the single-query fixed
+    /// cost W1-5 measured (1,000 rows: ~77 µs against ~2 µs amortized in a batch).
+    /// The ID section starts each row group's body, so a position costs one
+    /// 8-byte read, or an addition for implicit contiguous ids.
+    ///
+    /// Deletions keep the column read: an active index would first have to be
+    /// mapped through the deletion bitmap, and that path is rare. Returns `None`
+    /// for that case and for malformed offsets, so the caller falls back to the
+    /// ordinary `_id` projection.
+    pub fn ids_at_active_positions(&self, positions: &[usize]) -> io::Result<Option<Vec<i64>>> {
+        if positions.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        if footer
+            .row_groups
+            .iter()
+            .any(|row_group| row_group.deletion_count > 0)
+        {
+            return Ok(None);
+        }
+        // (cumulative active start, row-group index) for the non-empty groups.
+        let mut starts: Vec<(usize, usize)> = Vec::with_capacity(footer.row_groups.len());
+        let mut cumulative = 0usize;
+        for (rg_i, row_group) in footer.row_groups.iter().enumerate() {
+            if row_group.row_count == 0 {
+                continue;
+            }
+            starts.push((cumulative, rg_i));
+            cumulative += row_group.row_count as usize;
+        }
+        if positions.iter().any(|&position| position >= cumulative) {
+            return Ok(None);
+        }
+
+        let file_guard = self.file.read();
+        let Some(file) = file_guard.as_ref() else {
+            return Ok(None);
+        };
+        let mut mmap_guard = self.mmap_cache.write();
+        let mmap_ref = mmap_guard.get_or_create(file)?;
+        let mmap: &[u8] = &mmap_ref;
+
+        let mut ids = Vec::with_capacity(positions.len());
+        for &position in positions {
+            let slot = starts
+                .partition_point(|&(start, _)| start <= position)
+                .saturating_sub(1);
+            let (start, rg_i) = starts[slot];
+            let row_group = &footer.row_groups[rg_i];
+            let local = position - start;
+            let rg_rows = row_group.row_count as usize;
+            let rg_offset = row_group.offset as usize;
+            if local >= rg_rows || rg_offset + 32 > mmap.len() {
+                return Ok(None);
+            }
+            let id_encoding = mmap[rg_offset + 30];
+            let body = &mmap[rg_offset + 32..];
+            let Some(id) = rg_id_at(body, rg_rows, row_group.min_id, id_encoding, local) else {
+                return Ok(None);
+            };
+            ids.push(id as i64);
+        }
+        Ok(Some(ids))
+    }
+
     pub fn read_ids_by_indices(&self, row_indices: &[usize]) -> io::Result<Vec<i64>> {
 
         // Ensure IDs are loaded (lazy loading)
