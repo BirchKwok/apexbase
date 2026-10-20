@@ -510,7 +510,29 @@ def check_large_result(host: str, port: int, data: dict, limit: int = 50) -> Non
         assert row[2] == data["s"][index], (index, row)
 
 
-def run_pgwire(rows: int, warmup: int, iterations: int) -> tuple[list[dict], dict]:
+def pgwire_metric_names(rows: int) -> list[str]:
+    """Every metric this script can report, in report order."""
+    names = [
+        f"PGwire: Q/s ({clients} client{'s' if clients > 1 else ''})"
+        for clients in CLIENT_LEVELS
+    ]
+    names.append(f"PGwire: time to first row ({rows}-row result)")
+    names.append(f"PGwire: full transfer ({rows}-row result)")
+    names.append(f"PGwire: metadata probe p99 ({PROBE_BUSY_CLIENTS} clients busy)")
+    return names
+
+
+def run_pgwire(
+    rows: int,
+    warmup: int,
+    iterations: int,
+    only: list[str] | None = None,
+) -> tuple[list[dict], dict]:
+    wanted = set(only) if only else None
+
+    def want(name: str) -> bool:
+        return wanted is None or name in wanted
+
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -542,6 +564,9 @@ def run_pgwire(rows: int, warmup: int, iterations: int) -> tuple[list[dict], dic
         check_large_result("127.0.0.1", port, data)
 
         for clients in CLIENT_LEVELS:
+            name = f"PGwire: Q/s ({clients} client{'s' if clients > 1 else ''})"
+            if not want(name):
+                continue
             level = run_client_level("127.0.0.1", port, rows, clients, warmup, iterations)
             detail["levels"][str(clients)] = {
                 key: (round(value, 6) if isinstance(value, float) else value)
@@ -555,38 +580,45 @@ def run_pgwire(rows: int, warmup: int, iterations: int) -> tuple[list[dict], dic
                 }
             )
 
-        transfer = measure_large_result("127.0.0.1", port, rows, max(warmup, 3), server.pid)
-        detail["large_result"] = {
-            key: (round(value, 6) if isinstance(value, float) else value)
-            for key, value in transfer.items()
-        }
-        results.append(
-            {
-                "category": "ApexBase PG wire",
-                "query": f"PGwire: time to first row ({rows}-row result)",
-                "ApexBase": round(transfer["first_row_ms"], 6),
+        first_name = f"PGwire: time to first row ({rows}-row result)"
+        transfer_name = f"PGwire: full transfer ({rows}-row result)"
+        if want(first_name) or want(transfer_name):
+            transfer = measure_large_result("127.0.0.1", port, rows, max(warmup, 3), server.pid)
+            detail["large_result"] = {
+                key: (round(value, 6) if isinstance(value, float) else value)
+                for key, value in transfer.items()
             }
-        )
-        results.append(
-            {
-                "category": "ApexBase PG wire",
-                "query": f"PGwire: full transfer ({rows}-row result)",
-                "ApexBase": round(transfer["total_ms"], 6),
-            }
-        )
+            if want(first_name):
+                results.append(
+                    {
+                        "category": "ApexBase PG wire",
+                        "query": first_name,
+                        "ApexBase": round(transfer["first_row_ms"], 6),
+                    }
+                )
+            if want(transfer_name):
+                results.append(
+                    {
+                        "category": "ApexBase PG wire",
+                        "query": transfer_name,
+                        "ApexBase": round(transfer["total_ms"], 6),
+                    }
+                )
 
-        probe = measure_probe("127.0.0.1", port, rows, warmup, max(iterations, 7))
-        detail["probe"] = {
-            key: (round(value, 6) if isinstance(value, float) else value)
-            for key, value in probe.items()
-        }
-        results.append(
-            {
-                "category": "ApexBase PG wire",
-                "query": f"PGwire: metadata probe p99 ({PROBE_BUSY_CLIENTS} clients busy)",
-                "ApexBase": round(probe["p99_ms"], 6),
+        probe_name = f"PGwire: metadata probe p99 ({PROBE_BUSY_CLIENTS} clients busy)"
+        if want(probe_name):
+            probe = measure_probe("127.0.0.1", port, rows, warmup, max(iterations, 7))
+            detail["probe"] = {
+                key: (round(value, 6) if isinstance(value, float) else value)
+                for key, value in probe.items()
             }
-        )
+            results.append(
+                {
+                    "category": "ApexBase PG wire",
+                    "query": probe_name,
+                    "ApexBase": round(probe["p99_ms"], 6),
+                }
+            )
     finally:
         if server is not None:
             stop_server(server)
@@ -600,11 +632,25 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=7)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help="Measure only the named metric(s); used by the guard to recheck a "
+        "marked metric in a fresh process",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
+    known = set(pgwire_metric_names(args.rows))
+    unknown = [name for name in args.only if name not in known]
+    if unknown:
+        parser.error("--only metric(s) not reported by this script: " + ", ".join(unknown))
 
-    results, detail = run_pgwire(args.rows, args.warmup, args.iterations)
+    results, detail = run_pgwire(
+        args.rows, args.warmup, args.iterations, only=args.only
+    )
     report = {
         **full_bench.get_report_metadata("apexbase-canary"),
         "config": {

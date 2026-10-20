@@ -467,6 +467,60 @@ def execute_gate(args, output_dir, evidence):
                 print(f"\n{comparison_output}", end="")
                 return completed.returncode
 
+            def recheck_marked(stem, marked_reports, command_builder, summary_name, file_prefix):
+                """Re-measure marked metrics alone, each in a fresh process.
+
+                A metric can be marked only because it runs late in a shared
+                process whose earlier metrics left a different cache/memory state
+                (M-22), or because a concurrency probe's p99 is bimodal. A real
+                slowdown reproduces in the isolated run; a coupling marker does not.
+                """
+                comparison_text = (output_dir / f"{stem}.txt").read_text(
+                    encoding="utf-8"
+                )
+                metric_names = report_metric_names(marked_reports["base"][0])
+                marked = marked_metrics(comparison_text, metric_names)
+                remaining = []
+                lines = []
+                for index, metric in enumerate(marked):
+                    counts = {"base": 0, "current": 0}
+                    reports = {"base": [], "current": []}
+                    collect = make_collect(
+                        f"{file_prefix}-{index}",
+                        counts,
+                        reports,
+                        lambda side, report, metric=metric: command_builder(
+                            metric, report
+                        ),
+                    )
+                    collect(SAMPLE_ORDER)
+                    status = run_comparison(
+                        collect, reports, f"{file_prefix}-{index}"
+                    )
+                    lines.append(
+                        f"{metric}: "
+                        + (
+                            "still regressed in a fresh process"
+                            if status != 0
+                            else "clean in a fresh process"
+                        )
+                    )
+                    if status != 0:
+                        remaining.append(metric)
+                (output_dir / summary_name).write_text(
+                    "\n".join(lines) + "\n", encoding="utf-8"
+                )
+                print("\nMarked-metric recheck (fresh process per metric):")
+                print("\n".join(lines))
+                if marked and not remaining:
+                    print(
+                        "All marked metrics pass when measured in a fresh process; "
+                        "the full-sequence marker is cross-metric coupling, not a "
+                        "query regression."
+                    )
+                    return 0
+                return 1
+
             counts = {"base": 0, "current": 0}
             reports = {"base": [], "current": []}
             collect = make_collect(
@@ -481,55 +535,15 @@ def execute_gate(args, output_dir, evidence):
             comparison_status = run_comparison(collect, reports, "comparison")
 
             if comparison_status == 1 and args.mode == "full":
-                # A metric can be marked only because it runs late in a shared
-                # process whose earlier metrics left a different cache/memory
-                # state (M-22). Re-measure every marked metric alone, in a fresh
-                # process, before calling it a regression: a real slowdown shows
-                # up there too; a cross-metric coupling does not.
-                comparison_text = (output_dir / "comparison.txt").read_text(
-                    encoding="utf-8"
+                comparison_status = recheck_marked(
+                    "comparison",
+                    reports,
+                    lambda metric, report: benchmark_arguments(
+                        "full", None, None, None, report, only_metric=metric
+                    ),
+                    "perf-recheck.txt",
+                    "recheck",
                 )
-                metric_names = report_metric_names(reports["base"][0])
-                marked = marked_metrics(comparison_text, metric_names)
-                remaining = []
-                recheck_lines = []
-                for index, metric in enumerate(marked):
-                    recheck_counts = {"base": 0, "current": 0}
-                    recheck_reports = {"base": [], "current": []}
-                    collect_recheck = make_collect(
-                        f"recheck-{index}",
-                        recheck_counts,
-                        recheck_reports,
-                        lambda side, report, metric=metric: benchmark_arguments(
-                            "full", None, None, None, report, only_metric=metric
-                        ),
-                    )
-                    collect_recheck(SAMPLE_ORDER)
-                    recheck_status = run_comparison(
-                        collect_recheck, recheck_reports, f"recheck-{index}"
-                    )
-                    recheck_lines.append(
-                        f"{metric}: "
-                        + (
-                            "still regressed in a fresh process"
-                            if recheck_status != 0
-                            else "clean in a fresh process"
-                        )
-                    )
-                    if recheck_status != 0:
-                        remaining.append(metric)
-                (output_dir / "perf-recheck.txt").write_text(
-                    "\n".join(recheck_lines) + "\n", encoding="utf-8"
-                )
-                print("\nMarked-metric recheck (fresh process per metric):")
-                print("\n".join(recheck_lines))
-                if marked and not remaining:
-                    print(
-                        "All marked metrics pass when measured in a fresh process; "
-                        "the full-sequence marker is cross-metric coupling, not a "
-                        "query regression."
-                    )
-                    comparison_status = 0
 
             # The full gate also covers the OLAP Q/s read profile
             # (ApexBase-only, canary scale) as a separate base/current
@@ -746,6 +760,22 @@ def execute_gate(args, output_dir, evidence):
                 pgwire_status = run_comparison(
                     collect_pgwire, pgwire_reports, "pgwire-comparison"
                 )
+                if pgwire_status == 1:
+                    pgwire_status = recheck_marked(
+                        "pgwire-comparison",
+                        pgwire_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary",
+                            None,
+                            None,
+                            None,
+                            report,
+                            pgwire_only=True,
+                            only_metric=metric,
+                        ),
+                        "pgwire-recheck.txt",
+                        "pgwire-recheck",
+                    )
                 comparison_status = max(comparison_status, pgwire_status)
 
                 # Hot shapes the public scoreboard cannot carry (M-21): DELETE,

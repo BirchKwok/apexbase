@@ -364,6 +364,52 @@ COUNT WHERE category                          0.244 ms         0.291 ms     +19.
     ]
 
 
+def test_pgwire_metric_names_cover_the_script():
+    path = ROOT / "benchmarks" / "bench_pg_wire_concurrency.py"
+    spec = importlib.util.spec_from_file_location("pgwire_script", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    names = module.pgwire_metric_names(200_000)
+    assert names[0] == "PGwire: Q/s (1 client)"
+    assert "PGwire: Q/s (8 clients)" in names
+    assert "PGwire: time to first row (200000-row result)" in names
+    assert "PGwire: full transfer (200000-row result)" in names
+    assert "PGwire: metadata probe p99 (24 clients busy)" in names
+
+
+def test_pgwire_only_runs_one_metric(tmp_path):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "benchmarks" / "bench_pg_wire_concurrency.py"),
+            "--rows", "3000",
+            "--warmup", "1",
+            "--iterations", "1",
+            "--only", "PGwire: metadata probe p99 (24 clients busy)",
+            "--output", str(tmp_path / "pgwire.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads((tmp_path / "pgwire.json").read_text(encoding="utf-8"))
+    assert [row["query"] for row in report["results"]] == [
+        "PGwire: metadata probe p99 (24 clients busy)"
+    ]
+
+
+def test_local_guard_pgwire_recheck_uses_only_metric(local_guard):
+    source = Path(local_guard.__file__).read_text(encoding="utf-8")
+
+    # M-23: a marked pgwire metric is re-measured alone, in a fresh process.
+    assert "pgwire-recheck.txt" in source
+    assert "recheck_marked(" in source
+    assert "pgwire_only=True" in source
+
+
 def test_local_guard_full_mode_rechecks_marked_metrics(local_guard):
     source = Path(local_guard.__file__).read_text(encoding="utf-8")
 
