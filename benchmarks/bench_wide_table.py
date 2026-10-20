@@ -376,7 +376,37 @@ def check(client, table, sql_template, expected, mid):
         raise AssertionError(f"unchecked shape: {name}")
 
 
-def run_wide_table(rows, warmup, iterations, min_row_groups=MIN_ROW_GROUPS):
+def wide_metric_names():
+    """Every reported metric name, in report order."""
+    names = []
+    for prefix, shapes in (
+        ("Wide", PLAIN_SHAPES),
+        ("Wide/Zstd", COMPRESSED_SHAPES),
+        ("Wide", EXECUTOR_SHAPES),
+        ("Wide/Zstd", EXECUTOR_SHAPES),
+        ("Wide", COLD_SHAPES),
+        ("Wide/Zstd", COLD_SHAPES),
+        ("Wide", SPARSE_DELETE_SHAPES),
+        ("Wide/Zstd", SPARSE_DELETE_SHAPES),
+    ):
+        names.extend(f"{prefix}: {name}" for name, _ in shapes)
+    # Report order is plain shapes -> plain executor -> plain cold -> plain
+    # sparse, then the same for zstd; dedupe without reordering.
+    return list(dict.fromkeys(names))
+
+
+def run_wide_table(
+    rows,
+    warmup,
+    iterations,
+    min_row_groups=MIN_ROW_GROUPS,
+    only=None,
+):
+    wanted = set(only) if only else None
+
+    def want(metric):
+        return wanted is None or metric in wanted
+
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -427,9 +457,11 @@ def run_wide_table(rows, warmup, iterations, min_row_groups=MIN_ROW_GROUPS):
             shapes = PLAIN_SHAPES if label == "plain" else COMPRESSED_SHAPES
             prefix = "Wide" if label == "plain" else "Wide/Zstd"
             for name, sql in shapes:
+                metric = f"{prefix}: {name}"
+                if not want(metric):
+                    continue
                 check(client, table, sql, expected, mid)
                 warm_ms = measure(client, table, sql, warmup, iterations, mid)
-                metric = f"{prefix}: {name}"
                 results.append(
                     {
                         "category": "ApexBase wide table",
@@ -438,7 +470,7 @@ def run_wide_table(rows, warmup, iterations, min_row_groups=MIN_ROW_GROUPS):
                     }
                 )
                 detail["shapes"][metric] = {"warm_ms": round(warm_ms, 6)}
-            if label == "plain":
+            if label == "plain" and wanted is None:
                 for name, sql in INFORMATIONAL_SHAPES:
                     check(client, table, sql, expected, mid)
                     warm_ms = measure(client, table, sql, warmup, iterations, mid)
@@ -446,9 +478,11 @@ def run_wide_table(rows, warmup, iterations, min_row_groups=MIN_ROW_GROUPS):
                         "warm_ms": round(warm_ms, 6)
                     }
             for name, sql in EXECUTOR_SHAPES:
+                metric = f"{prefix}: {name}"
+                if not want(metric):
+                    continue
                 check_executor(client, table, sql, mid)
                 warm_ms = measure_executor(client, table, sql, warmup, iterations, mid)
-                metric = f"{prefix}: {name}"
                 results.append(
                     {
                         "category": "ApexBase wide table",
@@ -458,9 +492,11 @@ def run_wide_table(rows, warmup, iterations, min_row_groups=MIN_ROW_GROUPS):
                 )
                 detail["shapes"][metric] = {"warm_ms": round(warm_ms, 6)}
             for name, sql in COLD_SHAPES:
+                metric = f"{prefix}: {name}"
+                if not want(metric):
+                    continue
                 check(client, table, sql, expected, mid)
                 cold_ms = measure_cold(db_dir, table, sql, iterations, mid)
-                metric = f"{prefix}: {name}"
                 results.append(
                     {
                         "category": "ApexBase wide table",
@@ -470,6 +506,9 @@ def run_wide_table(rows, warmup, iterations, min_row_groups=MIN_ROW_GROUPS):
                 )
                 detail["shapes"][metric] = {"cold_ms": round(cold_ms, 6)}
             for name, sql in SPARSE_DELETE_SHAPES:
+                metric = f"{prefix}: {name}"
+                if not want(metric):
+                    continue
                 client.execute(
                     f"DELETE FROM {table} WHERE k >= 5000 AND k < "
                     f"{5000 + SPARSE_DELETED_ROWS}"
@@ -477,7 +516,6 @@ def run_wide_table(rows, warmup, iterations, min_row_groups=MIN_ROW_GROUPS):
                 client.flush()
                 check(client, table, sql, expected, mid)
                 warm_ms = measure(client, table, sql, warmup, iterations, mid)
-                metric = f"{prefix}: {name}"
                 results.append(
                     {
                         "category": "ApexBase wide table",
@@ -508,14 +546,30 @@ def main(argv=None):
     # tests can lower it, the guard always runs the default.
     parser.add_argument("--min-row-groups", type=int, default=MIN_ROW_GROUPS)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help="Measure only the named metric(s); used by the guard to recheck a "
+        "marked metric in a fresh process",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
     if args.min_row_groups <= 0:
         parser.error("min-row-groups must be positive")
+    known = set(wide_metric_names())
+    unknown = [name for name in args.only if name not in known]
+    if unknown:
+        parser.error("--only metric(s) not reported by this script: " + ", ".join(unknown))
 
     results, detail = run_wide_table(
-        args.rows, args.warmup, args.iterations, args.min_row_groups
+        args.rows,
+        args.warmup,
+        args.iterations,
+        args.min_row_groups,
+        only=args.only,
     )
     report = {
         **full_bench.get_report_metadata("apexbase-canary"),

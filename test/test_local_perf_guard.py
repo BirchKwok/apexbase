@@ -401,6 +401,50 @@ def test_pgwire_only_runs_one_metric(tmp_path):
     ]
 
 
+def test_wide_metric_names_cover_the_zstd_filtered_aggregation():
+    path = ROOT / "benchmarks" / "bench_wide_table.py"
+    spec = importlib.util.spec_from_file_location("wide_script", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    names = module.wide_metric_names()
+    assert "Wide/Zstd: filtered aggregation" in names
+    assert any(name.startswith("Wide: ") for name in names)
+    assert len(names) == len(set(names))
+
+
+def test_wide_only_runs_one_metric(tmp_path):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "benchmarks" / "bench_wide_table.py"),
+            "--rows", "20000",
+            "--warmup", "1",
+            "--iterations", "1",
+            "--min-row-groups", "1",
+            "--only", "Wide/Zstd: filtered aggregation",
+            "--output", str(tmp_path / "wide.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads((tmp_path / "wide.json").read_text(encoding="utf-8"))
+    assert [row["query"] for row in report["results"]] == [
+        "Wide/Zstd: filtered aggregation"
+    ]
+
+
+def test_local_guard_wide_recheck_uses_only_metric(local_guard):
+    source = Path(local_guard.__file__).read_text(encoding="utf-8")
+
+    # M-23: a marked wide-table metric is re-measured alone.
+    assert "wide-recheck.txt" in source
+    assert "wide_only=True" in source
+
+
 def test_local_guard_pgwire_recheck_uses_only_metric(local_guard):
     source = Path(local_guard.__file__).read_text(encoding="utf-8")
 

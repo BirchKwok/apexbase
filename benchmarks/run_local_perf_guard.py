@@ -716,6 +716,22 @@ def execute_gate(args, output_dir, evidence):
                 wide_status = run_comparison(
                     collect_wide, wide_reports, "wide-comparison"
                 )
+                if wide_status == 1:
+                    wide_status = recheck_marked(
+                        "wide-comparison",
+                        wide_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary",
+                            None,
+                            None,
+                            None,
+                            report,
+                            wide_only=True,
+                            only_metric=metric,
+                        ),
+                        "wide-recheck.txt",
+                        "wide-recheck",
+                    )
                 comparison_status = max(comparison_status, wide_status)
 
                 # Mixed retrieval: one table carries both a text column and a
