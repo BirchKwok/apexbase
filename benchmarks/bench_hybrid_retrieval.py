@@ -118,7 +118,31 @@ def rrf_fuse(branch_lists, top_k=TOP_K, rrf_k=RRF_K):
     return [doc_id for doc_id, _score in ranked[:top_k]]
 
 
-def run_hybrid_retrieval(rows, warmup, iterations):
+def hybrid_metric_names(rows):
+    """Every reported metric name, in report order."""
+    labels = [
+        "BM25 top-50 (needle)",
+        f"vector top-50 (exact, {rows} x {DIM})",
+        "fused top-10 (RRF 50+50)",
+        "SQL MATCH row selection (needle)",
+        "SQL MATCH row selection + filter",
+        "SQL MATCH row selection (absent term)",
+        "SQL MATCH row selection (dense term, page)",
+        "SQL ORDER BY cosine_distance LIMIT 10",
+        "SQL ORDER BY distance alias LIMIT 10",
+        "SQL MATCH + ORDER BY distance LIMIT 10",
+        "SQL filter + ORDER BY distance LIMIT 10",
+        "SQL MATCH row selection (vector table)",
+    ]
+    return [f"Hybrid: {label}" for label in labels]
+
+
+def run_hybrid_retrieval(rows, warmup, iterations, only=None):
+    wanted = set(only) if only else None
+
+    def want(metric):
+        return wanted is None or metric in wanted
+
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -207,6 +231,9 @@ def run_hybrid_retrieval(rows, warmup, iterations):
         )
         for name, call in shapes:
             label = name.format(rows=rows, dim=DIM)
+            metric = f"Hybrid: {label}"
+            if not want(metric):
+                continue
             for _ in range(warmup):
                 call()
             samples = []
@@ -284,6 +311,9 @@ def run_hybrid_retrieval(rows, warmup, iterations):
             ("SQL MATCH row selection (absent term)", absent_sql),
             ("SQL MATCH row selection (dense term, page)", dense_sql),
         ):
+            metric = f"Hybrid: {label}"
+            if not want(metric):
+                continue
             for _ in range(warmup):
                 client.execute(sql)
             samples = []
@@ -343,6 +373,9 @@ def run_hybrid_retrieval(rows, warmup, iterations):
             ("SQL ORDER BY cosine_distance LIMIT 10", plain_ordered_sql),
             ("SQL ORDER BY distance alias LIMIT 10", ordered_sql),
         ):
+            metric = f"Hybrid: {label}"
+            if not want(metric):
+                continue
             for _ in range(warmup):
                 client.execute(sql)
             samples = []
@@ -399,6 +432,9 @@ def run_hybrid_retrieval(rows, warmup, iterations):
             ("SQL MATCH + ORDER BY distance LIMIT 10", needle_distance_sql),
             ("SQL filter + ORDER BY distance LIMIT 10", range_distance_sql),
         ):
+            metric = f"Hybrid: {label}"
+            if not want(metric):
+                continue
             for _ in range(warmup):
                 client.execute(sql)
             samples = []
@@ -435,6 +471,9 @@ def run_hybrid_retrieval(rows, warmup, iterations):
         for label, sql in (
             ("SQL MATCH row selection (vector table)", vector_match_sql),
         ):
+            metric = f"Hybrid: {label}"
+            if not want(metric):
+                continue
             for _ in range(warmup):
                 client.execute(sql)
             samples = []
@@ -463,11 +502,25 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=7)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help="Measure only the named metric(s); used by the guard to recheck a "
+        "marked metric in a fresh process",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
+    known = set(hybrid_metric_names(args.rows))
+    unknown = [name for name in args.only if name not in known]
+    if unknown:
+        parser.error("--only metric(s) not reported by this script: " + ", ".join(unknown))
 
-    results, detail = run_hybrid_retrieval(args.rows, args.warmup, args.iterations)
+    results, detail = run_hybrid_retrieval(
+        args.rows, args.warmup, args.iterations, only=args.only
+    )
     report = {
         **full_bench.get_report_metadata("apexbase-canary"),
         "config": {

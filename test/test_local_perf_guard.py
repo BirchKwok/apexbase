@@ -437,6 +437,49 @@ def test_wide_only_runs_one_metric(tmp_path):
     ]
 
 
+def test_hybrid_metric_names_cover_the_sql_match_shape():
+    path = ROOT / "benchmarks" / "bench_hybrid_retrieval.py"
+    spec = importlib.util.spec_from_file_location("hybrid_script", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    names = module.hybrid_metric_names(50_000)
+    assert "Hybrid: SQL MATCH row selection (needle)" in names
+    assert "Hybrid: BM25 top-50 (needle)" in names
+    assert len(names) == len(set(names))
+
+
+def test_hybrid_only_runs_one_metric(tmp_path):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "benchmarks" / "bench_hybrid_retrieval.py"),
+            "--rows", "3000",
+            "--warmup", "1",
+            "--iterations", "1",
+            "--only", "Hybrid: SQL MATCH row selection (needle)",
+            "--output", str(tmp_path / "hybrid.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads((tmp_path / "hybrid.json").read_text(encoding="utf-8"))
+    assert [row["query"] for row in report["results"]] == [
+        "Hybrid: SQL MATCH row selection (needle)"
+    ]
+
+
+def test_local_guard_hybrid_recheck_uses_only_metric(local_guard):
+    source = Path(local_guard.__file__).read_text(encoding="utf-8")
+
+    # M-23: a marked hybrid metric is re-measured alone.
+    assert "hybrid-recheck.txt" in source
+    assert "hybrid_only=True" in source
+
+
 def test_local_guard_wide_recheck_uses_only_metric(local_guard):
     source = Path(local_guard.__file__).read_text(encoding="utf-8")
 

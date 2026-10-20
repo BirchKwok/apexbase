@@ -753,6 +753,22 @@ def execute_gate(args, output_dir, evidence):
                 hybrid_status = run_comparison(
                     collect_hybrid, hybrid_reports, "hybrid-comparison"
                 )
+                if hybrid_status == 1:
+                    hybrid_status = recheck_marked(
+                        "hybrid-comparison",
+                        hybrid_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary",
+                            None,
+                            None,
+                            None,
+                            report,
+                            hybrid_only=True,
+                            only_metric=metric,
+                        ),
+                        "hybrid-recheck.txt",
+                        "hybrid-recheck",
+                    )
                 comparison_status = max(comparison_status, hybrid_status)
 
                 # PG wire concurrency: a real server driven by concurrent
