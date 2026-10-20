@@ -472,6 +472,82 @@ def test_hybrid_only_runs_one_metric(tmp_path):
     ]
 
 
+def test_htap_metric_names_cover_the_range_delete_shape():
+    path = ROOT / "benchmarks" / "bench_htap_overlay.py"
+    spec = importlib.util.spec_from_file_location("htap_script", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    names = module.htap_metric_names()
+    assert "HTAP: aggregate after a range delete" in names
+    assert any(name.endswith("(+1% appended)") for name in names)
+    assert len(names) == len(set(names))
+
+
+def test_htap_only_runs_one_metric(tmp_path):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "benchmarks" / "bench_htap_overlay.py"),
+            "--rows", "5000",
+            "--warmup", "1",
+            "--iterations", "1",
+            "--only", "HTAP: aggregate after a range delete",
+            "--output", str(tmp_path / "htap.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads((tmp_path / "htap.json").read_text(encoding="utf-8"))
+    assert [row["query"] for row in report["results"]] == [
+        "HTAP: aggregate after a range delete"
+    ]
+
+
+def test_zone_metric_names_and_single_metric_run(tmp_path):
+    path = ROOT / "benchmarks" / "bench_string_zone_shapes.py"
+    spec = importlib.util.spec_from_file_location("zone_script", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    names = module.zone_metric_names()
+    assert "Zone: varied-length equality" in names
+    assert len(names) == len(set(names))
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(path),
+            "--rows", "20000",
+            "--warmup", "1",
+            "--iterations", "1",
+            "--only", "Zone: varied-length equality",
+            "--output", str(tmp_path / "zone.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads((tmp_path / "zone.json").read_text(encoding="utf-8"))
+    assert [row["query"] for row in report["results"]] == [
+        "Zone: varied-length equality"
+    ]
+
+
+def test_local_guard_htap_and_zone_rechecks_use_only_metric(local_guard):
+    source = Path(local_guard.__file__).read_text(encoding="utf-8")
+
+    assert "htap-recheck.txt" in source
+    assert "htap_only=True" in source
+    assert "zs-recheck.txt" in source
+    assert "string_zones_only=True" in source
+
+
 def test_local_guard_hybrid_recheck_uses_only_metric(local_guard):
     source = Path(local_guard.__file__).read_text(encoding="utf-8")
 

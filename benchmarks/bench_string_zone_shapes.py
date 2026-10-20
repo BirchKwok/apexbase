@@ -122,7 +122,17 @@ def measure(client, sql, warmup, iterations):
     return statistics.median(samples)
 
 
-def run_shapes(rows, warmup, iterations):
+def zone_metric_names():
+    """Every reported metric name, in report order."""
+    return [f"Zone: {name}" for name, _, _ in GATE_SHAPES]
+
+
+def run_shapes(rows, warmup, iterations, only=None):
+    wanted = set(only) if only else None
+
+    def want(metric):
+        return wanted is None or metric in wanted
+
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -176,6 +186,9 @@ def run_shapes(rows, warmup, iterations):
             return expected
 
         for name, sql, expected in GATE_SHAPES:
+            metric = f"Zone: {name}"
+            if not want(metric):
+                continue
             query = sql.format(**substitutions)
             rows_returned = len(client.execute(query).to_dict())
             want = expected_rows(name, expected)
@@ -192,6 +205,8 @@ def run_shapes(rows, warmup, iterations):
             detail["shapes"][name] = {"warm_ms": round(warm_ms, 6), "rows": rows_returned}
 
         for name, sql, expected in CONTROL_SHAPES:
+            if wanted is not None:
+                continue
             query = sql.format(**substitutions)
             rows_returned = len(client.execute(query).to_dict())
             want = expected_rows(name, expected)
@@ -213,11 +228,25 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=7)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help="Measure only the named metric(s); used by the guard to recheck a "
+        "marked metric in a fresh process",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
+    known = set(zone_metric_names())
+    unknown = [name for name in args.only if name not in known]
+    if unknown:
+        parser.error("--only metric(s) not reported by this script: " + ", ".join(unknown))
 
-    results, detail = run_shapes(args.rows, args.warmup, args.iterations)
+    results, detail = run_shapes(
+        args.rows, args.warmup, args.iterations, only=args.only
+    )
     report = {
         **full_bench.get_report_metadata("apexbase-canary"),
         "config": {

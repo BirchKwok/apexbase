@@ -202,7 +202,21 @@ def check(client, sql_template, rows, appended):
         assert got["n"] == want_rows, (sql, got, want_rows)
 
 
-def run_htap(rows, warmup, iterations):
+def htap_metric_names():
+    """Every reported metric name, in report order."""
+    names = [f"HTAP: {name} (+1% appended)" for name, _ in GATE_SHAPES]
+    names.extend(f"HTAP: {name}" for name, _, _ in DELETION_SHAPES)
+    names.extend(f"HTAP: {name}" for name, _, _ in PENDING_SHAPES)
+    names.append("HTAP: aggregate after a range delete")
+    return names
+
+
+def run_htap(rows, warmup, iterations, only=None):
+    wanted = set(only) if only else None
+
+    def want(metric):
+        return wanted is None or metric in wanted
+
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -223,6 +237,8 @@ def run_htap(rows, warmup, iterations):
 
         # Clean controls first, on the persisted base alone.
         for name, sql in CONTROL_SHAPES[:3]:
+            if wanted is not None:
+                continue
             check(client, sql, rows, appended)
             detail["controls"][name] = {
                 "warm_ms": round(measure(client, sql, warmup, iterations), 6)
@@ -237,12 +253,15 @@ def run_htap(rows, warmup, iterations):
         detail["appended_rows"] = extra
 
         for name, sql in GATE_SHAPES:
+            metric = f"HTAP: {name} (+1% appended)"
+            if not want(metric):
+                continue
             check(client, sql, rows, appended)
             warm_ms = measure(client, sql, warmup, iterations)
             results.append(
                 {
                     "category": "ApexBase HTAP overlay",
-                    "query": f"HTAP: {name} (+1% appended)",
+                    "query": metric,
                     "ApexBase": round(warm_ms, 6),
                 }
             )
@@ -253,6 +272,8 @@ def run_htap(rows, warmup, iterations):
         client.flush()
         sparse_oracle = client.execute("SELECT b, s FROM t").to_dict()
         for name, sql, expected_rows in DELETION_SHAPES:
+            if not want(f"HTAP: {name}"):
+                continue
             got = client.execute(sql.replace("{table}", "t")).to_dict()
             if expected_rows is None and sql.strip().startswith("SELECT s,"):
                 # GROUP BY: the surviving rows per label must match the scan. Ties in
@@ -300,6 +321,8 @@ def run_htap(rows, warmup, iterations):
             row["a"] for row in client.execute("SELECT a FROM t").to_dict()
         ][:widest]
         for name, sql, expected_rows in PENDING_SHAPES:
+            if not want(f"HTAP: {name}"):
+                continue
             got = client.execute(sql.replace("{table}", "t")).to_dict()
             assert len(got) == expected_rows, (sql, len(got), expected_rows)
             if expected_rows:
@@ -318,7 +341,7 @@ def run_htap(rows, warmup, iterations):
         # The two-predicate shape keeps its own informational row: its fused lane
         # needs the cached path, which an overlay cannot use yet.
         for name, sql in CONTROL_SHAPES[2:]:
-            if "informational" not in name:
+            if wanted is not None or "informational" not in name:
                 continue
             check(client, sql, rows, appended)
             detail["controls"][name] = {
@@ -328,6 +351,8 @@ def run_htap(rows, warmup, iterations):
 
         # Informational: how much the overlay costs relative to the clean read.
         for index, (name, _) in enumerate(GATE_SHAPES):
+            if wanted is not None:
+                continue
             control = CONTROL_SHAPES[index][0]
             clean_ms = detail["controls"][control]["warm_ms"]
             overlay_ms = detail["shapes"][name]["warm_ms"]
@@ -340,6 +365,10 @@ def run_htap(rows, warmup, iterations):
         # group used to cost a full scalar pass (200k rows: deleting 199999 took
         # `sum` 0.34 ms against 0.13 ms once those groups are skipped). Measured
         # last so it cannot change the fixture the shapes above describe.
+        range_metric = "HTAP: aggregate after a range delete"
+        if not want(range_metric):
+            client.close()
+            return results, detail
         client.use_table("t")
         client.execute("DELETE FROM t WHERE _id <= 150000")
         client.flush()
@@ -373,11 +402,25 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=7)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help="Measure only the named metric(s); used by the guard to recheck a "
+        "marked metric in a fresh process",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
+    known = set(htap_metric_names())
+    unknown = [name for name in args.only if name not in known]
+    if unknown:
+        parser.error("--only metric(s) not reported by this script: " + ", ".join(unknown))
 
-    results, detail = run_htap(args.rows, args.warmup, args.iterations)
+    results, detail = run_htap(
+        args.rows, args.warmup, args.iterations, only=args.only
+    )
     report = {
         **full_bench.get_report_metadata("apexbase-canary"),
         "config": {

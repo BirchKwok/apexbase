@@ -675,6 +675,22 @@ def execute_gate(args, output_dir, evidence):
                 )
                 collect_zs(SAMPLE_ORDER)
                 zs_status = run_comparison(collect_zs, zs_reports, "zs-comparison")
+                if zs_status == 1:
+                    zs_status = recheck_marked(
+                        "zs-comparison",
+                        zs_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary",
+                            None,
+                            None,
+                            None,
+                            report,
+                            string_zones_only=True,
+                            only_metric=metric,
+                        ),
+                        "zs-recheck.txt",
+                        "zs-recheck",
+                    )
                 comparison_status = max(comparison_status, zs_status)
 
                 # HTAP overlay: the same fused aggregations with 1% appended rows
@@ -695,6 +711,22 @@ def execute_gate(args, output_dir, evidence):
                 htap_status = run_comparison(
                     collect_htap, htap_reports, "htap-comparison"
                 )
+                if htap_status == 1:
+                    htap_status = recheck_marked(
+                        "htap-comparison",
+                        htap_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary",
+                            None,
+                            None,
+                            None,
+                            report,
+                            htap_only=True,
+                            only_metric=metric,
+                        ),
+                        "htap-recheck.txt",
+                        "htap-recheck",
+                    )
                 comparison_status = max(comparison_status, htap_status)
 
                 # Wide tables: 16 columns over seven row groups, plus a
