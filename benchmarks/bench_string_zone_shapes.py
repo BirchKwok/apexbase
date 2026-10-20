@@ -191,9 +191,9 @@ def run_shapes(rows, warmup, iterations, only=None):
                 continue
             query = sql.format(**substitutions)
             rows_returned = len(client.execute(query).to_dict())
-            want = expected_rows(name, expected)
-            if rows_returned != want:
-                raise RuntimeError(f"{name}: expected {want} rows, got {rows_returned}")
+            expected_count = expected_rows(name, expected)
+            if rows_returned != expected_count:
+                raise RuntimeError(f"{name}: expected {expected_count} rows, got {rows_returned}")
             warm_ms = measure(client, query, warmup, iterations)
             results.append(
                 {
@@ -209,9 +209,9 @@ def run_shapes(rows, warmup, iterations, only=None):
                 continue
             query = sql.format(**substitutions)
             rows_returned = len(client.execute(query).to_dict())
-            want = expected_rows(name, expected)
-            if want is not None and rows_returned != want:
-                raise RuntimeError(f"{name}: expected {want} rows, got {rows_returned}")
+            expected_count = expected_rows(name, expected)
+            if expected_count is not None and rows_returned != expected_count:
+                raise RuntimeError(f"{name}: expected {expected_count} rows, got {rows_returned}")
             detail["controls"][name] = {
                 "warm_ms": round(measure(client, query, warmup, iterations), 6),
                 "rows": rows_returned,

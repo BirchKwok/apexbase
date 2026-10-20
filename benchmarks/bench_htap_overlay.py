@@ -291,8 +291,8 @@ def run_htap(rows, warmup, iterations, only=None):
                     assert counts.get(row["s"]) == row["n"], (sql, row, counts.get(row["s"]))
             elif expected_rows is None:
                 # Aggregate: check the value against an independent scan of `b`.
-                want = sum(row["b"] for row in sparse_oracle if row["b"] is not None)
-                assert got and abs(got[0]["sb"] - want) < 1e-6, (sql, got[:1], want)
+                want_sum = sum(row["b"] for row in sparse_oracle if row["b"] is not None)
+                assert got and abs(got[0]["sb"] - want_sum) < 1e-6, (sql, got[:1], want_sum)
             else:
                 assert len(got) == expected_rows, (sql, len(got), expected_rows)
                 if expected_rows:
