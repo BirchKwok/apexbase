@@ -2535,6 +2535,12 @@ class ApexBaseBench:
             "AND score BETWEEN 20 AND 80"
         )
 
+    def bench_prefix_like_count(self):
+        """COUNT-only under a prefix LIKE: answered from the dictionary mask."""
+        return self._query_all(
+            "SELECT COUNT(*) AS n FROM default WHERE city LIKE 'Bei%'"
+        )
+
     def bench_prefix_like_aggregation(self):
         return self._query_all(
             "SELECT COUNT(*) AS n, AVG(score) AS av "

@@ -211,6 +211,34 @@ def test_a_string_filter_count_column_skips_the_value_payload():
             client.close()
 
 
+def test_a_prefix_filter_count_stays_exact_without_the_value_payload():
+    """The cached prefix lane answers COUNT-only from the dictionary mask."""
+    rows = 200_000
+    with tempfile.TemporaryDirectory() as tmp:
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("t", schema={"k": "int64", "v": "int64", "s": "string"})
+        client.use_table("t")
+        client.store({
+            "k": list(range(rows)),
+            "v": list(range(rows)),
+            "s": ["Beijing" if i % 2 == 0 else "Shanghai" for i in range(rows)],
+        })
+        client.flush()
+        try:
+            expected = len([i for i in range(rows) if i % 2 == 0])
+            # Both the Python pre-parse path and the executor `*` rewrite.
+            assert _value(
+                client, "SELECT COUNT(*) AS n FROM t WHERE s LIKE 'Bei%'") == expected
+            assert _value(
+                client, "SELECT COUNT(v) AS n FROM t WHERE s LIKE 'Bei%'") == expected
+            star = _median_ms(client, "SELECT COUNT(*) AS n FROM t WHERE s LIKE 'Bei%'")
+            summed = _median_ms(client, "SELECT SUM(v) AS n FROM t WHERE s LIKE 'Bei%'")
+            # COUNT-only must come from the group-id mask, not the value payload.
+            assert star < summed * 0.6 + 0.2, (star, summed)
+        finally:
+            client.close()
+
+
 def test_a_string_filter_count_column_stays_exact_with_nulls_and_deletes():
     rows = 120_000
     with tempfile.TemporaryDirectory() as tmp:

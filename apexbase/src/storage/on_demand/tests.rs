@@ -4440,6 +4440,85 @@ fn cached_string_filter_count_plan_scans_no_value_column() {
 }
 
 #[test]
+fn cached_prefix_count_plan_scans_no_value_column() {
+    // Prefix filtering is just a mask over the cached dictionary groups, so a
+    // count-only plan must not scan any value column either.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("cached_prefix_count_plan.apex");
+    let rows = 100_000usize;
+    let schema = [
+        ("k".to_string(), ColumnType::Int64),
+        ("v".to_string(), ColumnType::Int64),
+        ("n".to_string(), ColumnType::Int64),
+    ];
+    {
+        let storage = OnDemandStorage::create_with_schema_and_durability(
+            &path,
+            crate::storage::DurabilityLevel::Fast,
+            &schema,
+        )
+        .unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("k".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+        int_cols.insert(
+            "v".to_string(),
+            (0..rows).map(|row| row as i64 * 2).collect::<Vec<i64>>(),
+        );
+        int_cols.insert(
+            "n".to_string(),
+            (0..rows).map(|row| row as i64).collect::<Vec<i64>>(),
+        );
+        let mut nulls = HashMap::new();
+        nulls.insert(
+            "n".to_string(),
+            (0..rows).map(|row| row % 4 == 0).collect::<Vec<bool>>(),
+        );
+        storage
+            .insert_typed_with_nulls_full(
+                int_cols,
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                HashMap::new(),
+                nulls,
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let dict_strings = vec!["ab".to_string(), "bc".to_string()];
+    let group_ids: Vec<u16> = (0..rows).map(|row| (row % 2) as u16).collect();
+    let cached = |prefix: &str, cols: &[&str]| {
+        storage
+            .execute_filtered_string_prefix_agg_cached(
+                "k",
+                &dict_strings,
+                &group_ids,
+                prefix,
+                cols,
+            )
+            .unwrap()
+    };
+    let counted = cached("a", &["*"]).expect("count-only prefix lane");
+    assert_eq!(counted[0].0, 50_000);
+    assert_eq!((counted[0].1, counted[0].2, counted[0].3), (0.0, 0.0, 0.0));
+    let mixed = cached("a", &["*", "v"]).expect("mixed prefix lane");
+    assert_eq!(mixed[0].0, 50_000);
+    assert_eq!(mixed[1].0, 50_000);
+    assert_eq!(
+        mixed[1].1,
+        (0..rows)
+            .filter(|row| row % 2 == 0)
+            .map(|row| (row * 2) as f64)
+            .sum::<f64>()
+    );
+    // A prefix that matches no dictionary group reports zero, not a fallback.
+    let none = cached("zz", &["*"]).expect("no-match count-only prefix lane");
+    assert_eq!(none[0].0, 0);
+}
+
+#[test]
 fn string_tail_zone_prunes_equal_length_shared_prefix_rows() {
     // Timestamp/UUID-shaped values are all the same length and share their
     // first eight bytes, so neither the byte-length zone nor the first-eight

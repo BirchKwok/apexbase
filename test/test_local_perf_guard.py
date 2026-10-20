@@ -435,6 +435,7 @@ def test_hot_shape_specs_cover_the_scoreboard_gaps():
         "COUNT(col) covered",
         "COUNT(col) partial",
         "COUNT(col) string filter",
+        "Prefix LIKE COUNT",
         "Numeric range LIMIT (delta overlay)",
         "Numeric range LIMIT (filter-column update)",
         "String cell UPDATE (single row)",

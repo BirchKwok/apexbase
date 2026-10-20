@@ -3024,6 +3024,23 @@ impl OnDemandStorage {
                     .collect(),
             ));
         }
+        // Count-only: the group ids already encode the prefix predicate, so the
+        // count is their histogram over the matching dictionary groups - no
+        // value column has to be scanned.
+        if agg_cols.iter().all(|name| *name == "*" || *name == "1") {
+            let total = group_ids
+                .iter()
+                .filter(|&&group| {
+                    matching_groups.get(group as usize).copied().unwrap_or(false)
+                })
+                .count() as i64;
+            return Ok(Some(
+                agg_cols
+                    .iter()
+                    .map(|_| (total, 0.0, 0.0, 0.0, false))
+                    .collect(),
+            ));
+        }
         let real_cols: Vec<&str> = agg_cols
             .iter()
             .copied()

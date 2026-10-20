@@ -24,6 +24,7 @@ CANARY_SPECS = (
     ("COUNT(col) covered", "bench_count_column_covered", "mean"),
     ("COUNT(col) partial", "bench_count_column_partial", "mean"),
     ("COUNT(col) string filter", "bench_count_column_string_filter", "mean"),
+    ("Prefix LIKE COUNT", "bench_prefix_like_count", "mean"),
     ("SELECT * LIMIT 100", "bench_select_limit", "median"),
     ("Projection full scan (3 cols)", "bench_projected_full_scan", "mean"),
     ("String equality filter", "bench_filter_string", "mean"),
@@ -136,6 +137,7 @@ HOT_SHAPE_NAMES = (
     "COUNT(col) covered",
     "COUNT(col) partial",
     "COUNT(col) string filter",
+    "Prefix LIKE COUNT",
     # Both overlay shapes build their own tables, so they can run before the
     # `default` mutations below.
     "Numeric range LIMIT (delta overlay)",
