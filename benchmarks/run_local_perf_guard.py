@@ -154,7 +154,7 @@ def benchmark_arguments(
     mode, rows, warmup, iterations, output, qps_only=False, quant_only=False,
     index_only=False, parallel_only=False, width_only=False, string_zones_only=False,
     htap_only=False, wide_only=False, hybrid_only=False, pgwire_only=False,
-    hot_shapes_only=False, only_metric=None,
+    hot_shapes_only=False, only_metric=None, mixed_only=False,
 ):
     if width_only:
         # The width-fidelity phase builds its own tables (one V4 full-width
@@ -186,6 +186,12 @@ def benchmark_arguments(
         # pipeline; it is its own script as well.
         script = ROOT / "benchmarks" / "bench_hybrid_retrieval.py"
         defaults = (50_000, 2, 7)
+    elif mixed_only:
+        # The mixed read/write phase runs writer processes and reader threads
+        # against one table and asserts the final row set, so it is its own
+        # script as well.
+        script = ROOT / "benchmarks" / "bench_mixed_rw.py"
+        defaults = (50_000, 0, 1)
     elif pgwire_only:
         # The PG wire phase starts a real server, drives it with concurrent
         # simple-query connections and asserts every timed count, so it is its
@@ -918,6 +924,36 @@ def execute_gate(args, output_dir, evidence):
                     collect_hot, hot_reports, "hot-comparison"
                 )
                 comparison_status = max(comparison_status, hot_status)
+
+                # Mixed read/write: writer processes and reader threads on one
+                # table, with the final row set asserted. This is the only phase
+                # that exercises cross-process writes and reads together.
+                mixed_counts = {"base": 0, "current": 0}
+                mixed_reports = {"base": [], "current": []}
+                collect_mixed = make_collect(
+                    "mixed",
+                    mixed_counts,
+                    mixed_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, mixed_only=True
+                    ),
+                )
+                collect_mixed(SAMPLE_ORDER)
+                mixed_status = run_comparison(
+                    collect_mixed, mixed_reports, "mixed-comparison"
+                )
+                if mixed_status == 1:
+                    mixed_status = recheck_marked(
+                        "mixed-comparison",
+                        mixed_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary", None, None, None, report,
+                            mixed_only=True, only_metric=metric,
+                        ),
+                        "mixed-recheck.txt",
+                        "mixed-recheck",
+                    )
+                comparison_status = max(comparison_status, mixed_status)
 
             print(f"Reports and comparison saved in {output_dir}")
         finally:

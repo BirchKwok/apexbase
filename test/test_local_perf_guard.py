@@ -325,7 +325,10 @@ def test_local_guard_full_mode_runs_every_dedicated_phase(local_guard):
 
     # Every dedicated base/current phase of --mode full must stay wired: the
     # guard's coverage is the union of these interleaved comparisons.
-    for phase in ("qps", "quant", "idx", "par", "wf", "zs", "htap", "wide", "hybrid", "pgwire", "hot"):
+    for phase in (
+        "qps", "quant", "idx", "par", "wf", "zs", "htap", "wide", "hybrid",
+        "pgwire", "hot", "mixed",
+    ):
         assert f"collect_{phase} = make_collect(" in source
         assert f'"{phase}-comparison"' in source
     assert "width_only=True" in source
@@ -337,6 +340,7 @@ def test_local_guard_full_mode_runs_every_dedicated_phase(local_guard):
     # M-21: the full perf phase is the frozen 103-metric public scoreboard, so
     # the DELETE/UPDATE/count-only/overlay shapes run as their own phase.
     assert "hot_shapes_only=True" in source
+    assert "mixed_only=True" in source
 
 
 def test_local_guard_only_metric_recheck_arguments(local_guard):
@@ -605,6 +609,49 @@ def test_width_metric_names_and_single_metric_run(tmp_path):
     ]
 
 
+def test_mixed_metric_names_and_single_metric_run(tmp_path):
+    path = ROOT / "benchmarks" / "bench_mixed_rw.py"
+    spec = importlib.util.spec_from_file_location("mixed_script", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    names = module.mixed_metric_names(2, 2)
+    assert names[0] == "Mixed: writer rows/s (2 writers)"
+    assert "Mixed: read p99 (ms)" in names
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(path),
+            "--rows", "2000",
+            "--writers", "2",
+            "--readers", "2",
+            "--per-writer", "100",
+            "--only", "Mixed: writer rows/s (2 writers)",
+            "--output", str(tmp_path / "mixed.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads((tmp_path / "mixed.json").read_text(encoding="utf-8"))
+    assert [row["query"] for row in report["results"]] == [
+        "Mixed: writer rows/s (2 writers)"
+    ]
+    assert report["mixed_read_write"]["final_rows"] == 2200
+
+
+def test_local_guard_mixed_phase_uses_the_mixed_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "canary", None, None, None, "report.json", mixed_only=True
+    )
+
+    assert Path(command[0]).name == "bench_mixed_rw.py"
+    assert "mixed-recheck.txt" in Path(local_guard.__file__).read_text(encoding="utf-8")
+
+
 def test_local_guard_rechecks_every_phase(local_guard):
     source = Path(local_guard.__file__).read_text(encoding="utf-8")
 
@@ -621,6 +668,7 @@ def test_local_guard_rechecks_every_phase(local_guard):
         "idx-recheck.txt",
         "par-recheck.txt",
         "wf-recheck.txt",
+        "mixed-recheck.txt",
     ):
         assert suffix in source, suffix
 
