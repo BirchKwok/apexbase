@@ -223,7 +223,25 @@ def measure_first_touch(bench: WidthBench, sql: str, cycles: int) -> tuple[float
     return statistics.median(times), int(min(faults))
 
 
-def run_width_fidelity(rows: int, warmup: int, iterations: int):
+def width_metric_names():
+    """Every reported metric name, in report order."""
+    names = [f"Width: bytes on disk ({label})" for label, _, _ in LAYOUTS]
+    for label, _, _ in LAYOUTS:
+        names.extend(f"Width: {name} ({label})" for name, _ in SHAPES)
+    return names
+
+
+def run_width_fidelity(
+    rows: int,
+    warmup: int,
+    iterations: int,
+    only=None,
+):
+    wanted = set(only) if only else None
+
+    def want(metric):
+        return wanted is None or metric in wanted
+
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
@@ -269,11 +287,13 @@ def run_width_fidelity(rows: int, warmup: int, iterations: int):
             detail["files"][label] = sorted(
                 path.name for path in db_dir.glob(f"{table}*") if path.is_file()
             )
-            results.append({
-                "category": "ApexBase width fidelity",
-                "query": f"Width: bytes on disk ({label})",
-                "ApexBase": detail["table_bytes"][label],
-            })
+            bytes_metric = f"Width: bytes on disk ({label})"
+            if want(bytes_metric):
+                results.append({
+                    "category": "ApexBase width fidelity",
+                    "query": bytes_metric,
+                    "ApexBase": detail["table_bytes"][label],
+                })
         client.close()
 
         point_lookup_id = rows // 2 + 1
@@ -283,6 +303,9 @@ def run_width_fidelity(rows: int, warmup: int, iterations: int):
             bench.open()
             try:
                 for name, sql in SHAPES:
+                    metric = f"Width: {name} ({label})"
+                    if not want(metric):
+                        continue
                     query = sql.format(table=table, id=point_lookup_id)
                     warm_ms = measure_warm(bench, query, warmup, iterations)
                     cold_ms, pages = measure_first_touch(bench, query, FIRST_TOUCH_CYCLES)
@@ -361,11 +384,25 @@ def main(argv=None):
     parser.add_argument("--warmup", type=int, default=2)
     parser.add_argument("--iterations", type=int, default=7)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help="Measure only the named metric(s); used by the guard to recheck a "
+        "marked metric in a fresh process",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
+    known = set(width_metric_names())
+    unknown = [name for name in args.only if name not in known]
+    if unknown:
+        parser.error("--only metric(s) not reported by this script: " + ", ".join(unknown))
 
-    results, detail = run_width_fidelity(args.rows, args.warmup, args.iterations)
+    results, detail = run_width_fidelity(
+        args.rows, args.warmup, args.iterations, only=args.only
+    )
     report = {
         **full_bench.get_report_metadata("apexbase-canary"),
         "config": {

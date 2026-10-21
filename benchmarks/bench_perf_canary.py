@@ -120,6 +120,14 @@ PARALLEL_ONLY_SPECS = (
     ("Parallel batch scan (auto)", "bench_parallel_batch_scan_auto", "mean"),
 )
 
+def filter_canary_specs(specs, names):
+    """Keep only the named specs, preserving the profile order."""
+    if not names:
+        return tuple(specs)
+    wanted = set(names)
+    return tuple(spec for spec in specs if spec[0] in wanted)
+
+
 def _canary_spec(name):
     for spec in CANARY_SPECS:
         if spec[0] == name:
@@ -357,6 +365,7 @@ def run_canary(
     index_only=False,
     parallel_only=False,
     hot_shapes_only=False,
+    only=None,
 ):
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
@@ -403,6 +412,8 @@ def run_canary(
             specs = ()
         else:
             specs = CANARY_SPECS
+        if only:
+            specs = filter_canary_specs(specs, only)
         if specs:
             for spec in specs:
                 name, method_name, mode = spec[0], spec[1], spec[2]
@@ -442,7 +453,11 @@ def run_canary(
                 print(f"{name:<34} {elapsed_ms:>12.6f} ms")
         if not index_only and not parallel_only and not hot_shapes_only:
             quant_results, _quant_recall = run_quantized_canary(rows, warmup, iterations)
-            results.extend(quant_results)
+            results.extend(
+                result
+                for result in quant_results
+                if only is None or result["query"] in only
+            )
 
         if not index_only and not parallel_only and not hot_shapes_only:
             # OLAP Q/s read profile (ApexBase-only). The harness recreates the
@@ -461,6 +476,8 @@ def run_canary(
             )
             qps_labels = qps_metric_labels(QPS_THREAD_COUNTS)
             for label, key in qps_labels:
+                if only and label not in only:
+                    continue
                 results.append({
                     "category": "ApexBase Q/s",
                     "query": label,
@@ -472,8 +489,11 @@ def run_canary(
             and not index_only
             and not parallel_only
             and not hot_shapes_only
+            and not only
         ):
             results.extend(run_commit_canary(rows, warmup, iterations))
+        if only and not results:
+            raise RuntimeError(f"--only matched no canary metric: {sorted(only)}")
         return results
     finally:
         bench.close()
@@ -512,6 +532,14 @@ def main(argv=None):
         help="Run only the DML/count-only/overlay shapes the full perf "
         "scoreboard cannot sample (M-21 phase)",
     )
+    parser.add_argument(
+        "--only",
+        action="append",
+        default=[],
+        metavar="METRIC",
+        help="Keep only the named canary metric(s); used by the guard to "
+        "recheck a marked metric in a fresh process",
+    )
     args = parser.parse_args(argv)
     if args.rows <= 0 or args.warmup < 0 or args.iterations <= 0:
         parser.error("rows and iterations must be positive; warmup must be non-negative")
@@ -547,21 +575,33 @@ def main(argv=None):
         results, quantized_recall = run_quantized_canary(
             args.rows, args.warmup, args.iterations
         )
+        if args.only:
+            results = [
+                result for result in results if result["query"] in args.only
+            ]
+            if not results:
+                raise SystemExit(
+                    f"--only matched no quantized metric: {sorted(args.only)}"
+                )
     elif args.index_only:
         results = run_canary(
-            args.rows, args.warmup, args.iterations, index_only=True
+            args.rows, args.warmup, args.iterations, index_only=True,
+            only=args.only,
         )
     elif args.parallel_only:
         results = run_canary(
-            args.rows, args.warmup, args.iterations, parallel_only=True
+            args.rows, args.warmup, args.iterations, parallel_only=True,
+            only=args.only,
         )
     elif args.hot_shapes_only:
         results = run_canary(
-            args.rows, args.warmup, args.iterations, hot_shapes_only=True
+            args.rows, args.warmup, args.iterations, hot_shapes_only=True,
+            only=args.only,
         )
     else:
         results = run_canary(
-            args.rows, args.warmup, args.iterations, qps_only=args.qps_only
+            args.rows, args.warmup, args.iterations, qps_only=args.qps_only,
+            only=args.only,
         )
     report = {
         **full_bench.get_report_metadata("apexbase-canary"),

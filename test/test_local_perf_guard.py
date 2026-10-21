@@ -539,6 +539,92 @@ def test_zone_metric_names_and_single_metric_run(tmp_path):
     ]
 
 
+def test_canary_filter_keeps_the_requested_spec():
+    path = ROOT / "benchmarks" / "bench_perf_canary.py"
+    spec = importlib.util.spec_from_file_location("canary_script", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    specs = module.CANARY_SPECS
+    only = module.filter_canary_specs(specs, ["COUNT(*)"])
+    assert [item[0] for item in only] == ["COUNT(*)"]
+    assert module.filter_canary_specs(specs, []) == specs
+
+
+def test_canary_only_runs_one_index_metric(tmp_path):
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "benchmarks" / "bench_perf_canary.py"),
+            "--rows", "2000",
+            "--warmup", "1",
+            "--iterations", "1",
+            "--index-only",
+            "--only", "Index equality (rare)",
+            "--output", str(tmp_path / "canary.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads((tmp_path / "canary.json").read_text(encoding="utf-8"))
+    assert [row["query"] for row in report["results"]] == ["Index equality (rare)"]
+
+
+def test_width_metric_names_and_single_metric_run(tmp_path):
+    path = ROOT / "benchmarks" / "bench_width_fidelity.py"
+    spec = importlib.util.spec_from_file_location("width_script", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    names = module.width_metric_names()
+    assert "Width: Point lookup (V5 narrow)" in names
+    assert len(names) == len(set(names))
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(path),
+            "--rows", "20000",
+            "--warmup", "1",
+            "--iterations", "1",
+            "--only", "Width: Point lookup (V5 narrow)",
+            "--output", str(tmp_path / "width.json"),
+        ],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    report = json.loads((tmp_path / "width.json").read_text(encoding="utf-8"))
+    assert [row["query"] for row in report["results"]] == [
+        "Width: Point lookup (V5 narrow)"
+    ]
+
+
+def test_local_guard_rechecks_every_phase(local_guard):
+    source = Path(local_guard.__file__).read_text(encoding="utf-8")
+
+    # Every dedicated phase now re-measures a marked metric in a fresh process.
+    for suffix in (
+        "perf-recheck.txt",
+        "pgwire-recheck.txt",
+        "wide-recheck.txt",
+        "hybrid-recheck.txt",
+        "htap-recheck.txt",
+        "zs-recheck.txt",
+        "qps-recheck.txt",
+        "quant-recheck.txt",
+        "idx-recheck.txt",
+        "par-recheck.txt",
+        "wf-recheck.txt",
+    ):
+        assert suffix in source, suffix
+
+
 def test_local_guard_htap_and_zone_rechecks_use_only_metric(local_guard):
     source = Path(local_guard.__file__).read_text(encoding="utf-8")
 

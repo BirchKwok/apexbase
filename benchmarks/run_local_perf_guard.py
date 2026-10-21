@@ -565,6 +565,17 @@ def execute_gate(args, output_dir, evidence):
                 qps_status = run_comparison(
                     collect_qps, qps_reports, "qps-comparison"
                 )
+                if qps_status == 1:
+                    qps_status = recheck_marked(
+                        "qps-comparison",
+                        qps_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary", None, None, None, report,
+                            qps_only=True, only_metric=metric,
+                        ),
+                        "qps-recheck.txt",
+                        "qps-recheck",
+                    )
                 comparison_status = max(comparison_status, qps_status)
 
                 # Quantized distance scans are a core vector hot path but are
@@ -584,6 +595,17 @@ def execute_gate(args, output_dir, evidence):
                 quant_status = run_comparison(
                     collect_quant, quant_reports, "quant-comparison"
                 )
+                if quant_status == 1:
+                    quant_status = recheck_marked(
+                        "quant-comparison",
+                        quant_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary", None, None, None, report,
+                            quant_only=True, only_metric=metric,
+                        ),
+                        "quant-recheck.txt",
+                        "quant-recheck",
+                    )
                 comparison_status = max(comparison_status, quant_status)
 
                 # Index-accelerated reads are a core OLTP hot path
@@ -609,6 +631,17 @@ def execute_gate(args, output_dir, evidence):
                 idx_status = run_comparison(
                     collect_idx, idx_reports, "idx-comparison"
                 )
+                if idx_status == 1:
+                    idx_status = recheck_marked(
+                        "idx-comparison",
+                        idx_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary", None, None, None, report,
+                            index_only=True, only_metric=metric,
+                        ),
+                        "idx-recheck.txt",
+                        "idx-recheck",
+                    )
                 comparison_status = max(comparison_status, idx_status)
 
                 # The opt-in parallel fold (architecture review R5.7 phase A)
@@ -634,6 +667,17 @@ def execute_gate(args, output_dir, evidence):
                 par_status = run_comparison(
                     collect_par, par_reports, "par-comparison"
                 )
+                if par_status == 1:
+                    par_status = recheck_marked(
+                        "par-comparison",
+                        par_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary", None, None, None, report,
+                            parallel_only=True, only_metric=metric,
+                        ),
+                        "par-recheck.txt",
+                        "par-recheck",
+                    )
                 comparison_status = max(comparison_status, par_status)
 
                 # V5 width fidelity: the same dataset written once in the V4
@@ -656,6 +700,17 @@ def execute_gate(args, output_dir, evidence):
                 )
                 collect_wf(SAMPLE_ORDER)
                 wf_status = run_comparison(collect_wf, wf_reports, "wf-comparison")
+                if wf_status == 1:
+                    wf_status = recheck_marked(
+                        "wf-comparison",
+                        wf_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary", None, None, None, report,
+                            width_only=True, only_metric=metric,
+                        ),
+                        "wf-recheck.txt",
+                        "wf-recheck",
+                    )
                 comparison_status = max(comparison_status, wf_status)
 
                 # V5 string zone maps: the shapes the value and tail ranges
