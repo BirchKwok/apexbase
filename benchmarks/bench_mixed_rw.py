@@ -93,10 +93,9 @@ def _reader(root: str, rows: int, stop: threading.Event, started: threading.Even
 
 
 def mixed_metric_names(writers: int, readers: int) -> list[str]:
+    """Metrics that gate. Reader Q/s and p50 stay in the detail block."""
     return [
         f"Mixed: writer rows/s ({writers} writers)",
-        f"Mixed: reader Q/s ({readers} readers)",
-        "Mixed: read p50 (ms)",
         "Mixed: read p99 (ms)",
     ]
 
@@ -229,10 +228,16 @@ def run_mixed(rows: int, writers: int, readers: int, per_writer: int, only=None)
                 "final_rows": total,
             }
         )
+        # Reader throughput and p50 are bimodal on the same wheel (two stable
+        # modes differing ~2x: the loop mixes a 0.007 ms COUNT, a ~0.15 ms point
+        # read and a ~0.65 ms range count, and scheduler/cache state flips the
+        # mix), so they are reported for diagnosis but do not gate: a 5-sample
+        # median can land on either mode. Writer throughput and read p99 are
+        # stable across runs, and reader concurrency has its own `qps` phase.
+        detail["reader_qps"] = round(qps, 6)
+        detail["read_p50_ms"] = round(p50, 6)
         for name, value in (
             (f"Mixed: writer rows/s ({writers} writers)", rows_per_s),
-            (f"Mixed: reader Q/s ({readers} readers)", qps),
-            ("Mixed: read p50 (ms)", p50),
             ("Mixed: read p99 (ms)", p99),
         ):
             if want(name):

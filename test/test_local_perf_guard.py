@@ -617,8 +617,8 @@ def test_mixed_metric_names_and_single_metric_run(tmp_path):
     spec.loader.exec_module(module)
 
     names = module.mixed_metric_names(2, 2)
-    assert names[0] == "Mixed: writer rows/s (2 writers)"
-    assert "Mixed: read p99 (ms)" in names
+    assert names == ["Mixed: writer rows/s (2 writers)", "Mixed: read p99 (ms)"]
+    assert len(names) == len(set(names))
 
     completed = subprocess.run(
         [
