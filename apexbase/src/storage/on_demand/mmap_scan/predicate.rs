@@ -3008,12 +3008,30 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            let decompressed = self.decompressed_rg_body(
-                rg_meta.offset,
-                rg_meta.offset + rg_meta.data_size,
-                compress_flag,
-                &rg_bytes[32..],
-            )?;
+            let chunked = footer
+                .chunk_tables
+                .get(rg_i)
+                .is_some_and(|cols| cols.iter().any(Option::is_some));
+            let decompressed = if chunked {
+                let mut needed = vec![false; col_count];
+                if let Some(slot) = needed.get_mut(col_idx as usize) {
+                    *slot = true;
+                }
+                self.decompressed_rg_body_columns(
+                    rg_meta.offset,
+                    rg_meta.offset + rg_meta.data_size,
+                    compress_flag,
+                    &rg_bytes[32..],
+                    &needed,
+                )?
+            } else {
+                self.decompressed_rg_body(
+                    rg_meta.offset,
+                    rg_meta.offset + rg_meta.data_size,
+                    compress_flag,
+                    &rg_bytes[32..],
+                )?
+            };
             let body: &[u8] = decompressed
                 .as_ref()
                 .map(|body| body.as_slice())
@@ -3031,7 +3049,7 @@ impl OnDemandStorage {
             // RCIX fast path: jump directly to target column offset
             let rcix_available = rg_i < footer.col_offsets.len()
                 && col_idx < footer.col_offsets[rg_i].len()
-                && compress_flag == RG_COMPRESS_NONE;
+                && (compress_flag == RG_COMPRESS_NONE || chunked);
             if rcix_available {
                 let col_body_off = footer.col_offsets[rg_i][col_idx] as usize;
                 if col_body_off + null_bitmap_len > body.len() {
