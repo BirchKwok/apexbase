@@ -1441,8 +1441,8 @@ impl OnDemandStorage {
         if data.is_empty() {
             return Ok(FusedLaneDecoded::Missing);
         }
-        let enc = if encoding_version == RG_ENCODING_VERSION { data[0] } else { COL_ENCODING_PLAIN };
-        let payload = if encoding_version == RG_ENCODING_VERSION { &data[1..] } else { data };
+        let enc = if rg_columns_are_encoded(encoding_version) { data[0] } else { COL_ENCODING_PLAIN };
+        let payload = if rg_columns_are_encoded(encoding_version) { &data[1..] } else { data };
         if enc == COL_ENCODING_PLAIN && payload.len() >= 8 {
             let count =
                 u64::from_le_bytes(payload[0..8].try_into().unwrap()) as usize;
@@ -1469,7 +1469,7 @@ impl OnDemandStorage {
         // BITPACK int columns decode straight into the caller buffer:
         // the generic path would allocate a second per-RG Vec.
         if is_int
-            && encoding_version == RG_ENCODING_VERSION
+            && rg_columns_are_encoded(encoding_version)
             && enc == COL_ENCODING_BITPACK
             && payload.len() >= 17
         {
@@ -1492,7 +1492,7 @@ impl OnDemandStorage {
                 return Ok(FusedLaneDecoded::BufferI64);
             }
         }
-        let (col_data, _) = if encoding_version == RG_ENCODING_VERSION {
+        let (col_data, _) = if rg_columns_are_encoded(encoding_version) {
             read_column_encoded(data, col_type)?
         } else {
             ColumnData::from_bytes_typed(data, col_type)?

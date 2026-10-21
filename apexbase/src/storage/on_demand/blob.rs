@@ -182,7 +182,7 @@ impl OnDemandStorage {
             }
 
             let col_type = footer.schema.columns[idx].1;
-            let consumed = if encoding_version == RG_ENCODING_VERSION {
+            let consumed = if rg_columns_are_encoded(encoding_version) {
                 skip_column_encoded(&body[pos..], col_type)?
             } else {
                 ColumnData::skip_bytes_typed(&body[pos..], col_type)?

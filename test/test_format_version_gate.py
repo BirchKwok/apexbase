@@ -80,7 +80,9 @@ def test_newer_row_group_encoding_version_is_rejected():
         blob = bytearray(open(path, "rb").read())
         # Row group header: 32 bytes at the start of the body; byte 29 is the
         # column-body encoding revision.
-        blob[256 + 29] = 2
+        # Version 2 is the supported chunked layout; the first unsupported
+        # revision is 3.
+        blob[256 + 29] = 3
         with open(path, "wb") as handle:
             handle.write(bytes(blob))
 

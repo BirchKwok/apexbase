@@ -206,6 +206,26 @@ impl OnDemandStorage {
             Ok(f) => f,
             Err(_) => return Ok(None), // transient inconsistency during concurrent write
         };
+        // One layout decision covers the whole table, so checking the first
+        // populated row group rejects a file written by a newer build before the
+        // footer is cached and before any lane can guess at its rules.
+        if let Some(rg) = footer.row_groups.iter().find(|rg| rg.row_count > 0) {
+            if std::env::var_os("APEX_DBG_FOOTER").is_some() {
+                eprintln!("DBG footer rg offset={} rows={}", rg.offset, rg.row_count);
+            }
+            let file_guard = self.file.read();
+            if let Some(file) = file_guard.as_ref() {
+                let mut mmap = self.mmap_cache.write();
+                let mut rg_header = [0u8; 32];
+                mmap.read_at(file, &mut rg_header, rg.offset)?;
+                if rg_header[29] > RG_CHUNKED_ENCODING_VERSION {
+                    return Err(err_data(format!(
+                        "row group encoding version {} is newer than this build supports ({})",
+                        rg_header[29], RG_CHUNKED_ENCODING_VERSION
+                    )));
+                }
+            }
+        }
         // Cache the footer for subsequent reads
         *self.v4_footer.write() = Some(footer.clone());
         Ok(Some(footer))
@@ -282,7 +302,7 @@ impl OnDemandStorage {
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let encoding_version = rg_bytes.get(29).copied().unwrap_or(0);
             if compress_flag != RG_COMPRESS_NONE
-                || encoding_version != RG_ENCODING_VERSION
+                || !rg_columns_are_encoded(encoding_version)
                 || rg_idx >= footer.col_offsets.len()
                 || footer.col_offsets[rg_idx].is_empty()
             {
@@ -574,7 +594,7 @@ impl OnDemandStorage {
 
         // A row group written by a newer build may use column-body rules this
         // build does not know, so it is refused rather than guessed at.
-        if encoding_version > RG_ENCODING_VERSION {
+        if encoding_version > RG_CHUNKED_ENCODING_VERSION {
             return Err(err_data(format!(
                 "row group encoding version {encoding_version} is newer than this build supports ({RG_ENCODING_VERSION})"
             )));
@@ -586,7 +606,7 @@ impl OnDemandStorage {
         // instead of scanning 512KB IDs + full column sequence.
         if compress_flag == RG_COMPRESS_NONE
             && !has_deletes
-            && encoding_version == RG_ENCODING_VERSION
+            && rg_columns_are_encoded(encoding_version)
             && rg_idx < footer.col_offsets.len()
             && !footer.col_offsets[rg_idx].is_empty()
         {
@@ -837,7 +857,7 @@ impl OnDemandStorage {
                 if !has_deletes
                     && active_skip == 0
                     && rows_to_take < rg_rows
-                    && encoding_version == RG_ENCODING_VERSION
+                    && rg_columns_are_encoded(encoding_version)
                 {
                     let (col_data, consumed) =
                         read_column_encoded_partial(&body[pos..], col_type, rows_to_take)?;
@@ -857,7 +877,7 @@ impl OnDemandStorage {
                 } else {
                     // Full column read path — narrowed to the physical rows this
                     // window actually needs when a deletion vector is present.
-                    let (col_data, consumed) = if encoding_version == RG_ENCODING_VERSION {
+                    let (col_data, consumed) = if rg_columns_are_encoded(encoding_version) {
                         match deletion_window.as_ref().map(|(_, cover)| *cover) {
                             // The partial reader unpacks values one at a time, which
                             // beats the bulk decoder only while the window is a small
@@ -921,7 +941,7 @@ impl OnDemandStorage {
                 rg_filled[out_pos] = true;
             } else {
                 // Skip this column (no allocation, encoding-aware)
-                let consumed = if encoding_version == RG_ENCODING_VERSION {
+                let consumed = if rg_columns_are_encoded(encoding_version) {
                     skip_column_encoded(&body[pos..], col_type)?
                 } else {
                     ColumnData::skip_bytes_typed(&body[pos..], col_type)?
@@ -1668,7 +1688,7 @@ impl OnDemandStorage {
             // RCIX FAST PATH: uncompressed + RCIX available → jump directly to each column
             // Eliminates sequential skip of unneeded columns (O(1) per column seek).
             let rcix = footer.col_offsets.get(rg_i).filter(|v| !v.is_empty());
-            if compress_flag == RG_COMPRESS_NONE && encoding_version == RG_ENCODING_VERSION && rcix.is_some() {
+            if compress_flag == RG_COMPRESS_NONE && rg_columns_are_encoded(encoding_version) && rcix.is_some() {
                 let body = rg_bytes.get(32..).unwrap_or(&[]);
                 let rg_col_offsets = rcix.unwrap();
 
@@ -1751,7 +1771,7 @@ impl OnDemandStorage {
                 if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
                     col_null_bitmaps[out_pos].extend_from_slice(null_bytes);
 
-                    let (col_data, consumed) = if encoding_version == RG_ENCODING_VERSION {
+                    let (col_data, consumed) = if rg_columns_are_encoded(encoding_version) {
                         read_column_encoded(&body[pos..], col_type)?
                     } else {
                         ColumnData::from_bytes_typed(&body[pos..], col_type)?
@@ -1765,7 +1785,7 @@ impl OnDemandStorage {
                     col_accumulators[out_pos].append(&col_data);
                     rg_filled[out_pos] = true;
                 } else {
-                    let consumed = if encoding_version == RG_ENCODING_VERSION {
+                    let consumed = if rg_columns_are_encoded(encoding_version) {
                         skip_column_encoded(&body[pos..], col_type)?
                     } else {
                         ColumnData::skip_bytes_typed(&body[pos..], col_type)?
@@ -1956,7 +1976,7 @@ impl OnDemandStorage {
 
                 let col_type = schema.columns[col_idx].1;
                 if let Some(&out_pos) = col_idx_to_out.get(&col_idx) {
-                    let (col_data, consumed) = if encoding_version == RG_ENCODING_VERSION {
+                    let (col_data, consumed) = if rg_columns_are_encoded(encoding_version) {
                         read_column_encoded(&body[pos..], col_type)?
                     } else {
                         ColumnData::from_bytes_typed(&body[pos..], col_type)?
@@ -1969,7 +1989,7 @@ impl OnDemandStorage {
                     };
                     col_accumulators[out_pos].append(&col_data);
                 } else {
-                    let consumed = if encoding_version == RG_ENCODING_VERSION {
+                    let consumed = if rg_columns_are_encoded(encoding_version) {
                         skip_column_encoded(&body[pos..], col_type)?
                     } else {
                         ColumnData::skip_bytes_typed(&body[pos..], col_type)?
@@ -3773,7 +3793,7 @@ impl OnDemandStorage {
 
             // Use RCIX for O(1) per-column access when available
             let rcix = if compress_flag == RG_COMPRESS_NONE
-                && encoding_version == RG_ENCODING_VERSION
+                && rg_columns_are_encoded(encoding_version)
                 && rg_i < footer.col_offsets.len()
                 && footer.col_offsets[rg_i].len() >= col_count
             {
@@ -3794,7 +3814,7 @@ impl OnDemandStorage {
                             break;
                         }
                         pos += null_bitmap_len;
-                        let consumed = if encoding_version == RG_ENCODING_VERSION {
+                        let consumed = if rg_columns_are_encoded(encoding_version) {
                             skip_column_encoded(&body[pos..], ct)?
                         } else {
                             ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -3827,8 +3847,8 @@ impl OnDemandStorage {
                     pos += null_bitmap_len;
                     (nb, &body[pos..])
                 };
-                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -4022,7 +4042,7 @@ impl OnDemandStorage {
 
                 if !extracted {
                     // Fallback: decode full column and pick values at target indices
-                    let (col_data, _) = if encoding_version == RG_ENCODING_VERSION {
+                    let (col_data, _) = if rg_columns_are_encoded(encoding_version) {
                         read_column_encoded(col_bytes, ct)?
                     } else {
                         ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -4266,7 +4286,7 @@ impl OnDemandStorage {
                 }
 
                 if rcix.is_none() {
-                    let consumed = if encoding_version == RG_ENCODING_VERSION {
+                    let consumed = if rg_columns_are_encoded(encoding_version) {
                         skip_column_encoded(&body[pos..], ct)?
                     } else {
                         ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -4542,7 +4562,7 @@ impl OnDemandStorage {
             }
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let encoding_version = rg_bytes.get(29).copied().unwrap_or(0);
-            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+            if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                 return Ok(None);
             }
 
@@ -4962,7 +4982,7 @@ impl OnDemandStorage {
             }
         }
 
-        // Upfront check: all needed RGs must have RCIX (encoding_version == RG_ENCODING_VERSION + col_offsets)
+        // Upfront check: all needed RGs must have RCIX (rg_columns_are_encoded(encoding_version) + col_offsets)
         for (rg_i, hits) in rg_map.iter().enumerate() {
             if hits.is_empty() {
                 continue;
@@ -5042,7 +5062,7 @@ impl OnDemandStorage {
             // on the plain twin, and a 3-column projection of the same ids 330 us
             // against 9.5 us. Only an encoding revision or compression flag this
             // build does not know is still declined rather than guessed at.
-            if encoding_version != RG_ENCODING_VERSION
+            if !rg_columns_are_encoded(encoding_version)
                 || !matches!(
                     compress_flag,
                     RG_COMPRESS_NONE | RG_COMPRESS_LZ4 | RG_COMPRESS_ZSTD

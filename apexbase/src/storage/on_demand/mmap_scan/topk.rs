@@ -125,7 +125,7 @@ impl OnDemandStorage {
                         found_nulls = nulls;
                         break;
                     }
-                    let consumed = if encoding_version == RG_ENCODING_VERSION {
+                    let consumed = if rg_columns_are_encoded(encoding_version) {
                         skip_column_encoded(&body[pos..], schema.columns[ci].1)?
                     } else {
                         ColumnData::skip_bytes_typed(&body[pos..], schema.columns[ci].1)?
@@ -142,7 +142,7 @@ impl OnDemandStorage {
             // no tag and starts straight at the data. (The dictionary lane indexes
             // `col_bytes[enc_offset..]` because `StringDictView::parse` expects the
             // payload *including* that byte, which is why this split differs.)
-            let (encoding, payload) = if encoding_version == RG_ENCODING_VERSION {
+            let (encoding, payload) = if rg_columns_are_encoded(encoding_version) {
                 let Some(&tag) = col_bytes.first() else {
                     return Ok(None);
                 };
@@ -426,7 +426,7 @@ impl OnDemandStorage {
                         found_nulls = nulls;
                         break;
                     }
-                    let consumed = if encoding_version == RG_ENCODING_VERSION {
+                    let consumed = if rg_columns_are_encoded(encoding_version) {
                         skip_column_encoded(&body[pos..], schema.columns[ci].1)?
                     } else {
                         ColumnData::skip_bytes_typed(&body[pos..], schema.columns[ci].1)?
@@ -439,7 +439,7 @@ impl OnDemandStorage {
             if col_bytes.is_empty() || col_nulls.iter().any(|&byte| byte != 0) {
                 return Ok(None);
             }
-            let enc_offset = if encoding_version == RG_ENCODING_VERSION {
+            let enc_offset = if rg_columns_are_encoded(encoding_version) {
                 1
             } else {
                 0
@@ -680,7 +680,7 @@ impl OnDemandStorage {
                         found_nulls = nulls;
                         break;
                     }
-                    let consumed = if encoding_version == RG_ENCODING_VERSION {
+                    let consumed = if rg_columns_are_encoded(encoding_version) {
                         skip_column_encoded(&body[pos..], schema.columns[ci].1)?
                     } else {
                         ColumnData::skip_bytes_typed(&body[pos..], schema.columns[ci].1)?
@@ -706,8 +706,8 @@ impl OnDemandStorage {
                 return Ok(None);
             }
 
-            let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-            let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+            let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+            let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                 col_bytes[0]
             } else {
                 COL_ENCODING_PLAIN
@@ -793,7 +793,7 @@ impl OnDemandStorage {
                 }
             } else {
                 // Non-PLAIN: decode and scan
-                let (col_data, _) = if encoding_version == RG_ENCODING_VERSION {
+                let (col_data, _) = if rg_columns_are_encoded(encoding_version) {
                     read_column_encoded(col_bytes, col_type)?
                 } else {
                     ColumnData::from_bytes_typed(col_bytes, col_type)?
@@ -1204,7 +1204,7 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+            if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                 return Ok(None); // compressed / legacy encodings → fall back
             }
             let body = &rg_bytes[32..];

@@ -130,7 +130,7 @@ impl OnDemandStorage {
                             break;
                         }
                         let ct = schema.columns[ci].1;
-                        let consumed = if encoding_version == RG_ENCODING_VERSION {
+                        let consumed = if rg_columns_are_encoded(encoding_version) {
                             skip_column_encoded(&body[walk..], ct)?
                         } else {
                             ColumnData::skip_bytes_typed(&body[walk..], ct)?
@@ -147,8 +147,8 @@ impl OnDemandStorage {
 
             {
                 let ct = col_type;
-                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -212,7 +212,7 @@ impl OnDemandStorage {
                         }
                     } else {
                         // Encoded column: fallback to full decode
-                        let (col_data, _) = if encoding_version == RG_ENCODING_VERSION {
+                        let (col_data, _) = if rg_columns_are_encoded(encoding_version) {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?

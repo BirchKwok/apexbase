@@ -627,7 +627,7 @@ impl OnDemandStorage {
             }
 
             // RCIX fast path: jump directly to target column without scanning all columns
-            let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version == RG_ENCODING_VERSION {
+            let rcix = if compress_flag == RG_COMPRESS_NONE && rg_columns_are_encoded(encoding_version) {
                 footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx)
             } else {
                 None
@@ -643,8 +643,8 @@ impl OnDemandStorage {
                 let ct = schema.columns[col_idx].1;
                 let col_bytes = &body[col_off + null_bitmap_len..];
                 {
-                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                    let encoding = if encoding_version == RG_ENCODING_VERSION {
+                    let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                    let encoding = if rg_columns_are_encoded(encoding_version) {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN
@@ -709,7 +709,7 @@ impl OnDemandStorage {
                         }
                     } else if encoding != COL_ENCODING_PLAIN && matches!(ct, ColumnType::String) {
                         // Non-PLAIN encoded String: decode then scan
-                        let (col_data, _consumed) = if encoding_version == RG_ENCODING_VERSION {
+                        let (col_data, _consumed) = if rg_columns_are_encoded(encoding_version) {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -773,8 +773,8 @@ impl OnDemandStorage {
                     let ct = schema.columns[ci].1;
                     if ci == col_idx {
                         let col_bytes = &body[pos..];
-                        let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                        let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                        let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                        let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                             col_bytes[0]
                         } else {
                             COL_ENCODING_PLAIN
@@ -838,7 +838,7 @@ impl OnDemandStorage {
                             }
                         }
                     }
-                    let consumed = if encoding_version == RG_ENCODING_VERSION {
+                    let consumed = if rg_columns_are_encoded(encoding_version) {
                         skip_column_encoded(&body[pos..], ct)?
                     } else {
                         ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -945,7 +945,7 @@ impl OnDemandStorage {
             let rg_bytes = &mmap_ref[rg_start..rg_end];
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let encoding_version = rg_bytes.get(29).copied().unwrap_or(0);
-            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+            if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                 return Ok(None);
             }
             let Some(rcix) = footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx) else {
@@ -1031,7 +1031,7 @@ impl OnDemandStorage {
             let rg_bytes = &mmap_ref[rg_start..rg_end];
             let compress_flag = rg_bytes.get(28).copied().unwrap_or(RG_COMPRESS_NONE);
             let encoding_version = rg_bytes.get(29).copied().unwrap_or(0);
-            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+            if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                 return Ok(None);
             }
             let Some(rcix) = footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx) else {
@@ -2621,7 +2621,7 @@ impl OnDemandStorage {
             let has_deletes = rg_meta.deletion_count > 0;
 
             // RCIX: jump directly to the target column
-            let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version == RG_ENCODING_VERSION {
+            let rcix = if compress_flag == RG_COMPRESS_NONE && rg_columns_are_encoded(encoding_version) {
                 footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx)
             } else {
                 None
@@ -3041,8 +3041,8 @@ impl OnDemandStorage {
                 let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
                 let data_start = col_body_off + null_bitmap_len;
                 let col_bytes = &body[data_start..];
-                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -3185,8 +3185,8 @@ impl OnDemandStorage {
 
                 if ci == col_idx {
                     let col_bytes = &body[pos..];
-                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                    let encoding = if encoding_version == RG_ENCODING_VERSION {
+                    let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                    let encoding = if rg_columns_are_encoded(encoding_version) {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN
@@ -3253,7 +3253,7 @@ impl OnDemandStorage {
                         }
                     } else {
                         // Non-PLAIN encoding (RLE, BITPACK, etc.): decode then scan
-                        let (col_data, _consumed) = if encoding_version == RG_ENCODING_VERSION {
+                        let (col_data, _consumed) = if rg_columns_are_encoded(encoding_version) {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -3297,7 +3297,7 @@ impl OnDemandStorage {
                         }
                     }
                 }
-                let consumed = if encoding_version == RG_ENCODING_VERSION {
+                let consumed = if rg_columns_are_encoded(encoding_version) {
                     skip_column_encoded(&body[pos..], ct)?
                 } else {
                     ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -4205,8 +4205,8 @@ impl OnDemandStorage {
                 let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
                 let data_start = col_body_off + null_bitmap_len;
                 let col_bytes = &body[data_start..];
-                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -4284,8 +4284,8 @@ impl OnDemandStorage {
 
                 if ci == col_idx {
                     let col_bytes = &body[pos..];
-                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                    let encoding = if encoding_version == RG_ENCODING_VERSION {
+                    let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                    let encoding = if rg_columns_are_encoded(encoding_version) {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN
@@ -4350,7 +4350,7 @@ impl OnDemandStorage {
                         }
                     } else {
                         // Non-PLAIN encoding: decode then scan
-                        let (col_data, _consumed) = if encoding_version == RG_ENCODING_VERSION {
+                        let (col_data, _consumed) = if rg_columns_are_encoded(encoding_version) {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -4392,7 +4392,7 @@ impl OnDemandStorage {
                         }
                     }
                 }
-                let consumed = if encoding_version == RG_ENCODING_VERSION {
+                let consumed = if rg_columns_are_encoded(encoding_version) {
                     skip_column_encoded(&body[pos..], ct)?
                 } else {
                     ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -4555,7 +4555,7 @@ impl OnDemandStorage {
 
             if is_int {
                 // Try zero-copy PLAIN path first
-                let enc = if encoding_version == RG_ENCODING_VERSION && !where_col_bytes.is_empty() {
+                let enc = if rg_columns_are_encoded(encoding_version) && !where_col_bytes.is_empty() {
                     where_col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -4604,7 +4604,7 @@ impl OnDemandStorage {
                     }
                 }
             } else {
-                let enc = if encoding_version == RG_ENCODING_VERSION && !where_col_bytes.is_empty() {
+                let enc = if rg_columns_are_encoded(encoding_version) && !where_col_bytes.is_empty() {
                     where_col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -4638,7 +4638,7 @@ impl OnDemandStorage {
                 continue;
             }
             let set_data = &body[set_col_off + null_bitmap_len..];
-            let set_enc = if encoding_version == RG_ENCODING_VERSION && !set_data.is_empty() {
+            let set_enc = if rg_columns_are_encoded(encoding_version) && !set_data.is_empty() {
                 set_data[0]
             } else {
                 COL_ENCODING_PLAIN
@@ -4950,7 +4950,7 @@ impl OnDemandStorage {
         } else {
             0
         };
-        if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+        if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
             return Ok(None);
         }
 
@@ -5069,7 +5069,7 @@ impl OnDemandStorage {
         } else {
             0
         };
-        if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+        if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
             return Ok(None);
         }
 
@@ -5428,8 +5428,8 @@ impl OnDemandStorage {
                 let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
                 let data_start = col_body_off + null_bitmap_len;
                 let col_bytes = &body[data_start..];
-                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN
@@ -5530,8 +5530,8 @@ impl OnDemandStorage {
                 let ct = schema.columns[ci].1;
                 if ci == col_idx {
                     let col_bytes = &body[pos..];
-                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                    let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                    let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                    let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN
@@ -5581,7 +5581,7 @@ impl OnDemandStorage {
                     } else {
                         // Range pruning before full decode: read min/max from encoding
                         // header without allocating to skip RGs with no matching values.
-                        if is_int && encoding_version == RG_ENCODING_VERSION {
+                        if is_int && rg_columns_are_encoded(encoding_version) {
                             let data = &col_bytes[enc_offset..];
                             let can_skip = if encoding == COL_ENCODING_BITPACK && data.len() >= 17 {
                                 let bit_width = data[8] as u32;
@@ -5621,7 +5621,7 @@ impl OnDemandStorage {
                                 break;
                             }
                         }
-                        let (col_data, _) = if encoding_version == RG_ENCODING_VERSION {
+                        let (col_data, _) = if rg_columns_are_encoded(encoding_version) {
                             read_column_encoded(col_bytes, ct)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, ct)?
@@ -5666,7 +5666,7 @@ impl OnDemandStorage {
                     }
                     break; // Found and processed the target column, move to next RG
                 }
-                let consumed = if encoding_version == RG_ENCODING_VERSION {
+                let consumed = if rg_columns_are_encoded(encoding_version) {
                     skip_column_encoded(&body[pos..], ct)?
                 } else {
                     ColumnData::skip_bytes_typed(&body[pos..], ct)?
@@ -5934,8 +5934,8 @@ impl OnDemandStorage {
                     }
                     let null_bytes = &body[col_off..col_off + null_bitmap_len];
                     let col_bytes = &body[col_off + null_bitmap_len..];
-                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1usize } else { 0 };
-                    let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                    let enc_offset = if rg_columns_are_encoded(encoding_version) { 1usize } else { 0 };
+                    let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                         col_bytes[0]
                     } else {
                         COL_ENCODING_PLAIN

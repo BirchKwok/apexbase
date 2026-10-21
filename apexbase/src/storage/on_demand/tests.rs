@@ -5221,7 +5221,7 @@ fn newer_row_group_encoding_version_is_rejected() {
 
     let mut bytes = std::fs::read(&path).unwrap();
     assert_eq!(bytes[HEADER_SIZE + 29], RG_ENCODING_VERSION);
-    bytes[HEADER_SIZE + 29] = RG_ENCODING_VERSION + 1;
+    bytes[HEADER_SIZE + 29] = RG_CHUNKED_ENCODING_VERSION + 1;
     std::fs::write(&path, &bytes).unwrap();
 
     let storage = OnDemandStorage::open(&path).unwrap();
@@ -6895,4 +6895,103 @@ fn test_zstd_body_decodes_without_a_fixed_reservation() {
         assert_eq!(decoded.len(), body.len(), "size mismatch for {rows} rows");
         assert!(decoded == body, "content mismatch for {rows} rows");
     }
+}
+
+#[test]
+fn chunk_layout_keeps_the_prefix_and_separates_correlated_columns() {
+    // The chunked layout stores one frame per column, so it gives up the
+    // cross-column redundancy a single flat frame can exploit. This is why the
+    // write path only takes it when the payload grows by at most 8%: correlated
+    // columns must be refused, independent ones accepted. The id/deletion prefix
+    // is stored verbatim and must be the first bytes of the payload.
+    use crate::storage::on_demand::{
+        decompress_column_frame, encode_rg_body_with_layout, write_column_encoded,
+        ColumnEncodingOptions, CompressionType, CHUNK_FRAME_HEADER_LEN,
+    };
+
+    let rows = 4096usize;
+    let prefix: Vec<u8> = (0..rows)
+        .flat_map(|i| (i as u64).to_le_bytes())
+        .chain(std::iter::repeat(0u8).take(rows.div_ceil(8)))
+        .collect();
+
+    let build = |independent: bool| {
+        let columns: Vec<ColumnData> = (0..16)
+            .map(|col| {
+                let values: Vec<i64> = (0..rows)
+                    .map(|row| {
+                        if independent {
+                            let mut x = (row as u64)
+                                .wrapping_mul(6364136223846793005)
+                                .wrapping_add((col as u64).wrapping_mul(1442695040888963407));
+                            x ^= x >> 33;
+                            x as i64
+                        } else {
+                            (row as i64) * 17 + col as i64
+                        }
+                    })
+                    .collect();
+                ColumnData::Int64(values)
+            })
+            .collect();
+        let mut flat = prefix.clone();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        {
+            let mut cursor = std::io::Cursor::new(&mut flat);
+            cursor.set_position(prefix.len() as u64);
+            for col in &columns {
+                let start = cursor.position() as usize;
+                write_column_encoded(
+                    col,
+                    ColumnType::Int64,
+                    &mut cursor,
+                    ColumnEncodingOptions::default(),
+                )
+                .unwrap();
+                ranges.push((start, cursor.position() as usize));
+            }
+        }
+        (flat, ranges)
+    };
+
+    let (flat, ranges) = build(false);
+    let (_, flat_frame, _, _) =
+        encode_rg_body_with_layout(flat.clone(), &ranges, CompressionType::Zstd, Some(false))
+            .unwrap();
+    let (_, payload, chunks, _) =
+        encode_rg_body_with_layout(flat.clone(), &ranges, CompressionType::Zstd, Some(true))
+            .unwrap();
+    let chunks = chunks.expect("forced chunk layout must produce a directory");
+    let frame_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    let prefix_bytes =
+        decompress_column_frame(&payload[..CHUNK_FRAME_HEADER_LEN + frame_len]).unwrap();
+    assert_eq!(&prefix_bytes[..prefix.len()], &prefix[..], "prefix frame must round-trip");
+    assert_eq!(chunks[0].flat_off as usize, ranges[0].0);
+    assert_eq!(
+        chunks[chunks.len() - 1].flat_off as usize + ranges.last().unwrap().1
+            - ranges.last().unwrap().0,
+        flat.len()
+    );
+    let correlated = payload.len() as f64 / flat_frame.len() as f64;
+    assert!(
+        correlated > 1.5,
+        "correlated columns must be refused by the size gate, ratio {correlated}"
+    );
+
+    let (flat, ranges) = build(true);
+    let (_, flat_frame, _, _) =
+        encode_rg_body_with_layout(flat.clone(), &ranges, CompressionType::Zstd, Some(false))
+            .unwrap();
+    let (_, payload, chunks, _) =
+        encode_rg_body_with_layout(flat.clone(), &ranges, CompressionType::Zstd, Some(true))
+            .unwrap();
+    assert!(chunks.is_some());
+    let independent = payload.len() as f64 / flat_frame.len() as f64;
+    eprintln!(
+        "chunk growth: correlated={correlated:.4} independent={independent:.4}"
+    );
+    assert!(
+        independent <= 1.08,
+        "independent columns must fit the 8% budget, ratio {independent}"
+    );
 }

@@ -1996,7 +1996,7 @@ impl OnDemandStorage {
                 }
                 // Skip column data (encoding-aware)
                 let ct = f_schema.columns[ci].1;
-                let consumed = if encoding_version == RG_ENCODING_VERSION {
+                let consumed = if rg_columns_are_encoded(encoding_version) {
                     skip_column_encoded(&body[pos..], ct)
                 } else {
                     ColumnData::skip_bytes_typed(&body[pos..], ct)

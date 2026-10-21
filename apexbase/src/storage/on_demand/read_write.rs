@@ -775,8 +775,8 @@ fn decode_point_column_value(
     read_blob: &dyn Fn(&[u8]) -> io::Result<Vec<u8>>,
 ) -> io::Result<crate::data::Value> {
     use crate::data::Value;
-    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-    let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+    let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+    let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
         col_bytes[0]
     } else {
         COL_ENCODING_PLAIN
@@ -1039,7 +1039,7 @@ fn decode_point_column_value(
                         value
                     }
                     _ => {
-                        let (cd, _) = if encoding_version == RG_ENCODING_VERSION {
+                        let (cd, _) = if rg_columns_are_encoded(encoding_version) {
                             read_column_encoded(col_bytes, col_type)?
                         } else {
                             ColumnData::from_bytes_typed(col_bytes, col_type)?
@@ -2735,6 +2735,12 @@ impl OnDemandStorage {
         // Read RG header (32 bytes) to check compression + encoding version
         let mut rg_hdr = [0u8; 32];
         self.read_cached_bytes(rg_offset, &mut rg_hdr)?;
+        if rg_hdr[29] > RG_CHUNKED_ENCODING_VERSION {
+            return Err(err_data(format!(
+                "row group encoding version {} is newer than this build supports ({})",
+                rg_hdr[29], RG_CHUNKED_ENCODING_VERSION
+            )));
+        }
         if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] != RG_ENCODING_VERSION {
             return Ok(None);
         }
@@ -3125,6 +3131,12 @@ impl OnDemandStorage {
 
         let mut rg_hdr = [0u8; 32];
         self.read_cached_bytes(rg_offset, &mut rg_hdr)?;
+        if rg_hdr[29] > RG_CHUNKED_ENCODING_VERSION {
+            return Err(err_data(format!(
+                "row group encoding version {} is newer than this build supports ({})",
+                rg_hdr[29], RG_CHUNKED_ENCODING_VERSION
+            )));
+        }
         if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] != RG_ENCODING_VERSION {
             return Ok(None);
         }
@@ -3487,6 +3499,12 @@ impl OnDemandStorage {
         // Check RG header compression flag
         let mut rg_hdr = [0u8; 32];
         self.read_cached_bytes(rg_meta.offset, &mut rg_hdr)?;
+        if rg_hdr[29] > RG_CHUNKED_ENCODING_VERSION {
+            return Err(err_data(format!(
+                "row group encoding version {} is newer than this build supports ({})",
+                rg_hdr[29], RG_CHUNKED_ENCODING_VERSION
+            )));
+        }
         if rg_hdr[28] != RG_COMPRESS_NONE || rg_hdr[29] != RG_ENCODING_VERSION {
             return Ok(None);
         }
@@ -4027,7 +4045,7 @@ impl OnDemandStorage {
             // The directory addresses the *logical* body layout, so it serves a
             // compressed group too once that group's body has been decompressed
             // (which is cached across point reads).
-            let has_rcix = encoding_version == RG_ENCODING_VERSION
+            let has_rcix = rg_columns_are_encoded(encoding_version)
                 && col_offsets_rg.len() >= col_count;
 
             if has_rcix {
@@ -4185,7 +4203,7 @@ impl OnDemandStorage {
                 let col_type = schema[col_idx].1;
                 let col_name = schema[col_idx].0.clone();
                 let col_bytes = &body[pos..];
-                let consumed = if encoding_version == RG_ENCODING_VERSION {
+                let consumed = if rg_columns_are_encoded(encoding_version) {
                     skip_column_encoded(col_bytes, col_type)?
                 } else {
                     ColumnData::skip_bytes_typed(col_bytes, col_type)?
@@ -6045,7 +6063,7 @@ impl OnDemandStorage {
 
                 // Parse column data (encoding-aware for version 1, plain for version 0)
                 let col_type = footer.schema.columns[col_idx].1;
-                let (col_data, consumed) = if encoding_version == RG_ENCODING_VERSION {
+                let (col_data, consumed) = if rg_columns_are_encoded(encoding_version) {
                     read_column_encoded(&body[pos..], col_type)?
                 } else {
                     ColumnData::from_bytes_typed(&body[pos..], col_type)?
@@ -6599,8 +6617,8 @@ impl OnDemandStorage {
                 let null_bytes = &body[col_body_off..col_body_off + null_bitmap_len];
                 let data_start = col_body_off + null_bitmap_len;
                 let col_bytes = &body[data_start..];
-                let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() {
+                let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() {
                     col_bytes[0]
                 } else {
                     COL_ENCODING_PLAIN

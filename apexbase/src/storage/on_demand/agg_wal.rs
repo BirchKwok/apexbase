@@ -1441,7 +1441,7 @@ impl OnDemandStorage {
             };
 
             // Must be uncompressed for zero-copy
-            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+            if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                 // Compressed RG: fall back to read_column_encoded per column
                 let body_raw = rg_bytes.get(32..).unwrap_or(&[]);
                 let decompressed_buf = self.decompressed_rg_body(
@@ -1780,7 +1780,7 @@ impl OnDemandStorage {
                     let rg_bytes = &mmap[rg_meta.offset as usize..rg_end];
                     let compress_flag = rg_bytes[28];
                     let encoding_version = rg_bytes[29];
-                    if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+                    if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                         return None;
                     }
 
@@ -2013,7 +2013,7 @@ impl OnDemandStorage {
             );
 
             // Need RCIX for filter column AND all agg columns
-            let rcix = if compress_flag == RG_COMPRESS_NONE && encoding_version == RG_ENCODING_VERSION {
+            let rcix = if compress_flag == RG_COMPRESS_NONE && rg_columns_are_encoded(encoding_version) {
                 footer.col_offsets.get(rg_i).filter(|v| {
                     v.len() > filter_idx && agg_indices.iter().all(|&(ci, _)| v.len() > ci)
                 })
@@ -2426,8 +2426,8 @@ impl OnDemandStorage {
                     let ct = schema.columns[ci].1;
                     if ci == filter_col_idx {
                         let col_bytes = &body[pos..];
-                        let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                        let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                        let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                        let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
                         let data = if enc_offset <= col_bytes.len() { &col_bytes[enc_offset..] } else { &[] };
                         if encoding == COL_ENCODING_PLAIN && matches!(ct, ColumnType::StringDict) && data.len() >= 16 {
                             let count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
@@ -2467,8 +2467,8 @@ impl OnDemandStorage {
                     }
                     // Advance pos past column data
                     let col_bytes = &body[pos..];
-                    let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                    let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                    let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                    let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
                     let data = if enc_offset <= col_bytes.len() { &col_bytes[enc_offset..] } else { &[] };
                     if encoding == COL_ENCODING_PLAIN && data.len() >= 8 {
                         let count = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0;8])) as usize;
@@ -2519,8 +2519,8 @@ impl OnDemandStorage {
                             pos2 += null_bitmap_len;
                             let ct = schema.columns[cii].1;
                             let col_bytes = &body[pos2..];
-                            let enc_offset = if encoding_version == RG_ENCODING_VERSION { 1 } else { 0 };
-                            let encoding = if encoding_version == RG_ENCODING_VERSION && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
+                            let enc_offset = if rg_columns_are_encoded(encoding_version) { 1 } else { 0 };
+                            let encoding = if rg_columns_are_encoded(encoding_version) && !col_bytes.is_empty() { col_bytes[0] } else { COL_ENCODING_PLAIN };
                             let data = if enc_offset <= col_bytes.len() { &col_bytes[enc_offset..] } else { &[] };
 
                             if cii == col_idx {
@@ -3727,7 +3727,7 @@ impl OnDemandStorage {
                     let rg_bytes = &mmap[rg_meta.offset as usize..rg_end];
                     let compress_flag = rg_bytes[28];
                     let encoding_version = rg_bytes[29];
-                    if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+                    if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                         return None;
                     }
                     let rcix = footer.col_offsets.get(rg_i)?;
@@ -4609,7 +4609,7 @@ impl OnDemandStorage {
             }
             let compress_flag = rg_bytes[28];
             let encoding_version = rg_bytes[29];
-            if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+            if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                 return Ok(None);
             }
             let rcix = match footer.col_offsets.get(rg_i) {
@@ -5086,7 +5086,7 @@ impl OnDemandStorage {
             let null_bitmap_len = (rg_rows + 7) / 8;
             let compress_flag = rg_bytes[28];
             let encoding_version = rg_bytes[29];
-            if compress_flag != crate::storage::on_demand::RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+            if compress_flag != crate::storage::on_demand::RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                 rg_row_offset += rg_rows; continue;
             }
             let body = rg_bytes.get(32..).unwrap_or(&[]);
@@ -7155,7 +7155,7 @@ impl OnDemandStorage {
                 let del_vec_len = null_bitmap_len;
                 let rcix = &footer.col_offsets[rg_i];
 
-                if compress_flag != RG_COMPRESS_NONE || encoding_version != RG_ENCODING_VERSION {
+                if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                     // Restart through the full decoder below. Mixing partial
                     // streaming results with a whole-column fallback would
                     // double count the row groups already consumed.
@@ -8056,7 +8056,7 @@ impl OnDemandStorage {
                 let f_data_start = f_col_off + null_bitmap_len;
                 if f_data_start >= body.len() { rg_row_offset += rg_rows; continue; }
                 let f_bytes = &body[f_data_start..];
-                let f_encoding = if encoding_version == RG_ENCODING_VERSION && !f_bytes.is_empty() { f_bytes[0] } else { 0 };
+                let f_encoding = if rg_columns_are_encoded(encoding_version) && !f_bytes.is_empty() { f_bytes[0] } else { 0 };
                 // Check for BITPACK filter: inline decode to avoid 500KB Vec<i64> per RG
                 let filter_is_bitpack = f_encoding == 2u8 && f_bytes.len() >= 18; // 1 enc + 17 header
                 let (bp_count, bp_bit_width, bp_min_val, bp_packed): (usize, usize, i64, &[u8]) = if filter_is_bitpack {
@@ -8083,7 +8083,7 @@ impl OnDemandStorage {
                 {
                     None
                 } else {
-                    Some(if encoding_version == RG_ENCODING_VERSION {
+                    Some(if rg_columns_are_encoded(encoding_version) {
                         read_column_encoded(f_bytes, schema.columns[filter_idx].1)?.0
                     } else {
                         ColumnData::from_bytes_typed(f_bytes, schema.columns[filter_idx].1)?.0
@@ -8098,7 +8098,7 @@ impl OnDemandStorage {
                     Some(ai) => {
                         let a_col_off = rcix[ai] as usize;
                         let a_data_start = a_col_off + null_bitmap_len;
-                        if a_data_start + 1 < body.len() && encoding_version == RG_ENCODING_VERSION {
+                        if a_data_start + 1 < body.len() && rg_columns_are_encoded(encoding_version) {
                             let enc = body[a_data_start];
                             let payload = &body[a_data_start + 1..];
                             if enc == 0u8 && payload.len() >= 8 {

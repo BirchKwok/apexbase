@@ -119,7 +119,7 @@ fn parse_v4_row_group(
     } else {
         0
     };
-    if encoding_version > RG_ENCODING_VERSION {
+    if encoding_version > RG_CHUNKED_ENCODING_VERSION {
         return Err(err_data(format!(
             "row group encoding version {encoding_version} is newer than this build supports ({RG_ENCODING_VERSION})"
         )));
@@ -187,7 +187,7 @@ fn parse_v4_row_group(
             .get(col_idx)
             .map(|(_, ct)| *ct)
             .unwrap_or(ColumnType::Null);
-        let (mut col, consumed) = if encoding_version == RG_ENCODING_VERSION {
+        let (mut col, consumed) = if rg_columns_are_encoded(encoding_version) {
             read_column_encoded(&body[pos..], col_type)?
         } else {
             ColumnData::from_bytes_typed(&body[pos..], col_type)?
@@ -1766,11 +1766,35 @@ impl OnDemandStorage {
             .position(|meta| meta.offset == rg_offset)
             .ok_or_else(|| err_data("chunked row group is not in the footer directory"))?;
         let rg_rows = footer.row_groups[rg_idx].row_count as usize;
-        let id_len = rg_id_section_len(rg_rows, RG_IDS_PLAIN);
         let mut out = vec![0u8; declared];
-        let prefix = (id_len + rg_rows.div_ceil(8)).min(raw.len()).min(declared);
-        out[..prefix].copy_from_slice(&raw[..prefix]);
+        // The prefix length is exactly the first column's flat offset: the
+        // writer records it there, so it covers implicit ids, plain ids and the
+        // deletion vector without guessing the id encoding here.
+        let prefix = columns
+            .iter()
+            .flatten()
+            .next()
+            .map(|col| col.flat_off as usize)
+            .unwrap_or(0)
+            .min(declared);
+        // The prefix (id section + deletion vector) is its own compressed frame
+        // at the head of the payload; column frames follow it.
         let mut pos = 0usize;
+        if prefix > 0 {
+            if raw.len() < CHUNK_FRAME_HEADER_LEN {
+                return Err(err_data("chunked prefix frame truncated"));
+            }
+            let frame_len =
+                u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+            let frame_end = CHUNK_FRAME_HEADER_LEN + frame_len;
+            if frame_end > raw.len() {
+                return Err(err_data("chunked prefix frame runs past the row group"));
+            }
+            let bytes = decompress_column_frame(&raw[..frame_end])?;
+            let copy = prefix.min(bytes.len());
+            out[..copy].copy_from_slice(&bytes[..copy]);
+            pos = frame_end;
+        }
         for col in columns.iter().flatten() {
             let mut frame_pos = pos;
             for chunk in &col.chunks {

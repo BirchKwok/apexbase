@@ -441,6 +441,18 @@ fn supported_file_version(version: u32) -> bool {
 /// writer emits this value today; a reader that meets a newer revision must
 /// refuse the Row Group rather than interpret its bytes with older rules.
 const RG_ENCODING_VERSION: u8 = 1;
+
+/// Both the flat (v1) and chunked (v2) row-group layouts use the tagged column
+/// encoding: the chunked layout only changes how the body is framed on disk.
+/// A reader that checks `== RG_ENCODING_VERSION` would otherwise parse a chunked
+/// group as a legacy untagged body.
+#[inline]
+pub(crate) fn rg_columns_are_encoded(encoding_version: u8) -> bool {
+    matches!(
+        encoding_version,
+        RG_ENCODING_VERSION | RG_CHUNKED_ENCODING_VERSION
+    )
+}
 /// Revision 2: a *compressed* row group stores every column as an independently
 /// compressed frame, so a reader can decode only the columns it touches.
 /// Selected only when `APEX_CHUNK_INDEX` is on and the layout does not cost more
@@ -2153,17 +2165,24 @@ pub(crate) fn encode_rg_body_with_layout(
     force: Option<bool>,
 ) -> io::Result<(u8, Vec<u8>, Option<Vec<ChunkedColumn>>, Vec<u32>)> {
     let flat_offsets: Vec<u32> = ranges.iter().map(|&(start, _)| start as u32).collect();
-    let chunkable = !matches!(compression, CompressionType::None)
+    let chunkable = (force == Some(true) || chunk_index_enabled())
+        && !matches!(compression, CompressionType::None)
         && flat.len() >= COMPRESS_MIN_BODY_SIZE
-        && !ranges.is_empty()
-        && chunk_index_enabled();
+        && !ranges.is_empty();
     if chunkable && force != Some(false) {
         let (flag, flat_frame) = compress_rg_body(flat.clone(), compression);
         if flag != RG_COMPRESS_NONE {
             let columns: Vec<&[u8]> =
                 ranges.iter().map(|&(start, end)| &flat[start..end]).collect();
-            if let Some((payload, chunks)) = chunk_rg_body(&columns, compression)? {
+            let prefix_len = ranges.first().map(|&(start, _)| start).unwrap_or(0);
+            let prefix = &flat[..prefix_len];
+            if let Some((payload, chunks)) =
+                chunk_rg_body_with_prefix(&columns, prefix, compression)?
+            {
                 let growth = payload.len() as f64 / flat_frame.len() as f64;
+                if std::env::var_os("APEX_CHUNK_DEBUG").is_some() {
+                    eprintln!("CHUNK growth={growth:.4} prefix={} payload={} flat={}", prefix.len(), payload.len(), flat_frame.len());
+                }
                 if force == Some(true) || growth <= 1.0 + CHUNK_LAYOUT_MAX_GROWTH {
                     return Ok((flag, payload, Some(chunks), flat_offsets));
                 }
@@ -2197,13 +2216,37 @@ pub(crate) fn chunk_rg_body(
     columns: &[&[u8]],
     compression: CompressionType,
 ) -> io::Result<Option<(Vec<u8>, Vec<ChunkedColumn>)>> {
+    chunk_rg_body_with_prefix(columns, &[], compression)
+}
+
+/// Chunk a row-group body while keeping its uncompressed prefix (id section and
+/// deletion vector) at the head of the payload.
+///
+/// The prefix is stored verbatim: it is the part of the flat body that the
+/// chunk directory cannot describe (it is not a column), and readers rebuild it
+/// byte for byte. `flat_off` of the first column is the prefix length, so the
+/// reassembled layout is exactly the flat body the readers already address.
+pub(crate) fn chunk_rg_body_with_prefix(
+    columns: &[&[u8]],
+    prefix: &[u8],
+    compression: CompressionType,
+) -> io::Result<Option<(Vec<u8>, Vec<ChunkedColumn>)>> {
     if matches!(compression, CompressionType::None) || columns.is_empty() {
         return Ok(None);
     }
-    let flat_len: usize = columns.iter().map(|col| col.len()).sum();
+    let flat_len: usize = prefix.len() + columns.iter().map(|col| col.len()).sum::<usize>();
     let mut payload: Vec<u8> = Vec::with_capacity(flat_len / 2 + 64);
+    // The prefix is compressed as its own frame: storing it verbatim would lose
+    // the compression the flat layout gives the same bytes and push the 8%
+    // size gate over budget for realistic tables.
+    if !prefix.is_empty() {
+        let (flag, compressed) = compress_frame(prefix, compression);
+        payload.extend_from_slice(&(compressed.len() as u32).to_le_bytes());
+        payload.push(flag);
+        payload.extend_from_slice(&compressed);
+    }
     let mut chunks: Vec<ChunkedColumn> = Vec::with_capacity(columns.len());
-    let mut flat_off = 0u32;
+    let mut flat_off = prefix.len() as u32;
     for col in columns {
         if col.is_empty() {
             return Ok(None);
