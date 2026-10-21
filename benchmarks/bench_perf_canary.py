@@ -367,6 +367,7 @@ def run_canary(
     hot_shapes_only=False,
     only=None,
 ):
+    only = only or None
     full_bench.ensure_optional_imports()
     if not full_bench.HAS_APEXBASE:
         raise RuntimeError("ApexBase is not importable; run maturin develop --release first")
