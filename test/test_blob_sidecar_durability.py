@@ -98,3 +98,24 @@ def test_packed_blobs_store_duplicate_payloads_once():
             assert client.read_blobs("payload", list(range(1, 9))) == [duplicate] * 8
         finally:
             client.close()
+
+
+def test_packed_blobs_dedupe_across_store_calls():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("files", {"payload": "blob"})
+        client.use_table("files")
+        duplicate = _payload(512 * 1024, 11)
+        client.store({"payload": [duplicate]})
+        client.flush()
+        client.store({"payload": [duplicate]})
+        client.flush()
+        packed = os.path.join(tmp, "files.apex.blobs", "packed.blob")
+        assert os.path.getsize(packed) < 700 * 1024
+        try:
+            rows = client.execute("SELECT payload FROM files").to_dict()
+            assert [row["payload"] for row in rows] == [duplicate, duplicate]
+        finally:
+            client.close()

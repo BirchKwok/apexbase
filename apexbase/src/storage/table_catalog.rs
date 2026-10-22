@@ -1106,6 +1106,7 @@ fn unlink_table_files(table_path: &Path) {
     // (`<table>.apex.blobs`). It is a directory, so the suffix loop above cannot
     // reclaim it; without this every DROP leaves the payloads on disk forever.
     let _ = fs::remove_dir_all(format!("{stem}.blobs"));
+    crate::storage::on_demand::forget_blob_packed_dedup(table_path);
     // Rewrite scratch files carry a pid and sequence number, so they are not
     // matched by the fixed suffixes above and would otherwise stay behind in the
     // directory after the table is dropped.

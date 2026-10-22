@@ -39,6 +39,18 @@ pub(crate) struct BlobReadCache {
     objects_dir: PathBuf,
 }
 
+/// Packed payload offsets keyed by (table path, length, crc32). A client often
+/// stores duplicate payloads in separate batches/flushes, which recreate the
+/// storage object, so the dedup state lives at process scope; it is cleared for
+/// a path when that table's files are reaped.
+static BLOB_PACKED_DEDUP: once_cell::sync::Lazy<
+    parking_lot::RwLock<std::collections::HashMap<(PathBuf, u64, u32), u64>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
+
+pub(crate) fn forget_blob_packed_dedup(path: &Path) {
+    BLOB_PACKED_DEDUP.write().retain(|(table, _, _), _| table != path);
+}
+
 #[inline]
 fn null_bit_is_set(bitmap: &[u8], row_idx: usize) -> bool {
     let byte_idx = row_idx / 8;
@@ -330,7 +342,11 @@ impl OnDemandStorage {
             }
 
             if value.len() <= BLOB_PACKED_THRESHOLD {
-                if let Some(&offset) = packed_dedup.get(&(len, checksum)) {
+                let shared = BLOB_PACKED_DEDUP
+                    .read()
+                    .get(&(self.path.clone(), len, checksum))
+                    .copied();
+                if let Some(offset) = packed_dedup.get(&(len, checksum)).copied().or(shared) {
                     descriptors.push(encode_blob_descriptor(
                         BLOB_MODE_PACKED,
                         len,
@@ -353,6 +369,13 @@ impl OnDemandStorage {
                 file.write_all(value)?;
                 packed_offset += value.len() as u64;
                 packed_dedup.insert((len, checksum), offset);
+                {
+                    let mut map = BLOB_PACKED_DEDUP.write();
+                    if map.len() >= 4096 {
+                        map.clear();
+                    }
+                    map.insert((self.path.clone(), len, checksum), offset);
+                }
                 descriptors.push(encode_blob_descriptor(
                     BLOB_MODE_PACKED,
                     len,
