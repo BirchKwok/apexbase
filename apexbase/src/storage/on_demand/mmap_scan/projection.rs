@@ -4391,11 +4391,16 @@ impl OnDemandStorage {
                     if matches!(ct, ColumnType::Blob) {
                         use arrow::array::LargeBinaryArray;
                         let mut payloads = Vec::with_capacity(vals.len());
+                        let mut blob_cache = self.blob_read_cache();
                         for descriptor in vals {
                             payloads.push(
                                 descriptor
                                     .as_deref()
-                                    .map(|bytes| self.read_blob_value(bytes))
+                                    .map(|bytes| {
+                                        self.read_blob_bytes_with_cache(
+                                            bytes, &mut blob_cache, None,
+                                        )
+                                    })
                                     .transpose()?,
                             );
                         }

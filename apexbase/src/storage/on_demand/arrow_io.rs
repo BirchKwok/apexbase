@@ -442,6 +442,7 @@ impl OnDemandStorage {
                             (0..count.min(active_count)).collect()
                         };
                         let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(row_iter.len());
+                        let mut blob_cache = self.blob_read_cache();
                         for i in row_iter {
                             if i >= count {
                                 values.push(None);
@@ -459,7 +460,7 @@ impl OnDemandStorage {
                             }
                             let start = offsets[i] as usize;
                             let end = offsets[i + 1] as usize;
-                            values.push(Some(self.read_blob_value(&data[start..end])?));
+                            values.push(Some(self.read_blob_bytes_with_cache(&data[start..end], &mut blob_cache, None)?));
                         }
                         let refs: Vec<Option<&[u8]>> =
                             values.iter().map(|v| v.as_deref()).collect();
@@ -962,6 +963,7 @@ impl OnDemandStorage {
                         use arrow::array::LargeBinaryArray;
                         let count = offsets.len().saturating_sub(1);
                         let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(row_count);
+                        let mut blob_cache = self.blob_read_cache();
                         for i in 0..row_count {
                             if is_null(col_idx, i) || i >= count {
                                 values.push(None);
@@ -969,7 +971,7 @@ impl OnDemandStorage {
                             }
                             let start = offsets[i] as usize;
                             let end = offsets[i + 1] as usize;
-                            values.push(Some(self.read_blob_value(&data[start..end])?));
+                            values.push(Some(self.read_blob_bytes_with_cache(&data[start..end], &mut blob_cache, None)?));
                         }
                         let refs: Vec<Option<&[u8]>> =
                             values.iter().map(|v| v.as_deref()).collect();
@@ -1449,6 +1451,7 @@ impl OnDemandStorage {
                             (0..actual_limit.min(count)).collect()
                         };
                         let mut values: Vec<Option<Vec<u8>>> = Vec::with_capacity(row_iter.len());
+                        let mut blob_cache = self.blob_read_cache();
                         for i in row_iter {
                             if i >= count {
                                 values.push(None);
@@ -1466,7 +1469,7 @@ impl OnDemandStorage {
                             }
                             let start = offsets[i] as usize;
                             let end = offsets[i + 1] as usize;
-                            values.push(Some(self.read_blob_value(&data[start..end])?));
+                            values.push(Some(self.read_blob_bytes_with_cache(&data[start..end], &mut blob_cache, None)?));
                         }
                         let refs: Vec<Option<&[u8]>> =
                             values.iter().map(|v| v.as_deref()).collect();

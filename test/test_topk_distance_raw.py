@@ -93,17 +93,26 @@ def test_raw_skips_the_result_view_fixed_cost():
             for _ in range(3):
                 client.topk_distance("vec", query, k=10)
                 client.topk_distance("vec", query, k=10, raw=True)
-            default_times = []
-            raw_times = []
-            for _ in range(30):
-                start = time.perf_counter()
-                client.topk_distance("vec", query, k=10)
-                default_times.append(time.perf_counter() - start)
-                start = time.perf_counter()
-                client.topk_distance("vec", query, k=10, raw=True)
-                raw_times.append(time.perf_counter() - start)
-            default_ms = statistics.median(default_times) * 1000
-            raw_ms = statistics.median(raw_times) * 1000
-            assert raw_ms < default_ms, (raw_ms, default_ms)
+            # Paired A/B with alternating order: a busy machine slows both calls
+            # of a pair together, so the median per-pair ratio stays meaningful
+            # while a single median of each side can flip under load.
+            ratios = []
+            for iteration in range(21):
+                if iteration % 2 == 0:
+                    start = time.perf_counter()
+                    client.topk_distance("vec", query, k=10)
+                    default_s = time.perf_counter() - start
+                    start = time.perf_counter()
+                    client.topk_distance("vec", query, k=10, raw=True)
+                    raw_s = time.perf_counter() - start
+                else:
+                    start = time.perf_counter()
+                    client.topk_distance("vec", query, k=10, raw=True)
+                    raw_s = time.perf_counter() - start
+                    start = time.perf_counter()
+                    client.topk_distance("vec", query, k=10)
+                    default_s = time.perf_counter() - start
+                ratios.append(raw_s / default_s)
+            assert statistics.median(ratios) < 0.95, statistics.median(ratios)
         finally:
             client.close()

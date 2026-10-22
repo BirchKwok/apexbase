@@ -34,7 +34,7 @@ struct BlobDescriptor {
     locator: Vec<u8>,
 }
 
-struct BlobReadCache {
+pub(crate) struct BlobReadCache {
     packed_file: Option<File>,
     objects_dir: PathBuf,
 }
@@ -214,6 +214,15 @@ impl OnDemandStorage {
     pub fn blob_sidecar_dir(&self) -> PathBuf {
         blob_dir_for_path(&self.path)
     }
+    /// One cache for a batch of blob reads: packed blobs share a single open
+    /// file instead of opening `packed.blob` once per row.
+    pub(crate) fn blob_read_cache(&self) -> BlobReadCache {
+        BlobReadCache {
+            packed_file: None,
+            objects_dir: self.blob_sidecar_dir().join("objects"),
+        }
+    }
+
 
     pub fn write_blob_value(&self, value: &[u8]) -> io::Result<Vec<u8>> {
         let checksum = crc32fast::hash(value);
@@ -236,7 +245,7 @@ impl OnDemandStorage {
             let offset = file.seek(SeekFrom::End(0))?;
             file.write_all(value)?;
             file.flush()?;
-            if self.durability == super::DurabilityLevel::Max {
+            if self.durability != super::DurabilityLevel::Fast {
                 file.sync_all()?;
             }
             return Ok(encode_blob_descriptor(
@@ -258,7 +267,7 @@ impl OnDemandStorage {
                 .open(&object_path)?;
             file.write_all(value)?;
             file.flush()?;
-            if self.durability == super::DurabilityLevel::Max {
+            if self.durability != super::DurabilityLevel::Fast {
                 file.sync_all()?;
             }
         }
@@ -353,7 +362,7 @@ impl OnDemandStorage {
                 {
                     Ok(mut file) => {
                         file.write_all(value)?;
-                        if self.durability == super::DurabilityLevel::Max {
+                        if self.durability != super::DurabilityLevel::Fast {
                             file.sync_all()?;
                         }
                         break object_id;
@@ -372,7 +381,7 @@ impl OnDemandStorage {
 
         if let Some(mut file) = packed_file {
             file.flush()?;
-            if self.durability == super::DurabilityLevel::Max {
+            if self.durability != super::DurabilityLevel::Fast {
                 file.sync_all()?;
             }
         }
