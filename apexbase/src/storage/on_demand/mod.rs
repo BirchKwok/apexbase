@@ -610,8 +610,12 @@ fn rg_id_encoding_for(ids: &[u64], allow_implicit: bool) -> u8 {
 
 /// True when this table's path enables the implicit-ID encoding.
 fn implicit_ids_allowed(path: &std::path::Path) -> bool {
-    path.components()
-        .any(|part| part.as_os_str() == std::ffi::OsStr::new(".apex_tmp"))
+    // Row groups written with contiguous ids omit the 8-byte-per-row id section;
+    // readers reconstruct `min_id + row`. This is on by default (it was limited
+    // to `.apex_tmp` tables until the column-chunk work landed); an explicit
+    // `APEX_IMPLICIT_IDS=0` keeps the old plain-id layout for A/B debugging.
+    let _ = path;
+    !std::env::var("APEX_IMPLICIT_IDS").is_ok_and(|value| value == "0")
 }
 
 fn ids_are_contiguous(ids: &[u64]) -> bool {
