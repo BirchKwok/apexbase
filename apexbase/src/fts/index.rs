@@ -489,6 +489,10 @@ struct IndexState {
     pending_wal: Vec<WalOp>,
     next_term_id: u32,
     needs_rebuild: bool,
+    /// `(state signature, live doc count, live term total)`. The signature mixes
+    /// every counter the two aggregates depend on, so a mutation rebuilds the
+    /// cache while repeated BM25 stats calls read it once.
+    stats_cache: std::sync::Mutex<Option<(u64, u64, u64)>>,
 }
 
 impl IndexState {
@@ -701,6 +705,52 @@ impl IndexState {
             .total_terms()
             .saturating_sub(shadowed_base_terms)
             + delta_terms
+    }
+
+    fn stats_signature(&self) -> u64 {
+        let mut hash = 0u64;
+        let delta_terms: u64 = self
+            .delta_tokens
+            .values()
+            .map(|tokens| tokens.iter().filter(|&&token| token != 0).count() as u64)
+            .sum();
+        for value in [
+            self.base_docs.len(),
+            self.delta_docs.len(),
+            self.shadowed_docs.len(),
+            self.deleted_docs.len(),
+            self.base_tokens.total_terms(),
+            self.delta_tokens.len() as u64,
+            delta_terms,
+        ] {
+            hash = hash.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(value);
+        }
+        hash
+    }
+
+    /// Live document count with the same signature-keyed cache as the term total.
+    fn live_doc_count(&self) -> u64 {
+        self.cached_stats().0
+    }
+
+    /// Live term total, cached until the state signature changes.
+    fn live_term_total_cached(&self) -> u64 {
+        self.cached_stats().1
+    }
+
+    fn cached_stats(&self) -> (u64, u64) {
+        let signature = self.stats_signature();
+        let cached = *self.stats_cache.lock().expect("fts stats cache poisoned");
+        if let Some((cached_signature, docs, terms)) = cached {
+            if cached_signature == signature {
+                return (docs, terms);
+            }
+        }
+        let docs = self.live_docs().len();
+        let terms = self.live_term_total();
+        *self.stats_cache.lock().expect("fts stats cache poisoned") =
+            Some((signature, docs, terms));
+        (docs, terms)
     }
 
     fn live_docs(&self) -> RoaringTreemap {

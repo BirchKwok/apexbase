@@ -326,8 +326,8 @@ impl FtsEngine {
             return Ok(Vec::new());
         }
 
-        let doc_count = state.live_docs().len().max(1) as f32;
-        let average_length = (state.live_term_total() as f32 / doc_count).max(1.0);
+        let doc_count = state.live_doc_count().max(1) as f32;
+        let average_length = (state.live_term_total_cached() as f32 / doc_count).max(1.0);
         let mut idf = Vec::with_capacity(query_terms.len());
         for (term_id, index) in query_terms {
             let document_frequency = postings[index].len() as f32;
@@ -457,7 +457,7 @@ impl FtsEngine {
     pub fn stats(&self) -> HashMap<String, u64> {
         let state = self.core.state.read();
         let mut stats = HashMap::new();
-        stats.insert("doc_count".into(), state.live_docs().len());
+        stats.insert("doc_count".into(), state.live_doc_count());
         let mut terms: AHashSet<&str> = state.base_terms().unwrap_or_default().into_iter().collect();
         terms.extend(state.delta_postings.keys().map(String::as_str));
         let live_term_count = terms

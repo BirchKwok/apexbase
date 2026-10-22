@@ -305,4 +305,30 @@ mod tests {
         assert!(!engine.needs_rebuild());
         assert_eq!(engine.search_ids("rust").unwrap(), vec![1]);
     }
+
+    #[test]
+    fn cached_live_stats_are_invalidated_by_mutations() {
+        let engine = FtsEngine::memory_only(FtsConfig::default()).unwrap();
+        engine
+            .add_documents_arrow_texts(
+                &[1, 2, 3],
+                &["alpha beta gamma", "alpha beta", "delta epsilon"],
+            )
+            .unwrap();
+        let first = engine.stats();
+        assert_eq!(first["doc_count"], 3);
+        // Repeated stats calls read the cached aggregate.
+        assert_eq!(engine.stats()["doc_count"], 3);
+
+        engine.remove_documents(&[2]).unwrap();
+        let after = engine.stats();
+        assert_eq!(after["doc_count"], 2);
+        assert_eq!(after["deleted_count"], 1);
+        // BM25 after the mutation must use the refreshed live term total.
+        let ranked = engine.search_ranked("alpha", 10).unwrap();
+        assert_eq!(
+            ranked.iter().map(|hit| hit.doc_id).collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
 }
