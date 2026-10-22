@@ -6995,3 +6995,26 @@ fn chunk_layout_keeps_the_prefix_and_separates_correlated_columns() {
         "independent columns must fit the 8% budget, ratio {independent}"
     );
 }
+
+#[test]
+fn oversized_column_offsets_are_rejected_instead_of_truncated() {
+    // The on-disk format stores u32 value offsets; a column past 4 GiB must fail
+    // loudly rather than wrap and corrupt every later row.
+    use crate::storage::on_demand::{
+        write_column_encoded, ColumnEncodingOptions, ColumnType,
+    };
+    let column = ColumnData::String {
+        offsets: vec![0, u32::MAX as u64 + 2],
+        data: vec![0u8; 4],
+    };
+    let mut out = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut out);
+    let error = write_column_encoded(
+        &column,
+        ColumnType::String,
+        &mut cursor,
+        ColumnEncodingOptions::default(),
+    )
+    .expect_err("offsets past u32::MAX must be rejected");
+    assert!(error.to_string().contains("4 GiB"), "{error}");
+}

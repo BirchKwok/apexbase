@@ -803,6 +803,10 @@ impl ColumnData {
             ColumnData::String { offsets, data } | ColumnData::Binary { offsets, data } => {
                 // OPTIMIZATION: Pre-allocate and use bulk memcpy for offsets
                 let count = offsets.len().saturating_sub(1);
+                debug_assert!(
+                    offsets.iter().all(|&offset| offset <= u32::MAX as u64),
+                    "column payload exceeds the 4 GiB u32 offset limit"
+                );
                 let disk_offsets = offsets_to_u32(offsets);
                 let mut buf = Vec::with_capacity(8 + disk_offsets.len() * 4 + 8 + data.len());
                 buf.extend_from_slice(&(count as u64).to_le_bytes());

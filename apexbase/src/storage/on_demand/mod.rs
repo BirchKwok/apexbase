@@ -1562,6 +1562,24 @@ fn write_column_encoded<W: Write>(
     writer: &mut W,
     options: ColumnEncodingOptions,
 ) -> io::Result<()> {
+    // The disk format keeps u32 value offsets; silently truncating them would
+    // corrupt every later row, so a payload past 4 GiB is refused instead.
+    let offsets_exceed_u32 = match col {
+        ColumnData::String { offsets, .. }
+        | ColumnData::Binary { offsets, .. } => {
+            offsets.iter().any(|&offset| offset > u32::MAX as u64)
+        }
+        ColumnData::StringDict { dict_offsets, .. } => {
+            dict_offsets.iter().any(|&offset| offset > u32::MAX as u64)
+        }
+        _ => false,
+    };
+    if offsets_exceed_u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "column payload exceeds the 4 GiB u32 offset limit",
+        ));
+    }
     match col {
         ColumnData::Float64(data) => {
             if let Some(encoded) = dictionary_encode_f64(data) {
