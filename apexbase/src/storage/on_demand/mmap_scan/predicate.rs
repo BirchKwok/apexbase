@@ -3008,22 +3008,29 @@ impl OnDemandStorage {
             } else {
                 0
             };
+            let del_vec_len = (rg_rows + 7) / 8;
+            let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
+            let id_section = rg_id_section_len(rg_rows, id_encoding);
+            let has_deletes = rg_meta.deletion_count > 0;
+            let null_bitmap_len = (rg_rows + 7) / 8;
             let chunked = footer
                 .chunk_tables
                 .get(rg_i)
                 .is_some_and(|cols| cols.iter().any(Option::is_some));
-            let decompressed = if chunked {
-                let mut needed = vec![false; col_count];
-                if let Some(slot) = needed.get_mut(col_idx as usize) {
-                    *slot = true;
-                }
-                self.decompressed_rg_body_columns(
+
+            // Chunked groups decode only the filter column; the full body (all
+            // columns plus a zeroed flat buffer) is never allocated.
+            let chunked_parts = if chunked {
+                self.decompressed_chunked_columns(
                     rg_meta.offset,
-                    rg_meta.offset + rg_meta.data_size,
-                    compress_flag,
+                    &[col_idx as usize],
                     &rg_bytes[32..],
-                    &needed,
                 )?
+            } else {
+                None
+            };
+            let decompressed_full = if chunked_parts.is_some() {
+                None
             } else {
                 self.decompressed_rg_body(
                     rg_meta.offset,
@@ -3032,26 +3039,48 @@ impl OnDemandStorage {
                     &rg_bytes[32..],
                 )?
             };
-            let body: &[u8] = decompressed
-                .as_ref()
-                .map(|body| body.as_slice())
-                .unwrap_or(&rg_bytes[32..]);
-            let del_vec_len = (rg_rows + 7) / 8;
-            let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
-            let id_section = rg_id_section_len(rg_rows, id_encoding);
-            if id_section + del_vec_len > body.len() {
-                return Err(err_data("RG del vec truncated"));
-            }
-            let del_bytes = &body[id_section..id_section + del_vec_len];
-            let has_deletes = rg_meta.deletion_count > 0;
-            let null_bitmap_len = (rg_rows + 7) / 8;
+            let (body, col_body_off, del_bytes_owned): (&[u8], usize, Vec<u8>) =
+                if let Some((prefix, columns)) = &chunked_parts {
+                    if prefix.len() < del_vec_len {
+                        return Err(err_data("chunked RG deletion vector truncated"));
+                    }
+                    let column = columns
+                        .first()
+                        .map(|(_, bytes)| bytes.as_slice())
+                        .unwrap_or(&[]);
+                    (
+                        column,
+                        0,
+                        prefix[prefix.len() - del_vec_len..].to_vec(),
+                    )
+                } else {
+                    let full: &[u8] = decompressed_full
+                        .as_ref()
+                        .map(|body| body.as_slice())
+                        .unwrap_or(&rg_bytes[32..]);
+                    if id_section + del_vec_len > full.len() {
+                        return Err(err_data("RG del vec truncated"));
+                    }
+                    let col_off = footer
+                        .col_offsets
+                        .get(rg_i)
+                        .and_then(|offsets| offsets.get(col_idx as usize))
+                        .copied()
+                        .unwrap_or(0) as usize;
+                    (
+                        full,
+                        col_off,
+                        full[id_section..id_section + del_vec_len].to_vec(),
+                    )
+                };
+            let del_bytes = del_bytes_owned.as_slice();
 
             // RCIX fast path: jump directly to target column offset
-            let rcix_available = rg_i < footer.col_offsets.len()
-                && col_idx < footer.col_offsets[rg_i].len()
-                && (compress_flag == RG_COMPRESS_NONE || chunked);
+            let rcix_available = chunked_parts.is_some()
+                || (rg_i < footer.col_offsets.len()
+                    && col_idx < footer.col_offsets[rg_i].len()
+                    && compress_flag == RG_COMPRESS_NONE);
             if rcix_available {
-                let col_body_off = footer.col_offsets[rg_i][col_idx] as usize;
                 if col_body_off + null_bitmap_len > body.len() {
                     global_row_offset += rg_rows;
                     continue;

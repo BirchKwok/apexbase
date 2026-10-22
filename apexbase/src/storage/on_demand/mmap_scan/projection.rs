@@ -1739,6 +1739,57 @@ impl OnDemandStorage {
             }
 
             // SEQUENTIAL PATH: compressed or no RCIX — decompress and scan all columns
+            // Chunked groups: decode only the requested columns, without the
+            // flat body (all columns) or its zero-filled allocation.
+            let chunked = footer
+                .row_groups
+                .iter()
+                .position(|meta| meta.offset == rg_meta.offset)
+                .and_then(|index| footer.chunk_tables.get(index))
+                .is_some_and(|cols| cols.iter().any(Option::is_some));
+            if chunked {
+                if let Some((prefix, columns)) = self.decompressed_chunked_columns(
+                    rg_meta.offset,
+                    col_indices,
+                    rg_bytes.get(32..).unwrap_or(&[]),
+                )? {
+                    if prefix.len() >= del_vec_len {
+                        all_del_bytes
+                            .extend_from_slice(&prefix[prefix.len() - del_vec_len..]);
+                    }
+                    for (col_idx, col_bytes) in columns {
+                        let Some(&out_pos) = col_idx_to_out.get(&col_idx) else {
+                            continue;
+                        };
+                        if col_bytes.len() < null_bitmap_len {
+                            continue;
+                        }
+                        col_null_bitmaps[out_pos]
+                            .extend_from_slice(&col_bytes[..null_bitmap_len]);
+                        let (col_data, _) = read_column_encoded(
+                            &col_bytes[null_bitmap_len..],
+                            schema.columns[col_idx].1,
+                        )?;
+                        let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                            col_data.decode_string_dict()
+                        } else {
+                            col_data
+                        };
+                        col_accumulators[out_pos].append(&col_data);
+                        rg_filled[out_pos] = true;
+                    }
+                    Self::pad_missing_rg_columns(
+                        schema,
+                        col_indices,
+                        &rg_filled,
+                        rg_rows,
+                        null_bitmap_len,
+                        &mut col_accumulators,
+                        &mut col_null_bitmaps,
+                    );
+                    continue;
+                }
+            }
             let decompressed_buf = self.decompressed_rg_body(
                 rg_meta.offset,
                 rg_meta.offset + rg_meta.data_size,

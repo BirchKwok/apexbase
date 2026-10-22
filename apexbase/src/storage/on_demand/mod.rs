@@ -2180,9 +2180,6 @@ pub(crate) fn encode_rg_body_with_layout(
                 chunk_rg_body_with_prefix(&columns, prefix, compression)?
             {
                 let growth = payload.len() as f64 / flat_frame.len() as f64;
-                if std::env::var_os("APEX_CHUNK_DEBUG").is_some() {
-                    eprintln!("CHUNK growth={growth:.4} prefix={} payload={} flat={}", prefix.len(), payload.len(), flat_frame.len());
-                }
                 if force == Some(true) || growth <= 1.0 + CHUNK_LAYOUT_MAX_GROWTH {
                     return Ok((flag, payload, Some(chunks), flat_offsets));
                 }

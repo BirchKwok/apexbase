@@ -100,7 +100,6 @@ fn assemble_chunked_body(
     raw: &[u8],
     declared: usize,
     columns: &[Option<ChunkedColumn>],
-    needed: Option<&[bool]>,
 ) -> io::Result<Vec<u8>> {
     let mut out = vec![0u8; declared];
     let prefix = columns
@@ -125,24 +124,20 @@ fn assemble_chunked_body(
         out[..copy].copy_from_slice(&bytes[..copy]);
         pos = frame_end;
     }
-    for (column_index, col) in columns.iter().enumerate() {
-        let Some(col) = col else { continue; };
-        let wanted = needed.map_or(true, |mask| mask.get(column_index).copied().unwrap_or(false));
+    for col in columns.iter().flatten() {
         let mut frame_pos = pos;
         for chunk in &col.chunks {
             let frame_end = frame_pos + CHUNK_FRAME_HEADER_LEN + chunk.len as usize;
             if frame_end > raw.len() {
                 return Err(err_data("chunked column frame runs past the row group"));
             }
-            if wanted {
-                let bytes = decompress_column_frame(&raw[frame_pos..frame_end])?;
-                let start = col.flat_off as usize;
-                let end = start + bytes.len();
-                if end > out.len() {
-                    return Err(err_data("chunked column frame exceeds the flat body"));
-                }
-                out[start..end].copy_from_slice(&bytes);
+            let bytes = decompress_column_frame(&raw[frame_pos..frame_end])?;
+            let start = col.flat_off as usize;
+            let end = start + bytes.len();
+            if end > out.len() {
+                return Err(err_data("chunked column frame exceeds the flat body"));
             }
+            out[start..end].copy_from_slice(&bytes);
             frame_pos = frame_end;
         }
         pos = frame_pos;
@@ -193,7 +188,7 @@ fn parse_v4_row_group(
             .map(|col| col.flat_len as usize)
             .max()
             .unwrap_or(0);
-        Some(assemble_chunked_body(&rg_buf[32..], declared, columns, None)?)
+        Some(assemble_chunked_body(&rg_buf[32..], declared, columns)?)
     } else {
         decompress_rg_body(compress_flag, &rg_buf[32..])?
     };
@@ -1797,9 +1792,6 @@ impl OnDemandStorage {
                 .cloned()
         });
         let chunked = chunk_entry.is_some();
-        if std::env::var_os("APEX_CHUNK_DEBUG").is_some() {
-            eprintln!("DBG body rg={rg_offset} chunked={chunked} raw_len={}", raw.len());
-        }
         let declared = chunk_entry
             .as_ref()
             .and_then(|cols| cols.iter().flatten().map(|col| col.flat_len).max())
@@ -1815,24 +1807,20 @@ impl OnDemandStorage {
         Ok(Some(body))
     }
 
-    /// Decompress only the requested columns of a chunked row group.
+    /// Decompress the requested columns of a chunked row group, plus the
+    /// uncompressed prefix (id section + deletion vector) they live behind.
     ///
-    /// The returned buffer keeps the flat layout (prefix and column offsets) but
-    /// leaves unrequested columns zeroed: callers must address columns by
-    /// `footer.col_offsets` and never parse a column they did not ask for. The
-    /// partial body is not cached; a full-body read still populates the cache.
-    pub(crate) fn decompressed_rg_body_columns(
+    /// Unlike a full-body reassembly this never allocates or zeroes the flat
+    /// body: callers address each returned column from offset 0 and slice the
+    /// deletion vector off the prefix. Returns `None` when the row group is not
+    /// chunked or no requested column has a directory entry.
+    pub(crate) fn decompressed_chunked_columns(
         &self,
         rg_offset: u64,
-        rg_end: u64,
-        compress_flag: u8,
+        wanted: &[usize],
         raw: &[u8],
-        needed: &[bool],
-    ) -> io::Result<Option<std::sync::Arc<Vec<u8>>>> {
-        if compress_flag == RG_COMPRESS_NONE {
-            return Ok(None);
-        }
-        let chunk_entry = self.v4_footer.read().as_ref().and_then(|footer| {
+    ) -> io::Result<Option<(Vec<u8>, Vec<(usize, Vec<u8>)>)>> {
+        let entry = self.v4_footer.read().as_ref().and_then(|footer| {
             let rg_idx = footer
                 .row_groups
                 .iter()
@@ -1843,21 +1831,49 @@ impl OnDemandStorage {
                 .filter(|cols| cols.iter().any(Option::is_some))
                 .cloned()
         });
-        let Some(columns) = chunk_entry else {
-            return Ok(None);
-        };
-        let declared = columns
+        let Some(columns) = entry else { return Ok(None) };
+        let mut out: Vec<(usize, Vec<u8>)> = Vec::with_capacity(wanted.len());
+        let prefix_len = columns
             .iter()
             .flatten()
-            .map(|col| col.flat_len as usize)
-            .max()
+            .next()
+            .map(|col| col.flat_off as usize)
             .unwrap_or(0);
-        let body = assemble_chunked_body(raw, declared, &columns, Some(needed))?;
-        let _ = rg_end;
-        Ok(Some(std::sync::Arc::new(body)))
+        let mut prefix = Vec::new();
+        let mut pos = 0usize;
+        if prefix_len > 0 {
+            if raw.len() < CHUNK_FRAME_HEADER_LEN {
+                return Err(err_data("chunked prefix frame truncated"));
+            }
+            let frame_len = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+            let frame_end = CHUNK_FRAME_HEADER_LEN + frame_len;
+            if frame_end > raw.len() {
+                return Err(err_data("chunked prefix frame runs past the row group"));
+            }
+            prefix = decompress_column_frame(&raw[..frame_end])?;
+            pos = frame_end;
+        }
+        for (index, col) in columns.iter().enumerate() {
+            let Some(col) = col else { continue; };
+            let take = wanted.contains(&index);
+            for chunk in &col.chunks {
+                let frame_end = pos + CHUNK_FRAME_HEADER_LEN + chunk.len as usize;
+                if frame_end > raw.len() {
+                    return Err(err_data("chunked column frame runs past the row group"));
+                }
+                if take {
+                    out.push((index, decompress_column_frame(&raw[pos..frame_end])?));
+                }
+                pos = frame_end;
+            }
+        }
+        if out.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some((prefix, out)))
     }
 
-    /// Rebuild a chunked row group body in the flat layout.
+    /// Rebuild a chunked row group body in the flat layout.    /// Rebuild a chunked row group body in the flat layout.
     ///
     /// The id section and the deletion vector are uncompressed and lead the body
     /// in both layouts, so they are carried over byte for byte; every column is
@@ -1872,7 +1888,7 @@ impl OnDemandStorage {
         let columns = chunk_entry
             .as_ref()
             .ok_or_else(|| err_data("chunked row group has no chunk directory"))?;
-        assemble_chunked_body(raw, declared, columns, None)
+        assemble_chunked_body(raw, declared, columns)
     }
 
     /// Unmap this table's file.
