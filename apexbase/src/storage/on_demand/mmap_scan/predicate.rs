@@ -3022,9 +3022,10 @@ impl OnDemandStorage {
             // columns plus a zeroed flat buffer) is never allocated.
             let chunked_parts = if chunked {
                 self.decompressed_chunked_columns(
-                    rg_meta.offset,
+                    rg_i,
                     &[col_idx as usize],
                     &rg_bytes[32..],
+                    has_deletes,
                 )?
             } else {
                 None

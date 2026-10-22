@@ -1816,22 +1816,24 @@ impl OnDemandStorage {
     /// chunked or no requested column has a directory entry.
     pub(crate) fn decompressed_chunked_columns(
         &self,
-        rg_offset: u64,
+        rg_idx: usize,
         wanted: &[usize],
         raw: &[u8],
+        need_prefix: bool,
     ) -> io::Result<Option<(Vec<u8>, Vec<(usize, Vec<u8>)>)>> {
-        let entry = self.v4_footer.read().as_ref().and_then(|footer| {
-            let rg_idx = footer
-                .row_groups
-                .iter()
-                .position(|meta| meta.offset == rg_offset)?;
-            footer
-                .chunk_tables
-                .get(rg_idx)
-                .filter(|cols| cols.iter().any(Option::is_some))
-                .cloned()
-        });
-        let Some(columns) = entry else { return Ok(None) };
+        // Borrow the chunk directory for the whole call: cloning it per row
+        // group allocated one Vec of chunk refs per group on every scan.
+        let footer = self.v4_footer.read();
+        let Some(footer) = footer.as_ref() else {
+            return Ok(None);
+        };
+        let Some(columns) = footer
+            .chunk_tables
+            .get(rg_idx)
+            .filter(|cols| cols.iter().any(Option::is_some))
+        else {
+            return Ok(None);
+        };
         let mut out: Vec<(usize, Vec<u8>)> = Vec::with_capacity(wanted.len());
         let prefix_len = columns
             .iter()
@@ -1850,7 +1852,12 @@ impl OnDemandStorage {
             if frame_end > raw.len() {
                 return Err(err_data("chunked prefix frame runs past the row group"));
             }
-            prefix = decompress_column_frame(&raw[..frame_end])?;
+            // Without deletions the id section + deletion vector are never read;
+            // decompressing the whole prefix frame (ids dominate it) would cost
+            // more than the single column the caller actually needs.
+            if need_prefix {
+                prefix = decompress_column_frame(&raw[..frame_end])?;
+            }
             pos = frame_end;
         }
         for (index, col) in columns.iter().enumerate() {

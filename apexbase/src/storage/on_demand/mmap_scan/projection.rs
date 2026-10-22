@@ -1742,20 +1742,21 @@ impl OnDemandStorage {
             // Chunked groups: decode only the requested columns, without the
             // flat body (all columns) or its zero-filled allocation.
             let chunked = footer
-                .row_groups
-                .iter()
-                .position(|meta| meta.offset == rg_meta.offset)
-                .and_then(|index| footer.chunk_tables.get(index))
+                .chunk_tables
+                .get(rg_i)
                 .is_some_and(|cols| cols.iter().any(Option::is_some));
             if chunked {
                 if let Some((prefix, columns)) = self.decompressed_chunked_columns(
-                    rg_meta.offset,
+                    rg_i,
                     col_indices,
                     rg_bytes.get(32..).unwrap_or(&[]),
+                    rg_meta.deletion_count > 0,
                 )? {
                     if prefix.len() >= del_vec_len {
                         all_del_bytes
                             .extend_from_slice(&prefix[prefix.len() - del_vec_len..]);
+                    } else if rg_meta.deletion_count == 0 {
+                        all_del_bytes.extend(std::iter::repeat(0).take(del_vec_len));
                     }
                     for (col_idx, col_bytes) in columns {
                         let Some(&out_pos) = col_idx_to_out.get(&col_idx) else {
