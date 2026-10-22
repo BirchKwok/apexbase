@@ -119,3 +119,33 @@ def test_packed_blobs_dedupe_across_store_calls():
             assert [row["payload"] for row in rows] == [duplicate, duplicate]
         finally:
             client.close()
+
+
+def test_vacuum_reclaims_dedicated_objects_after_delete():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("files", {"payload": "blob"})
+        client.use_table("files")
+        inline = b"inline-payload"
+        dedicated_a = _payload(5 * 1024 * 1024, 21)
+        dedicated_b = _payload(5 * 1024 * 1024 + 3, 22)
+        client.store({"payload": [inline, dedicated_a, dedicated_b]})
+        client.flush()
+        objects = os.path.join(tmp, "files.apex.blobs", "objects")
+        assert len(os.listdir(objects)) == 2
+
+        client.execute("DELETE FROM files WHERE _id = 2")
+        client.flush()
+        assert client.vacuum_blobs() == 1
+        assert len(os.listdir(objects)) == 1
+        try:
+            assert client.read_blob("payload", 1) == inline
+            assert client.read_blob("payload", 3) == dedicated_b
+            assert client.execute("SELECT COUNT(*) AS n FROM files").to_dict() == [{"n": 2}]
+            # A second sweep is a no-op and must not remove live objects.
+            assert client.vacuum_blobs() == 0
+        finally:
+            client.close()
+

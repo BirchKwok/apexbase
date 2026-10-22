@@ -2451,6 +2451,20 @@ impl ApexStorageImpl {
         Ok(())
     }
 
+    /// Sweep dedicated blob objects that no live row references.
+    #[pyo3(name = "_vacuum_blob_objects")]
+    fn vacuum_blob_objects(&self, py: Python<'_>) -> PyResult<u64> {
+        let table_path = self.get_current_table_path()?;
+        py.allow_threads(|| {
+            let backend = crate::Database::cached_backend(&table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            backend
+                .storage
+                .vacuum_blob_objects()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
     #[pyo3(name = "_fts_flush")]
     fn fts_flush(&self, py: Python<'_>) -> PyResult<()> {
         let table_name = self.current_table.read().clone();

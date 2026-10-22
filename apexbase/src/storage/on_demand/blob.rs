@@ -427,6 +427,83 @@ impl OnDemandStorage {
         Ok(descriptors)
     }
 
+    /// Remove dedicated blob objects that no live row references.
+    ///
+    /// Packed regions cannot be reclaimed without rewriting the descriptors that
+    /// point at them, so this only sweeps `<table>.blobs/objects`. The scan reads
+    /// every blob column of the persisted base and honours the deletion vector;
+    /// call it while no writer is active (it is a maintenance operation, not a
+    /// hot-path guard).
+    pub fn vacuum_blob_objects(&self) -> io::Result<u64> {
+        // Pending rows and appended delta rows are not part of the base scan
+        // below; their payloads must not be mistaken for garbage.
+        if self.has_delta()
+            || self.has_pending_deltas()
+            || self.pending_rows.load(std::sync::atomic::Ordering::Relaxed) > 0
+            || self.columns.read().iter().any(|column| !column.is_empty())
+        {
+            return Err(err_data(
+                "vacuum_blob_objects requires a flushed table with no pending writes",
+            ));
+        }
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(0);
+        };
+        let blob_columns: Vec<usize> = footer
+            .schema
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, column_type))| matches!(column_type, ColumnType::Blob))
+            .map(|(index, _)| index)
+            .collect();
+        if blob_columns.is_empty() {
+            return Ok(0);
+        }
+        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for column_index in blob_columns {
+            let (columns, deleted) = self.scan_columns_mmap(&[column_index], &footer)?;
+            let Some(ColumnData::Binary { offsets, data }) = columns.first() else {
+                continue;
+            };
+            for row in 0..offsets.len().saturating_sub(1) {
+                if let Some(byte) = deleted.get(row / 8) {
+                    if (byte >> (row % 8)) & 1 == 1 {
+                        continue;
+                    }
+                }
+                let start = offsets[row] as usize;
+                let end = offsets[row + 1] as usize;
+                if start > end || end > data.len() {
+                    continue;
+                }
+                if let Some(descriptor) = decode_blob_descriptor(&data[start..end]) {
+                    if descriptor.mode == BLOB_MODE_DEDICATED {
+                        if let Ok(object_id) = std::str::from_utf8(&descriptor.locator) {
+                            live.insert(object_id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        let objects_dir = self.blob_sidecar_dir().join("objects");
+        let mut removed = 0u64;
+        let Ok(entries) = std::fs::read_dir(&objects_dir) else {
+            return Ok(0);
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !live.contains(&name) && std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
     pub fn read_blob_value(&self, descriptor_bytes: &[u8]) -> io::Result<Vec<u8>> {
         let Some(desc) = decode_blob_descriptor(descriptor_bytes) else {
             return Ok(descriptor_bytes.to_vec());

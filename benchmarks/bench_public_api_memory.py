@@ -106,6 +106,7 @@ PUBLIC_API_CASES = (
     "ApexClient.read_blob_descriptor",
     "ApexClient.read_blob_info",
     "ApexClient.read_blob_infos",
+    "ApexClient.vacuum_blobs",
     "ApexClient.retrieve_many",
     "ApexClient.retrieve_all",
     "ApexClient.list_fields",
@@ -406,6 +407,9 @@ class Fixture:
             c.store({"value": ROWS + 1, "score": 1.0, "category": "cat", "content": "buffered"})
         elif name in {"add_column", "drop_column", "rename_column", "get_column_dtype"}:
             self._fresh_table("columns", {"value": "int64", "extra": "string"})
+        elif name == "vacuum_blobs":
+            c.use_table("main")
+            c.flush()
         elif name in {"search_text", "search_text_with_scores", "fuzzy_search_text", "search_and_retrieve", "search_and_retrieve_top", "get_fts_stats", "compact_fts_index", "warmup_fts_terms", "set_fts_fuzzy_config"}:
             self._fts_ready()
 
@@ -532,6 +536,9 @@ class Fixture:
         if name == "retrieve":
             c.use_table("main")
             return c.retrieve(1)
+        if name == "vacuum_blobs":
+            c.use_table("main")
+            return c.vacuum_blobs()
         if name.startswith("read_blob"):
             if name == "read_blob":
                 return c.read_blob("payload", 1)

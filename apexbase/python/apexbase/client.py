@@ -5990,6 +5990,21 @@ class ApexClient:
             }
         return {'fts_enabled': True, 'engine_initialized': False, 'table': table}
 
+    def vacuum_blobs(self) -> int:
+        """Reclaim dedicated BLOB objects no live row references.
+
+        Blob payloads live in a sidecar next to the table (``<table>.apex.blobs``).
+        DROP removes the whole sidecar, and packed payloads are deduplicated, but
+        a payload that only deleted rows referenced survives until this sweep.
+        Packed regions are not rewritten (that would rewrite every descriptor);
+        only ``objects/`` entries are removed. Run while no writer is active.
+
+        Returns the number of object files removed.
+        """
+        self._check_connection()
+        self._ensure_table_selected()
+        return int(self._storage._vacuum_blob_objects())
+
     def compact_fts_index(self, table_name: str = None):
         """
         Compact the FTS index for a table.
