@@ -433,6 +433,95 @@ impl ApexStorageImpl {
         Ok((schema_ptr, array_ptr))
     }
 
+    /// Flat single-query TopK: return `(ids, distances)` without building an
+    /// Arrow RecordBatch or a Python ResultView.
+    ///
+    /// The fixed-list and binary direct scans produce the ranked positions and
+    /// distances; only the k winning ids are resolved (the same O(k) path as the
+    /// default binding). `topk_distance(raw=True)` uses this; the default method
+    /// keeps its ResultView shape.
+    #[pyo3(name = "_topk_distance_vectors_ffi")]
+    fn topk_distance_vectors_ffi(
+        &self,
+        py: Python<'_>,
+        col: &str,
+        query_bytes: &[u8],
+        k: usize,
+        metric: &str,
+    ) -> PyResult<(Vec<i64>, Vec<f64>)> {
+        use crate::compute::vector_ops::{
+            bytes_to_query_vec_f32, DistanceComputer, DistanceMetric,
+        };
+        use arrow::array::Int64Array;
+
+        let query_f32 = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "_topk_distance_vectors_ffi: query_bytes must be raw little-endian float32 bytes",
+            )
+        })?;
+        if query_f32.is_empty() || query_f32.iter().any(|value| !value.is_finite()) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "_topk_distance_vectors_ffi: query vector must be non-empty and contain only finite values",
+            ));
+        }
+        let table_path = self
+            .get_current_table_path()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let col_owned = col.to_string();
+        let metric_str = metric.to_string();
+
+        py.allow_threads(|| -> PyResult<(Vec<i64>, Vec<f64>)> {
+            let metric_enum = DistanceMetric::from_str(&metric_str).ok_or_else(|| {
+                PyRuntimeError::new_err(format!(
+                    "_topk_distance_vectors_ffi: unknown metric '{}'",
+                    metric_str
+                ))
+            })?;
+            let backend = crate::Database::cached_backend(&table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let computer = DistanceComputer::new(metric_enum, query_f32.clone());
+
+            let topk = backend
+                .topk_fixedlist_direct(&col_owned, &computer, k)
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    backend
+                        .topk_binary_direct(&col_owned, &computer, k)
+                        .ok()
+                        .flatten()
+                });
+            let Some(topk) = topk else {
+                // A raw scan only serves the fixed-list/binary mmap lanes; other
+                // encodings keep using the default ResultView API.
+                return Err(PyRuntimeError::new_err(format!(
+                    "topk_distance(raw=True): column '{}' is not served by the direct vector scan",
+                    col_owned
+                )));
+            };
+            let positions: Vec<usize> = topk.iter().map(|(row_idx, _)| *row_idx).collect();
+            let ids: Vec<i64> = match backend.storage.ids_at_active_positions(&positions) {
+                Ok(Some(ids)) => ids,
+                _ => {
+                    let id_batch = backend
+                        .read_columns_to_arrow(Some(&["_id"]), 0, None)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let id_col = id_batch
+                        .column_by_name("_id")
+                        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                        .ok_or_else(|| {
+                            PyRuntimeError::new_err(
+                                "topk_distance(raw=True): _id column is not Int64",
+                            )
+                        })?;
+                    positions.iter().map(|&row| id_col.value(row)).collect()
+                }
+            };
+            let dists: Vec<f64> = topk.iter().map(|(_, distance)| *distance as f64).collect();
+            Ok((ids, dists))
+        })
+    }
+
     #[pyo3(name = "_topk_distance_ffi")]
     fn topk_distance_ffi(
         &self,

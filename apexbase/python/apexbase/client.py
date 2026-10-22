@@ -4541,7 +4541,8 @@ class ApexClient:
         accelerator: str = None,
         candidate_k: int = None,
         rescore: bool = True,
-    ) -> 'ResultView':
+        raw: bool = False,
+    ):
         """Heap-based TopK vector distance search: O(n log k), faster than ORDER BY + LIMIT.
 
         Executes::
@@ -4568,6 +4569,11 @@ class ApexClient:
                 ``'linf'`` / ``'chebyshev'``,
                 ``'cosine'`` / ``'cosine_distance'``,
                 ``'dot'`` / ``'inner_product'``.
+            raw: Return ``{"ids": [...], "distances": [...]}`` instead of a
+                ``ResultView`` (default ``False``). This skips the Arrow
+                RecordBatch and ResultView construction, which dominates the
+                fixed cost of a single-query TopK; the ranking is identical.
+                Not supported together with ``accelerator`` yet.
             id_col: Name for the output ``_id`` column (default ``'_id'``).
             dist_col: Name for the output distance column (default ``'dist'``).
             accelerator: Optional system-maintained quantized column used for
@@ -4591,6 +4597,15 @@ class ApexClient:
             raise ValueError("topk_distance: query must not be empty")
         if not np.isfinite(query_array).all():
             raise ValueError("topk_distance: query must contain only finite values")
+        if raw:
+            if accelerator is not None:
+                raise ValueError(
+                    "topk_distance: raw=True does not support accelerator yet"
+                )
+            ids, distances = self._storage._topk_distance_vectors_ffi(
+                col, query_array.tobytes(), k, metric
+            )
+            return {"ids": ids, "distances": distances}
         if accelerator is not None:
             if not isinstance(accelerator, str) or not accelerator:
                 raise ValueError("topk_distance: accelerator must be a non-empty column name")
