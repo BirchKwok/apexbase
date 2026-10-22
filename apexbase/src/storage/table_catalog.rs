@@ -1102,6 +1102,10 @@ fn unlink_table_files(table_path: &Path) {
     for suffix in TABLE_FILE_SUFFIXES {
         let _ = fs::remove_file(&format!("{stem}{suffix}"));
     }
+    // Blob payloads live in a sidecar directory next to the table file
+    // (`<table>.apex.blobs`). It is a directory, so the suffix loop above cannot
+    // reclaim it; without this every DROP leaves the payloads on disk forever.
+    let _ = fs::remove_dir_all(format!("{stem}.blobs"));
     // Rewrite scratch files carry a pid and sequence number, so they are not
     // matched by the fixed suffixes above and would otherwise stay behind in the
     // directory after the table is dropped.

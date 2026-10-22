@@ -60,3 +60,41 @@ def test_packed_blob_batch_reads_every_row_through_one_sidecar():
             assert client.read_blobs("payload", list(range(1, 65))) == payloads
         finally:
             client.close()
+
+
+def test_drop_table_reclaims_the_blob_sidecar():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("files", {"payload": "blob"})
+        client.use_table("files")
+        client.store({"payload": [_payload(200 * 1024, 5), _payload(5 * 1024 * 1024, 6)]})
+        client.flush()
+        sidecar = os.path.join(tmp, "files.apex.blobs")
+        assert os.path.isdir(sidecar)
+        client.drop_table("files")
+        client.close()
+        assert not os.path.exists(sidecar)
+        assert not os.path.exists(os.path.join(tmp, "files.apex"))
+
+
+def test_packed_blobs_store_duplicate_payloads_once():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("files", {"payload": "blob"})
+        client.use_table("files")
+        duplicate = _payload(512 * 1024, 9)
+        client.store({"payload": [duplicate] * 8})
+        client.flush()
+        packed = os.path.join(tmp, "files.apex.blobs", "packed.blob")
+        # Eight identical 512 KB payloads: one packed copy, not 4 MB.
+        assert os.path.getsize(packed) < 700 * 1024
+        try:
+            rows = client.execute("SELECT payload FROM files").to_dict()
+            assert [row["payload"] for row in rows] == [duplicate] * 8
+            assert client.read_blobs("payload", list(range(1, 9))) == [duplicate] * 8
+        finally:
+            client.close()

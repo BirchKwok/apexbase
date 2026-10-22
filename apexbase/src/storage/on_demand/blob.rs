@@ -294,6 +294,11 @@ impl OnDemandStorage {
                 .collect());
         }
         let mut descriptors = Vec::with_capacity(values.len());
+        // Repeated payloads inside one batch (e.g. a table of duplicated
+        // documents) are stored once in packed.blob; the descriptor already
+        // carries the 32-bit checksum readers verify against.
+        let mut packed_dedup: std::collections::HashMap<(u64, u32), u64> =
+            std::collections::HashMap::new();
         let mut packed_file: Option<File> = None;
         let mut packed_offset = 0u64;
         let mut blob_dir_created = false;
@@ -325,6 +330,15 @@ impl OnDemandStorage {
             }
 
             if value.len() <= BLOB_PACKED_THRESHOLD {
+                if let Some(&offset) = packed_dedup.get(&(len, checksum)) {
+                    descriptors.push(encode_blob_descriptor(
+                        BLOB_MODE_PACKED,
+                        len,
+                        checksum,
+                        &offset.to_le_bytes(),
+                    ));
+                    continue;
+                }
                 if packed_file.is_none() {
                     let mut file = OpenOptions::new()
                         .create(true)
@@ -338,6 +352,7 @@ impl OnDemandStorage {
                 let file = packed_file.as_mut().unwrap();
                 file.write_all(value)?;
                 packed_offset += value.len() as u64;
+                packed_dedup.insert((len, checksum), offset);
                 descriptors.push(encode_blob_descriptor(
                     BLOB_MODE_PACKED,
                     len,
