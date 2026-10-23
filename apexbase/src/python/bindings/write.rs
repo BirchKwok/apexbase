@@ -2451,6 +2451,68 @@ impl ApexStorageImpl {
         Ok(())
     }
 
+    /// Build and persist a coarse IVF index for the current table.
+    #[pyo3(name = "_create_vector_index")]
+    fn create_vector_index(
+        &self,
+        py: Python<'_>,
+        col: &str,
+        nlist: usize,
+        iterations: usize,
+    ) -> PyResult<()> {
+        let table_path = self.get_current_table_path()?;
+        let col = col.to_string();
+        py.allow_threads(|| {
+            let backend = crate::Database::cached_backend(&table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            backend
+                .storage
+                .create_vector_index(&col, nlist, iterations)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
+    /// `(dim, nlist, rows, metric, inertia, list_sizes)` or `None`.
+    #[pyo3(name = "_vector_index_info")]
+    fn vector_index_info(
+        &self,
+        py: Python<'_>,
+    ) -> PyResult<Option<(usize, usize, usize, String, f64, Vec<usize>)>> {
+        let table_path = self.get_current_table_path()?;
+        py.allow_threads(|| {
+            let backend = crate::Database::cached_backend(&table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let info = backend
+                .storage
+                .vector_index_info()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(info.map(|index| {
+                (
+                    index.dim,
+                    index.nlist,
+                    index.rows,
+                    index.metric,
+                    index.inertia,
+                    index.list_sizes,
+                )
+            }))
+        })
+    }
+
+    /// Remove the persisted coarse index; returns whether a file existed.
+    #[pyo3(name = "_drop_vector_index")]
+    fn drop_vector_index(&self, py: Python<'_>) -> PyResult<bool> {
+        let table_path = self.get_current_table_path()?;
+        py.allow_threads(|| {
+            let backend = crate::Database::cached_backend(&table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            backend
+                .storage
+                .drop_vector_index()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
     /// Sweep dedicated blob objects that no live row references.
     #[pyo3(name = "_vacuum_blob_objects")]
     fn vacuum_blob_objects(&self, py: Python<'_>) -> PyResult<u64> {

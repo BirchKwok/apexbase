@@ -1,5 +1,16 @@
 use super::*;
 
+/// Metadata for the persisted coarse vector index (`<table>.apex.ivf`).
+#[derive(Debug, Clone)]
+pub struct VectorIndexInfo {
+    pub dim: usize,
+    pub nlist: usize,
+    pub rows: usize,
+    pub metric: String,
+    pub inertia: f64,
+    pub list_sizes: Vec<usize>,
+}
+
 impl OnDemandStorage {
     pub fn topk_binary_direct(
         &self,
@@ -1543,4 +1554,284 @@ impl OnDemandStorage {
         drop(buf_guard);
         Ok(Some(results))
     }
+
+    // ── Coarse vector index (W5-1 stage 1) ────────────────────────────────
+    //
+    // Builds a persisted IVF index (`<table>.apex.ivf`) over a fixed-list or
+    // binary f32 vector column: k-means centroids plus per-list row positions.
+    // Query integration (nprobe) comes in the next stage; this stage owns the
+    // build/inspect/drop lifecycle so it can be reviewed and tested alone.
+
+    fn vector_index_path(&self) -> std::path::PathBuf {
+        let mut path = self.path.clone();
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        path.set_file_name(format!("{name}.ivf"));
+        path
+    }
+
+    /// Read the active rows of a fixed-list/binary f32 vector column as a flat
+    /// row-major f32 buffer. `None` means the column is not a supported vector
+    /// column.
+    fn collect_vector_rows(&self, col_name: &str) -> io::Result<Option<(Vec<f32>, usize)>> {
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        let Some(col_idx) = footer.schema.get_index(col_name) else {
+            return Ok(None);
+        };
+        let (columns, deleted) = self.scan_columns_mmap(&[col_idx], &footer)?;
+        let Some(column) = columns.first() else {
+            return Ok(None);
+        };
+        let mut vectors: Vec<f32> = Vec::new();
+        let mut dim = 0usize;
+        match column {
+            ColumnData::FixedList { data, dim: column_dim } => {
+                dim = *column_dim as usize;
+                if dim == 0 || data.len() % (dim * 4) != 0 {
+                    return Ok(None);
+                }
+                let mut row = 0usize;
+                for chunk in data.chunks_exact(dim * 4) {
+                    let alive = deleted
+                        .get(row / 8)
+                        .map_or(true, |byte| (byte >> (row % 8)) & 1 == 0);
+                    row += 1;
+                    if !alive {
+                        continue;
+                    }
+                    for value in chunk.chunks_exact(4) {
+                        vectors.push(f32::from_le_bytes(value.try_into().unwrap()));
+                    }
+                }
+            }
+            ColumnData::Binary { offsets, data } => {
+                let row_count = offsets.len().saturating_sub(1);
+                let mut row = 0usize;
+                while row < row_count {
+                    let start = offsets[row] as usize;
+                    let end = offsets[row + 1] as usize;
+                    let alive = deleted
+                        .get(row / 8)
+                        .map_or(true, |byte| (byte >> (row % 8)) & 1 == 0);
+                    row += 1;
+                    if !alive || start > end || end > data.len() {
+                        continue;
+                    }
+                    let bytes = &data[start..end];
+                    if bytes.len() % 4 != 0 {
+                        return Ok(None);
+                    }
+                    let row_dim = bytes.len() / 4;
+                    if dim == 0 {
+                        dim = row_dim;
+                    } else if dim != row_dim {
+                        return Ok(None);
+                    }
+                    for value in bytes.chunks_exact(4) {
+                        vectors.push(f32::from_le_bytes(value.try_into().unwrap()));
+                    }
+                }
+            }
+            _ => return Ok(None),
+        }
+        if dim == 0 {
+            return Ok(None);
+        }
+        Ok(Some((vectors, dim)))
+    }
+
+    /// Build and persist a coarse IVF index for `col_name`.
+    pub fn create_vector_index(
+        &self,
+        col_name: &str,
+        nlist: usize,
+        iterations: usize,
+    ) -> io::Result<()> {
+        if self.has_delta() || self.has_pending_deltas() {
+            return Err(err_data(
+                "create_vector_index requires a flushed table with no pending writes",
+            ));
+        }
+        let Some((vectors, dim)) = self.collect_vector_rows(col_name)? else {
+            return Err(err_data(format!(
+                "column '{}' is not a supported f32 vector column",
+                col_name
+            )));
+        };
+        let rows = vectors.len() / dim;
+        if rows == 0 {
+            return Err(err_data("create_vector_index: the table has no rows"));
+        }
+        let nlist = nlist.max(1).min(rows);
+        let iterations = iterations.max(1);
+        let (centroids, assignments, inertia) =
+            kmeans_ivf(&vectors, rows, dim, nlist, iterations);
+
+        let mut list_offsets = vec![0u64; nlist + 1];
+        for &assignment in &assignments {
+            list_offsets[assignment as usize + 1] += 1;
+        }
+        for index in 1..list_offsets.len() {
+            list_offsets[index] += list_offsets[index - 1];
+        }
+        let mut order: Vec<u32> = (0..rows as u32).collect();
+        order.sort_unstable_by_key(|&row| assignments[row as usize]);
+        let mut payload = Vec::with_capacity(
+            30 + centroids.len() * 4 + list_offsets.len() * 8 + order.len() * 4,
+        );
+        payload.extend_from_slice(b"AVIX");
+        payload.push(1);
+        payload.push(0);
+        payload.extend_from_slice(&(dim as u32).to_le_bytes());
+        payload.extend_from_slice(&(nlist as u32).to_le_bytes());
+        payload.extend_from_slice(&(rows as u64).to_le_bytes());
+        payload.extend_from_slice(&inertia.to_le_bytes());
+        for centroid in &centroids {
+            payload.extend_from_slice(&centroid.to_le_bytes());
+        }
+        for offset in &list_offsets {
+            payload.extend_from_slice(&offset.to_le_bytes());
+        }
+        for row in &order {
+            payload.extend_from_slice(&row.to_le_bytes());
+        }
+        let path = self.vector_index_path();
+        let tmp = path.with_extension("ivf.tmp");
+        std::fs::write(&tmp, &payload)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+
+    /// Read the persisted coarse index metadata, if one exists.
+    pub fn vector_index_info(&self) -> io::Result<Option<VectorIndexInfo>> {
+        let path = self.vector_index_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if bytes.len() < 30 || &bytes[0..4] != b"AVIX" {
+            return Err(err_data("vector index file is not an AVIX index"));
+        }
+        let dim = u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize;
+        let nlist = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+        let rows = u64::from_le_bytes(bytes[14..22].try_into().unwrap()) as usize;
+        let inertia = f64::from_le_bytes(bytes[22..30].try_into().unwrap());
+        let metric = match bytes[5] {
+            0 => "l2".to_string(),
+            other => format!("metric_{other}"),
+        };
+        let offsets_start = 30 + nlist * dim * 4;
+        let offsets_end = offsets_start + (nlist + 1) * 8;
+        if offsets_end > bytes.len() {
+            return Err(err_data("vector index file is truncated"));
+        }
+        let mut list_sizes = Vec::with_capacity(nlist);
+        for index in 0..nlist {
+            let start = u64::from_le_bytes(
+                bytes[offsets_start + index * 8..offsets_start + index * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            let end = u64::from_le_bytes(
+                bytes[offsets_start + (index + 1) * 8..offsets_start + (index + 1) * 8 + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as usize;
+            list_sizes.push(end.saturating_sub(start));
+        }
+        Ok(Some(VectorIndexInfo {
+            dim,
+            nlist,
+            rows,
+            metric,
+            inertia,
+            list_sizes,
+        }))
+    }
+
+    /// Remove the persisted coarse index. Returns whether a file was removed.
+    pub fn drop_vector_index(&self) -> io::Result<bool> {
+        match std::fs::remove_file(self.vector_index_path()) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+
+/// Deterministic k-means over a flat row-major f32 buffer.
+///
+/// Centroid seeding takes evenly spaced rows so repeated builds are identical;
+/// empty clusters keep their previous centroid. Returns (centroids, assignment
+/// per row, final inertia).
+fn kmeans_ivf(
+    vectors: &[f32],
+    rows: usize,
+    dim: usize,
+    nlist: usize,
+    iterations: usize,
+) -> (Vec<f32>, Vec<u32>, f64) {
+    let mut centroids = vec![0f32; nlist * dim];
+    for cluster in 0..nlist {
+        let row = cluster * rows / nlist;
+        centroids[cluster * dim..(cluster + 1) * dim]
+            .copy_from_slice(&vectors[row * dim..(row + 1) * dim]);
+    }
+    let mut assignments = vec![0u32; rows];
+    for _ in 0..iterations {
+        let mut sums = vec![0f32; nlist * dim];
+        let mut counts = vec![0u64; nlist];
+        for row in 0..rows {
+            let vector = &vectors[row * dim..(row + 1) * dim];
+            let mut best = 0usize;
+            let mut best_distance = f32::INFINITY;
+            for cluster in 0..nlist {
+                let centroid = &centroids[cluster * dim..(cluster + 1) * dim];
+                let mut distance = 0f32;
+                for index in 0..dim {
+                    let delta = vector[index] - centroid[index];
+                    distance += delta * delta;
+                }
+                if distance < best_distance {
+                    best_distance = distance;
+                    best = cluster;
+                }
+            }
+            assignments[row] = best as u32;
+            counts[best] += 1;
+            let target = &mut sums[best * dim..(best + 1) * dim];
+            for index in 0..dim {
+                target[index] += vector[index];
+            }
+        }
+        for cluster in 0..nlist {
+            if counts[cluster] == 0 {
+                continue;
+            }
+            let inverse = 1.0f32 / counts[cluster] as f32;
+            for index in 0..dim {
+                centroids[cluster * dim + index] = sums[cluster * dim + index] * inverse;
+            }
+        }
+    }
+    let mut inertia = 0f64;
+    for row in 0..rows {
+        let vector = &vectors[row * dim..(row + 1) * dim];
+        let centroid =
+            &centroids[assignments[row] as usize * dim..(assignments[row] as usize + 1) * dim];
+        let mut distance = 0f64;
+        for index in 0..dim {
+            let delta = (vector[index] - centroid[index]) as f64;
+            distance += delta * delta;
+        }
+        inertia += distance;
+    }
+    (centroids, assignments, inertia)
 }

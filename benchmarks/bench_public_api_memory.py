@@ -107,6 +107,9 @@ PUBLIC_API_CASES = (
     "ApexClient.read_blob_info",
     "ApexClient.read_blob_infos",
     "ApexClient.vacuum_blobs",
+    "ApexClient.create_vector_index",
+    "ApexClient.vector_index_info",
+    "ApexClient.drop_vector_index",
     "ApexClient.retrieve_many",
     "ApexClient.retrieve_all",
     "ApexClient.list_fields",
@@ -410,6 +413,15 @@ class Fixture:
         elif name == "vacuum_blobs":
             c.use_table("main")
             c.flush()
+        elif name in {
+            "create_vector_index",
+            "vector_index_info",
+            "drop_vector_index",
+        }:
+            self.prepared["vectors"] = self._vector_ready()
+            self.prepared["vector_table"] = c.current_table
+            if name != "create_vector_index":
+                c.create_vector_index("vec", nlist=8, iterations=3)
         elif name in {"search_text", "search_text_with_scores", "fuzzy_search_text", "search_and_retrieve", "search_and_retrieve_top", "get_fts_stats", "compact_fts_index", "warmup_fts_terms", "set_fts_fuzzy_config"}:
             self._fts_ready()
 
@@ -539,6 +551,14 @@ class Fixture:
         if name == "vacuum_blobs":
             c.use_table("main")
             return c.vacuum_blobs()
+        if name in {"create_vector_index", "vector_index_info", "drop_vector_index"}:
+            c.use_table(self.prepared["vector_table"])
+            if name == "create_vector_index":
+                return c.create_vector_index("vec", nlist=8, iterations=3)
+            if name == "vector_index_info":
+                return c.vector_index_info()
+            self.repeatable = False
+            return c.drop_vector_index()
         if name.startswith("read_blob"):
             if name == "read_blob":
                 return c.read_blob("payload", 1)

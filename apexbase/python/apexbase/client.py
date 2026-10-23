@@ -6005,6 +6005,51 @@ class ApexClient:
             }
         return {'fts_enabled': True, 'engine_initialized': False, 'table': table}
 
+    def create_vector_index(self, col: str, nlist: int = 64, iterations: int = 10) -> None:
+        """Build and persist a coarse IVF index for a float32 vector column.
+
+        The index lives next to the table (``<table>.apex.ivf``) and stores
+        k-means centroids plus per-list row positions. Building is
+        deterministic (centroids seed from evenly spaced rows) and requires a
+        flushed table with no pending writes. Query integration (``nprobe``) is
+        the next stage; this API owns the build/inspect/drop lifecycle.
+
+        Args:
+            col: float32 vector column (fixed-size list or binary f32).
+            nlist: number of coarse clusters (clamped to the row count).
+            iterations: k-means refinement steps (at least 1).
+        """
+        self._check_connection()
+        self._ensure_table_selected()
+        self._storage._create_vector_index(col, int(nlist), int(iterations))
+
+    def vector_index_info(self):
+        """Return the coarse vector index metadata, or ``None`` if absent.
+
+        The mapping has ``dim``, ``nlist``, ``rows``, ``metric``, ``inertia``
+        and ``list_sizes`` (one entry per inverted list).
+        """
+        self._check_connection()
+        self._ensure_table_selected()
+        info = self._storage._vector_index_info()
+        if info is None:
+            return None
+        dim, nlist, rows, metric, inertia, list_sizes = info
+        return {
+            "dim": dim,
+            "nlist": nlist,
+            "rows": rows,
+            "metric": metric,
+            "inertia": inertia,
+            "list_sizes": list_sizes,
+        }
+
+    def drop_vector_index(self) -> bool:
+        """Remove the persisted coarse vector index; True if a file was removed."""
+        self._check_connection()
+        self._ensure_table_selected()
+        return bool(self._storage._drop_vector_index())
+
     def vacuum_blobs(self) -> int:
         """Reclaim dedicated BLOB objects no live row references.
 
