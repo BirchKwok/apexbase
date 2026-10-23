@@ -143,8 +143,10 @@ impl MmapCache {
                     Mmap::map(file)?
                 }
             };
-            // On Linux, hint sequential access so the kernel doubles readahead.
-            #[cfg(target_os = "linux")]
+            // Hint sequential access so the kernel doubles readahead. Linux got
+            // this first; macOS uses the same madvise advice and the engine's
+            // scans are sequential either way.
+            #[cfg(unix)]
             {
                 let _ = mmap.advise(memmap2::Advice::Sequential);
             }
