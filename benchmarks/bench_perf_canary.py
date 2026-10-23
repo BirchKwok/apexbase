@@ -257,6 +257,49 @@ def recall_at_k(exact_ids, returned_ids, k):
     return hits / exact_ids.shape[0]
 
 
+def run_fts_score_canary(rows, warmup, iterations):
+    """Time `ORDER BY FTS_SCORE() DESC LIMIT 10` over a dense match set.
+
+    Builds its own fixture instead of touching the shared canary bench: the
+    score-map bound only matters when many documents match, and building the FTS
+    index inside the shared fixture broke the later DML/Q/s sections.
+    """
+    doc_rows = max(1000, rows // 4)
+    rng = np.random.default_rng(20260824)
+    words = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+    documents = []
+    for index in range(doc_rows):
+        terms = [words[(index * 7 + offset) % len(words)] for offset in range(6)]
+        if index % 2 == 0:
+            terms.insert(0, "alpha")
+        documents.append(" ".join(terms))
+    with tempfile.TemporaryDirectory(prefix="apexbase_fts_canary_") as tmpdir:
+        client = ApexClient(tmpdir, drop_if_exists=True)
+        try:
+            client.create_table("docs", {"body": "string"})
+            client.use_table("docs")
+            client.init_fts(index_fields=["body"])
+            client.store({"body": documents})
+            client.flush()
+            client.compact_fts_index()
+            statement = (
+                "SELECT _id FROM docs WHERE MATCH('alpha') "
+                "ORDER BY FTS_SCORE('alpha') DESC LIMIT 10"
+            )
+
+            def run_once():
+                client.execute(statement).to_dict()
+
+            elapsed = full_bench.run_bench(run_once, warmup, iterations)
+            return [{
+                "category": "ApexBase canary",
+                "query": "FTS score top-10 (dense term)",
+                "ApexBase": round(elapsed, 6),
+            }]
+        finally:
+            client.close()
+
+
 def run_quantized_canary(rows, warmup, iterations):
     """Measure compressed-domain L2 TopK without including column construction.
 
@@ -457,6 +500,13 @@ def run_canary(
             results.extend(
                 result
                 for result in quant_results
+                if only is None or result["query"] in only
+            )
+
+        if not index_only and not parallel_only and not hot_shapes_only:
+            results.extend(
+                result
+                for result in run_fts_score_canary(rows, warmup, iterations)
                 if only is None or result["query"] in only
             )
 
