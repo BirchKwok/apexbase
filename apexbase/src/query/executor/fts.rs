@@ -57,6 +57,36 @@ impl ApexExecutor {
         }
     }
 
+    /// Bound the FTS score map for `ORDER BY FTS_SCORE() DESC LIMIT n`.
+    ///
+    /// The full map materialises every match; when the statement's first sort
+    /// key is a descending FTS score and a LIMIT applies, only the top
+    /// `offset + limit` rows can appear, so the FTS engine may return just that
+    /// many hits. Anything else (ascending score, other sort keys, grouping,
+    /// joins, DISTINCT) keeps the full map.
+    fn fts_score_limit(stmt: &SelectStatement) -> Option<usize> {
+        if stmt.distinct
+            || stmt.distinct_on.is_some()
+            || !stmt.joins.is_empty()
+            || !stmt.group_by.is_empty()
+            || !stmt.group_by_exprs.is_empty()
+            || stmt.having.is_some()
+        {
+            return None;
+        }
+        let limit = stmt.limit?;
+        let first = stmt.order_by.first()?;
+        if !first.descending {
+            return None;
+        }
+        match &first.expr {
+            Some(SqlExpr::FtsScore { .. }) => {
+                Some(limit.saturating_add(stmt.offset.unwrap_or(0)))
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_fts_score_expr(
         expr: SqlExpr,
         default_query: Option<&str>,
@@ -159,11 +189,14 @@ impl ApexExecutor {
         let engine = manager
             .get_engine(table_name)
             .map_err(|error| err_data(error.to_string()))?;
+        let score_limit = Self::fts_score_limit(stmt);
         let mut score_maps = AHashMap::with_capacity(queries.len());
         for query in queries {
-            let hits = engine
-                .search_scored(&query)
-                .map_err(|error| err_data(error.to_string()))?;
+            let hits = match score_limit {
+                Some(limit) => engine.search_ranked(&query, limit),
+                None => engine.search_scored(&query),
+            }
+            .map_err(|error| err_data(error.to_string()))?;
             let scores = hits
                 .into_iter()
                 .map(|hit| (hit.doc_id, hit.score))

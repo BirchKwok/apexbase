@@ -1668,3 +1668,45 @@ def test_create_fts_index_with_options_parses_and_searches():
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+    def test_bounded_sql_fts_score_matches_unbounded_top(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            client = ApexClient(dirpath=temp_dir)
+            client.create_table("default")
+            client.init_fts(index_fields=["body"])
+            documents = []
+            for index in range(300):
+                repeats = (index % 5) + 1
+                documents.append(
+                    {"body": ("rust " * repeats) + ("filler " * (index % 7)) + f"doc {index}"}
+                )
+            client.store(documents)
+            client.compact_fts_index()
+
+            ordered = "ORDER BY FTS_SCORE('rust') DESC"
+            unbounded = client.execute(
+                f"SELECT _id, FTS_SCORE() AS relevance FROM default WHERE MATCH('rust') {ordered}"
+            ).to_pandas()
+            bounded = client.execute(
+                f"SELECT _id, FTS_SCORE() AS relevance FROM default WHERE MATCH('rust') {ordered} LIMIT 10"
+            ).to_pandas()
+            assert bounded["_id"].tolist() == unbounded["_id"].tolist()[:10]
+            assert bounded["relevance"].tolist() == unbounded["relevance"].tolist()[:10]
+
+            # Aliased ordering (no bound) and ascending ordering stay correct.
+            alias_bounded = client.execute(
+                "SELECT _id, FTS_SCORE() AS relevance FROM default "
+                "WHERE MATCH('rust') ORDER BY relevance DESC LIMIT 10"
+            ).to_pandas()
+            assert alias_bounded["_id"].tolist() == unbounded["_id"].tolist()[:10]
+            ascending = client.execute(
+                f"SELECT _id, FTS_SCORE() AS relevance FROM default WHERE MATCH('rust') "
+                "ORDER BY FTS_SCORE('rust') ASC LIMIT 10"
+            ).to_pandas()
+            ascending_all = client.execute(
+                f"SELECT _id, FTS_SCORE() AS relevance FROM default WHERE MATCH('rust') "
+                "ORDER BY FTS_SCORE('rust') ASC"
+            ).to_pandas()
+            assert ascending["_id"].tolist() == ascending_all["_id"].tolist()[:10]
+            client.close()
