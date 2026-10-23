@@ -1917,8 +1917,13 @@ impl OnDemandStorage {
             candidates.iter().map(|&row| score(row)).collect()
         };
         let mut best = scored;
+        if best.len() > k {
+            // Only the k smallest matter: partition first (O(n)) and sort the
+            // k-element prefix instead of sorting every candidate.
+            best.select_nth_unstable_by(k - 1, |left, right| left.1.total_cmp(&right.1));
+            best.truncate(k);
+        }
         best.sort_unstable_by(|left, right| left.1.total_cmp(&right.1));
-        best.truncate(k);
         Ok(Some(best))
     }
 }
