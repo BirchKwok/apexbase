@@ -6052,16 +6052,17 @@ class ApexClient:
     def vector_index_info(self):
         """Return the coarse vector index metadata, or ``None`` if absent.
 
-        The mapping has ``dim``, ``nlist``, ``rows``, ``metric``, ``inertia``
-        and ``list_sizes`` (one entry per inverted list).
+        The mapping has ``version``, ``dim``, ``nlist``, ``rows``, ``metric``,
+        ``inertia`` and ``list_sizes`` (one entry per inverted list).
         """
         self._check_connection()
         self._ensure_table_selected()
         info = self._storage._vector_index_info()
         if info is None:
             return None
-        dim, nlist, rows, metric, inertia, list_sizes = info
+        version, dim, nlist, rows, metric, inertia, list_sizes = info
         return {
+            "version": version,
             "dim": dim,
             "nlist": nlist,
             "rows": rows,

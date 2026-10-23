@@ -2472,12 +2472,12 @@ impl ApexStorageImpl {
         })
     }
 
-    /// `(dim, nlist, rows, metric, inertia, list_sizes)` or `None`.
+    /// `(version, dim, nlist, rows, metric, inertia, list_sizes)` or `None`.
     #[pyo3(name = "_vector_index_info")]
     fn vector_index_info(
         &self,
         py: Python<'_>,
-    ) -> PyResult<Option<(usize, usize, usize, String, f64, Vec<usize>)>> {
+    ) -> PyResult<Option<(u8, usize, usize, usize, String, f64, Vec<usize>)>> {
         let table_path = self.get_current_table_path()?;
         py.allow_threads(|| {
             let backend = crate::Database::cached_backend(&table_path)
@@ -2488,6 +2488,7 @@ impl ApexStorageImpl {
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             Ok(info.map(|index| {
                 (
+                    index.version,
                     index.dim,
                     index.nlist,
                     index.rows,

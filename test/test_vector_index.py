@@ -39,6 +39,7 @@ def test_build_inspect_and_drop_index():
             assert os.path.isfile(index_path)
             info = client.vector_index_info()
             assert info is not None
+            assert info["version"] == 2
             assert info["dim"] == DIM
             assert info["nlist"] == 16
             assert info["rows"] == ROWS

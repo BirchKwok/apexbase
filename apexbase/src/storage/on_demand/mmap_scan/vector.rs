@@ -2,6 +2,13 @@ use super::*;
 /// Decompressed float buffers for the opt-in IVF path, keyed by table path and
 /// column. A file fingerprint (length + mtime) invalidates it after a write, so
 /// the buffer is rebuilt once instead of on every query.
+/// Memory-mapped index files (`<table>.apex.ivf`), keyed by path and file
+/// fingerprint. v2 indexes carry the vector payload, so mapping beats reading
+/// and copying tens of megabytes per query.
+static IVF_MMAP_CACHE: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<std::path::PathBuf, (u64, u64, std::sync::Arc<memmap2::Mmap>)>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
 static IVF_VECTOR_CACHE: once_cell::sync::Lazy<
     parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, String), (u64, u64, std::sync::Arc<Vec<f32>>, usize)>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
@@ -10,6 +17,7 @@ static IVF_VECTOR_CACHE: once_cell::sync::Lazy<
 /// Metadata for the persisted coarse vector index (`<table>.apex.ivf`).
 #[derive(Debug, Clone)]
 pub struct VectorIndexInfo {
+    pub version: u8,
     pub dim: usize,
     pub nlist: usize,
     pub rows: usize,
@@ -1689,15 +1697,16 @@ impl OnDemandStorage {
         let mut order: Vec<u32> = (0..rows as u32).collect();
         order.sort_unstable_by_key(|&row| assignments[row as usize]);
         let mut payload = Vec::with_capacity(
-            30 + centroids.len() * 4 + list_offsets.len() * 8 + order.len() * 4,
+            32 + centroids.len() * 4 + list_offsets.len() * 8 + order.len() * 4 + order.len() * dim * 4,
         );
         payload.extend_from_slice(b"AVIX");
-        payload.push(1);
+        payload.push(2);
         payload.push(0);
         payload.extend_from_slice(&(dim as u32).to_le_bytes());
         payload.extend_from_slice(&(nlist as u32).to_le_bytes());
         payload.extend_from_slice(&(rows as u64).to_le_bytes());
         payload.extend_from_slice(&inertia.to_le_bytes());
+        payload.extend_from_slice(&[0u8, 0u8]); // pad to a 32-byte, 4-aligned header
         for centroid in &centroids {
             payload.extend_from_slice(&centroid.to_le_bytes());
         }
@@ -1707,47 +1716,87 @@ impl OnDemandStorage {
         for row in &order {
             payload.extend_from_slice(&row.to_le_bytes());
         }
+        // v2: per-list contiguous vector copies, in the same order as row_ids.
+        // Probes then read each selected list as one sequential block instead of
+        // chasing random rows through the original column buffer.
+        for &row in &order {
+            let row = row as usize;
+            for index in 0..dim {
+                payload.extend_from_slice(&vectors[row * dim + index].to_le_bytes());
+            }
+        }
         let path = self.vector_index_path();
         let tmp = path.with_extension("ivf.tmp");
         std::fs::write(&tmp, &payload)?;
         std::fs::rename(&tmp, &path)?;
-        // Warm the query-side buffer so the first nprobe call does not pay the
-        // full column decode.
-        if let Ok(metadata) = std::fs::metadata(&self.path) {
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|duration| duration.as_nanos() as u64)
-                .unwrap_or(0);
-            IVF_VECTOR_CACHE.lock().insert(
-                (self.path.clone(), col_name.to_string()),
-                (metadata.len(), modified, std::sync::Arc::new(vectors), dim),
-            );
-        }
         Ok(())
+    }
+
+
+    /// Remove the persisted coarse index. Returns whether a file was removed.
+    pub fn drop_vector_index(&self) -> io::Result<bool> {
+        match std::fs::remove_file(self.vector_index_path()) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+    fn vector_index_mmap(
+        &self,
+    ) -> io::Result<Option<std::sync::Arc<memmap2::Mmap>>> {
+        let path = self.vector_index_path();
+        let metadata = match std::fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let modified = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|duration| duration.as_nanos() as u64)
+            .unwrap_or(0);
+        if let Some((length, cached_modified, mmap)) = IVF_MMAP_CACHE.lock().get(&path) {
+            if *length == metadata.len() && *cached_modified == modified {
+                return Ok(Some(mmap.clone()));
+            }
+        }
+        let file = std::fs::File::open(&path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let mmap = std::sync::Arc::new(mmap);
+        IVF_MMAP_CACHE.lock().insert(
+            path,
+            (metadata.len(), modified, mmap.clone()),
+        );
+        Ok(Some(mmap))
+    }
+
+    /// `(version, dim, nlist, rows, inertia)` from an index file header.
+    fn vector_index_header(bytes: &[u8]) -> io::Result<(u8, usize, usize, usize, f64)> {
+        if bytes.len() < 32 || &bytes[0..4] != b"AVIX" {
+            return Err(err_data("vector index file is not an AVIX index"));
+        }
+        Ok((
+            bytes[4],
+            u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize,
+            u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize,
+            u64::from_le_bytes(bytes[14..22].try_into().unwrap()) as usize,
+            f64::from_le_bytes(bytes[22..30].try_into().unwrap()),
+        ))
     }
 
     /// Read the persisted coarse index metadata, if one exists.
     pub fn vector_index_info(&self) -> io::Result<Option<VectorIndexInfo>> {
-        let path = self.vector_index_path();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+        let Some(mmap) = self.vector_index_mmap()? else {
+            return Ok(None);
         };
-        if bytes.len() < 30 || &bytes[0..4] != b"AVIX" {
-            return Err(err_data("vector index file is not an AVIX index"));
-        }
-        let dim = u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize;
-        let nlist = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
-        let rows = u64::from_le_bytes(bytes[14..22].try_into().unwrap()) as usize;
-        let inertia = f64::from_le_bytes(bytes[22..30].try_into().unwrap());
+        let bytes: &[u8] = &mmap;
+        let (version, dim, nlist, rows, inertia) = Self::vector_index_header(bytes)?;
         let metric = match bytes[5] {
             0 => "l2".to_string(),
             other => format!("metric_{other}"),
         };
-        let offsets_start = 30 + nlist * dim * 4;
+        let offsets_start = 32 + nlist * dim * 4;
         let offsets_end = offsets_start + (nlist + 1) * 8;
         if offsets_end > bytes.len() {
             return Err(err_data("vector index file is truncated"));
@@ -1767,6 +1816,7 @@ impl OnDemandStorage {
             list_sizes.push(end.saturating_sub(start));
         }
         Ok(Some(VectorIndexInfo {
+            version,
             dim,
             nlist,
             rows,
@@ -1776,30 +1826,30 @@ impl OnDemandStorage {
         }))
     }
 
-    /// Remove the persisted coarse index. Returns whether a file was removed.
-    pub fn drop_vector_index(&self) -> io::Result<bool> {
-        match std::fs::remove_file(self.vector_index_path()) {
-            Ok(()) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-    fn read_vector_index(
+    /// Exact distances over the rows of the closest `nprobe` inverted lists.
+    ///
+    /// Returns positions in the active row space (the same space the index
+    /// stores) and their l2 distances, sorted ascending. With `nprobe == nlist`
+    /// this equals the brute-force TopK.
+    pub fn topk_ivf(
         &self,
-    ) -> io::Result<Option<(usize, usize, Vec<f32>, Vec<u64>, Vec<u32>)>> {
-        let path = self.vector_index_path();
-        let bytes = match std::fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(error) => return Err(error),
+        col_name: &str,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> io::Result<Option<Vec<(usize, f32)>>> {
+        let Some(mmap) = self.vector_index_mmap()? else {
+            return Ok(None);
         };
-        if bytes.len() < 30 || &bytes[0..4] != b"AVIX" {
-            return Err(err_data("vector index file is not an AVIX index"));
+        let bytes: &[u8] = &mmap;
+        let (version, dim, nlist, rows, _inertia) = Self::vector_index_header(bytes)?;
+        if dim != query.len() {
+            return Err(err_data(format!(
+                "vector index dimension {dim} does not match the query dimension {}",
+                query.len()
+            )));
         }
-        let dim = u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize;
-        let nlist = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
-        let rows = u64::from_le_bytes(bytes[14..22].try_into().unwrap()) as usize;
-        let centroids_start = 30;
+        let centroids_start = 32;
         let centroids_end = centroids_start + nlist * dim * 4;
         let offsets_end = centroids_end + (nlist + 1) * 8;
         let ids_end = offsets_end + rows * 4;
@@ -1818,30 +1868,63 @@ impl OnDemandStorage {
         for chunk in bytes[offsets_end..ids_end].chunks_exact(4) {
             row_ids.push(u32::from_le_bytes(chunk.try_into().unwrap()));
         }
-        Ok(Some((dim, nlist, centroids, offsets, row_ids)))
-    }
+        let mut lists: Vec<(f32, usize)> = (0..nlist)
+            .map(|list| {
+                let centroid = &centroids[list * dim..(list + 1) * dim];
+                let mut distance = 0f32;
+                for index in 0..dim {
+                    let delta = query[index] - centroid[index];
+                    distance += delta * delta;
+                }
+                (distance, list)
+            })
+            .collect();
+        lists.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+        let probe = nprobe.clamp(1, nlist);
+        let mut best: Vec<(usize, f32)> = Vec::with_capacity(k.saturating_mul(probe).max(16));
 
-    /// Exact distances over the rows of the closest `nprobe` inverted lists.
-    ///
-    /// Returns positions in the **active row space** (the same space the index
-    /// stores) and their l2-squared distances, sorted ascending. With
-    /// `nprobe == nlist` this must equal the brute-force TopK.
-    pub fn topk_ivf(
-        &self,
-        col_name: &str,
-        query: &[f32],
-        k: usize,
-        nprobe: usize,
-    ) -> io::Result<Option<Vec<(usize, f32)>>> {
-        let Some((dim, nlist, centroids, offsets, row_ids)) = self.read_vector_index()? else {
-            return Ok(None);
-        };
-        if dim != query.len() {
-            return Err(err_data(format!(
-                "vector index dimension {dim} does not match the query dimension {}",
-                query.len()
-            )));
+        if version >= 2 {
+            use crate::compute::vector_ops::{
+                topk_heap_on_floats, DistanceComputer, DistanceMetric,
+            };
+            let vectors_end = ids_end + rows * dim * 4;
+            if vectors_end > bytes.len() {
+                return Err(err_data("vector index vector payload is truncated"));
+            }
+            let vector_bytes = &bytes[ids_end..vectors_end];
+            debug_assert_eq!(vector_bytes.as_ptr() as usize % 4, 0);
+            // SAFETY: the header is padded to 32 bytes and every preceding section
+            // is a multiple of 4 bytes, so the payload is 4-byte aligned; the
+            // mapping outlives this borrow.
+            let list_vectors: &[f32] =
+                unsafe { std::slice::from_raw_parts(vector_bytes.as_ptr() as *const f32, rows * dim) };
+            let computer = DistanceComputer::new(DistanceMetric::L2, query.to_vec());
+            for (_, list) in lists.iter().take(probe) {
+                let start = offsets[*list] as usize;
+                let end = offsets[*list + 1] as usize;
+                if start >= end || end > row_ids.len() {
+                    continue;
+                }
+                let block = &list_vectors[start * dim..end * dim];
+                let take = k.min(end - start);
+                for (position, distance) in
+                    topk_heap_on_floats(block, end - start, dim, &computer, take)
+                {
+                    if let Some(&row) = row_ids.get(start + position) {
+                        best.push((row as usize, distance));
+                    }
+                }
+            }
+            if best.len() > k {
+                best.select_nth_unstable_by(k - 1, |left, right| left.1.total_cmp(&right.1));
+                best.truncate(k);
+            }
+            best.sort_unstable_by(|left, right| left.1.total_cmp(&right.1));
+            return Ok(Some(best));
         }
+
+        // v1 index files carry no vector payload: use the cached column buffer
+        // and scalar candidate scoring.
         let fingerprint = std::fs::metadata(&self.path).ok().map(|metadata| {
             let modified = metadata
                 .modified()
@@ -1876,19 +1959,6 @@ impl OnDemandStorage {
             }
         };
         let rows = vectors.len() / column_dim;
-        let mut lists: Vec<(f32, usize)> = (0..nlist)
-            .map(|list| {
-                let centroid = &centroids[list * dim..(list + 1) * dim];
-                let mut distance = 0f32;
-                for index in 0..dim {
-                    let delta = query[index] - centroid[index];
-                    distance += delta * delta;
-                }
-                (distance, list)
-            })
-            .collect();
-        lists.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
-        let probe = nprobe.clamp(1, nlist);
         let mut candidates: Vec<usize> = Vec::new();
         for (_, list) in lists.into_iter().take(probe) {
             let start = offsets[list] as usize;
@@ -1909,8 +1979,6 @@ impl OnDemandStorage {
             }
             (row, distance.sqrt())
         };
-        // Rayon pays off for wide probes; a one/two-list probe is small enough
-        // that scheduling the tasks costs more than the scan itself.
         let scored: Vec<(usize, f32)> = if candidates.len() >= 8192 {
             candidates.par_iter().map(|&row| score(row)).collect()
         } else {
@@ -1918,8 +1986,6 @@ impl OnDemandStorage {
         };
         let mut best = scored;
         if best.len() > k {
-            // Only the k smallest matter: partition first (O(n)) and sort the
-            // k-element prefix instead of sorting every candidate.
             best.select_nth_unstable_by(k - 1, |left, right| left.1.total_cmp(&right.1));
             best.truncate(k);
         }
