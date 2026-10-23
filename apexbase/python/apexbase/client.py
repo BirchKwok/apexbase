@@ -5499,6 +5499,8 @@ class ApexClient:
                 mapped[field.name] = "binary"
             elif pa_mod.types.is_large_binary(typ):
                 mapped[field.name] = "blob"
+            elif pa_mod.types.is_string(typ) or pa_mod.types.is_large_string(typ):
+                mapped[field.name] = "string"
             elif pa_mod.types.is_fixed_size_list(typ) and (
                 pa_mod.types.is_float16(typ.value_type)
                 or pa_mod.types.is_float32(typ.value_type)
@@ -5509,8 +5511,21 @@ class ApexClient:
                 mapped[field.name] = "date"
             elif pa_mod.types.is_timestamp(typ):
                 mapped[field.name] = "timestamp"
-            else:
+            elif pa_mod.types.is_fixed_size_binary(typ):
+                mapped[field.name] = "binary"
+            elif pa_mod.types.is_dictionary(typ) and pa_mod.types.is_string(
+                typ.value_type
+            ):
                 mapped[field.name] = "string"
+            else:
+                # Silently calling an unknown Arrow type "string" corrupts the
+                # column (decimals, lists, structs, time-of-day, ...). Refuse it
+                # and let the caller cast explicitly.
+                raise ValueError(
+                    f"Arrow column '{field.name}' has unsupported type {typ}; "
+                    "cast it to a supported type (string/int/float/bool/binary/"
+                    "date/timestamp or a float vector list) before import"
+                )
         return mapped
 
     # ============ Utility ============
