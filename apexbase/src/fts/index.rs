@@ -410,6 +410,8 @@ struct PackedDocTokens {
     doc_ids: Vec<u64>,
     offsets: Vec<u64>,
     tokens: Vec<u32>,
+    /// Non-zero token count, maintained on construction so live stats are O(1).
+    total_terms: u64,
 }
 
 impl PackedDocTokens {
@@ -425,10 +427,12 @@ impl PackedDocTokens {
             doc_ids: Vec::with_capacity(records.len()),
             offsets: Vec::with_capacity(records.len() + 1),
             tokens: Vec::with_capacity(token_count),
+            total_terms: 0,
         };
         packed.offsets.push(0);
         for (doc_id, tokens) in records {
             packed.doc_ids.push(doc_id);
+            packed.total_terms += tokens.iter().filter(|&&token| token != 0).count() as u64;
             packed.tokens.extend_from_slice(&tokens);
             packed.offsets.push(packed.tokens.len() as u64);
         }
@@ -436,7 +440,7 @@ impl PackedDocTokens {
     }
 
     fn total_terms(&self) -> u64 {
-        self.tokens.iter().filter(|&&token| token != 0).count() as u64
+        self.total_terms
     }
 }
 
