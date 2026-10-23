@@ -19,15 +19,14 @@ const DEFAULT_PAGE_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// Byte budget for the whole-column scan buffers (`scan_buf` / `scan_buf_f16`) used by the
 /// vector TopK lanes.
 ///
-/// **Unlimited by default**: those buffers are the zero-copy fast lane's working set, and a
-/// default cap made ordinary vector queries stand down — a 128 MB default cost
-/// `Batch quantized TopK L2 (float16)` **+1479%** in the full gate (1M x 128 f16 needs 256 MB).
-/// The cap is therefore opt-in: set `APEX_SCAN_BUFFER_MB` to bound a column (out-of-core runs
-/// do this from the process cap — the OOC harness passes limit/8), leaving the lane to decline
-/// and the caller to read a windowed batch instead. Windowed scoring that bounds RSS
-/// without losing the lane is implemented for all six vector TopK lanes (OOC-6), so a
-/// deployment that must bound memory can set the cap instead of standing the lane down.
-const DEFAULT_SCAN_BUFFER_BUDGET_BYTES: usize = usize::MAX;
+/// **512 MiB by default**: the zero-copy lanes read a whole column, so an unbounded default
+/// made a 1M x 1024 f32 column (4 GiB) an OOM instead of a windowed scan. A 128 MB default
+/// used to cost `Batch quantized TopK L2 (float16)` **+1479%** in the full gate because
+/// 1M x 128 f16 needs 256 MB; 512 MiB keeps every current benchmark shape on the fast lane
+/// (1M x 128 f32 is exactly 512 MiB) while larger columns fall back to the OOC-6 windowed
+/// scoring that bounds RSS without standing the lane down. `APEX_SCAN_BUFFER_MB` overrides
+/// the budget (`0` = unlimited; out-of-core runs pass limit/8).
+const DEFAULT_SCAN_BUFFER_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
 /// `APEX_SCAN_BUFFER_MB` parsing, kept pure so it can be tested without mutating the
 /// process environment: `0` means unlimited, an unparsable value falls back to the

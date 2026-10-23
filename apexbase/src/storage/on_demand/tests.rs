@@ -3750,17 +3750,17 @@ fn scan_buffer_budget_env_parsing() {
     const MB: usize = 1024 * 1024;
     assert_eq!(
         parse_scan_buffer_budget(None),
-        usize::MAX,
-        "unlimited by default: a default cap made ordinary vector TopK stand down (+1479% \
-         on Batch quantized TopK L2 (float16) in the full gate)"
+        512 * MB,
+        "bounded by default (512 MiB) so an unbounded vector column cannot OOM the process; \
+         current gate shapes stay on the fast lane (1M x 128 f32 is exactly 512 MiB)"
     );
     assert_eq!(parse_scan_buffer_budget(Some("64")), 64 * MB);
     assert_eq!(parse_scan_buffer_budget(Some(" 8 ")), 8 * MB, "whitespace tolerated");
     assert_eq!(parse_scan_buffer_budget(Some("0")), usize::MAX, "0 = unlimited");
     assert_eq!(
         parse_scan_buffer_budget(Some("nonsense")),
-        usize::MAX,
-        "an unparsable value keeps the default (unlimited) rather than inventing a cap"
+        512 * MB,
+        "an unparsable value keeps the default budget"
     );
     assert_eq!(
         parse_scan_buffer_budget(Some(&usize::MAX.to_string())),
