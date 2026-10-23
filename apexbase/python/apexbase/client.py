@@ -5929,6 +5929,102 @@ class ApexClient:
         
         return np.array([r[0] for r in results], dtype=np.int64)
 
+    def hybrid_search(
+        self,
+        vector_query,
+        text_query: str,
+        k: int = 10,
+        *,
+        vector_col: str = 'vec',
+        metric: str = 'l2',
+        fusion: str = 'rrf',
+        alpha: float = 0.5,
+        candidate_k: int = None,
+        rrf_k: int = 60,
+    ) -> 'ResultView':
+        """Fuse a vector TopK branch and a BM25 branch into one ranked result.
+
+        The vector branch uses :meth:`topk_distance` and the text branch uses the
+        FTS index (:meth:`search_text_with_scores`); the two rankings are fused
+        on the client's ``_id`` values. FTS must be initialised first.
+
+        Args:
+            vector_query: Query vector for the vector branch.
+            text_query: Query string for the BM25 branch.
+            k: Number of fused results (default 10).
+            vector_col: Vector column name (default ``'vec'``).
+            metric: Distance metric passed to :meth:`topk_distance`.
+            fusion: ``'rrf'`` (reciprocal rank fusion) or ``'weighted'``.
+            alpha: Vector weight for ``fusion='weighted'`` (0 = text only,
+                1 = vector only); ignored by RRF.
+            candidate_k: Per-branch candidate count (default ``max(4*k, 64)``).
+            rrf_k: RRF constant (default 60).
+
+        Returns:
+            ``ResultView`` with columns ``_id`` and ``score``, sorted by the
+            fused score descending (ties by ``_id``).
+        """
+        import numpy as np
+
+        self._check_connection()
+        self._ensure_table_selected()
+        if not isinstance(k, (int, np.integer)) or isinstance(k, (bool, np.bool_)) or int(k) < 1:
+            raise ValueError("hybrid_search: k must be a positive integer")
+        if fusion not in ('rrf', 'weighted'):
+            raise ValueError("hybrid_search: fusion must be 'rrf' or 'weighted'")
+        if fusion == 'weighted' and not (0.0 <= float(alpha) <= 1.0):
+            raise ValueError("hybrid_search: alpha must be within [0, 1]")
+        candidates = max(int(k), int(candidate_k) if candidate_k is not None else max(4 * int(k), 64))
+        if candidates < 1:
+            raise ValueError("hybrid_search: candidate_k must be positive")
+
+        vector = self.topk_distance(
+            vector_col, vector_query, k=candidates, metric=metric, raw=True
+        )
+        text = self.search_text_with_scores(text_query, limit=candidates)
+
+        scores = {}
+        if fusion == 'rrf':
+            for rank, doc_id in enumerate(vector.get('ids', [])):
+                scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+            for rank, (doc_id, _) in enumerate(text):
+                scores[doc_id] = scores.get(doc_id, 0.0) + 1.0 / (rrf_k + rank + 1)
+        else:
+            vector_ids = vector.get('ids', [])
+            distances = vector.get('distances', [])
+            vector_norm = {}
+            if vector_ids:
+                low = min(distances)
+                high = max(distances)
+                span = high - low
+                for doc_id, distance in zip(vector_ids, distances):
+                    vector_norm[doc_id] = 1.0 if span <= 0 else 1.0 - (distance - low) / span
+            text_norm = {}
+            if text:
+                top = max(score for _, score in text)
+                for doc_id, score in text:
+                    text_norm[doc_id] = (score / top) if top > 0 else 0.0
+            for doc_id in set(vector_norm) | set(text_norm):
+                scores[doc_id] = float(alpha) * vector_norm.get(doc_id, 0.0) + (
+                    1.0 - float(alpha)
+                ) * text_norm.get(doc_id, 0.0)
+
+        ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))[: int(k)]
+        pa_mod = _ensure_pyarrow()
+        if not ranked:
+            rv = ResultView(lazy_pydict={'_id': [], 'score': []})
+            rv._show_internal_id = True
+            return rv
+        table = pa_mod.table(
+            {
+                '_id': [int(doc_id) for doc_id, _ in ranked],
+                'score': [float(score) for _, score in ranked],
+            }
+        )
+        rv = ResultView(arrow_table=table, data=None)
+        rv._show_internal_id = True
+        return rv
+
     def search_and_retrieve(self, query: str, table_name: str = None,
                            limit: Optional[int] = None, offset: int = 0) -> 'ResultView':
         """

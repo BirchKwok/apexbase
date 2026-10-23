@@ -97,6 +97,7 @@ PUBLIC_API_CASES = (
     "ApexClient.execute_batch_parallel",
     "ApexClient.topk_distance",
     "ApexClient.batch_topk_distance",
+    "ApexClient.hybrid_search",
     "ApexClient.query",
     "ApexClient.retrieve",
     "ApexClient.read_blob",
@@ -354,6 +355,22 @@ class Fixture:
             self._fresh_table("durable", {"value": "int64"})
         elif name in {"topk_distance", "batch_topk_distance"}:
             self.prepared["vectors"] = self._vector_ready()
+        elif name == "hybrid_search":
+            table = self._fresh_table(
+                "hybrid", {"content": "string", "vec": "float32_vector"}
+            )
+            rng = self.np.random.default_rng(44)
+            vectors = rng.random((256, 16), dtype=self.np.float32)
+            c.init_fts(index_fields=["content"])
+            c.store(
+                {
+                    "content": [f"apexbase hybrid document {i}" for i in range(256)],
+                    "vec": [row for row in vectors],
+                }
+            )
+            c.flush()
+            self.prepared["hybrid_table"] = table
+            self.prepared["hybrid_vectors"] = vectors
         elif name in {"create_quantized_column", "drop_quantized_column"}:
             table = self._fresh_table(
                 "quantized",
@@ -548,6 +565,11 @@ class Fixture:
         if name == "retrieve":
             c.use_table("main")
             return c.retrieve(1)
+        if name == "hybrid_search":
+            c.use_table(self.prepared["hybrid_table"])
+            return c.hybrid_search(
+                self.prepared["hybrid_vectors"][0], "hybrid document", k=10
+            )
         if name == "vacuum_blobs":
             c.use_table("main")
             return c.vacuum_blobs()
