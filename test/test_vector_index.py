@@ -82,3 +82,27 @@ def test_index_requires_a_vector_column_and_flushed_rows():
             assert info["rows"] == 1
         finally:
             client.close()
+
+
+def test_nprobe_rescores_candidates_and_full_probe_matches_bruteforce():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, matrix = _make_table(tmp)
+        client.create_vector_index("vec", nlist=16, iterations=8)
+        try:
+            query = matrix[123].copy()
+            exact = client.topk_distance("vec", query, k=10, raw=True)
+            full = client.topk_distance("vec", query, k=10, nprobe=16, raw=True)
+            assert full["ids"] == exact["ids"]
+            assert all(
+                abs(left - right) < 1e-4
+                for left, right in zip(full["distances"], exact["distances"])
+            )
+
+            # One-list probe on clustered data still recalls most of the exact
+            # neighbours; candidates are always rescored exactly.
+            approximate = client.topk_distance("vec", query, k=10, nprobe=1, raw=True)
+            overlap = len(set(approximate["ids"]) & set(exact["ids"]))
+            assert overlap >= 8, (overlap, approximate, exact)
+            assert approximate["distances"] == sorted(approximate["distances"])
+        finally:
+            client.close()

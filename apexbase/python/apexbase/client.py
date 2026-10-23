@@ -4542,6 +4542,7 @@ class ApexClient:
         candidate_k: int = None,
         rescore: bool = True,
         raw: bool = False,
+        nprobe: int = None,
     ):
         """Heap-based TopK vector distance search: O(n log k), faster than ORDER BY + LIMIT.
 
@@ -4597,6 +4598,31 @@ class ApexClient:
             raise ValueError("topk_distance: query must not be empty")
         if not np.isfinite(query_array).all():
             raise ValueError("topk_distance: query must contain only finite values")
+        if nprobe is not None:
+            if accelerator is not None:
+                raise ValueError(
+                    "topk_distance: nprobe does not support accelerator yet"
+                )
+            if (
+                not isinstance(nprobe, (int, np.integer))
+                or isinstance(nprobe, (bool, np.bool_))
+                or int(nprobe) < 1
+            ):
+                raise ValueError("topk_distance: nprobe must be a positive integer")
+            ids, distances = self._storage._topk_distance_ivf_ffi(
+                col, query_array.tobytes(), k, metric, int(nprobe)
+            )
+            if raw:
+                return {"ids": ids, "distances": distances}
+            if not ids:
+                rv = ResultView(lazy_pydict={id_col: [], dist_col: []})
+                rv._show_internal_id = True
+                return rv
+            pa_mod = _ensure_pyarrow()
+            table = pa_mod.table({id_col: ids, dist_col: distances})
+            rv = ResultView(arrow_table=table, data=None)
+            rv._show_internal_id = True
+            return rv
         if raw:
             if accelerator is not None:
                 raise ValueError(

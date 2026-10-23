@@ -1,4 +1,11 @@
 use super::*;
+/// Decompressed float buffers for the opt-in IVF path, keyed by table path and
+/// column. A file fingerprint (length + mtime) invalidates it after a write, so
+/// the buffer is rebuilt once instead of on every query.
+static IVF_VECTOR_CACHE: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, String), (u64, u64, std::sync::Arc<Vec<f32>>, usize)>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
 
 /// Metadata for the persisted coarse vector index (`<table>.apex.ivf`).
 #[derive(Debug, Clone)]
@@ -1704,6 +1711,20 @@ impl OnDemandStorage {
         let tmp = path.with_extension("ivf.tmp");
         std::fs::write(&tmp, &payload)?;
         std::fs::rename(&tmp, &path)?;
+        // Warm the query-side buffer so the first nprobe call does not pay the
+        // full column decode.
+        if let Ok(metadata) = std::fs::metadata(&self.path) {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0);
+            IVF_VECTOR_CACHE.lock().insert(
+                (self.path.clone(), col_name.to_string()),
+                (metadata.len(), modified, std::sync::Arc::new(vectors), dim),
+            );
+        }
         Ok(())
     }
 
@@ -1763,7 +1784,145 @@ impl OnDemandStorage {
             Err(error) => Err(error),
         }
     }
+    fn read_vector_index(
+        &self,
+    ) -> io::Result<Option<(usize, usize, Vec<f32>, Vec<u64>, Vec<u32>)>> {
+        let path = self.vector_index_path();
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        if bytes.len() < 30 || &bytes[0..4] != b"AVIX" {
+            return Err(err_data("vector index file is not an AVIX index"));
+        }
+        let dim = u32::from_le_bytes(bytes[6..10].try_into().unwrap()) as usize;
+        let nlist = u32::from_le_bytes(bytes[10..14].try_into().unwrap()) as usize;
+        let rows = u64::from_le_bytes(bytes[14..22].try_into().unwrap()) as usize;
+        let centroids_start = 30;
+        let centroids_end = centroids_start + nlist * dim * 4;
+        let offsets_end = centroids_end + (nlist + 1) * 8;
+        let ids_end = offsets_end + rows * 4;
+        if ids_end > bytes.len() {
+            return Err(err_data("vector index file is truncated"));
+        }
+        let mut centroids = Vec::with_capacity(nlist * dim);
+        for chunk in bytes[centroids_start..centroids_end].chunks_exact(4) {
+            centroids.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let mut offsets = Vec::with_capacity(nlist + 1);
+        for chunk in bytes[centroids_end..offsets_end].chunks_exact(8) {
+            offsets.push(u64::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        let mut row_ids = Vec::with_capacity(rows);
+        for chunk in bytes[offsets_end..ids_end].chunks_exact(4) {
+            row_ids.push(u32::from_le_bytes(chunk.try_into().unwrap()));
+        }
+        Ok(Some((dim, nlist, centroids, offsets, row_ids)))
+    }
+
+    /// Exact distances over the rows of the closest `nprobe` inverted lists.
+    ///
+    /// Returns positions in the **active row space** (the same space the index
+    /// stores) and their l2-squared distances, sorted ascending. With
+    /// `nprobe == nlist` this must equal the brute-force TopK.
+    pub fn topk_ivf(
+        &self,
+        col_name: &str,
+        query: &[f32],
+        k: usize,
+        nprobe: usize,
+    ) -> io::Result<Option<Vec<(usize, f32)>>> {
+        let Some((dim, nlist, centroids, offsets, row_ids)) = self.read_vector_index()? else {
+            return Ok(None);
+        };
+        if dim != query.len() {
+            return Err(err_data(format!(
+                "vector index dimension {dim} does not match the query dimension {}",
+                query.len()
+            )));
+        }
+        let fingerprint = std::fs::metadata(&self.path).ok().map(|metadata| {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|duration| duration.as_nanos() as u64)
+                .unwrap_or(0);
+            (metadata.len(), modified)
+        });
+        let cache_key = (self.path.clone(), col_name.to_string());
+        let cached = fingerprint.and_then(|(length, modified)| {
+            IVF_VECTOR_CACHE
+                .lock()
+                .get(&cache_key)
+                .filter(|(cached_length, cached_modified, _, _)| {
+                    *cached_length == length && *cached_modified == modified
+                })
+                .map(|(_, _, vectors, dim)| (vectors.clone(), *dim))
+        });
+        let (vectors, column_dim) = match cached {
+            Some((vectors, dim)) => (vectors, dim),
+            None => {
+                let Some((vectors, dim)) = self.collect_vector_rows(col_name)? else {
+                    return Ok(None);
+                };
+                let vectors = std::sync::Arc::new(vectors);
+                if let Some((length, modified)) = fingerprint {
+                    let mut cache = IVF_VECTOR_CACHE.lock();
+                    cache.insert(cache_key, (length, modified, vectors.clone(), dim));
+                }
+                (vectors, dim)
+            }
+        };
+        let rows = vectors.len() / column_dim;
+        let mut lists: Vec<(f32, usize)> = (0..nlist)
+            .map(|list| {
+                let centroid = &centroids[list * dim..(list + 1) * dim];
+                let mut distance = 0f32;
+                for index in 0..dim {
+                    let delta = query[index] - centroid[index];
+                    distance += delta * delta;
+                }
+                (distance, list)
+            })
+            .collect();
+        lists.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
+        let probe = nprobe.clamp(1, nlist);
+        let mut candidates: Vec<usize> = Vec::new();
+        for (_, list) in lists.into_iter().take(probe) {
+            let start = offsets[list] as usize;
+            let end = offsets[list + 1] as usize;
+            for &row in &row_ids[start..end.min(row_ids.len())] {
+                let row = row as usize;
+                if row < rows {
+                    candidates.push(row);
+                }
+            }
+        }
+        let score = |row: usize| -> (usize, f32) {
+            let vector = &vectors[row * column_dim..(row + 1) * column_dim];
+            let mut distance = 0f32;
+            for index in 0..dim {
+                let delta = query[index] - vector[index];
+                distance += delta * delta;
+            }
+            (row, distance.sqrt())
+        };
+        // Rayon pays off for wide probes; a one/two-list probe is small enough
+        // that scheduling the tasks costs more than the scan itself.
+        let scored: Vec<(usize, f32)> = if candidates.len() >= 8192 {
+            candidates.par_iter().map(|&row| score(row)).collect()
+        } else {
+            candidates.iter().map(|&row| score(row)).collect()
+        };
+        let mut best = scored;
+        best.sort_unstable_by(|left, right| left.1.total_cmp(&right.1));
+        best.truncate(k);
+        Ok(Some(best))
+    }
 }
+
 
 
 /// Deterministic k-means over a flat row-major f32 buffer.

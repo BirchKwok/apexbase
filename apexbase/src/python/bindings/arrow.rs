@@ -522,6 +522,74 @@ impl ApexStorageImpl {
         })
     }
 
+    /// Approximate TopK through the persisted coarse IVF index.
+    ///
+    /// `nprobe` selects the closest inverted lists by centroid distance, then the
+    /// candidates are rescored exactly. With `nprobe == nlist` this matches the
+    /// brute-force result; smaller values trade recall for fewer distance
+    /// computations.
+    #[pyo3(name = "_topk_distance_ivf_ffi")]
+    fn topk_distance_ivf_ffi(
+        &self,
+        py: Python<'_>,
+        col: &str,
+        query_bytes: &[u8],
+        k: usize,
+        metric: &str,
+        nprobe: usize,
+    ) -> PyResult<(Vec<i64>, Vec<f64>)> {
+        use crate::compute::vector_ops::bytes_to_query_vec_f32;
+        use arrow::array::Int64Array;
+
+        if metric != "l2" && metric != "euclidean" {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "_topk_distance_ivf_ffi: the coarse index stores l2 distances; use metric='l2'",
+            ));
+        }
+        let query_f32 = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err(
+                "_topk_distance_ivf_ffi: query_bytes must be raw little-endian float32 bytes",
+            )
+        })?;
+        let table_path = self
+            .get_current_table_path()
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
+        let col_owned = col.to_string();
+
+        py.allow_threads(|| -> PyResult<(Vec<i64>, Vec<f64>)> {
+            let backend = crate::Database::cached_backend(&table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let Some(topk) = backend
+                .storage
+                .topk_ivf(&col_owned, &query_f32, k, nprobe)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            else {
+                return Err(PyRuntimeError::new_err(format!(
+                    "topk_distance(nprobe=...): no coarse vector index for table column '{}'; call create_vector_index first",
+                    col_owned
+                )));
+            };
+            let positions: Vec<usize> = topk.iter().map(|(row, _)| *row).collect();
+            let ids: Vec<i64> = match backend.storage.ids_at_active_positions(&positions) {
+                Ok(Some(ids)) => ids,
+                _ => {
+                    let id_batch = backend
+                        .read_columns_to_arrow(Some(&["_id"]), 0, None)
+                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                    let id_col = id_batch
+                        .column_by_name("_id")
+                        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                        .ok_or_else(|| {
+                            PyRuntimeError::new_err("topk_distance: _id column is not Int64")
+                        })?;
+                    positions.iter().map(|&row| id_col.value(row)).collect()
+                }
+            };
+            let dists: Vec<f64> = topk.iter().map(|(_, distance)| *distance as f64).collect();
+            Ok((ids, dists))
+        })
+    }
+
     #[pyo3(name = "_topk_distance_ffi")]
     fn topk_distance_ffi(
         &self,
