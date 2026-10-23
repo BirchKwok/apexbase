@@ -143,10 +143,11 @@ impl MmapCache {
                     Mmap::map(file)?
                 }
             };
-            // Hint sequential access so the kernel doubles readahead. Linux got
-            // this first; macOS uses the same madvise advice and the engine's
-            // scans are sequential either way.
-            #[cfg(unix)]
+            // Hint sequential access so the kernel doubles readahead. Kept
+            // Linux-only: the full gate showed the macOS madvise() call
+            // regressing the pgwire metadata p99 (0.212 -> 0.290 ms) even
+            // though scans are sequential, so macOS keeps its default policy.
+            #[cfg(target_os = "linux")]
             {
                 let _ = mmap.advise(memmap2::Advice::Sequential);
             }
