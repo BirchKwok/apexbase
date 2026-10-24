@@ -1139,7 +1139,9 @@ impl OnDemandStorage {
             compression: std::sync::atomic::AtomicU8::new(CompressionType::None as u8),
             narrow_float32: std::sync::atomic::AtomicBool::new(narrow_float32_requested()),
             page_cache: RwLock::new(HashMap::new()),
-            decompressed_rg_cache: RwLock::new(DecompressedRgCache::default()),
+            decompressed_rg_cache: RwLock::new(DecompressedRgCache::new(
+                storage_cache_caps().decompressed_rg,
+            )),
             page_cache_budget: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_PAGE_CACHE_BUDGET_BYTES,
             ),
@@ -1400,7 +1402,9 @@ impl OnDemandStorage {
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             narrow_float32: std::sync::atomic::AtomicBool::new(narrow_float32),
             page_cache: RwLock::new(HashMap::new()),
-            decompressed_rg_cache: RwLock::new(DecompressedRgCache::default()),
+            decompressed_rg_cache: RwLock::new(DecompressedRgCache::new(
+                storage_cache_caps().decompressed_rg,
+            )),
             page_cache_budget: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_PAGE_CACHE_BUDGET_BYTES,
             ),
@@ -1602,7 +1606,9 @@ impl OnDemandStorage {
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             narrow_float32: std::sync::atomic::AtomicBool::new(narrow_float32),
             page_cache: RwLock::new(HashMap::new()),
-            decompressed_rg_cache: RwLock::new(DecompressedRgCache::default()),
+            decompressed_rg_cache: RwLock::new(DecompressedRgCache::new(
+                storage_cache_caps().decompressed_rg,
+            )),
             page_cache_budget: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_PAGE_CACHE_BUDGET_BYTES,
             ),
@@ -1883,8 +1889,7 @@ impl OnDemandStorage {
         };
         let body = std::sync::Arc::new(decompressed);
         let mut cache = self.decompressed_rg_cache.write();
-        let budget = self.decompressed_rg_budget_bytes();
-        cache.insert(key, std::sync::Arc::clone(&body), budget);
+        cache.insert(key, std::sync::Arc::clone(&body));
         Ok(Some(body))
     }
 
@@ -2650,10 +2655,6 @@ impl OnDemandStorage {
     /// toggle it between queries.
     pub(crate) fn scan_buffer_budget_bytes(&self) -> usize {
         storage_cache_caps().scan_buffer
-    }
-
-    pub(crate) fn decompressed_rg_budget_bytes(&self) -> usize {
-        storage_cache_caps().decompressed_rg
     }
 
     /// The row-group deletion vector, read straight from the mmap row groups.
@@ -6854,27 +6855,38 @@ fn physical_base_with_deletions(footer: &V4Footer) -> Option<usize> {
 /// Keyed by `(row-group offset, compressed length)`; the whole cache is dropped
 /// when the table changes (`invalidate_page_cache`), exactly like the page cache,
 /// so a stale body can never outlive a write.
-#[derive(Default)]
 pub(crate) struct DecompressedRgCache {
     entries: HashMap<(u64, u64), std::sync::Arc<Vec<u8>>>,
     order: std::collections::VecDeque<(u64, u64)>,
     bytes: usize,
+    /// Byte budget, resolved once when the storage is created so the decompress
+    /// path never consults the process-wide cache caps.
+    budget: usize,
 }
 
 impl DecompressedRgCache {
+    fn new(budget: usize) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            bytes: 0,
+            budget,
+        }
+    }
+
     fn get(&self, key: (u64, u64)) -> Option<std::sync::Arc<Vec<u8>>> {
         self.entries.get(&key).cloned()
     }
 
-    fn insert(&mut self, key: (u64, u64), body: std::sync::Arc<Vec<u8>>, budget: usize) {
-        if body.len() > budget {
+    fn insert(&mut self, key: (u64, u64), body: std::sync::Arc<Vec<u8>>) {
+        if body.len() > self.budget {
             return;
         }
         if self.entries.insert(key, std::sync::Arc::clone(&body)).is_none() {
             self.order.push_back(key);
             self.bytes += body.len();
         }
-        while self.bytes > budget {
+        while self.bytes > self.budget {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
