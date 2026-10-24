@@ -6149,14 +6149,15 @@ class ApexClient:
         """Return the coarse vector index metadata, or ``None`` if absent.
 
         The mapping has ``version``, ``dim``, ``nlist``, ``rows``, ``metric``,
-        ``inertia`` and ``list_sizes`` (one entry per inverted list).
+        ``inertia``, ``list_sizes`` (one entry per inverted list) and ``stale``
+        (the table changed since the build; rebuild before using ``nprobe``).
         """
         self._check_connection()
         self._ensure_table_selected()
         info = self._storage._vector_index_info()
         if info is None:
             return None
-        version, dim, nlist, rows, metric, inertia, list_sizes = info
+        version, dim, nlist, rows, metric, inertia, list_sizes, stale = info
         return {
             "version": version,
             "dim": dim,
@@ -6165,6 +6166,7 @@ class ApexClient:
             "metric": metric,
             "inertia": inertia,
             "list_sizes": list_sizes,
+            "stale": stale,
         }
 
     def drop_vector_index(self) -> bool:

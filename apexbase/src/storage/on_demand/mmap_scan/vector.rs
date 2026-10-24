@@ -24,6 +24,9 @@ pub struct VectorIndexInfo {
     pub metric: String,
     pub inertia: f64,
     pub list_sizes: Vec<usize>,
+    /// `true` when the table's active row count no longer matches the rows the
+    /// index was built over (rows were added or deleted since the build).
+    pub stale: bool,
 }
 
 impl OnDemandStorage {
@@ -1815,6 +1818,7 @@ impl OnDemandStorage {
             ) as usize;
             list_sizes.push(end.saturating_sub(start));
         }
+        let stale = self.active_row_count() as usize != rows;
         Ok(Some(VectorIndexInfo {
             version,
             dim,
@@ -1823,6 +1827,7 @@ impl OnDemandStorage {
             metric,
             inertia,
             list_sizes,
+            stale,
         }))
     }
 
@@ -1847,6 +1852,12 @@ impl OnDemandStorage {
             return Err(err_data(format!(
                 "vector index dimension {dim} does not match the query dimension {}",
                 query.len()
+            )));
+        }
+        let active = self.active_row_count() as usize;
+        if active != rows {
+            return Err(err_data(format!(
+                "vector index is stale: built over {rows} rows but the table now has {active}; rebuild it with create_vector_index"
             )));
         }
         let centroids_start = 32;

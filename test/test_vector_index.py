@@ -107,3 +107,28 @@ def test_nprobe_rescores_candidates_and_full_probe_matches_bruteforce():
             assert approximate["distances"] == sorted(approximate["distances"])
         finally:
             client.close()
+
+
+def test_nprobe_rejects_a_stale_index_and_info_reports_it():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, matrix = _make_table(tmp)
+        try:
+            client.create_vector_index("vec", nlist=8, iterations=4)
+            assert client.vector_index_info()["stale"] is False
+            query = matrix[10].copy()
+            client.topk_distance("vec", query, k=5, nprobe=8)
+
+            extra = np.arange(DIM, dtype=np.float32)
+            client.store({"label": [ROWS], "vec": [extra]})
+            client.flush()
+            assert client.vector_index_info()["stale"] is True
+            with pytest.raises(RuntimeError, match="stale"):
+                client.topk_distance("vec", query, k=5, nprobe=8)
+
+            client.create_vector_index("vec", nlist=8, iterations=4)
+            assert client.vector_index_info()["stale"] is False
+            exact = client.topk_distance("vec", query, k=5, raw=True)
+            full = client.topk_distance("vec", query, k=5, nprobe=8, raw=True)
+            assert full["ids"] == exact["ids"]
+        finally:
+            client.close()
