@@ -302,6 +302,177 @@ impl OnDemandStorage {
         Ok(Some(result))
     }
 
+    /// Exact distances for a coarse candidate set read straight from the flat
+    /// vector bytes.
+    ///
+    /// The quantized rescore stage used to materialise the candidate rows
+    /// through Arrow, which cost several milliseconds for a few hundred rows and
+    /// made coarse+rescore slower than the exact lane. This reads the same rows
+    /// from the mapped row groups (no Arrow batch) and returns the candidates in
+    /// the active row space, so callers map ids with `ids_at_active_positions`.
+    /// `None` means the layout is not a flat uncompressed f32 list.
+    pub fn rescore_vector_rows(
+        &self,
+        col_name: &str,
+        candidates: &[usize],
+        computer: &crate::compute::vector_ops::DistanceComputer,
+        k: usize,
+    ) -> io::Result<Option<Vec<(i64, f32)>>> {
+        if candidates.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        let Some(col_idx) = footer.schema.get_index(col_name) else {
+            return Ok(None);
+        };
+        if footer.schema.columns[col_idx].1 != ColumnType::FixedList {
+            return Ok(None);
+        }
+        let dim = computer.query.len();
+        let file_guard = self.file.read();
+        let Some(file) = file_guard.as_ref() else {
+            return Ok(None);
+        };
+        let mmap_arc = self.mmap_cache.write().get_mmap_arc(file)?;
+        drop(file_guard);
+        let mmap: &[u8] = &mmap_arc;
+
+        struct RgDesc {
+            active_start: usize,
+            active_count: usize,
+            vector_abs: usize,
+            row_width: usize,
+            del_abs: Option<usize>,
+            count: usize,
+            ids_abs: usize,
+            min_id: u64,
+            implicit_ids: bool,
+        }
+        let mut rgs: Vec<RgDesc> = Vec::with_capacity(footer.row_groups.len());
+        let mut co_idx = 0usize;
+        let mut active_cursor = 0usize;
+        for rg_meta in &footer.row_groups {
+            if rg_meta.row_count == 0 {
+                continue;
+            }
+            let rg_rows = rg_meta.row_count as usize;
+            let rg_end = (rg_meta.offset + rg_meta.data_size) as usize;
+            if rg_end > mmap.len() {
+                return Ok(None);
+            }
+            let active = rg_meta.active_rows() as usize;
+            let compress = mmap[rg_meta.offset as usize + 28];
+            let encoding = mmap[rg_meta.offset as usize + 29];
+            if compress != RG_COMPRESS_NONE
+                || encoding < 1
+                || co_idx >= footer.col_offsets.len()
+                || col_idx >= footer.col_offsets[co_idx].len()
+            {
+                return Ok(None);
+            }
+            let bitmap = (rg_rows + 7) / 8;
+            let data_abs =
+                rg_meta.offset as usize + 32 + footer.col_offsets[co_idx][col_idx] as usize + bitmap;
+            if data_abs + 13 > mmap.len() || mmap[data_abs] != COL_ENCODING_PLAIN {
+                return Ok(None);
+            }
+            let count =
+                u64::from_le_bytes(mmap[data_abs + 1..data_abs + 9].try_into().unwrap()) as usize;
+            let row_dim =
+                u32::from_le_bytes(mmap[data_abs + 9..data_abs + 13].try_into().unwrap()) as usize;
+            if count != rg_rows || row_dim != dim {
+                return Ok(None);
+            }
+            let row_width = dim * 4;
+            let vector_abs = data_abs + 13;
+            if vector_abs + count * row_width > mmap.len() {
+                return Ok(None);
+            }
+            let del_abs = if rg_meta.deletion_count > 0 {
+                let id_encoding = mmap[rg_meta.offset as usize + 30];
+                let del_start = rg_meta.offset as usize + 32
+                    + crate::storage::on_demand::rg_id_section_len(rg_rows, id_encoding);
+                if del_start + bitmap > mmap.len() {
+                    return Ok(None);
+                }
+                Some(del_start)
+            } else {
+                None
+            };
+            let id_encoding = mmap[rg_meta.offset as usize + 30];
+            let implicit_ids =
+                id_encoding == crate::storage::on_demand::RG_IDS_IMPLICIT_CONTIGUOUS;
+            rgs.push(RgDesc {
+                active_start: active_cursor,
+                active_count: active,
+                vector_abs,
+                row_width,
+                del_abs,
+                count,
+                ids_abs: rg_meta.offset as usize + 32,
+                min_id: rg_meta.min_id,
+                implicit_ids,
+            });
+            active_cursor += active;
+            co_idx += 1;
+        }
+
+        let mut scored: Vec<(i64, f32)> = Vec::with_capacity(candidates.len());
+        for &candidate in candidates {
+            if candidate >= active_cursor {
+                continue;
+            }
+            let Some(rg) = rgs
+                .iter()
+                .find(|rg| candidate >= rg.active_start && candidate < rg.active_start + rg.active_count)
+            else {
+                continue;
+            };
+            let local_active = candidate - rg.active_start;
+            let physical = match rg.del_abs {
+                None => local_active,
+                Some(del_abs) => {
+                    let mut live = 0usize;
+                    let mut row = 0usize;
+                    while row < rg.count {
+                        if (mmap[del_abs + row / 8] >> (row % 8)) & 1 == 0 {
+                            if live == local_active {
+                                break;
+                            }
+                            live += 1;
+                        }
+                        row += 1;
+                    }
+                    if row >= rg.count {
+                        continue;
+                    }
+                    row
+                }
+            };
+            let start = rg.vector_abs + physical * rg.row_width;
+            let mut values = Vec::with_capacity(dim);
+            for chunk in mmap[start..start + rg.row_width].chunks_exact(4) {
+                values.push(f32::from_le_bytes(chunk.try_into().unwrap()));
+            }
+            let score = computer.compute_topk_ordering(&values);
+            let id = if rg.implicit_ids {
+                (rg.min_id + physical as u64) as i64
+            } else {
+                let id_abs = rg.ids_abs + physical * 8;
+                if id_abs + 8 > mmap.len() {
+                    return Ok(None);
+                }
+                u64::from_le_bytes(mmap[id_abs..id_abs + 8].try_into().unwrap()) as i64
+            };
+            scored.push((id, computer.finalize_topk_distance(score)));
+        }
+        scored.sort_unstable_by(|left, right| left.1.total_cmp(&right.1));
+        scored.truncate(k);
+        Ok(Some(scored))
+    }
+
     pub fn topk_fixedlist_direct(
         &self,
         col_name: &str,

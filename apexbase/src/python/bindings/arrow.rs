@@ -928,6 +928,28 @@ impl ApexStorageImpl {
                 .iter()
                 .map(|(row, _)| *row)
                 .collect::<Vec<_>>();
+            // Fast path: read the candidate vectors straight from the mapped row
+            // groups instead of materialising them through Arrow (a few hundred
+            // rows cost several ms that way, which dominated the whole rescore).
+            if let Some(rescored) = backend
+                .storage
+                .rescore_vector_rows(&source_col, &candidate_rows, &computer, k)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
+            {
+                let ids = rescored.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+                let distances = rescored
+                    .iter()
+                    .map(|(_, distance)| *distance as f64)
+                    .collect::<Vec<_>>();
+                return RecordBatch::try_new(
+                    out_schema,
+                    vec![
+                        std::sync::Arc::new(Int64Array::from(ids)) as ArrayRef,
+                        std::sync::Arc::new(Float64Array::from(distances)) as ArrayRef,
+                    ],
+                )
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
+            }
             let exact_batch = backend
                 .read_columns_by_indices_to_arrow(&candidate_rows, Some(&[&source_col, "_id"]))
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;

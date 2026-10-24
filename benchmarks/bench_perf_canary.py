@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import statistics
 import shutil
 import sys
 import tempfile
@@ -257,6 +258,65 @@ def recall_at_k(exact_ids, returned_ids, k):
     return hits / exact_ids.shape[0]
 
 
+def run_quantized_rescore_canary(rows, warmup, iterations):
+    """Time float16 coarse ranking plus an exact rescore, per query.
+
+    The rescore used to materialise candidate rows through Arrow, which made the
+    two-stage path slower than the exact lane. Its candidates are now read from
+    the mapped row groups, so the canary gates both the latency and the recall of
+    the combined stage (a fast-but-wrong rescore fails the recall floor).
+    """
+    quant_rows = max(2_000, rows // 2)
+    dim = 128
+    rng = np.random.default_rng(20260825)
+    vectors = rng.normal(size=(quant_rows, dim)).astype(np.float32)
+    queries = vectors[:5] + rng.normal(scale=0.02, size=(5, dim)).astype(np.float32)
+    exact_ids = exact_topk_ids(vectors, queries, 10)
+    with tempfile.TemporaryDirectory(prefix="apexbase_quant_rescore_canary_") as tmpdir:
+        client = ApexClient(tmpdir, drop_if_exists=True)
+        try:
+            client.create_table("vectors", {"embedding": "float32_vector"})
+            client.store([{"embedding": vector} for vector in vectors])
+            accelerator = client.create_quantized_column("embedding", codec="float16")
+
+            def run_queries():
+                return [
+                    client.topk_distance(
+                        "embedding", query, k=10, accelerator=accelerator, candidate_k=40
+                    ).to_dict()
+                    for query in queries
+                ]
+
+            for _ in range(warmup):
+                run_queries()
+            samples = []
+            for _ in range(iterations):
+                started = time.perf_counter()
+                run_queries()
+                samples.append((time.perf_counter() - started) * 1000.0 / len(queries))
+            latency = statistics.median(samples)
+            found = [
+                {int(row["_id"]) for row in rows_ if row["_id"] is not None}
+                for rows_ in run_queries()
+            ]
+            measured = sum(
+                len({int(row) + 1 for row in exact_row} & found_row)
+                / max(1, len(set(exact_row)))
+                for exact_row, found_row in zip(exact_ids, found)
+            ) / len(found)
+            assert measured >= 0.9, (
+                f"float16 coarse+rescore recall@10 {measured:.3f} fell below 0.9: "
+                "the rescore stage is returning wrong neighbours"
+            )
+            return [{
+                "category": "ApexBase canary",
+                "query": "Quantized float16 coarse + rescore top-10",
+                "ApexBase": round(latency, 6),
+            }]
+        finally:
+            client.close()
+
+
 def run_fts_score_canary(rows, warmup, iterations):
     """Time `ORDER BY FTS_SCORE() DESC LIMIT 10` over a dense match set.
 
@@ -504,6 +564,11 @@ def run_canary(
             )
 
         if not index_only and not parallel_only and not hot_shapes_only:
+            results.extend(
+                result
+                for result in run_quantized_rescore_canary(rows, warmup, iterations)
+                if only is None or result["query"] in only
+            )
             results.extend(
                 result
                 for result in run_fts_score_canary(rows, warmup, iterations)
