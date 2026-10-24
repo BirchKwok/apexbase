@@ -2528,6 +2528,20 @@ impl ApexStorageImpl {
         })
     }
 
+    /// Compact `packed.blob` to the payloads live rows still reference.
+    #[pyo3(name = "_vacuum_packed_blobs")]
+    fn vacuum_packed_blobs(&self, py: Python<'_>) -> PyResult<u64> {
+        let table_path = self.get_current_table_path()?;
+        py.allow_threads(|| {
+            let backend = crate::Database::cached_backend(&table_path)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            backend
+                .storage
+                .vacuum_packed_blobs()
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })
+    }
+
     #[pyo3(name = "_fts_flush")]
     fn fts_flush(&self, py: Python<'_>) -> PyResult<()> {
         let table_name = self.current_table.read().clone();

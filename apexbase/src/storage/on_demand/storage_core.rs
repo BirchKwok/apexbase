@@ -1106,6 +1106,9 @@ impl OnDemandStorage {
         path: &Path,
         durability: super::DurabilityLevel,
     ) -> io::Result<Self> {
+        // Finish a packed-blob vacuum interrupted by a crash before any reader
+        // opens the table: its journaled rename sequence is idempotent.
+        crate::storage::on_demand::recover_packed_vacuum(path)?;
         // Clean up stale .tmp files from crashed atomic writes
         let tmp_path = path.with_extension("apex.tmp");
         if tmp_path.exists() {
@@ -1356,6 +1359,7 @@ impl OnDemandStorage {
     /// Skips DeltaStore::load (saves 1 stat syscall) and internal File::open (saves 1 open syscall).
     /// For pure read paths only — DeltaStore is initialized empty (no pending updates).
     pub fn open_for_read_with_file(path: &Path, file: File, file_len: u64) -> io::Result<Self> {
+        crate::storage::on_demand::recover_packed_vacuum(path)?;
         // Apply pending delete state before creating the mmap so reads see fresh data
         let _ = apply_pending_deletes(path);
         let mut file_len = file_len;

@@ -108,6 +108,7 @@ PUBLIC_API_CASES = (
     "ApexClient.read_blob_info",
     "ApexClient.read_blob_infos",
     "ApexClient.vacuum_blobs",
+    "ApexClient.vacuum_packed_blobs",
     "ApexClient.create_vector_index",
     "ApexClient.vector_index_info",
     "ApexClient.drop_vector_index",
@@ -427,7 +428,7 @@ class Fixture:
             c.store({"value": ROWS + 1, "score": 1.0, "category": "cat", "content": "buffered"})
         elif name in {"add_column", "drop_column", "rename_column", "get_column_dtype"}:
             self._fresh_table("columns", {"value": "int64", "extra": "string"})
-        elif name == "vacuum_blobs":
+        elif name in {"vacuum_blobs", "vacuum_packed_blobs"}:
             c.use_table("main")
             c.flush()
         elif name in {
@@ -570,9 +571,11 @@ class Fixture:
             return c.hybrid_search(
                 self.prepared["hybrid_vectors"][0], "hybrid document", k=10
             )
-        if name == "vacuum_blobs":
+        if name in {"vacuum_blobs", "vacuum_packed_blobs"}:
             c.use_table("main")
-            return c.vacuum_blobs()
+            if name == "vacuum_blobs":
+                return c.vacuum_blobs()
+            return c.vacuum_packed_blobs()
         if name in {"create_vector_index", "vector_index_info", "drop_vector_index"}:
             c.use_table(self.prepared["vector_table"])
             if name == "create_vector_index":

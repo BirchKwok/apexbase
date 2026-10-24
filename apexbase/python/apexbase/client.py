@@ -6188,6 +6188,25 @@ class ApexClient:
         self._ensure_table_selected()
         return int(self._storage._vacuum_blob_objects())
 
+    def vacuum_packed_blobs(self) -> int:
+        """Compact ``packed.blob`` down to the payloads live rows reference.
+
+        Packed payloads are append-only, so rows removed by deletes keep their
+        bytes until this rewrite. The table file is copied, every live
+        descriptor's 8-byte locator is patched, and both files are published
+        through a journaled rename sequence: a crash mid-vacuum is completed on
+        the next open, never exposing a half-patched table. Only uncompressed,
+        flat (non-chunked) tables are supported; others raise ``RuntimeError``.
+
+        Run while no writer is active.
+
+        Returns:
+            Number of bytes reclaimed from the packed file.
+        """
+        self._check_connection()
+        self._ensure_table_selected()
+        return int(self._storage._vacuum_packed_blobs())
+
     def compact_fts_index(self, table_name: str = None):
         """
         Compact the FTS index for a table.

@@ -582,7 +582,7 @@ const RG_IDS_PLAIN: u8 = 0;
 const RG_IDS_IMPLICIT_CONTIGUOUS: u8 = 1;
 
 #[inline(always)]
-fn rg_id_section_len(row_count: usize, id_encoding: u8) -> usize {
+pub(crate) fn rg_id_section_len(row_count: usize, id_encoding: u8) -> usize {
     if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
         0
     } else {
@@ -1951,7 +1951,7 @@ fn read_column_encoded_partial(
 
 /// Read a column with encoding prefix: [encoding:u8][encoded_data...]
 /// Returns (ColumnData, bytes_consumed) including the encoding prefix byte.
-fn read_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<(ColumnData, usize)> {
+pub(crate) fn read_column_encoded(bytes: &[u8], col_type: ColumnType) -> io::Result<(ColumnData, usize)> {
     if bytes.is_empty() {
         return Err(err_data("read_column_encoded: empty input"));
     }
