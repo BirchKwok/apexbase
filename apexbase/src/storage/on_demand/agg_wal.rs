@@ -3464,7 +3464,7 @@ impl OnDemandStorage {
             .into_iter()
             .map(std::sync::Arc::new)
             .collect::<Vec<_>>();
-        let max_cache_bytes = crate::storage::on_demand::cache_caps().numeric_agg;
+        let max_cache_bytes = crate::storage::on_demand::storage_cache_caps().numeric_agg;
         const MAX_CACHE_COLUMNS: usize = 16;
         let mut cache = self.numeric_scan_cache.write();
         for (&index, column) in column_indices.iter().zip(&decoded) {

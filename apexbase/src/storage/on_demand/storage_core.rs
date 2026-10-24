@@ -86,6 +86,25 @@ pub(crate) fn cache_caps() -> CacheCaps {
     derive_cache_caps(budget)
 }
 
+/// Final caps for this process: the budget split plus the per-cache overrides.
+///
+/// Resolved once (first use) so hot paths never read the environment; every read
+/// afterwards is one atomic load.
+static STORAGE_CACHE_CAPS: std::sync::OnceLock<CacheCaps> = std::sync::OnceLock::new();
+
+pub(crate) fn storage_cache_caps() -> CacheCaps {
+    *STORAGE_CACHE_CAPS.get_or_init(|| {
+        let mut caps = cache_caps();
+        if let Ok(value) = std::env::var("APEX_SCAN_BUFFER_MB") {
+            caps.scan_buffer = parse_scan_buffer_budget(Some(&value));
+        }
+        if let Ok(value) = std::env::var("APEX_DECOMPRESSED_RG_MB") {
+            caps.decompressed_rg = parse_scan_buffer_budget(Some(&value));
+        }
+        caps
+    })
+}
+
 /// `APEX_SCAN_BUFFER_MB` parsing, kept pure so it can be tested without mutating the
 /// process environment: `0` means unlimited, an unparsable value falls back to the
 /// default budget.
@@ -2630,17 +2649,11 @@ impl OnDemandStorage {
     /// environment lookup is irrelevant next to the scan it guards, and tests can
     /// toggle it between queries.
     pub(crate) fn scan_buffer_budget_bytes(&self) -> usize {
-        match std::env::var("APEX_SCAN_BUFFER_MB").ok().as_deref() {
-            Some(value) => parse_scan_buffer_budget(Some(value)),
-            None => cache_caps().scan_buffer,
-        }
+        storage_cache_caps().scan_buffer
     }
 
     pub(crate) fn decompressed_rg_budget_bytes(&self) -> usize {
-        match std::env::var("APEX_DECOMPRESSED_RG_MB").ok().as_deref() {
-            Some(value) => parse_scan_buffer_budget(Some(value)),
-            None => cache_caps().decompressed_rg,
-        }
+        storage_cache_caps().decompressed_rg
     }
 
     /// The row-group deletion vector, read straight from the mmap row groups.
