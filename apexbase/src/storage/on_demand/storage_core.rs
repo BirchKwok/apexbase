@@ -105,6 +105,45 @@ pub(crate) fn storage_cache_caps() -> CacheCaps {
     })
 }
 
+/// A resolved per-cache cap, cached in a relaxed atomic so hot paths pay one load
+/// (and never read the environment) without changing the storage struct layout.
+static SCAN_BUFFER_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static DECOMPRESSED_RG_BUDGET_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+static NUMERIC_AGG_BUDGET: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+fn cached_cap(
+    slot: &std::sync::atomic::AtomicUsize,
+    pick: impl Fn(CacheCaps) -> usize,
+    override_env: &str,
+) -> usize {
+    use std::sync::atomic::Ordering;
+    let value = slot.load(Ordering::Relaxed);
+    if value != 0 {
+        return value;
+    }
+    let mut resolved = pick(storage_cache_caps());
+    if let Ok(raw) = std::env::var(override_env) {
+        resolved = parse_scan_buffer_budget(Some(&raw));
+    }
+    slot.store(resolved, Ordering::Relaxed);
+    resolved
+}
+
+pub(crate) fn decompressed_rg_budget_bytes() -> usize {
+    cached_cap(
+        &DECOMPRESSED_RG_BUDGET_BYTES,
+        |caps| caps.decompressed_rg,
+        "APEX_DECOMPRESSED_RG_MB",
+    )
+}
+
+pub(crate) fn numeric_agg_budget_bytes() -> usize {
+    cached_cap(&NUMERIC_AGG_BUDGET, |caps| caps.numeric_agg, "")
+}
+
 /// `APEX_SCAN_BUFFER_MB` parsing, kept pure so it can be tested without mutating the
 /// process environment: `0` means unlimited, an unparsable value falls back to the
 /// default budget.
@@ -1139,9 +1178,7 @@ impl OnDemandStorage {
             compression: std::sync::atomic::AtomicU8::new(CompressionType::None as u8),
             narrow_float32: std::sync::atomic::AtomicBool::new(narrow_float32_requested()),
             page_cache: RwLock::new(HashMap::new()),
-            decompressed_rg_cache: RwLock::new(DecompressedRgCache::new(
-                storage_cache_caps().decompressed_rg,
-            )),
+            decompressed_rg_cache: RwLock::new(DecompressedRgCache::default()),
             page_cache_budget: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_PAGE_CACHE_BUDGET_BYTES,
             ),
@@ -1402,9 +1439,7 @@ impl OnDemandStorage {
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             narrow_float32: std::sync::atomic::AtomicBool::new(narrow_float32),
             page_cache: RwLock::new(HashMap::new()),
-            decompressed_rg_cache: RwLock::new(DecompressedRgCache::new(
-                storage_cache_caps().decompressed_rg,
-            )),
+            decompressed_rg_cache: RwLock::new(DecompressedRgCache::default()),
             page_cache_budget: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_PAGE_CACHE_BUDGET_BYTES,
             ),
@@ -1606,9 +1641,7 @@ impl OnDemandStorage {
             compression: std::sync::atomic::AtomicU8::new(comp_type as u8),
             narrow_float32: std::sync::atomic::AtomicBool::new(narrow_float32),
             page_cache: RwLock::new(HashMap::new()),
-            decompressed_rg_cache: RwLock::new(DecompressedRgCache::new(
-                storage_cache_caps().decompressed_rg,
-            )),
+            decompressed_rg_cache: RwLock::new(DecompressedRgCache::default()),
             page_cache_budget: std::sync::atomic::AtomicUsize::new(
                 DEFAULT_PAGE_CACHE_BUDGET_BYTES,
             ),
@@ -2654,7 +2687,7 @@ impl OnDemandStorage {
     /// environment lookup is irrelevant next to the scan it guards, and tests can
     /// toggle it between queries.
     pub(crate) fn scan_buffer_budget_bytes(&self) -> usize {
-        storage_cache_caps().scan_buffer
+        cached_cap(&SCAN_BUFFER_BUDGET, |caps| caps.scan_buffer, "APEX_SCAN_BUFFER_MB")
     }
 
     /// The row-group deletion vector, read straight from the mmap row groups.
@@ -6855,38 +6888,28 @@ fn physical_base_with_deletions(footer: &V4Footer) -> Option<usize> {
 /// Keyed by `(row-group offset, compressed length)`; the whole cache is dropped
 /// when the table changes (`invalidate_page_cache`), exactly like the page cache,
 /// so a stale body can never outlive a write.
+#[derive(Default)]
 pub(crate) struct DecompressedRgCache {
     entries: HashMap<(u64, u64), std::sync::Arc<Vec<u8>>>,
     order: std::collections::VecDeque<(u64, u64)>,
     bytes: usize,
-    /// Byte budget, resolved once when the storage is created so the decompress
-    /// path never consults the process-wide cache caps.
-    budget: usize,
 }
 
 impl DecompressedRgCache {
-    fn new(budget: usize) -> Self {
-        Self {
-            entries: HashMap::new(),
-            order: std::collections::VecDeque::new(),
-            bytes: 0,
-            budget,
-        }
-    }
-
     fn get(&self, key: (u64, u64)) -> Option<std::sync::Arc<Vec<u8>>> {
         self.entries.get(&key).cloned()
     }
 
     fn insert(&mut self, key: (u64, u64), body: std::sync::Arc<Vec<u8>>) {
-        if body.len() > self.budget {
+        let budget = crate::storage::on_demand::decompressed_rg_budget_bytes();
+        if body.len() > budget {
             return;
         }
         if self.entries.insert(key, std::sync::Arc::clone(&body)).is_none() {
             self.order.push_back(key);
             self.bytes += body.len();
         }
-        while self.bytes > self.budget {
+        while self.bytes > budget {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };
