@@ -37,6 +37,10 @@ pub enum ColumnType {
     /// Blob descriptor column. Small payloads may be inline; larger payloads
     /// live in table sidecar files and are resolved only when projected.
     Blob = TYPE_BLOB,
+    /// JSON document, stored as its canonical text form (validated in Python/Arrow
+    /// conversion). Arrow projects it as UTF-8, like the string type it shares its
+    /// column storage with.
+    Json = TYPE_JSON,
 }
 
 impl ColumnType {
@@ -64,6 +68,7 @@ impl ColumnType {
                 | ColumnType::StringDict
                 | ColumnType::Binary
                 | ColumnType::Blob
+                | ColumnType::Json
                 | ColumnType::Timestamp
                 | ColumnType::Date
         )
@@ -98,6 +103,7 @@ impl ColumnType {
             TYPE_TURBOQUANT3_VECTOR => Some(ColumnType::TurboQuant3Vector),
             TYPE_TURBOQUANT4_VECTOR => Some(ColumnType::TurboQuant4Vector),
             TYPE_BLOB => Some(ColumnType::Blob),
+            TYPE_JSON => Some(ColumnType::Json),
             _ => None,
         }
     }
@@ -117,6 +123,7 @@ impl ColumnType {
             DataType::Bool => ColumnType::Bool,
             DataType::Binary => ColumnType::Binary,
             DataType::Blob => ColumnType::Blob,
+            DataType::Json => ColumnType::Json,
             DataType::Timestamp => ColumnType::Timestamp,
             DataType::Date => ColumnType::Date,
             DataType::Float16Vector => ColumnType::Float16List,
@@ -153,7 +160,8 @@ impl ColumnType {
             | ColumnType::TurboQuant2Vector
             | ColumnType::TurboQuant3Vector
             | ColumnType::TurboQuant4Vector
-            | ColumnType::Blob => 0,
+            | ColumnType::Blob
+            | ColumnType::Json => 0,
         }
     }
 
@@ -173,6 +181,7 @@ impl ColumnType {
                 | ColumnType::TurboQuant3Vector
                 | ColumnType::TurboQuant4Vector
                 | ColumnType::Blob
+                | ColumnType::Json
         )
     }
 
@@ -546,7 +555,7 @@ impl ColumnData {
                 ColumnData::Int64(Vec::new())
             }
             ColumnType::Float32 | ColumnType::Float64 => ColumnData::Float64(Vec::new()),
-            ColumnType::String => ColumnData::String {
+            ColumnType::String | ColumnType::Json => ColumnData::String {
                 offsets: vec![0u64],
                 data: Vec::new(),
             },
@@ -1086,7 +1095,7 @@ impl ColumnData {
                 pos += byte_len;
                 Ok((ColumnData::Float64(v), pos))
             }
-            ColumnType::String => {
+            ColumnType::String | ColumnType::Json => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 if pos + offsets_len > bytes.len() {
@@ -1268,7 +1277,7 @@ impl ColumnData {
                 let count = read_u64!() as usize;
                 pos += count * 8;
             }
-            ColumnType::String | ColumnType::Binary | ColumnType::Blob => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 pos += offsets_len;

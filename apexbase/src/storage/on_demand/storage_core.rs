@@ -3830,7 +3830,7 @@ impl OnDemandStorage {
                 ColumnType::Float64 | ColumnType::Float32 => {
                     float_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
-                ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::Null => {
                     string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
                 ColumnType::Bool => {
@@ -3871,7 +3871,7 @@ impl OnDemandStorage {
                             .unwrap_or(0.0);
                         float_columns.get_mut(col_name).unwrap().push(v);
                     }
-                    ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                    ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::Null => {
                         let v = data
                             .get(col_name)
                             .and_then(|v| match v {
@@ -4237,7 +4237,7 @@ impl OnDemandStorage {
                 ColumnType::Float64 | ColumnType::Float32 => {
                     float_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
-                ColumnType::String | ColumnType::StringDict => {
+                ColumnType::String | ColumnType::StringDict | ColumnType::Json => {
                     string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
                 ColumnType::Binary | ColumnType::Blob => {
@@ -4307,7 +4307,7 @@ impl OnDemandStorage {
                             .unwrap_or(0.0);
                         float_columns.get_mut(col_name).unwrap().push(v);
                     }
-                    ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                    ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::Null => {
                         let v = val
                             .and_then(|v| {
                                 if let ColumnValueRef::String(s) = v.as_delta_column_value_ref() {
@@ -4723,7 +4723,7 @@ impl OnDemandStorage {
                         }
                         (
                             ColumnData::String { offsets, data },
-                            ColumnType::String | ColumnType::Null,
+                            ColumnType::String | ColumnType::Json | ColumnType::Null,
                         ) => {
                             let Some((&start, &end)) =
                                 offsets.get(row_idx_abs).zip(offsets.get(row_idx_abs + 1))
@@ -4892,7 +4892,7 @@ impl OnDemandStorage {
                         .collect();
                     float_columns.insert(col_name.clone(), filtered);
                 }
-                ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::Null => {
                     let normalized = if matches!(sliced, ColumnData::StringDict { .. }) {
                         sliced.decode_string_dict()
                     } else {
@@ -5984,7 +5984,7 @@ impl OnDemandStorage {
             | ColumnType::Timestamp
             | ColumnType::Date => ColumnData::Int64(vec![0i64; count]),
             ColumnType::Float64 | ColumnType::Float32 => ColumnData::Float64(vec![0.0f64; count]),
-            ColumnType::String | ColumnType::StringDict => ColumnData::String {
+            ColumnType::String | ColumnType::StringDict | ColumnType::Json => ColumnData::String {
                 offsets: vec![0u64; count + 1],
                 data: Vec::new(),
             },
@@ -6536,7 +6536,7 @@ impl OnDemandStorage {
                         ArrowDataType::Binary,
                         Arc::new(BinaryArray::from(Vec::<Option<&[u8]>>::new())),
                     ),
-                    ColumnType::String | ColumnType::StringDict | ColumnType::Null => (
+                    ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::Null => (
                         ArrowDataType::Utf8,
                         Arc::new(StringArray::from(Vec::<Option<&str>>::new())),
                     ),
@@ -6598,7 +6598,7 @@ impl OnDemandStorage {
                         .collect();
                     (ArrowDataType::Float64, Arc::new(Float64Array::from(values)))
                 }
-                ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::Null => {
                     let values: Vec<Option<String>> = positions
                         .iter()
                         .map(|(_, row_idx)| {

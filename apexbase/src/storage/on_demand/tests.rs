@@ -7054,3 +7054,42 @@ fn oversized_column_offsets_are_rejected_instead_of_truncated() {
     .expect_err("offsets past u32::MAX must be rejected");
     assert!(error.to_string().contains("4 GiB"), "{error}");
 }
+
+#[test]
+fn json_schema_survives_a_typed_insert() {
+    use super::{ColumnType, OnDemandStorage};
+    use crate::storage::DurabilityLevel;
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("json_schema.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        DurabilityLevel::Fast,
+        &[("doc".to_string(), ColumnType::Json)],
+    )
+    .unwrap();
+    assert_eq!(storage.get_schema()[0].1, ColumnType::Json, "after create");
+    storage
+        .insert_typed_with_nulls_full(
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::from([(
+                "doc".to_string(),
+                vec!["{\"a\": 1}".to_string()],
+            )]),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+            std::collections::HashMap::new(),
+        )
+        .unwrap();
+    assert_eq!(storage.get_schema()[0].1, ColumnType::Json, "after insert");
+    storage.save().unwrap();
+    assert_eq!(storage.get_schema()[0].1, ColumnType::Json, "after save");
+    drop(storage);
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert_eq!(reopened.get_schema()[0].1, ColumnType::Json);
+    let hits = reopened
+        .scan_string_filter_mmap("doc", "{\"a\": 1}", None)
+        .unwrap();
+    assert_eq!(hits, Some(vec![0]), "json equality scan");
+}

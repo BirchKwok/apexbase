@@ -409,7 +409,7 @@ impl OnDemandStorage {
             None => return Ok(None),
         };
         let col_type = schema.columns[col_idx].1;
-        if !matches!(col_type, ColumnType::String | ColumnType::StringDict) {
+        if !matches!(col_type, ColumnType::String | ColumnType::StringDict | ColumnType::Json) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("column '{col_name}' is not a string column"),
@@ -652,7 +652,7 @@ impl OnDemandStorage {
                     let data = &col_bytes[enc_offset..];
 
                     if encoding == COL_ENCODING_PLAIN
-                        && matches!(ct, ColumnType::String)
+                        && matches!(ct, ColumnType::String | ColumnType::Json)
                         && data.len() >= 8
                     {
                         let count = u64::from_le_bytes(data[0..8].try_into().unwrap()) as usize;
@@ -2359,7 +2359,7 @@ impl OnDemandStorage {
             None => return Ok(None),
         };
         let col_type = schema.columns[col_idx].1;
-        if !matches!(col_type, ColumnType::String | ColumnType::StringDict) {
+        if !matches!(col_type, ColumnType::String | ColumnType::StringDict | ColumnType::Json) {
             return Ok(None);
         }
         let is_dict = matches!(col_type, ColumnType::StringDict);
@@ -6249,7 +6249,7 @@ impl OnDemandStorage {
             None => return Ok(None),
         };
         let col_type = schema.columns[col_idx].1;
-        if !matches!(col_type, ColumnType::String | ColumnType::StringDict) {
+        if !matches!(col_type, ColumnType::String | ColumnType::StringDict | ColumnType::Json) {
             return Ok(None);
         }
         let is_dict_col = matches!(col_type, ColumnType::StringDict);
@@ -6303,7 +6303,7 @@ impl OnDemandStorage {
                 | ColumnType::Timestamp
                 | ColumnType::Date => ArrowDataType::Int64,
                 ColumnType::Float64 | ColumnType::Float32 => ArrowDataType::Float64,
-                ColumnType::String | ColumnType::StringDict => ArrowDataType::Utf8,
+                ColumnType::String | ColumnType::StringDict | ColumnType::Json => ArrowDataType::Utf8,
                 ColumnType::Bool => ArrowDataType::Boolean,
                 _ => ArrowDataType::Utf8,
             };

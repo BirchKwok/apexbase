@@ -756,7 +756,7 @@ impl ApexStorageImpl {
                     };
                     ordered_values.push(SchemaStableValue::Float64(v));
                 }
-                ColumnType::String => {
+                ColumnType::String | ColumnType::Json => {
                     let Ok(v) = value.extract::<&str>() else {
                         return Ok(None);
                     };
@@ -906,11 +906,12 @@ impl ApexStorageImpl {
                 "turboquant4_vector" | "tq4_vector" => ColumnType::TurboQuant4Vector,
                 "timestamp" | "datetime" => ColumnType::Timestamp,
                 "date" => ColumnType::Date,
+                "json" | "jsonb" => ColumnType::Json,
                 _ => return Err(PyValueError::new_err(format!(
                     "Unknown column type '{}' for column '{}'. Supported: int8, int16, int32, int64, \
                      uint8, uint16, uint32, uint64, float32, float64, bool, string, binary, blob, \
                      float32_vector, float16_vector, bfloat16_vector, int8_vector, uint8_vector, \
-                     bit1_vector, turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, date",
+                     bit1_vector, turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, date, json",
                     type_str, col_name
                 ))),
             };

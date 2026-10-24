@@ -1662,8 +1662,10 @@ class ApexClient:
                 ``uint8``/``uint16``/``uint32``/``uint64``, ``float32``/``float64``,
                 ``bool``, ``string``, ``binary``, ``blob``, ``float32_vector``,
                 ``float16_vector``, ``bfloat16_vector``, ``int8_vector``,
-                ``uint8_vector``, ``bit1_vector``, and ``turboquant2_vector`` /
-                ``turboquant3_vector`` / ``turboquant4_vector``.
+                ``uint8_vector``, ``bit1_vector``, ``turboquant2_vector`` /
+                ``turboquant3_vector`` / ``turboquant4_vector``, ``timestamp``,
+                ``date`` and ``json``. A ``json`` column stores canonical JSON
+                text and projects as UTF-8 (comparisons/order use that text).
                 Example: ``{"name": "string", "age": "int64"}``.
 
         Returns:

@@ -1679,7 +1679,7 @@ impl StorageEngine {
                                             };
                                             new_columns.push(ColumnData::Float64(vals));
                                         }
-                                        ColumnType::String
+                                        ColumnType::String | ColumnType::Json
                                         | ColumnType::StringDict
                                         | ColumnType::Null => {
                                             if let Some(vals) = string_columns.get(col_name) {
@@ -2096,7 +2096,7 @@ impl StorageEngine {
                                             };
                                             new_columns.push(ColumnData::Float64(vals));
                                         }
-                                        ColumnType::String
+                                        ColumnType::String | ColumnType::Json
                                         | ColumnType::StringDict
                                         | ColumnType::Null => match col {
                                             Some(ColumnData::String { offsets, data }) => {

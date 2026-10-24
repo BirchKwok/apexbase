@@ -419,7 +419,7 @@ impl ApexStorageImpl {
                     float_columns.insert(col_name.clone(), vec![v]);
                     null_positions.insert(col_name, vec![value.is_none()]);
                 }
-                ColumnType::String | ColumnType::StringDict => {
+                ColumnType::String | ColumnType::StringDict | ColumnType::Json => {
                     let v = if value.is_none() {
                         String::new()
                     } else if let Ok(v) = value.extract::<String>() {
@@ -1889,6 +1889,7 @@ impl ApexStorageImpl {
             "turboquant4_vector" | "tq4_vector" => crate::data::DataType::TurboQuant4Vector,
             "timestamp" | "datetime" => crate::data::DataType::Timestamp,
             "date" => crate::data::DataType::Date,
+            "json" | "jsonb" => crate::data::DataType::Json,
             other => {
                 // Silently creating a String column here used to hide typos in
                 // dynamic callers; fail loudly like create_table() does.
@@ -1898,7 +1899,7 @@ impl ApexStorageImpl {
                      bytes, binary, blob, large_binary, float16_vector, float32_vector, \
                      bfloat16_vector, int8_vector, uint8_vector, bit1_vector, \
                      turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, \
-                     datetime, date",
+                     datetime, date, json",
                     other, column_name
                 )))
             }

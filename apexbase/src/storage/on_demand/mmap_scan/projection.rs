@@ -30,7 +30,7 @@ fn parallel_index_extract_supports(col_type: ColumnType, encoding: u8) -> bool {
         // `RLE_BOOL` is common for long runs (a clustered flag column); the
         // lane decodes it at index below.
         ColumnType::Bool => matches!(encoding, COL_ENCODING_PLAIN | COL_ENCODING_RLE_BOOL),
-        ColumnType::String => encoding == COL_ENCODING_PLAIN,
+        ColumnType::String | ColumnType::Json => encoding == COL_ENCODING_PLAIN,
         _ => false,
     }
 }
@@ -265,7 +265,7 @@ impl OnDemandStorage {
                 return Ok(None);
             };
             match schema.columns[idx].1 {
-                ColumnType::String | ColumnType::StringDict => col_indices.push(idx),
+                ColumnType::String | ColumnType::StringDict | ColumnType::Json => col_indices.push(idx),
                 _ => return Ok(None),
             }
         }
@@ -2332,7 +2332,7 @@ impl OnDemandStorage {
                     len: row_count,
                 })
             }
-            ColumnType::String | ColumnType::Binary | ColumnType::Blob => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob => {
                 // Variable-length type: need to read offsets first
                 self.read_variable_column_range_mmap(
                     mmap_cache, file, index, dtype, start_row, row_count,
@@ -2459,7 +2459,7 @@ impl OnDemandStorage {
         }
 
         match dtype {
-            ColumnType::String => Ok(ColumnData::String { offsets, data }),
+            ColumnType::String | ColumnType::Json => Ok(ColumnData::String { offsets, data }),
             ColumnType::Binary | ColumnType::Blob => Ok(ColumnData::Binary { offsets, data }),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -2690,7 +2690,7 @@ impl OnDemandStorage {
     ) -> io::Result<ColumnData> {
         if row_indices.is_empty() {
             return Ok(match dtype {
-                ColumnType::String => ColumnData::String {
+                ColumnType::String | ColumnType::Json => ColumnData::String {
                     offsets: vec![0],
                     data: Vec::new(),
                 },
@@ -2721,7 +2721,7 @@ impl OnDemandStorage {
 
         if offset_indices.is_empty() {
             return Ok(match dtype {
-                ColumnType::String => ColumnData::String {
+                ColumnType::String | ColumnType::Json => ColumnData::String {
                     offsets: vec![0],
                     data: Vec::new(),
                 },
@@ -2791,7 +2791,7 @@ impl OnDemandStorage {
         }
 
         match dtype {
-            ColumnType::String => Ok(ColumnData::String {
+            ColumnType::String | ColumnType::Json => Ok(ColumnData::String {
                 offsets: result_offsets,
                 data: result_data,
             }),
@@ -3045,7 +3045,7 @@ impl OnDemandStorage {
                 )
                 .map(ColumnData::Float64)
             }
-            ColumnType::String | ColumnType::Binary | ColumnType::Blob => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob => {
                 // Optimized scattered read for variable-length types
                 self.read_variable_column_scattered_mmap(
                     mmap_cache,
@@ -3215,7 +3215,7 @@ impl OnDemandStorage {
                     | ColumnType::Timestamp
                     | ColumnType::Date => ColBuf::I64(vec![None; n_out]),
                     ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_out]),
-                    ColumnType::String | ColumnType::StringDict => {
+                    ColumnType::String | ColumnType::StringDict | ColumnType::Json => {
                         ColBuf::Str(StringBuilder::with_capacity(n_out, n_out * 10))
                     }
                     ColumnType::Bool => ColBuf::Bool(vec![None; n_out]),
@@ -3283,7 +3283,7 @@ impl OnDemandStorage {
                         | ColumnType::Date
                         | ColumnType::Float64
                         | ColumnType::Float32
-                        | ColumnType::String
+                        | ColumnType::String | ColumnType::Json
                         | ColumnType::StringDict
                         | ColumnType::Bool
                 )
@@ -3659,7 +3659,7 @@ impl OnDemandStorage {
                                 Arc::new(arr) as ArrayRef,
                             )
                         }
-                        ColumnType::String => {
+                        ColumnType::String | ColumnType::Json => {
                             let mut ranges: Vec<(usize, usize, usize)> = Vec::new();
                             for_each_rg!(
                                 |pairs: &[(usize, usize)],
@@ -4587,7 +4587,7 @@ impl OnDemandStorage {
                     | ColumnType::Timestamp
                     | ColumnType::Date => ColBuf::I64(vec![None; n_rows]),
                     ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_rows]),
-                    ColumnType::String | ColumnType::StringDict => ColBuf::Str(vec![None; n_rows]),
+                    ColumnType::String | ColumnType::StringDict | ColumnType::Json => ColBuf::Str(vec![None; n_rows]),
                     ColumnType::Bool => ColBuf::Bool(vec![None; n_rows]),
                     ColumnType::Binary => ColBuf::Bin(vec![None; n_rows]),
                     _ => ColBuf::Str(vec![None; n_rows]),
@@ -5076,7 +5076,7 @@ impl OnDemandStorage {
                 | ColumnType::Timestamp
                 | ColumnType::Date => ColBuf::I64(vec![None; n_ids]),
                 ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_ids]),
-                ColumnType::String | ColumnType::StringDict => ColBuf::Str(vec![None; n_ids]),
+                ColumnType::String | ColumnType::StringDict | ColumnType::Json => ColBuf::Str(vec![None; n_ids]),
                 ColumnType::Bool => ColBuf::Bool(vec![None; n_ids]),
                 ColumnType::Binary => ColBuf::Bin(vec![None; n_ids]),
                 _ => ColBuf::Str(vec![None; n_ids]), // rare types as string fallback

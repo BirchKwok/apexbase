@@ -72,7 +72,7 @@ impl ApexExecutor {
     fn column_is_string(backend: &TableStorageBackend, column: &str) -> bool {
         matches!(
             backend.get_column_type(column),
-            Some(crate::data::DataType::String)
+            Some(crate::data::DataType::String | crate::data::DataType::Json)
         )
     }
 

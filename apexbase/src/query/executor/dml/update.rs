@@ -869,7 +869,7 @@ impl ApexExecutor {
             )));
         }
         match target {
-            DataType::String => Ok(Value::String(value.to_string_value())),
+            DataType::String | DataType::Json => Ok(Value::String(value.to_string_value())),
             DataType::Bool => value
                 .as_bool()
                 .map(Value::Bool)

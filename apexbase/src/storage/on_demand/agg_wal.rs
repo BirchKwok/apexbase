@@ -2473,7 +2473,7 @@ impl OnDemandStorage {
                     if encoding == COL_ENCODING_PLAIN && data.len() >= 8 {
                         let count = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0;8])) as usize;
                         match ct {
-                            ColumnType::String => {
+                            ColumnType::String | ColumnType::Json => {
                                 let all_offsets_len = (count + 1) * 4;
                                 if 8 + all_offsets_len + 8 <= data.len() {
                                     let data_len = u64::from_le_bytes(data[8 + all_offsets_len..8 + all_offsets_len + 8].try_into().unwrap_or([0;8])) as usize;
@@ -2619,7 +2619,7 @@ impl OnDemandStorage {
                             if encoding == COL_ENCODING_PLAIN && data.len() >= 8 {
                                 let count = u64::from_le_bytes(data[0..8].try_into().unwrap_or([0;8])) as usize;
                                 match ct {
-                                    ColumnType::String => {
+                                    ColumnType::String | ColumnType::Json => {
                                         let all_offsets_len = (count + 1) * 4;
                                         if 8 + all_offsets_len + 8 <= data.len() {
                                             let data_len = u64::from_le_bytes(data[8 + all_offsets_len..8 + all_offsets_len + 8].try_into().unwrap_or([0;8])) as usize;
@@ -5644,7 +5644,7 @@ impl OnDemandStorage {
                         nulls,
                     })
                 }
-                ColumnType::String => {
+                ColumnType::String | ColumnType::Json => {
                     if data.len() < 8 {
                         return None;
                     }
@@ -9096,7 +9096,7 @@ impl OnDemandStorage {
                     ColumnType::Float64 | ColumnType::Float32 => {
                         float_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
-                    ColumnType::String | ColumnType::StringDict | ColumnType::Null => {
+                    ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::Null => {
                         string_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
                     ColumnType::Binary => {

@@ -495,6 +495,7 @@ pub fn datatype_to_column_type(dt: &DataType) -> ColumnType {
         DataType::Bool => ColumnType::Bool,
         DataType::Binary => ColumnType::Binary,
         DataType::Blob => ColumnType::Blob,
+        DataType::Json => ColumnType::Json,
         DataType::Timestamp => ColumnType::Timestamp,
         DataType::Date => ColumnType::Date,
         DataType::Float32Vector => ColumnType::FixedList,
@@ -523,6 +524,7 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         | ColumnType::UInt8 => DataType::Int64,
         ColumnType::Float64 | ColumnType::Float32 => DataType::Float64,
         ColumnType::String | ColumnType::StringDict => DataType::String,
+        ColumnType::Json => DataType::Json,
         ColumnType::Bool => DataType::Bool,
         ColumnType::Binary => DataType::Binary,
         ColumnType::Blob => DataType::Blob,
@@ -1440,7 +1442,10 @@ impl TableStorageBackend {
 
     #[inline]
     fn scan_string_candidate_supported(&self, column: &str) -> bool {
-        matches!(self.get_column_type(column), Some(DataType::String))
+        matches!(
+            self.get_column_type(column),
+            Some(DataType::String | DataType::Json)
+        )
     }
 
     #[inline]

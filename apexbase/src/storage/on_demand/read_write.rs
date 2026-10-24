@@ -5495,9 +5495,17 @@ impl OnDemandStorage {
                         &chunk_col_owned
                     };
 
-                    // Dict-encode low-cardinality string columns for disk
+                    // Dict-encode low-cardinality string columns for disk. JSON
+                    // columns share the string body format but must keep their
+                    // logical type in the footer, and a dictionary body would
+                    // expose the columns as plain StringDict to readers.
+                    let declared_type = schema_clone.columns[col_idx].1;
                     let dict_encoded = if rg_metas.is_empty() {
-                        Self::dict_encode_if_smaller(chunk_col_ref)
+                        if declared_type == ColumnType::String {
+                            Self::dict_encode_if_smaller(chunk_col_ref)
+                        } else {
+                            None
+                        }
                     } else if matches!(actual_col_types.get(col_idx), Some(ColumnType::StringDict))
                     {
                         chunk_col_ref.to_dict_encoded()
@@ -5518,7 +5526,13 @@ impl OnDemandStorage {
                             // length-prefixed row groups do) would otherwise parse plain
                             // bytes as a dictionary and silently return '' or fail with
                             // "StringDict dict_offsets truncated".
-                            ColumnData::String { .. } => ColumnType::String,
+                            ColumnData::String { .. } => {
+                                if schema_clone.columns[col_idx].1 == ColumnType::Json {
+                                    ColumnType::Json
+                                } else {
+                                    ColumnType::String
+                                }
+                            }
                             _ => schema_clone.columns[col_idx].1,
                         };
                         actual_col_types.push(actual_type);
@@ -7650,7 +7664,7 @@ impl OnDemandStorage {
                 .unwrap_or(16.0),
             None => match col_type {
                 ColumnType::Bool => 1.0,
-                ColumnType::Binary | ColumnType::String | ColumnType::StringDict => 16.0,
+                ColumnType::Binary | ColumnType::String | ColumnType::StringDict | ColumnType::Json => 16.0,
                 ColumnType::FixedList => 32.0,
                 ColumnType::Float16List => 16.0,
                 dtype if dtype.vector_codec().is_some() => 16.0,

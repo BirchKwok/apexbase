@@ -1838,7 +1838,7 @@ fn read_column_encoded_partial(
             let data = data_bytes[8..8 + byte_len].to_vec();
             Ok((ColumnData::Bool { data, len: actual }, total_consumed))
         }
-        ColumnType::String => {
+        ColumnType::String | ColumnType::Json => {
             if data_bytes.len() < 8 {
                 return Err(err_data("partial String: truncated"));
             }
@@ -2382,6 +2382,7 @@ const TYPE_BIT1_VECTOR: u8 = 23;
 const TYPE_TURBOQUANT2_VECTOR: u8 = 24;
 const TYPE_TURBOQUANT3_VECTOR: u8 = 25;
 const TYPE_TURBOQUANT4_VECTOR: u8 = 26;
+const TYPE_JSON: u8 = 27; // JSON document stored as canonical JSON text
 
 // ============================================================================
 // Data Types
