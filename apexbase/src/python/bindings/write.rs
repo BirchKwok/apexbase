@@ -2459,15 +2459,17 @@ impl ApexStorageImpl {
         col: &str,
         nlist: usize,
         iterations: usize,
+        metric: &str,
     ) -> PyResult<()> {
         let table_path = self.get_current_table_path()?;
         let col = col.to_string();
+        let metric = metric.to_string();
         py.allow_threads(|| {
             let backend = crate::Database::cached_backend(&table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             backend
                 .storage
-                .create_vector_index(&col, nlist, iterations)
+                .create_vector_index(&col, nlist, iterations, &metric)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })
     }

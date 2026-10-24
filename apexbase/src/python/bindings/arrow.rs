@@ -541,9 +541,9 @@ impl ApexStorageImpl {
         use crate::compute::vector_ops::bytes_to_query_vec_f32;
         use arrow::array::Int64Array;
 
-        if metric != "l2" && metric != "euclidean" {
+        if metric.is_empty() {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                "_topk_distance_ivf_ffi: the coarse index stores l2 distances; use metric='l2'",
+                "_topk_distance_ivf_ffi: metric must be non-empty",
             ));
         }
         let query_f32 = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
@@ -555,13 +555,14 @@ impl ApexStorageImpl {
             .get_current_table_path()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
         let col_owned = col.to_string();
+        let metric_owned = metric.to_string();
 
         py.allow_threads(|| -> PyResult<(Vec<i64>, Vec<f64>)> {
             let backend = crate::Database::cached_backend(&table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let Some(topk) = backend
                 .storage
-                .topk_ivf(&col_owned, &query_f32, k, nprobe)
+                .topk_ivf(&col_owned, &query_f32, k, nprobe, &metric_owned)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
             else {
                 return Err(PyRuntimeError::new_err(format!(

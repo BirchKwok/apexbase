@@ -132,3 +132,59 @@ def test_nprobe_rejects_a_stale_index_and_info_reports_it():
             assert full["ids"] == exact["ids"]
         finally:
             client.close()
+
+
+def test_cosine_index_probes_match_bruteforce():
+    with tempfile.TemporaryDirectory() as tmp:
+        # Orthogonal cluster directions make cosine neighbourhoods unambiguous,
+        # so a single-list probe has a high recall floor.
+        rng = np.random.default_rng(3)
+        centers = np.zeros((4, DIM), dtype=np.float32)
+        for index in range(4):
+            centers[index, index] = 8.0
+        labels = rng.integers(0, 4, ROWS)
+        matrix = (
+            centers[labels] + rng.standard_normal((ROWS, DIM)).astype(np.float32) * 0.1
+        ).astype(np.float32)
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("t", {"label": "int64", "vec": "float32_vector"})
+        client.use_table("t")
+        client.store({"label": list(range(ROWS)), "vec": [matrix[i] for i in range(ROWS)]})
+        client.flush()
+        # One list per cluster: a one-list probe then covers the query's whole
+        # cluster, while nprobe=4 still scans every list.
+        client.create_vector_index("vec", nlist=4, iterations=8, metric="cosine")
+        try:
+            assert client.vector_index_info()["metric"] == "cosine"
+            query = matrix[321].copy()
+            exact = client.topk_distance("vec", query, k=10, metric="cosine", raw=True)
+            full = client.topk_distance(
+                "vec", query, k=10, metric="cosine", nprobe=4, raw=True
+            )
+            # Equal-distance cluster mates can swap places between the exact
+            # heap and the per-list merge, so compare the distance profile and
+            # the neighbour set with a tie allowance.
+            assert len(set(full["ids"]) & set(exact["ids"])) >= 9
+            assert all(
+                abs(left - right) < 1e-4
+                for left, right in zip(
+                    sorted(full["distances"]), sorted(exact["distances"])
+                )
+            )
+            approximate = client.topk_distance(
+                "vec", query, k=10, metric="cosine", nprobe=1, raw=True
+            )
+            overlap = len(set(approximate["ids"]) & set(exact["ids"]))
+            assert overlap >= 8, (overlap, approximate, exact)
+        finally:
+            client.close()
+
+
+def test_create_vector_index_rejects_unsupported_metric():
+    with tempfile.TemporaryDirectory() as tmp:
+        client, _ = _make_table(tmp)
+        try:
+            with pytest.raises(ValueError, match="metric"):
+                client.create_vector_index("vec", nlist=8, metric="l1")
+        finally:
+            client.close()

@@ -6127,7 +6127,13 @@ class ApexClient:
             }
         return {'fts_enabled': True, 'engine_initialized': False, 'table': table}
 
-    def create_vector_index(self, col: str, nlist: int = 64, iterations: int = 10) -> None:
+    def create_vector_index(
+        self,
+        col: str,
+        nlist: int = 64,
+        iterations: int = 10,
+        metric: str = 'l2',
+    ) -> None:
         """Build and persist a coarse IVF index for a float32 vector column.
 
         The index lives next to the table (``<table>.apex.ivf``) and stores
@@ -6140,10 +6146,15 @@ class ApexClient:
             col: float32 vector column (fixed-size list or binary f32).
             nlist: number of coarse clusters (clamped to the row count).
             iterations: k-means refinement steps (at least 1).
+            metric: ``'l2'`` (default) or ``'cosine'``; must match the
+                ``topk_distance`` metric used to query the index.
         """
         self._check_connection()
         self._ensure_table_selected()
-        self._storage._create_vector_index(col, int(nlist), int(iterations))
+        metric = metric.lower()
+        if metric not in ("l2", "cosine"):
+            raise ValueError("create_vector_index: metric must be 'l2' or 'cosine'")
+        self._storage._create_vector_index(col, int(nlist), int(iterations), metric)
 
     def vector_index_info(self):
         """Return the coarse vector index metadata, or ``None`` if absent.

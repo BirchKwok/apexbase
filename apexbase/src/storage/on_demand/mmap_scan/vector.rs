@@ -29,6 +29,29 @@ pub struct VectorIndexInfo {
     pub stale: bool,
 }
 
+/// Metric codes stored in an AVIX header: 0 = L2, 1 = cosine distance.
+fn vector_index_metric_code(metric: &str) -> io::Result<u8> {
+    use crate::compute::vector_ops::DistanceMetric;
+    match DistanceMetric::from_str(metric) {
+        Some(DistanceMetric::L2) => Ok(0),
+        Some(DistanceMetric::CosineDistance) => Ok(1),
+        _ => Err(err_data(
+            "create_vector_index supports metric 'l2' or 'cosine' only",
+        )),
+    }
+}
+
+fn vector_index_metric(code: u8) -> io::Result<crate::compute::vector_ops::DistanceMetric> {
+    use crate::compute::vector_ops::DistanceMetric;
+    match code {
+        0 => Ok(DistanceMetric::L2),
+        1 => Ok(DistanceMetric::CosineDistance),
+        other => Err(err_data(format!(
+            "vector index uses unsupported metric code {other}"
+        ))),
+    }
+}
+
 impl OnDemandStorage {
     pub fn topk_binary_direct(
         &self,
@@ -1669,7 +1692,9 @@ impl OnDemandStorage {
         col_name: &str,
         nlist: usize,
         iterations: usize,
+        metric: &str,
     ) -> io::Result<()> {
+        let metric_code = vector_index_metric_code(metric)?;
         if self.has_delta() || self.has_pending_deltas() {
             return Err(err_data(
                 "create_vector_index requires a flushed table with no pending writes",
@@ -1685,6 +1710,28 @@ impl OnDemandStorage {
         if rows == 0 {
             return Err(err_data("create_vector_index: the table has no rows"));
         }
+        // Cosine distance is invariant to vector length, so the coarse lists and
+        // the stored payloads use normalised copies: L2 over them equals the
+        // cosine distance of the originals, which keeps every probe exact.
+        let vectors = if metric_code == 1 {
+            let mut normalised = vectors;
+            for row in 0..rows {
+                let start = row * dim;
+                let norm = normalised[start..start + dim]
+                    .iter()
+                    .map(|value| value * value)
+                    .sum::<f32>()
+                    .sqrt();
+                if norm > 0.0 {
+                    for value in &mut normalised[start..start + dim] {
+                        *value /= norm;
+                    }
+                }
+            }
+            normalised
+        } else {
+            vectors
+        };
         let nlist = nlist.max(1).min(rows);
         let iterations = iterations.max(1);
         let (centroids, assignments, inertia) =
@@ -1704,7 +1751,7 @@ impl OnDemandStorage {
         );
         payload.extend_from_slice(b"AVIX");
         payload.push(2);
-        payload.push(0);
+        payload.push(metric_code);
         payload.extend_from_slice(&(dim as u32).to_le_bytes());
         payload.extend_from_slice(&(nlist as u32).to_le_bytes());
         payload.extend_from_slice(&(rows as u64).to_le_bytes());
@@ -1797,6 +1844,7 @@ impl OnDemandStorage {
         let (version, dim, nlist, rows, inertia) = Self::vector_index_header(bytes)?;
         let metric = match bytes[5] {
             0 => "l2".to_string(),
+            1 => "cosine".to_string(),
             other => format!("metric_{other}"),
         };
         let offsets_start = 32 + nlist * dim * 4;
@@ -1842,6 +1890,7 @@ impl OnDemandStorage {
         query: &[f32],
         k: usize,
         nprobe: usize,
+        metric: &str,
     ) -> io::Result<Option<Vec<(usize, f32)>>> {
         let Some(mmap) = self.vector_index_mmap()? else {
             return Ok(None);
@@ -1879,15 +1928,21 @@ impl OnDemandStorage {
         for chunk in bytes[offsets_end..ids_end].chunks_exact(4) {
             row_ids.push(u32::from_le_bytes(chunk.try_into().unwrap()));
         }
+        let requested_metric = vector_index_metric_code(metric)?;
+        if requested_metric != bytes[5] {
+            return Err(err_data(
+                "topk_distance metric does not match the coarse index; rebuild the index for this metric",
+            ));
+        }
+        let metric = vector_index_metric(bytes[5])?;
+        let computer = crate::compute::vector_ops::DistanceComputer::new(
+            metric,
+            query.to_vec(),
+        );
         let mut lists: Vec<(f32, usize)> = (0..nlist)
             .map(|list| {
                 let centroid = &centroids[list * dim..(list + 1) * dim];
-                let mut distance = 0f32;
-                for index in 0..dim {
-                    let delta = query[index] - centroid[index];
-                    distance += delta * delta;
-                }
-                (distance, list)
+                (computer.compute(centroid), list)
             })
             .collect();
         lists.sort_unstable_by(|left, right| left.0.total_cmp(&right.0));
@@ -1895,9 +1950,7 @@ impl OnDemandStorage {
         let mut best: Vec<(usize, f32)> = Vec::with_capacity(k.saturating_mul(probe).max(16));
 
         if version >= 2 {
-            use crate::compute::vector_ops::{
-                topk_heap_on_floats, DistanceComputer, DistanceMetric,
-            };
+            use crate::compute::vector_ops::topk_heap_on_floats;
             let vectors_end = ids_end + rows * dim * 4;
             if vectors_end > bytes.len() {
                 return Err(err_data("vector index vector payload is truncated"));
@@ -1909,7 +1962,6 @@ impl OnDemandStorage {
             // mapping outlives this borrow.
             let list_vectors: &[f32] =
                 unsafe { std::slice::from_raw_parts(vector_bytes.as_ptr() as *const f32, rows * dim) };
-            let computer = DistanceComputer::new(DistanceMetric::L2, query.to_vec());
             for (_, list) in lists.iter().take(probe) {
                 let start = offsets[*list] as usize;
                 let end = offsets[*list + 1] as usize;
@@ -1934,8 +1986,13 @@ impl OnDemandStorage {
             return Ok(Some(best));
         }
 
-        // v1 index files carry no vector payload: use the cached column buffer
-        // and scalar candidate scoring.
+        // v1 index files carry no vector payload: they were only ever built for
+        // L2, so keep the legacy scalar path for them.
+        if bytes[5] != 0 {
+            return Err(err_data(
+                "legacy v1 vector indexes only support the l2 metric; rebuild the index",
+            ));
+        }
         let fingerprint = std::fs::metadata(&self.path).ok().map(|metadata| {
             let modified = metadata
                 .modified()

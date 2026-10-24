@@ -39,6 +39,7 @@ def main() -> int:
     parser.add_argument("--nlist", type=int, default=64)
     parser.add_argument("--nprobe", type=int, default=8)
     parser.add_argument("--k", type=int, default=10)
+    parser.add_argument("--metric", choices=("l2", "cosine"), default="l2")
     parser.add_argument("--output")
     args = parser.parse_args()
 
@@ -54,26 +55,42 @@ def main() -> int:
         client.flush()
         try:
             query = matrix[args.rows // 2].copy()
-            exact = client.topk_distance("vec", query, k=args.k, raw=True)
+            exact = client.topk_distance(
+                "vec", query, k=args.k, metric=args.metric, raw=True
+            )
             build_start = time.perf_counter()
-            client.create_vector_index("vec", nlist=args.nlist, iterations=6)
+            client.create_vector_index(
+                "vec", nlist=args.nlist, iterations=6, metric=args.metric
+            )
             build_ms = (time.perf_counter() - build_start) * 1000
-            probe = client.topk_distance("vec", query, k=args.k, nprobe=args.nprobe, raw=True)
+            probe = client.topk_distance(
+                "vec", query, k=args.k, metric=args.metric, nprobe=args.nprobe, raw=True
+            )
             recall = len(set(probe["ids"]) & set(exact["ids"])) / max(1, len(exact["ids"]))
 
             brute_ms = _median_ms(
-                lambda: client.topk_distance("vec", query, k=args.k, raw=True)
+                lambda: client.topk_distance(
+                    "vec", query, k=args.k, metric=args.metric, raw=True
+                )
             )
             probe_ms = _median_ms(
                 lambda: client.topk_distance(
-                    "vec", query, k=args.k, nprobe=args.nprobe, raw=True
+                    "vec",
+                    query,
+                    k=args.k,
+                    metric=args.metric,
+                    nprobe=args.nprobe,
+                    raw=True,
                 )
             )
             rows = [
                 {"category": "ApexBase vector index", "query": f"TopK brute force (rows={args.rows}, dim={args.dim})", "ApexBase": round(brute_ms, 3)},
                 {"category": "ApexBase vector index", "query": f"TopK IVF nprobe={args.nprobe}/{args.nlist} (rows={args.rows}, dim={args.dim})", "ApexBase": round(probe_ms, 3)},
             ]
-            print(f"rows={args.rows} dim={args.dim} nlist={args.nlist} nprobe={args.nprobe}")
+            print(
+                f"rows={args.rows} dim={args.dim} nlist={args.nlist} "
+                f"nprobe={args.nprobe} metric={args.metric}"
+            )
             print(f"index build          {build_ms:.1f} ms")
             print(f"brute force          {brute_ms:.4f} ms")
             print(f"IVF nprobe={args.nprobe}       {probe_ms:.4f} ms  (speedup {brute_ms / probe_ms:.2f}x)")
