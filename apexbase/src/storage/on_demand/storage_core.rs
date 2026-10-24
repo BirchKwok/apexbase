@@ -28,6 +28,64 @@ const DEFAULT_PAGE_CACHE_BUDGET_BYTES: usize = 16 * 1024 * 1024;
 /// the budget (`0` = unlimited; out-of-core runs pass limit/8).
 const DEFAULT_SCAN_BUFFER_BUDGET_BYTES: usize = 512 * 1024 * 1024;
 
+// ---------------------------------------------------------------------------
+// Process-level memory budget
+// ---------------------------------------------------------------------------
+
+/// Default budget for the process storage caches: 1 GiB.
+///
+/// The individual cache caps are historically fixed at 512 MiB (scan buffers),
+/// 64 MiB (decompressed row groups) and 128 MiB (numeric aggregation cache) —
+/// exactly the fractions below of a 1 GiB budget. `APEX_STORAGE_BUDGET_MB` scales
+/// the split coherently instead of tuning each cache separately; a deployment
+/// that must bound RSS sets the budget once and every storage cache follows.
+/// (`APEX_QUERY_MEMORY_MB` remains the separate per-query state budget, default
+/// 1 GiB, and is not touched by this knob.)
+pub(crate) const DEFAULT_STORAGE_BUDGET_BYTES: usize = 1024 * 1024 * 1024;
+
+/// Cache limits derived from the process memory budget.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CacheCaps {
+    pub scan_buffer: usize,
+    pub decompressed_rg: usize,
+    pub numeric_agg: usize,
+}
+
+/// Split a memory budget across the storage caches.
+///
+/// Fractions: scan buffers 1/2, numeric aggregation 1/8, decompressed row groups
+/// 1/16. A zero budget disables the process knob and keeps today's fixed caps.
+pub(crate) fn derive_cache_caps(budget_bytes: usize) -> CacheCaps {
+    let class = |divisor: usize| (budget_bytes / divisor).max(1);
+    CacheCaps {
+        scan_buffer: class(2),
+        numeric_agg: class(8),
+        decompressed_rg: class(16),
+    }
+}
+
+/// `APEX_STORAGE_BUDGET_MB` parsing, kept pure for tests: `0` disables the knob
+/// (fixed caps), an unparsable or tiny value falls back to the default budget.
+pub(crate) fn parse_storage_budget(raw: Option<&str>) -> usize {
+    match raw {
+        Some(value) => match value.trim().parse::<usize>() {
+            Ok(0) => 0,
+            Ok(mb) if mb >= 64 => mb.saturating_mul(1024 * 1024),
+            _ => DEFAULT_STORAGE_BUDGET_BYTES,
+        },
+        None => DEFAULT_STORAGE_BUDGET_BYTES,
+    }
+}
+
+/// Effective cache caps for this process.
+pub(crate) fn cache_caps() -> CacheCaps {
+    let budget = parse_storage_budget(std::env::var("APEX_STORAGE_BUDGET_MB").ok().as_deref());
+    if budget == 0 {
+        return derive_cache_caps(DEFAULT_STORAGE_BUDGET_BYTES);
+    }
+    derive_cache_caps(budget)
+}
+
 /// `APEX_SCAN_BUFFER_MB` parsing, kept pure so it can be tested without mutating the
 /// process environment: `0` means unlimited, an unparsable value falls back to the
 /// default budget.
@@ -1806,7 +1864,8 @@ impl OnDemandStorage {
         };
         let body = std::sync::Arc::new(decompressed);
         let mut cache = self.decompressed_rg_cache.write();
-        cache.insert(key, std::sync::Arc::clone(&body));
+        let budget = self.decompressed_rg_budget_bytes();
+        cache.insert(key, std::sync::Arc::clone(&body), budget);
         Ok(Some(body))
     }
 
@@ -2571,7 +2630,17 @@ impl OnDemandStorage {
     /// environment lookup is irrelevant next to the scan it guards, and tests can
     /// toggle it between queries.
     pub(crate) fn scan_buffer_budget_bytes(&self) -> usize {
-        parse_scan_buffer_budget(std::env::var("APEX_SCAN_BUFFER_MB").ok().as_deref())
+        match std::env::var("APEX_SCAN_BUFFER_MB").ok().as_deref() {
+            Some(value) => parse_scan_buffer_budget(Some(value)),
+            None => cache_caps().scan_buffer,
+        }
+    }
+
+    pub(crate) fn decompressed_rg_budget_bytes(&self) -> usize {
+        match std::env::var("APEX_DECOMPRESSED_RG_MB").ok().as_deref() {
+            Some(value) => parse_scan_buffer_budget(Some(value)),
+            None => cache_caps().decompressed_rg,
+        }
     }
 
     /// The row-group deletion vector, read straight from the mmap row groups.
@@ -6779,24 +6848,20 @@ pub(crate) struct DecompressedRgCache {
     bytes: usize,
 }
 
-/// Byte budget for `DecompressedRgCache` (the whole group is kept, so the budget
-/// is per table rather than per page).
-pub(crate) const DECOMPRESSED_RG_BUDGET: usize = 64 << 20;
-
 impl DecompressedRgCache {
     fn get(&self, key: (u64, u64)) -> Option<std::sync::Arc<Vec<u8>>> {
         self.entries.get(&key).cloned()
     }
 
-    fn insert(&mut self, key: (u64, u64), body: std::sync::Arc<Vec<u8>>) {
-        if body.len() > DECOMPRESSED_RG_BUDGET {
+    fn insert(&mut self, key: (u64, u64), body: std::sync::Arc<Vec<u8>>, budget: usize) {
+        if body.len() > budget {
             return;
         }
         if self.entries.insert(key, std::sync::Arc::clone(&body)).is_none() {
             self.order.push_back(key);
             self.bytes += body.len();
         }
-        while self.bytes > DECOMPRESSED_RG_BUDGET {
+        while self.bytes > budget {
             let Some(oldest) = self.order.pop_front() else {
                 break;
             };

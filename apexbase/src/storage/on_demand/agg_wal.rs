@@ -3464,7 +3464,7 @@ impl OnDemandStorage {
             .into_iter()
             .map(std::sync::Arc::new)
             .collect::<Vec<_>>();
-        const MAX_CACHE_BYTES: usize = 128 * 1024 * 1024;
+        let max_cache_bytes = crate::storage::on_demand::cache_caps().numeric_agg;
         const MAX_CACHE_COLUMNS: usize = 16;
         let mut cache = self.numeric_scan_cache.write();
         for (&index, column) in column_indices.iter().zip(&decoded) {
@@ -3476,13 +3476,13 @@ impl OnDemandStorage {
                 ColumnData::Float64(values) => values.len() * std::mem::size_of::<f64>(),
                 _ => 0,
             };
-            if bytes == 0 || bytes > MAX_CACHE_BYTES {
+            if bytes == 0 || bytes > max_cache_bytes {
                 continue;
             }
             let mut current_bytes = cache.iter().map(|(_, _, bytes)| *bytes).sum::<usize>();
             while !cache.is_empty()
                 && (cache.len() >= MAX_CACHE_COLUMNS
-                    || current_bytes.saturating_add(bytes) > MAX_CACHE_BYTES)
+                    || current_bytes.saturating_add(bytes) > max_cache_bytes)
             {
                 let (_, _, removed_bytes) = cache.remove(0);
                 current_bytes = current_bytes.saturating_sub(removed_bytes);

@@ -3741,6 +3741,42 @@ fn filtered_numeric_agg_skips_aggregate_column_nulls_across_row_groups() {
 }
 
 #[test]
+fn storage_budget_derives_the_cache_caps() {
+    use crate::storage::on_demand::{
+        derive_cache_caps, parse_storage_budget, DEFAULT_STORAGE_BUDGET_BYTES,
+    };
+    const MB: usize = 1024 * 1024;
+    assert_eq!(
+        parse_storage_budget(None),
+        DEFAULT_STORAGE_BUDGET_BYTES,
+        "1 GiB by default"
+    );
+    assert_eq!(parse_storage_budget(Some("0")), 0, "0 disables the knob");
+    assert_eq!(
+        parse_storage_budget(Some("32")),
+        DEFAULT_STORAGE_BUDGET_BYTES,
+        "a tiny budget falls back to the default instead of starving the caches"
+    );
+    assert_eq!(parse_storage_budget(Some("2048")), 2048 * MB);
+    assert_eq!(
+        parse_storage_budget(Some("nonsense")),
+        DEFAULT_STORAGE_BUDGET_BYTES
+    );
+
+    let defaults = derive_cache_caps(DEFAULT_STORAGE_BUDGET_BYTES);
+    assert_eq!(defaults.scan_buffer, 512 * MB);
+    assert_eq!(defaults.decompressed_rg, 64 * MB);
+    assert_eq!(defaults.numeric_agg, 128 * MB);
+    let quarter = derive_cache_caps(256 * MB);
+    assert_eq!(quarter.scan_buffer, 128 * MB);
+    assert_eq!(quarter.decompressed_rg, 16 * MB);
+    assert_eq!(quarter.numeric_agg, 32 * MB);
+    let tiny = derive_cache_caps(1);
+    assert_eq!(tiny.scan_buffer, 1);
+    assert_eq!(tiny.decompressed_rg, 1);
+}
+
+#[test]
 fn scan_buffer_budget_env_parsing() {
     // The vector TopK lanes hold a whole-column buffer; `APEX_SCAN_BUFFER_MB` decides how
     // large that may get before the lane stands down and reads a windowed batch instead
