@@ -3144,6 +3144,57 @@ impl ApexExecutor {
 
         let upper = name.to_uppercase();
         match upper.as_str() {
+            "JSON_EXTRACT" | "JSON_QUERY" | "JSON_VALUE" => {
+                if args.len() != 2 {
+                    return Err(err_input(format!("{upper} requires 2 arguments")));
+                }
+                let docs = Self::evaluate_expr_to_array(batch, &args[0])?;
+                let paths = Self::evaluate_expr_to_array(batch, &args[1])?;
+                let docs = docs
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| err_data(format!("{upper} requires a string/JSON column")))?;
+                let paths = paths
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .ok_or_else(|| err_data(format!("{upper} requires a string path")))?;
+                let scalar_only = upper == "JSON_VALUE";
+                let num_rows = batch.num_rows();
+                let mut out: Vec<Option<String>> = Vec::with_capacity(num_rows);
+                for row in 0..num_rows {
+                    let path_index = if paths.len() == 1 { 0 } else { row };
+                    if docs.is_null(row)
+                        || path_index >= paths.len()
+                        || paths.is_null(path_index)
+                    {
+                        out.push(None);
+                        continue;
+                    }
+                    let Ok(document) = serde_json::from_str::<serde_json::Value>(docs.value(row))
+                    else {
+                        out.push(None);
+                        continue;
+                    };
+                    let Some(found) = json_path_get(&document, paths.value(path_index)) else {
+                        out.push(None);
+                        continue;
+                    };
+                    if scalar_only {
+                        out.push(match found {
+                            serde_json::Value::String(text) => Some(text.clone()),
+                            serde_json::Value::Null => None,
+                            serde_json::Value::Number(number) => Some(number.to_string()),
+                            serde_json::Value::Bool(flag) => Some(flag.to_string()),
+                            _ => None,
+                        });
+                    } else {
+                        out.push(Some(found.to_string()));
+                    }
+                }
+                return Ok(Arc::new(StringArray::from(
+                    out.iter().map(|value| value.as_deref()).collect::<Vec<_>>(),
+                )));
+            }
             "GETVARIABLE" => {
                 if args.len() != 1 {
                     return Err(err_input("GETVARIABLE requires exactly one argument"));
@@ -6749,4 +6800,43 @@ impl ApexExecutor {
             Ok(result)
         }
     }
+}
+
+/// Resolve a minimal JSON path (`$`, `$.a`, `$.a[0].b`, `$['a']`) against a value.
+///
+/// Supports object keys after `.` or in single quotes inside brackets and array
+/// indexes; anything else returns `None` (the caller yields SQL NULL).
+pub(crate) fn json_path_get<'a>(
+    value: &'a serde_json::Value,
+    path: &str,
+) -> Option<&'a serde_json::Value> {
+    let mut rest = path.trim();
+    rest = rest.strip_prefix('$')?;
+    let mut current = value;
+    while !rest.is_empty() {
+        if let Some(stripped) = rest.strip_prefix('.') {
+            let end = stripped
+                .find(|c| c == '.' || c == '[')
+                .unwrap_or(stripped.len());
+            let key = &stripped[..end];
+            if key.is_empty() {
+                return None;
+            }
+            current = current.get(key)?;
+            rest = &stripped[end..];
+        } else if let Some(stripped) = rest.strip_prefix('[') {
+            let close = stripped.find(']')?;
+            let inner = stripped[..close].trim();
+            if let Some(quoted) = inner.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')) {
+                current = current.get(quoted)?;
+            } else {
+                let index: usize = inner.parse().ok()?;
+                current = current.get(index)?;
+            }
+            rest = &stripped[close + 1..];
+        } else {
+            return None;
+        }
+    }
+    Some(current)
 }
