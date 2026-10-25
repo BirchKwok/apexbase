@@ -225,39 +225,135 @@ fn assemble_chunked_body(
         .unwrap_or(0)
         .min(declared);
     let mut pos = 0usize;
+    // One zstd context per group: creating a `bulk::Decompressor` per frame cost
+    // more than decompressing the frame itself (4 groups x 4 frames vs 4 flat
+    // frames), which kept chunked point reads ~3x behind the flat layout.
+    let mut zstd_decoder = zstd::bulk::Decompressor::new()?;
     if prefix > 0 {
-        if raw.len() < CHUNK_FRAME_HEADER_LEN {
-            return Err(err_data("chunked prefix frame truncated"));
-        }
-        let frame_len = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
-        let frame_end = CHUNK_FRAME_HEADER_LEN + frame_len;
-        if frame_end > raw.len() {
-            return Err(err_data("chunked prefix frame runs past the row group"));
-        }
-        let bytes = decompress_column_frame(&raw[..frame_end])?;
-        let copy = prefix.min(bytes.len());
-        out[..copy].copy_from_slice(&bytes[..copy]);
-        pos = frame_end;
+        let bytes = chunk_frame_bytes(raw, &mut pos)?;
+        decompress_frame_into(bytes, &mut out[..prefix], &mut zstd_decoder)?;
     }
-    for col in columns.iter().flatten() {
-        let mut frame_pos = pos;
+    // Each column's flat range is `[flat_off, next flat_off)` (the last one runs
+    // to the declared body length), so a single-frame column can decompress
+    // straight into its destination instead of allocating a temporary Vec and
+    // copying it in. That intermediate buffer and copy was the bulk of the
+    // chunked-vs-flat gap on point reads.
+    let starts: Vec<usize> = columns
+        .iter()
+        .map(|col| {
+            col.as_ref()
+                .map(|col| col.flat_off as usize)
+                .unwrap_or(usize::MAX)
+        })
+        .collect();
+    let mut ranges: Vec<(usize, usize)> = vec![(0, 0); columns.len()];
+    for (index, &start) in starts.iter().enumerate() {
+        if start == usize::MAX {
+            continue;
+        }
+        let end = starts[index + 1..]
+            .iter()
+            .copied()
+            .find(|&later| later != usize::MAX)
+            .unwrap_or(declared);
+        ranges[index] = (start, end);
+    }
+    for (index, col) in columns.iter().enumerate() {
+        let Some(col) = col else { continue; };
+        let (start, end) = ranges[index];
+        if end < start || end > out.len() {
+            return Err(err_data("chunked column frame exceeds the flat body"));
+        }
+        let mut cursor = start;
         for chunk in &col.chunks {
-            let frame_end = frame_pos + CHUNK_FRAME_HEADER_LEN + chunk.len as usize;
+            let frame_end = pos + CHUNK_FRAME_HEADER_LEN + chunk.len as usize;
             if frame_end > raw.len() {
                 return Err(err_data("chunked column frame runs past the row group"));
             }
-            let bytes = decompress_column_frame(&raw[frame_pos..frame_end])?;
-            let start = col.flat_off as usize;
-            let end = start + bytes.len();
-            if end > out.len() {
-                return Err(err_data("chunked column frame exceeds the flat body"));
+            let frame = &raw[pos..frame_end];
+            pos = frame_end;
+            if col.chunks.len() == 1 && end >= cursor {
+                decompress_frame_into(frame, &mut out[cursor..end], &mut zstd_decoder)?;
+                cursor = end;
+            } else {
+                let bytes = decompress_column_frame(frame)?;
+                if cursor + bytes.len() > out.len() {
+                    return Err(err_data("chunked column frame exceeds the flat body"));
+                }
+                out[cursor..cursor + bytes.len()].copy_from_slice(&bytes);
+                cursor += bytes.len();
             }
-            out[start..end].copy_from_slice(&bytes);
-            frame_pos = frame_end;
         }
-        pos = frame_pos;
     }
     Ok(out)
+}
+
+/// Return the raw bytes of one chunk frame at `*position` and advance it.
+#[inline]
+fn chunk_frame_bytes<'a>(raw: &'a [u8], position: &mut usize) -> io::Result<&'a [u8]> {
+    let start = *position;
+    if raw.len() < start + CHUNK_FRAME_HEADER_LEN {
+        return Err(err_data("chunked frame truncated"));
+    }
+    let len = u32::from_le_bytes(raw[start..start + 4].try_into().unwrap()) as usize;
+    let end = start + CHUNK_FRAME_HEADER_LEN + len;
+    if end > raw.len() {
+        return Err(err_data("chunked frame runs past the row group"));
+    }
+    *position = end;
+    Ok(&raw[start..end])
+}
+
+/// Decompress one chunk frame into an exact-length destination buffer.
+///
+/// Mirrors `decompress_column_frame`, but writes into caller memory so the
+/// assembly path does not allocate one temporary `Vec` per column frame.
+fn decompress_frame_into(
+    frame: &[u8],
+    destination: &mut [u8],
+    zstd_decoder: &mut zstd::bulk::Decompressor,
+) -> io::Result<()> {
+    if frame.len() < CHUNK_FRAME_HEADER_LEN {
+        return Err(err_data("chunked column frame truncated"));
+    }
+    let len = u32::from_le_bytes(frame[0..4].try_into().unwrap()) as usize;
+    if CHUNK_FRAME_HEADER_LEN + len > frame.len() {
+        return Err(err_data("chunked column frame truncated"));
+    }
+    let flag = frame[4];
+    let body = &frame[CHUNK_FRAME_HEADER_LEN..CHUNK_FRAME_HEADER_LEN + len];
+    match flag {
+        RG_COMPRESS_NONE => {
+            if body.len() != destination.len() {
+                return Err(err_data("chunked column frame size mismatch"));
+            }
+            destination.copy_from_slice(body);
+        }
+        RG_COMPRESS_ZSTD => {
+            let written = zstd_decoder
+                .decompress_to_buffer(body, destination)
+                .map_err(|error| err_data(format!("ZSTD decompress failed: {error}")))?;
+            if written != destination.len() {
+                return Err(err_data("chunked column frame size mismatch"));
+            }
+        }
+        RG_COMPRESS_LZ4 => {
+            if body.len() < 4 {
+                return Err(err_data("chunked column frame size mismatch"));
+            }
+            let written = lz4_flex::decompress_into(&body[4..], destination)
+                .map_err(|error| err_data(format!("LZ4 decompress failed: {error}")))?;
+            if written != destination.len() {
+                return Err(err_data("chunked column frame size mismatch"));
+            }
+        }
+        other => {
+            return Err(err_data(format!(
+                "unsupported chunk frame compression {other}"
+            )))
+        }
+    }
+    Ok(())
 }
 
 /// Parse one V4 Row Group from its on-disk bytes (32-byte header + body).
@@ -1939,7 +2035,7 @@ impl OnDemandStorage {
         wanted: &[usize],
         raw: &[u8],
         need_prefix: bool,
-    ) -> io::Result<Option<(Vec<u8>, Vec<(usize, Vec<u8>)>)>> {
+    ) -> io::Result<Option<(Vec<u8>, Vec<(usize, std::sync::Arc<Vec<u8>>)>)>> {
         // Borrow the chunk directory for the whole call: cloning it per row
         // group allocated one Vec of chunk refs per group on every scan.
         let footer = self.v4_footer.read();
@@ -1953,7 +2049,12 @@ impl OnDemandStorage {
         else {
             return Ok(None);
         };
-        let mut out: Vec<(usize, Vec<u8>)> = Vec::with_capacity(wanted.len());
+        let rg_offset = footer
+            .row_groups
+            .get(rg_idx)
+            .map(|rg| rg.offset)
+            .unwrap_or(0);
+        let mut out: Vec<(usize, std::sync::Arc<Vec<u8>>)> = Vec::with_capacity(wanted.len());
         let prefix_len = columns
             .iter()
             .flatten()
@@ -1982,15 +2083,38 @@ impl OnDemandStorage {
         for (index, col) in columns.iter().enumerate() {
             let Some(col) = col else { continue; };
             let take = wanted.contains(&index);
+            // Decoded columns are cached under a synthetic key in the same map
+            // that holds assembled bodies: `decompressed_rg_cache` already owns
+            // the byte budget and the invalidation, and re-decoding a filter or
+            // aggregate column on every scan is what kept repeated chunked
+            // queries behind the cached flat layout.
+            let cache_key = (rg_offset, u64::MAX - index as u64);
+            if take {
+                if let Some(cached) = self.decompressed_rg_cache.read().get(cache_key) {
+                    out.push((index, cached));
+                    for chunk in &col.chunks {
+                        pos += CHUNK_FRAME_HEADER_LEN + chunk.len as usize;
+                    }
+                    continue;
+                }
+            }
+            let mut joined: Vec<u8> = Vec::new();
             for chunk in &col.chunks {
                 let frame_end = pos + CHUNK_FRAME_HEADER_LEN + chunk.len as usize;
                 if frame_end > raw.len() {
                     return Err(err_data("chunked column frame runs past the row group"));
                 }
                 if take {
-                    out.push((index, decompress_column_frame(&raw[pos..frame_end])?));
+                    joined.extend_from_slice(&decompress_column_frame(&raw[pos..frame_end])?);
                 }
                 pos = frame_end;
+            }
+            if take {
+                let decoded = std::sync::Arc::new(joined);
+                self.decompressed_rg_cache
+                    .write()
+                    .insert(cache_key, std::sync::Arc::clone(&decoded));
+                out.push((index, decoded));
             }
         }
         if out.is_empty() {

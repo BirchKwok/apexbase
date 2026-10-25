@@ -240,7 +240,7 @@ fn numeric_view_of<'a>(
 /// multi-frame column (only theoretical today) declines so the caller can fall
 /// back rather than misread a partial frame.
 fn numeric_view_in_chunked<'b>(
-    columns: &'b [(usize, Vec<u8>)],
+    columns: &'b [(usize, std::sync::Arc<Vec<u8>>)],
     col_idx: usize,
     col_type: ColumnType,
     null_len: usize,
