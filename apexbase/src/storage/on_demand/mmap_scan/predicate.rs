@@ -3042,18 +3042,23 @@ impl OnDemandStorage {
             };
             let (body, col_body_off, del_bytes_owned): (&[u8], usize, Vec<u8>) =
                 if let Some((prefix, columns)) = &chunked_parts {
-                    if prefix.len() < del_vec_len {
-                        return Err(err_data("chunked RG deletion vector truncated"));
-                    }
+                    // The prefix frame is only decompressed when the group has
+                    // deletions (ids and the deletion vector are never read
+                    // otherwise), so a deletion-free group legitimately hands
+                    // back an empty prefix here.
+                    let deletion_bytes = if has_deletes {
+                        if prefix.len() < del_vec_len {
+                            return Err(err_data("chunked RG deletion vector truncated"));
+                        }
+                        prefix[prefix.len() - del_vec_len..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
                     let column = columns
                         .first()
                         .map(|(_, bytes)| bytes.as_slice())
                         .unwrap_or(&[]);
-                    (
-                        column,
-                        0,
-                        prefix[prefix.len() - del_vec_len..].to_vec(),
-                    )
+                    (column, 0, deletion_bytes)
                 } else {
                     let full: &[u8] = decompressed_full
                         .as_ref()

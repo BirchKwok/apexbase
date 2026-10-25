@@ -148,6 +148,117 @@ unsafe fn aggregate_validated_2col_count_i64(
     }
 }
 
+
+/// A decoded numeric column view used by the filtered-aggregation fast paths.
+///
+/// Holds either a slice into the row-group bytes (plain/bit-packed payloads) or
+/// an owned decode (dictionary/RLE payloads); both flat and chunked row groups
+/// produce the same encoded column payload, so this view serves both layouts.
+enum NumericView<'a> {
+    I64(std::borrow::Cow<'a, [i64]>),
+    F64(std::borrow::Cow<'a, [f64]>),
+    Bitpack(&'a [u8]),
+    Bool(&'a [u8]),
+}
+
+impl NumericView<'_> {
+    #[inline]
+    fn at(&self, idx: usize) -> Option<f64> {
+        match self {
+            NumericView::I64(values) => values.get(idx).map(|&value| value as f64),
+            NumericView::F64(values) => values.get(idx).copied(),
+            NumericView::Bitpack(payload) => {
+                crate::storage::on_demand::bitpack_decode_at_idx(payload, idx).map(|v| v as f64)
+            }
+            NumericView::Bool(bits) => bits
+                .get(idx / 8)
+                .map(|byte| ((byte >> (idx % 8)) & 1) as f64),
+        }
+    }
+}
+
+/// Decode one encoded column payload (the encoding tag leads the payload) into a
+/// numeric view. Returns the view and whether the column is integral.
+fn numeric_view_of<'a>(
+    col_type: ColumnType,
+    payload: &'a [u8],
+    rg_rows: usize,
+) -> Option<(NumericView<'a>, bool)> {
+    let encoding = *payload.first()?;
+    let body = &payload[1..];
+    match col_type {
+        ColumnType::Bool => {
+            let need = rg_rows.div_ceil(8);
+            (body.len() >= need).then(|| (NumericView::Bool(&body[..need]), true))
+        }
+        ColumnType::Int64
+        | ColumnType::Int8
+        | ColumnType::Int16
+        | ColumnType::Int32
+        | ColumnType::UInt8
+        | ColumnType::UInt16
+        | ColumnType::UInt32
+        | ColumnType::UInt64
+        | ColumnType::Timestamp
+        | ColumnType::Date => {
+            if encoding == COL_ENCODING_BITPACK {
+                Some((NumericView::Bitpack(body), true))
+            } else if encoding == COL_ENCODING_PLAIN && body.len() >= 8 {
+                let count = u64::from_le_bytes(body[0..8].try_into().ok()?) as usize;
+                let n = count.min(rg_rows).min((body.len() - 8) / 8);
+                Some((NumericView::I64(bytes_as_i64_slice(&body[8..], n)), true))
+            } else {
+                match read_column_encoded(payload, col_type) {
+                    Ok((ColumnData::Int64(values), _)) => {
+                        Some((NumericView::I64(std::borrow::Cow::Owned(values)), true))
+                    }
+                    _ => None,
+                }
+            }
+        }
+        ColumnType::Float64 | ColumnType::Float32 => {
+            if encoding == COL_ENCODING_PLAIN && body.len() >= 8 {
+                let count = u64::from_le_bytes(body[0..8].try_into().ok()?) as usize;
+                let n = count.min(rg_rows).min((body.len() - 8) / 8);
+                Some((NumericView::F64(bytes_as_f64_slice(&body[8..], n)), false))
+            } else {
+                match read_column_encoded(payload, col_type) {
+                    Ok((ColumnData::Float64(values), _)) => {
+                        Some((NumericView::F64(std::borrow::Cow::Owned(values)), false))
+                    }
+                    _ => None,
+                }
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Split a decompressed chunked column (`[null bitmap][encoded payload]`) and
+/// decode the value view. `columns` is the (column index, bytes) list returned by
+/// `decompressed_chunked_columns`. The writer emits one frame per column; a
+/// multi-frame column (only theoretical today) declines so the caller can fall
+/// back rather than misread a partial frame.
+fn numeric_view_in_chunked<'b>(
+    columns: &'b [(usize, Vec<u8>)],
+    col_idx: usize,
+    col_type: ColumnType,
+    null_len: usize,
+    rg_rows: usize,
+) -> Option<(&'b [u8], NumericView<'b>, bool)> {
+    let mut matching = columns.iter().filter(|(idx, _)| *idx == col_idx);
+    let (_, bytes) = matching.next()?;
+    if matching.next().is_some() {
+        return None;
+    }
+    if bytes.len() < null_len {
+        return None;
+    }
+    let (nulls, payload) = bytes.split_at(null_len);
+    let (view, is_int) = numeric_view_of(col_type, payload, rg_rows)?;
+    Some((nulls, view, is_int))
+}
+
 impl OnDemandStorage {
     /// Exact COUNT(DISTINCT integral_column) for a bounded numeric domain.
     /// Each Row Group fills a local bitset and the final reduction ORs them,
@@ -1780,6 +1891,7 @@ impl OnDemandStorage {
                     let rg_bytes = &mmap[rg_meta.offset as usize..rg_end];
                     let compress_flag = rg_bytes[28];
                     let encoding_version = rg_bytes[29];
+
                     if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                         return None;
                     }
@@ -3724,9 +3836,194 @@ impl OnDemandStorage {
                     if rg_end > mmap.len() || rg_end < rg_meta.offset as usize + 32 {
                         return None;
                     }
+
                     let rg_bytes = &mmap[rg_meta.offset as usize..rg_end];
                     let compress_flag = rg_bytes[28];
                     let encoding_version = rg_bytes[29];
+                    // Chunked (per-column compressed) row groups: decompress only
+                    // the filter and aggregate columns instead of the whole body.
+                    // Before this branch a compressed group returned `None`, which
+                    // dropped the whole fused aggregation to the generic scan
+                    // (200k-row zstd COUNT/SUM: 0.42 ms against 0.07/0.14 ms flat).
+                    let split_agg = footer
+                        .chunk_tables
+                        .get(rg_i)
+                        .is_some_and(|cols| cols.iter().any(Option::is_some));
+                    if split_agg {
+                        let null_bitmap_len = (rg_rows + 7) / 8;
+                        let has_deletes = rg_meta.deletion_count > 0;
+                        if nc == 0 && fully_covered {
+                            part.matches += rg_meta.active_rows() as i64;
+                            return Some(part);
+                        }
+                        let mut wanted: Vec<usize> = Vec::with_capacity(nc + 1);
+                        if !fully_covered {
+                            wanted.push(filter_idx);
+                        }
+                        wanted.extend(agg_indices.iter().copied());
+                        let Some((prefix, columns)) = self
+                            .decompressed_chunked_columns(
+                                rg_i,
+                                &wanted,
+                                rg_bytes.get(32..).unwrap_or(&[]),
+                                has_deletes,
+                            )
+                            .ok()
+                            .flatten()
+                        else {
+                            return None;
+                        };
+                        let del_bytes: &[u8] = if has_deletes && prefix.len() >= null_bitmap_len
+                        {
+                            &prefix[prefix.len() - null_bitmap_len..]
+                        } else {
+                            &[]
+                        };
+                        let filter_parts = if fully_covered {
+                            None
+                        } else {
+                            match numeric_view_in_chunked(
+                                &columns,
+                                filter_idx,
+                                schema.columns[filter_idx].1,
+                                null_bitmap_len,
+                                rg_rows,
+                            ) {
+                                Some((nulls, view, _)) => Some((nulls, view)),
+                                None => return None,
+                            }
+                        };
+                        let count_only =
+                            nc == 1 && !needs_value(value_needed, value_positions[0]);
+                        let agg_parts = if nc == 1 {
+                            match numeric_view_in_chunked(
+                                &columns,
+                                agg_indices[0],
+                                schema.columns[agg_indices[0]].1,
+                                null_bitmap_len,
+                                rg_rows,
+                            ) {
+                                Some((nulls, view, is_int)) => {
+                                    if is_int {
+                                        part.is_int = true;
+                                    }
+                                    Some((nulls, Some(view)))
+                                }
+                                None => return None,
+                            }
+                        } else {
+                            None
+                        };
+                        let agg_has_nulls = agg_parts
+                            .as_ref()
+                            .is_some_and(|(nulls, _)| nulls.iter().any(|&byte| byte != 0));
+                        // Covering value aggregate with no NULLs and no deletes:
+                        // accumulate the decoded values with a tight loop.
+                        if fully_covered
+                            && nc == 1
+                            && !count_only
+                            && !agg_has_nulls
+                            && !has_deletes
+                        {
+                            if let Some((_, Some(view))) = agg_parts.as_ref() {
+                                match view {
+                                    NumericView::I64(values) => {
+                                        let mut sum = 0i64;
+                                        let mut mn = f64::INFINITY;
+                                        let mut mx = f64::NEG_INFINITY;
+                                        for &value in values.iter().take(rg_rows) {
+                                            sum += value;
+                                            let as_f64 = value as f64;
+                                            if as_f64 < mn {
+                                                mn = as_f64;
+                                            }
+                                            if as_f64 > mx {
+                                                mx = as_f64;
+                                            }
+                                        }
+                                        part.matches += rg_rows as i64;
+                                        part.count += values.len().min(rg_rows) as i64;
+                                        part.sum += sum as f64;
+                                        if mn < part.min {
+                                            part.min = mn;
+                                        }
+                                        if mx > part.max {
+                                            part.max = mx;
+                                        }
+                                        return Some(part);
+                                    }
+                                    NumericView::F64(values) => {
+                                        let mut sum = 0.0f64;
+                                        let mut mn = f64::INFINITY;
+                                        let mut mx = f64::NEG_INFINITY;
+                                        for &value in values.iter().take(rg_rows) {
+                                            sum += value;
+                                            if value < mn {
+                                                mn = value;
+                                            }
+                                            if value > mx {
+                                                mx = value;
+                                            }
+                                        }
+                                        part.matches += rg_rows as i64;
+                                        part.count += values.len().min(rg_rows) as i64;
+                                        part.sum += sum;
+                                        if mn < part.min {
+                                            part.min = mn;
+                                        }
+                                        if mx > part.max {
+                                            part.max = mx;
+                                        }
+                                        return Some(part);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        let filter_has_nulls = filter_parts
+                            .as_ref()
+                            .is_some_and(|(nulls, _)| nulls.iter().any(|&byte| byte != 0));
+                        for row_idx in 0..rg_rows {
+                            if has_deletes
+                                && (del_bytes[row_idx / 8] >> (row_idx % 8)) & 1 == 1
+                            {
+                                continue;
+                            }
+                            if let Some((filter_nulls, filter_view)) = filter_parts.as_ref() {
+                                if filter_has_nulls
+                                    && (filter_nulls[row_idx / 8] >> (row_idx % 8)) & 1 == 1
+                                {
+                                    continue;
+                                }
+                                let Some(value) = filter_view.at(row_idx) else {
+                                    continue;
+                                };
+                                if value < low || value > high {
+                                    continue;
+                                }
+                            }
+                            part.matches += 1;
+                            if let Some((agg_nulls, Some(view))) = agg_parts.as_ref() {
+                                if (agg_nulls[row_idx / 8] >> (row_idx % 8)) & 1 == 1 {
+                                    continue;
+                                }
+                                let Some(value) = view.at(row_idx) else {
+                                    continue;
+                                };
+                                part.add_f64(value);
+                            } else if nc == 1 {
+                                // `COUNT(col)`: only NULLness is needed.
+                                if let Some((agg_nulls, _)) = agg_parts.as_ref() {
+                                    if (agg_nulls[row_idx / 8] >> (row_idx % 8)) & 1 == 1 {
+                                        continue;
+                                    }
+                                }
+                                part.count += 1;
+                            }
+                        }
+                        return Some(part);
+                    }
+
                     if compress_flag != RG_COMPRESS_NONE || !rg_columns_are_encoded(encoding_version) {
                         return None;
                     }
