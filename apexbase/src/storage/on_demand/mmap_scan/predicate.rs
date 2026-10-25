@@ -597,25 +597,77 @@ impl OnDemandStorage {
             } else {
                 0
             };
-            let decompressed = self.decompressed_rg_body(
-                rg_meta.offset,
-                rg_meta.offset + rg_meta.data_size,
-                compress_flag,
-                &rg_bytes[32..],
-            )?;
-            let body: &[u8] = decompressed
-                .as_ref()
-                .map(|body| body.as_slice())
-                .unwrap_or(&rg_bytes[32..]);
             let del_vec_len = (rg_rows + 7) / 8;
             let del_start =
                 rg_id_section_len(rg_rows, rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN));
-            if del_start + del_vec_len > body.len() {
-                return Err(err_data("RG del vec truncated"));
-            }
-            let del_bytes = &body[del_start..del_start + del_vec_len];
             let has_deletes = rg_meta.deletion_count > 0;
             let null_bitmap_len = (rg_rows + 7) / 8;
+
+            // Chunked groups decode only the filter column; assembling the flat
+            // body would decompress every column of the row group (the sparse
+            // string filter cost 2.17 ms against 0.70 ms flat on a 200k-row zstd
+            // table). The prefix frame carries ids + the deletion vector and is
+            // only decompressed when the group has deletions.
+            let chunked = footer
+                .chunk_tables
+                .get(rg_i)
+                .is_some_and(|cols| cols.iter().any(Option::is_some));
+            let chunked_parts = if chunked {
+                self.decompressed_chunked_columns(
+                    rg_i,
+                    &[col_idx],
+                    &rg_bytes[32..],
+                    has_deletes,
+                )?
+            } else {
+                None
+            };
+            let decompressed = if chunked_parts.is_some() {
+                None
+            } else {
+                self.decompressed_rg_body(
+                    rg_meta.offset,
+                    rg_meta.offset + rg_meta.data_size,
+                    compress_flag,
+                    &rg_bytes[32..],
+                )?
+            };
+            let (body, col_off_hint, del_bytes_owned): (&[u8], usize, Vec<u8>) =
+                if let Some((prefix, columns)) = &chunked_parts {
+                    let deletion_bytes = if has_deletes {
+                        if prefix.len() < del_vec_len {
+                            return Err(err_data("chunked RG deletion vector truncated"));
+                        }
+                        prefix[prefix.len() - del_vec_len..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    let column = columns
+                        .first()
+                        .map(|(_, bytes)| bytes.as_slice())
+                        .unwrap_or(&[]);
+                    (column, 0, deletion_bytes)
+                } else {
+                    let full: &[u8] = decompressed
+                        .as_ref()
+                        .map(|body| body.as_slice())
+                        .unwrap_or(&rg_bytes[32..]);
+                    if del_start + del_vec_len > full.len() {
+                        return Err(err_data("RG del vec truncated"));
+                    }
+                    let col_off = footer
+                        .col_offsets
+                        .get(rg_i)
+                        .and_then(|offsets| offsets.get(col_idx))
+                        .copied()
+                        .unwrap_or(0) as usize;
+                    (
+                        full,
+                        col_off,
+                        full[del_start..del_start + del_vec_len].to_vec(),
+                    )
+                };
+            let del_bytes = del_bytes_owned.as_slice();
 
             // Zone-map skip: the zone carries the column's value range (or, in
             // files predating the prefix flag, its byte lengths).
@@ -627,14 +679,11 @@ impl OnDemandStorage {
             }
 
             // RCIX fast path: jump directly to target column without scanning all columns
-            let rcix = if compress_flag == RG_COMPRESS_NONE && rg_columns_are_encoded(encoding_version) {
-                footer.col_offsets.get(rg_i).filter(|v| v.len() > col_idx)
-            } else {
-                None
-            };
+            let rcix_available = chunked_parts.is_some()
+                || (compress_flag == RG_COMPRESS_NONE && rg_columns_are_encoded(encoding_version));
 
-            if let Some(rcix) = rcix {
-                let col_off = rcix[col_idx] as usize;
+            if rcix_available {
+                let col_off = col_off_hint;
                 if col_off + null_bitmap_len > body.len() {
                     global_row_offset += rg_rows;
                     continue;

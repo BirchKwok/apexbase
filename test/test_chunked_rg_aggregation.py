@@ -61,6 +61,23 @@ SCRIPT = textwrap.dedent(
     out["projected"] = reader.execute(
         "SELECT s FROM t LIMIT 5"
     ).to_dict()
+    # String equality with LIMIT runs the mmap string scan, which decodes only
+    # the filter column of a chunked group.
+    out["filtered_limit"] = reader.execute(
+        "SELECT s FROM t WHERE s = 'user_3' LIMIT 5"
+    ).to_dict()
+    out["filtered_count"] = reader.execute(
+        "SELECT COUNT(*) AS n FROM t WHERE s = 'user_3'"
+    ).to_dict()[0]["n"]
+    # Deletions force the prefix frame (ids + deletion vector) to be decoded;
+    # the scan must skip the deleted rows and keep the surviving ones.
+    reader.execute("DELETE FROM t WHERE k < 1000")
+    out["after_delete"] = reader.execute(
+        "SELECT COUNT(*) AS n FROM t WHERE s = 'user_3'"
+    ).to_dict()[0]["n"]
+    out["total_after_delete"] = reader.execute(
+        "SELECT COUNT(*) AS n FROM t"
+    ).to_dict()[0]["n"]
     reader.close()
 
     expected_sum = float(np.sum(x))
@@ -71,6 +88,10 @@ SCRIPT = textwrap.dedent(
     assert abs(out["sum_part"] - expected_part) <= abs(expected_part) * 1e-9 + 1e-6, (out["sum_part"], expected_part)
     assert out["count_part"] == 100001, out["count_part"]
     assert len(out["projected"]) == 5, out["projected"]
+    assert len(out["filtered_limit"]) == 5, out["filtered_limit"]
+    assert out["filtered_count"] == rows // 100, out["filtered_count"]
+    assert out["after_delete"] == rows // 100 - 10, out["after_delete"]
+    assert out["total_after_delete"] == rows - 1000, out["total_after_delete"]
     print("OK")
     """
 )
