@@ -1,8 +1,8 @@
 """Chunked row-group layout: window reads, format declaration and layout fixes.
 
-The chunked layout is still opt-in (``APEX_CHUNK_INDEX=1``); these tests run in
-subprocesses so the process-wide switch cannot leak into other tests. They pin
-three behaviours the layout needs before it can become the default:
+The chunked layout is the **default** for compressed row groups
+(``APEX_CHUNK_INDEX=0`` opts out). These tests run in subprocesses so the
+process-wide switch cannot leak into other tests. They pin three behaviours:
 
 * window reads (``LIMIT``/``OFFSET``/projection) return exactly the rows a flat
   table returns, repeated reads stay identical, and a delete survives;
@@ -164,33 +164,31 @@ def _run(args, env_overrides, timeout=600):
     return result
 
 
-def test_chunked_window_reads_and_v5_declaration(tmp_path):
-    build = _run(["-c", BUILD], {"APEX_CHUNK_INDEX": "1"})
-    import json
-
-    info = json.loads(build.stdout.strip().splitlines()[-1])
-    assert info["encoding"] == 2, "opt-in must write per-column frames"
-    assert info["version"] == 5, (
-        "a chunked group is a V5-only revision even without a Float32 column"
-    )
-    reads = _run(
-        ["-c", READS, info["tmp"]],
-        {"APEX_CHUNK_INDEX": "1"},
-    )
-    assert "after_delete" in reads.stdout
-
-
-def test_default_layout_stays_flat(tmp_path):
+def test_default_chunked_window_reads_and_v5_declaration():
     build = _run(["-c", BUILD], {"APEX_CHUNK_INDEX": None})
     import json
 
     info = json.loads(build.stdout.strip().splitlines()[-1])
-    assert info["encoding"] == 1, "the process default must stay flat"
-    assert info["version"] == 4, (
-        "a flat zstd table with no Float32 column keeps the V4 declaration"
+    assert info["encoding"] == 2, "independent columns must default to per-column frames"
+    assert info["version"] == 5, (
+        "a chunked group is a V5-only revision even without a Float32 column"
     )
     reads = _run(["-c", READS, info["tmp"]], {"APEX_CHUNK_INDEX": None})
     assert "after_delete" in reads.stdout
+
+
+def test_opt_out_keeps_the_flat_layout():
+    for value in ("0", "false", "no", "off"):
+        build = _run(["-c", BUILD], {"APEX_CHUNK_INDEX": value})
+        import json
+
+        info = json.loads(build.stdout.strip().splitlines()[-1])
+        assert info["encoding"] == 1, f"APEX_CHUNK_INDEX={value} must keep flat frames"
+        assert info["version"] == 4, (
+            "the opt-out keeps the V4 declaration for a flat zstd table"
+        )
+        reads = _run(["-c", READS, info["tmp"]], {"APEX_CHUNK_INDEX": value})
+        assert "after_delete" in reads.stdout
 
 
 def test_rewrite_preserves_the_source_layout():

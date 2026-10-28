@@ -1,7 +1,9 @@
 """Chunked (per-column compressed) row groups: fused aggregation + reads.
 
-The chunked layout is opt-in via ``APEX_CHUNK_INDEX=1``; these tests run in a
-subprocess so the process-wide switch cannot leak into other tests.
+The chunked layout is the default for compressed row groups; these tests force
+``APEX_CHUNK_INDEX=1`` and run in a subprocess so the process-wide switch cannot
+leak into other tests (the explicit value also keeps them independent of the
+default).
 """
 from __future__ import annotations
 

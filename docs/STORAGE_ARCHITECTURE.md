@@ -388,13 +388,14 @@ self-contained with IDs, deletion vector, and per-column data.
   to the read path); in-memory state always uses plain `String`.
 - Row groups can be LZ4- or ZSTD-compressed (flag bits in the RG header);
   default is no compression for maximum read performance.
-- A compressed row group may store each column as its **own** compressed frame
-  (`APEX_CHUNK_INDEX=1`, and only when that costs at most 8% more bytes than a
-  single flat frame). A scan that touches one column then decodes one column
+- A compressed row group stores each column as its **own** compressed frame by
+  default (when that costs at most 8% more bytes than a single flat frame;
+  `APEX_CHUNK_INDEX=0` opts back into the flat frame). A scan that touches one column then decodes one column
   instead of the whole group; the footer's `CHNK` directory records every
   column's offset in the flat body, so all readers keep addressing the same
-  layout. Window reads (`LIMIT`/`OFFSET`) decode only the projected columns, and
-  a table that stores chunked groups declares format version `5`. The directory
+  layout. Window reads (`LIMIT`/`OFFSET`) and filtered aggregates decode only the
+  columns they project or aggregate, and a table that stores chunked groups
+  declares format version `5`. The directory
   is shared behind an `Arc` so the footer clone every read entry point makes
   stays cheap. A full-file rewrite (for example the compressed-row-group
   `DELETE` path) preserves the source table's layout.

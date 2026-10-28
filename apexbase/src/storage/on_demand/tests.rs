@@ -7194,13 +7194,26 @@ fn encode_rg_body_skips_the_size_gate_once_the_layout_is_fixed() {
     assert_eq!(offsets, flat_offsets);
     assert!(!payload.is_empty());
 
-    // The process-level default is still off: an open decision stays flat.
-    if std::env::var_os("APEX_CHUNK_INDEX").is_none() {
-        let (_, _, chunks, _) =
-            encode_rg_body_with_layout(flat, &ranges, CompressionType::Zstd, None).unwrap();
-        assert!(
-            chunks.is_none(),
-            "the chunked layout is opt-in until its read lanes are complete"
-        );
-    }
+    // The process default (a `None` decision) is exercised end-to-end by
+    // `test/test_chunked_layout_read_paths.py`, which can set the opt-out in a
+    // subprocess without racing other tests; this test pins the forced arms.
+    let _ = flat;
+}
+
+#[test]
+fn decompress_column_frame_accepts_an_uncompressed_frame() {
+    // The chunk writer stores a column frame verbatim when compression would not
+    // shrink it. The per-column decoder must treat that flag exactly like the
+    // flat-body decoder does ("bytes are already the payload") instead of
+    // erroring; a compressed table whose vector column refused compression hit
+    // this on the default chunked layout.
+    use crate::storage::on_demand::{decompress_column_frame, CHUNK_FRAME_HEADER_LEN};
+
+    let body: Vec<u8> = (0..64u8).collect();
+    let mut frame: Vec<u8> = Vec::new();
+    frame.extend_from_slice(&(body.len() as u32).to_le_bytes());
+    frame.push(RG_COMPRESS_NONE);
+    frame.extend_from_slice(&body);
+    assert_eq!(frame.len(), CHUNK_FRAME_HEADER_LEN + body.len());
+    assert_eq!(decompress_column_frame(&frame).unwrap(), body);
 }

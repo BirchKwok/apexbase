@@ -35,10 +35,13 @@ def test_chunked_metric_names_are_well_formed(chunked_bench):
     names = chunked_bench.chunked_metric_names()
     assert len(names) == len(set(names))
     assert "Chunked: build (zstd fixture)" in names
+    assert "Chunked/Default: build (zstd fixture)" in names
     for name, _sql in chunked_bench.SHAPES:
         assert f"Chunked: {name}" in names
+        assert f"Chunked/Default: {name}" in names
     for name, _sql in chunked_bench.COLD_SHAPES:
         assert f"Chunked: {name}" in names
+        assert f"Chunked/Default: {name}" in names
     # The flat twin is informational: it must never be gated.
     assert not any(name.startswith("Chunked/Flat:") for name in names)
 
@@ -72,6 +75,7 @@ def test_chunked_fixture_is_asserted_and_reports_every_shape(chunked_bench):
 
     chunked = detail["variants"]["chunked"]
     flat = detail["variants"]["flat"]
+    default = detail["variants"]["default"]
     # The whole phase exists because this fixture keeps the layout: if the 8%
     # gate ever refuses it, the run must fail instead of silently sampling a
     # flat table under a chunked metric name.
@@ -79,12 +83,19 @@ def test_chunked_fixture_is_asserted_and_reports_every_shape(chunked_bench):
     assert flat["row_group_encoding"] == 1
     assert chunked["compression"] == "zstd"
     assert chunked["bytes"] < flat["bytes"] * 1.10, "the 8% gate bounds the growth"
+    # The default fixture follows the build's default: flat before the
+    # round-273 flip, per-column frames afterwards; both must be compressed.
+    assert default["row_group_encoding"] in (1, 2)
+    assert default["compression"] == "zstd"
     assert "Chunked: build (zstd fixture)" in names
-    # The informational twin is recorded for both warm and cold shapes but is
-    # not part of the gated rows.
+    assert "Chunked/Default: build (zstd fixture)" in names
+    # The flat twin is recorded for both warm and cold shapes but is not part
+    # of the gated rows; the default twin is gated and recorded too.
     for name, _sql in chunked_bench.SHAPES:
         assert f"Chunked/Flat: {name}" in detail["shapes"]
         assert f"Chunked: {name}" in detail["shapes"]
+        assert f"Chunked/Default: {name}" in detail["shapes"]
     for name, _sql in chunked_bench.COLD_SHAPES:
         assert "cold_ms" in detail["shapes"][f"Chunked: {name}"]
         assert "cold_ms" in detail["shapes"][f"Chunked/Flat: {name}"]
+        assert "cold_ms" in detail["shapes"][f"Chunked/Default: {name}"]

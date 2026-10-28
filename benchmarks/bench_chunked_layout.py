@@ -11,13 +11,15 @@ latency row per shape so the same-machine guard samples base/current like any
 other metric.
 
 Every shape is asserted against an independent computation over the generated
-rows. The flat twin is built and measured too, but only as an informational
-block: it is equal work on both sides of the guard, and keeping it out of the
-gated rows lets the phase measure the chunked layout without doubling every
-comparison.
+rows. Three fixtures are built:
 
-``APEX_CHUNK_INDEX`` is forced around the two writes so the phase keeps working
-after a future default flip; the process value is restored before the reads.
+* ``flat``: explicit ``APEX_CHUNK_INDEX=0``. Informational only: it is equal
+  work on both guard sides and shows what the per-column frames save.
+* ``chunked``: explicit ``APEX_CHUNK_INDEX=1``. Gated: both sides write
+  per-column frames, so the comparison measures the layout's read/write code.
+* ``default``: no override. Gated: this is what the default actually does, so
+  the comparison measures a default-value change (base writes flat, current
+  writes per-column frames after the V5 round 273 flip) on identical data.
 """
 
 from __future__ import annotations
@@ -252,15 +254,20 @@ def check(client, table, sql_template, expected, mid):
         raise AssertionError(f"unchecked shape: {sql_template}")
 
 
-def _build(client, table, data, compression, force_chunked):
+def _build(client, table, data, compression, layout):
+    """Build one fixture. ``layout`` is True (chunked), False (flat) or None
+    (leave the process default alone)."""
     client.create_table(table, SCHEMA)
     client.use_table(table)
     if compression:
         assert client.set_compression(compression) is not False, compression
     previous = os.environ.get("APEX_CHUNK_INDEX")
-    # Force the layout on both writes (not just the chunked one): the flat twin
-    # must be flat even if this process inherited the opt-in.
-    os.environ["APEX_CHUNK_INDEX"] = "1" if force_chunked else "0"
+    if layout is True:
+        os.environ["APEX_CHUNK_INDEX"] = "1"
+    elif layout is False:
+        os.environ["APEX_CHUNK_INDEX"] = "0"
+    else:
+        os.environ.pop("APEX_CHUNK_INDEX", None)
     try:
         start = time.perf_counter()
         client.store(data)
@@ -295,7 +302,7 @@ def run_chunked_layout(rows, warmup, iterations, only=None):
 
         # Informational flat twin: shows what the per-column frames save. It is
         # equal work on both guard sides, so it stays out of the gated rows.
-        build_flat_ms = _build(client, "chunk_flat", data, "zstd", force_chunked=False)
+        build_flat_ms = _build(client, "chunk_flat", data, "zstd", layout=False)
         flat_path = table_path(db_dir, "chunk_flat")
         flat_version, flat_compress, flat_encoding, _ = first_rg_header(flat_path)
         detail["variants"]["flat"] = {
@@ -312,7 +319,7 @@ def run_chunked_layout(rows, warmup, iterations, only=None):
             "comparison meaningless"
         )
 
-        build_ms = _build(client, "chunk_table", data, "zstd", force_chunked=True)
+        build_ms = _build(client, "chunk_table", data, "zstd", layout=True)
         path = table_path(db_dir, "chunk_table")
         version, compress_flag, encoding, id_encoding = first_rg_header(path)
         detail["variants"]["chunked"] = {
@@ -331,26 +338,58 @@ def run_chunked_layout(rows, warmup, iterations, only=None):
         )
         assert version in (4, 5), version  # 4 = pre-flip build, 5 = declares V5
 
+        # Default fixture: what this wheel writes with no override. Before the
+        # round-273 default flip the base wheel writes flat; afterwards both
+        # sides write per-column frames, so this comparison stays meaningful.
+        build_default_ms = _build(client, "chunk_default", data, "zstd", layout=None)
+        default_path = table_path(db_dir, "chunk_default")
+        default_version, default_compress, default_encoding, _ = first_rg_header(
+            default_path
+        )
+        detail["variants"]["default"] = {
+            "table": "chunk_default",
+            "compression": "zstd",
+            "file_version": default_version,
+            "row_group_encoding": default_encoding,
+            "row_groups": row_group_count(default_path),
+            "bytes": table_bytes(db_dir, "chunk_default"),
+            "build_ms": round(build_default_ms, 6),
+        }
+        assert default_encoding in (1, 2), (
+            "the default fixture must be a compressed zstd table"
+        )
+        assert default_compress != 0, "the default fixture must be compressed"
+
         # The build row is the only write metric; it compares the two sides'
         # compression work on identical input.
-        if want("Chunked: build (zstd fixture)"):
-            results.append({
-                "category": "ApexBase chunked layout",
-                "query": "Chunked: build (zstd fixture)",
-                "ApexBase": round(build_ms, 6),
-            })
-            detail["shapes"]["Chunked: build (zstd fixture)"] = {
-                "warm_ms": round(build_ms, 6)
-            }
+        for metric_name, value in (
+            ("Chunked: build (zstd fixture)", build_ms),
+            ("Chunked/Default: build (zstd fixture)", build_default_ms),
+        ):
+            if want(metric_name):
+                results.append({
+                    "category": "ApexBase chunked layout",
+                    "query": metric_name,
+                    "ApexBase": round(value, 6),
+                })
+                detail["shapes"][metric_name] = {"warm_ms": round(value, 6)}
 
-        for table, label in (("chunk_table", "chunked"), ("chunk_flat", "flat")):
-            prefix = "Chunked" if label == "chunked" else "Chunked/Flat"
+        for table, label in (
+            ("chunk_table", "chunked"),
+            ("chunk_flat", "flat"),
+            ("chunk_default", "default"),
+        ):
+            prefix = {
+                "chunked": "Chunked",
+                "flat": "Chunked/Flat",
+                "default": "Chunked/Default",
+            }[label]
             for name, sql in SHAPES:
                 metric = f"{prefix}: {name}"
                 check(client, table, sql, expected, mid)
                 warm_ms = measure(client, table, sql, warmup, iterations, mid)
                 detail["shapes"][metric] = {"warm_ms": round(warm_ms, 6)}
-                if label == "chunked" and want(metric):
+                if label in ("chunked", "default") and want(metric):
                     results.append({
                         "category": "ApexBase chunked layout",
                         "query": metric,
@@ -361,7 +400,7 @@ def run_chunked_layout(rows, warmup, iterations, only=None):
                 check(client, table, sql, expected, mid)
                 cold_ms = measure_cold(db_dir, table, sql, iterations, mid)
                 detail["shapes"][metric] = {"cold_ms": round(cold_ms, 6)}
-                if label == "chunked" and want(metric):
+                if label in ("chunked", "default") and want(metric):
                     results.append({
                         "category": "ApexBase chunked layout",
                         "query": metric,
@@ -376,9 +415,14 @@ def run_chunked_layout(rows, warmup, iterations, only=None):
 
 def chunked_metric_names():
     """Every gated metric name, in report order."""
-    names = ["Chunked: build (zstd fixture)"]
+    names = [
+        "Chunked: build (zstd fixture)",
+        "Chunked/Default: build (zstd fixture)",
+    ]
     names.extend(f"Chunked: {name}" for name, _ in SHAPES)
     names.extend(f"Chunked: {name}" for name, _ in COLD_SHAPES)
+    names.extend(f"Chunked/Default: {name}" for name, _ in SHAPES)
+    names.extend(f"Chunked/Default: {name}" for name, _ in COLD_SHAPES)
     return names
 
 

@@ -458,8 +458,9 @@ pub(crate) fn rg_columns_are_encoded(encoding_version: u8) -> bool {
 }
 /// Revision 2: a *compressed* row group stores every column as an independently
 /// compressed frame, so a reader can decode only the columns it touches.
-/// Selected only when `APEX_CHUNK_INDEX` is on and the layout does not cost more
-/// than `CHUNK_LAYOUT_MAX_GROWTH` in bytes.
+/// Selected by default for compressed groups unless `APEX_CHUNK_INDEX` is set to
+/// an off value, and only when the layout does not cost more than
+/// `CHUNK_LAYOUT_MAX_GROWTH` in bytes.
 const RG_CHUNKED_ENCODING_VERSION: u8 = 2;
 const HEADER_SIZE: usize = 256;
 const COLUMN_INDEX_ENTRY_SIZE: usize = 32;
@@ -2148,12 +2149,20 @@ fn decompress_rg_body(compress_flag: u8, compressed: &[u8]) -> io::Result<Option
 pub(crate) const CHUNK_FRAME_HEADER_LEN: usize = 5;
 
 /// Whether new compressed row groups may use the chunked (per-column frame)
-/// layout. **Off by default**: the layout is a format extension whose payoff and
-/// compression cost are still being measured (see `V5_NEXT_STEPS.md` §20/§21).
+/// layout.
+///
+/// **On by default** since V5 round 273: a compressed table whose columns do not
+/// correlate (the writer's 8% size gate checks that) stores one compressed frame
+/// per column, so a column-selective scan decodes one column instead of the whole
+/// group. The measured trade against the flat frame is a large win on
+/// column-selective scans (-53%..-91%), parity on windows/point reads/cold
+/// reopens/whole-column scans, and 4-5% smaller files. Set `APEX_CHUNK_INDEX=0`
+/// (or `false`/`no`/`off`) to keep writing the flat compressed layout — for
+/// example to hand a file to a build that predates the per-column frames.
 pub(crate) fn chunk_index_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("APEX_CHUNK_INDEX").ok().as_deref(),
-        Some("1") | Some("true") | Some("on")
+        Some("0") | Some("false") | Some("FALSE") | Some("False") | Some("no") | Some("off")
     )
 }
 
@@ -2325,8 +2334,17 @@ pub(crate) fn decompress_column_frame(frame: &[u8]) -> io::Result<Vec<u8>> {
     if CHUNK_FRAME_HEADER_LEN + len > frame.len() {
         return Err(err_data("chunked column frame truncated"));
     }
-    decompress_rg_body(frame[4], &frame[CHUNK_FRAME_HEADER_LEN..CHUNK_FRAME_HEADER_LEN + len])?
-        .ok_or_else(|| err_data("chunked column frame is not compressed"))
+    match decompress_rg_body(
+        frame[4],
+        &frame[CHUNK_FRAME_HEADER_LEN..CHUNK_FRAME_HEADER_LEN + len],
+    )? {
+        Some(body) => Ok(body),
+        // The writer stores a frame verbatim when compression would not shrink
+        // it (an incompressible column payload), exactly like the flat-body
+        // writer falls back to `RG_COMPRESS_NONE`. The flat decoder treats that
+        // flag as "already payload"; so must the per-column one.
+        None => Ok(frame[CHUNK_FRAME_HEADER_LEN..CHUNK_FRAME_HEADER_LEN + len].to_vec()),
+    }
 }
 
 /// Compress one column body, falling back to raw bytes when it does not help.

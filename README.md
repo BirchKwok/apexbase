@@ -148,8 +148,12 @@ pushdown, and distance TopK. v1.38.0 keeps the same format and fixes the
 `SELECT t.* … JOIN` projection failure, the SQL point-lookup latency gap and the
 read degradation a predicate `UPDATE` used to leave behind. V5 builds read V4
 files; to keep a file readable by
-a pre-V5 build, set `APEX_WIDTH_FIDELITY=0` to write the V4 layout. The format
-may still gain encodings before V5 is declared stable, so treat it as a preview
+a pre-V5 build, set `APEX_WIDTH_FIDELITY=0` to write the V4 layout. Compressed
+tables now store one compressed frame per column by default (so a
+column-selective scan does not decode the whole row group); set
+`APEX_CHUNK_INDEX=0` to keep the flat compressed frame, which is also what a
+build that predates per-column frames expects. The format may still gain
+encodings before V5 is declared stable, so treat it as a preview
 and see the [release notes](https://birchkwok.github.io/apexbase/latest/release-notes/)
 and [Storage Architecture](https://birchkwok.github.io/apexbase/latest/STORAGE_ARCHITECTURE/)
 for the compatibility rules.

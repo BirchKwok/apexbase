@@ -133,7 +133,10 @@ def test_packed_vacuum_rejects_compressed_row_groups():
         )
         client.flush()
         try:
-            with pytest.raises(RuntimeError, match="uncompressed"):
+            # A compressed table is refused whether it uses the flat compressed
+            # frame ("uncompressed row groups") or the default per-column frames
+            # ("flat row groups (chunked tables are not supported yet)").
+            with pytest.raises(RuntimeError, match="(uncompressed|flat row groups)"):
                 client.vacuum_packed_blobs()
         finally:
             client.close()
