@@ -200,7 +200,10 @@ def test_large_results_do_not_materialize_on_the_server(wire_bench, served):
     assert transfer["rows"] == served["rows"]
     assert transfer["first_row_ms"] < transfer["total_ms"]
     assert transfer["peak_rss_delta_mb"] is not None, "the RSS probe must observe the server"
-    assert transfer["peak_rss_delta_mb"] < 35.0, transfer
+    # The A/B separates streaming (~16 MB) from encoding everything first
+    # (~48 MB); a loaded runner measured 36.7 MB for the streaming path, so the
+    # bound keeps the separation with shared-runner headroom.
+    assert transfer["peak_rss_delta_mb"] < 40.0, transfer
 
 
 def _run_pair(wire_bench, port, sql, results, index, barrier):

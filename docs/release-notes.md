@@ -156,7 +156,10 @@ The data format, Python/Rust APIs and upgrade path are unchanged.
   were widened for the same reason: the join-count pruning guard now compares
   against 0.75x of the full count (the matrix measured 0.48x) and this release's
   overlay retrieve guard allows 0.03 ms on top of its 6x band, while a regression
-  to the merged lanes still fails both.
+  to the merged lanes still fails both. The PG-wire large-result RSS probe
+  widens its 35 MB bound to 40 MB: the streaming path measured 36.7 MB on a
+  loaded Linux runner, while the pre-fix "encode everything first" path stays
+  around 48 MB in the same A/B.
 - Refresh `benchmarks/latest_public_baseline.json` from this release's
   1,000,000-row run (kept at `benchmarks/results/v1.38.0-public.json`) so public
   comparisons are made against the V5 generation rather than the v1.36.2
