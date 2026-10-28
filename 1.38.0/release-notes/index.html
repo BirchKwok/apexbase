@@ -3053,6 +3053,22 @@ The data format, Python/Rust APIs and upgrade path are unchanged.</p>
   <code>--target x86_64-pc-windows-msvc</code> check reaches only the C dependencies —
   mimalloc/zstd need the Windows toolchain — so the Windows jobs remain the
   authoritative check.)</li>
+<li>Fix two release-matrix blockers in the branch's new tests before tagging.
+  <code>test_storage_budget</code> replaced the child interpreter's whole environment, so
+  the child could not import the in-tree package on CI (<code>maturin develop
+  --skip-install</code> leaves no editable install) and every Linux/macOS/Windows
+  pytest job failed with <code>ModuleNotFoundError: No module named
+  'apexbase.client'</code>; the child now prepends <code>apexbase/python</code> to <code>sys.path</code> and
+  inherits the environment (Windows needs <code>SYSTEMROOT</code>). The multi-predicate
+  <code>COUNT(v)</code>-vs-<code>SUM(v)</code> guard in <code>test_count_column_plan</code> assumed the count
+  lane costs half the sum lane plus 0.5 ms, while both lanes materialize the
+  predicate column and the shared runners measure ~0.82-0.86x; a 0.95x band
+  still catches a value-column decode (the ratio then approaches 1.0) and keeps
+  the matrix green. Two further single-shot timing bands in the branch's tests
+  were widened for the same reason: the join-count pruning guard now compares
+  against 0.75x of the full count (the matrix measured 0.48x) and this release's
+  overlay retrieve guard allows 0.03 ms on top of its 6x band, while a regression
+  to the merged lanes still fails both.</li>
 <li>Refresh <code>benchmarks/latest_public_baseline.json</code> from this release's
   1,000,000-row run (kept at <code>benchmarks/results/v1.38.0-public.json</code>) so public
   comparisons are made against the V5 generation rather than the v1.36.2
@@ -3361,6 +3377,18 @@ a version-5 file.</p>
   3.19 ms (1.1×), the load-sensitive file-I/O shape that a single public run also
   flagged in v1.36.2 and that the interleaved gate has repeatedly placed inside
   threshold</li>
+<li>Fix two release-matrix blockers in the branch's new tests before tagging.
+  <code>test_storage_budget</code> replaced the child interpreter's whole environment, so
+  the child could not import the in-tree package on CI (<code>maturin develop
+  --skip-install</code> leaves no editable install) and every Linux/macOS/Windows
+  pytest job failed with <code>ModuleNotFoundError: No module named
+  'apexbase.client'</code>; the child now prepends <code>apexbase/python</code> to <code>sys.path</code> and
+  inherits the environment (Windows needs <code>SYSTEMROOT</code>). The multi-predicate
+  <code>COUNT(v)</code>-vs-<code>SUM(v)</code> guard in <code>test_count_column_plan</code> assumed the count
+  lane costs half the sum lane plus 0.5 ms, while both lanes materialize the
+  predicate column and the shared runners measure ~0.82-0.86x; a 0.95x band
+  still catches a value-column decode (the ratio then approaches 1.0) and keeps
+  the matrix green.</li>
 <li>Refresh <code>benchmarks/latest_public_baseline.json</code> from this release's full
   1,000,000-row run (the report is kept at
   <code>benchmarks/results/v1.37.0-public.json</code>) so public comparisons are made
