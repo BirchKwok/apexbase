@@ -871,6 +871,12 @@ pub struct TableStorageBackend {
     /// High-cardinality string equality accelerator for `WHERE col = 'x' LIMIT 1`.
     /// Stores the first active row id for each distinct string value.
     first_string_row_id_cache: RwLock<HashMap<String, Arc<FirstStringRowIdCache>>>,
+    /// Byte budget for the three string read caches above. They grow with the
+    /// number of distinct string values (a 1M-distinct column is tens of MB),
+    /// so they are bounded by the process storage budget instead of memory.
+    string_cache_budget: usize,
+    /// Current estimated bytes held by those caches.
+    string_cache_bytes: AtomicUsize,
     /// Table epoch this instance's in-memory view was loaded from.
     ///
     /// A cache that stores this backend must tag it with *this* epoch rather than
@@ -1130,6 +1136,8 @@ impl TableStorageBackend {
             dict_cache: RwLock::new(HashMap::new()),
             string_distinct_count_cache: RwLock::new(HashMap::new()),
             first_string_row_id_cache: RwLock::new(HashMap::new()),
+            string_cache_budget: crate::storage::on_demand::read_cache_budget_bytes(),
+            string_cache_bytes: AtomicUsize::new(0),
             view_epoch: AtomicU64::new(crate::storage::epoch::current(path)),
         }
     }
@@ -1172,6 +1180,8 @@ impl TableStorageBackend {
             dict_cache: RwLock::new(HashMap::new()),
             string_distinct_count_cache: RwLock::new(HashMap::new()),
             first_string_row_id_cache: RwLock::new(HashMap::new()),
+            string_cache_budget: crate::storage::on_demand::read_cache_budget_bytes(),
+            string_cache_bytes: AtomicUsize::new(0),
             view_epoch: AtomicU64::new(crate::storage::epoch::current(path)),
         })
     }
@@ -2103,11 +2113,61 @@ impl TableStorageBackend {
     }
 
     #[inline]
-    fn invalidate_read_caches(&self) {
-        self.cached_columns.write().clear();
+    fn clear_string_read_caches(&self) {
         self.dict_cache.write().clear();
         self.string_distinct_count_cache.write().clear();
         self.first_string_row_id_cache.write().clear();
+        self.string_cache_bytes.store(0, Ordering::Relaxed);
+    }
+
+    /// Account one freshly built string cache entry against the backend budget.
+    ///
+    /// The caches are opportunistic: when the budget is exceeded the whole set is
+    /// dropped and rebuilt on the next miss. Clearing (rather than a per-entry
+    /// LRU) keeps the bookkeeping out of the read path, and the budget is large
+    /// enough (64 MiB by default) that a normal column set never thrashes.
+    #[inline]
+    fn account_string_cache(&self, bytes: usize) {
+        if self.string_cache_budget == 0 {
+            return;
+        }
+        let total = self
+            .string_cache_bytes
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes);
+        if total > self.string_cache_budget {
+            self.clear_string_read_caches();
+        }
+    }
+
+    /// Estimated heap bytes of one column's first-row-id accelerator.
+    fn first_row_id_cache_bytes(cache: &FirstStringRowIdCache) -> usize {
+        cache
+            .iter()
+            .map(|(value, _)| value.len() + 16 + std::mem::size_of::<u64>() + 8)
+            .sum()
+    }
+
+    fn dict_cache_bytes(dict: &[String], group_ids: &[u16]) -> usize {
+        dict.iter().map(|value| value.len() + 24).sum::<usize>()
+            + group_ids.len() * std::mem::size_of::<u16>()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_string_cache_budget_bytes(&mut self, bytes: usize) {
+        self.string_cache_budget = bytes;
+        self.string_cache_bytes.store(0, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn string_cache_bytes(&self) -> usize {
+        self.string_cache_bytes.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    fn invalidate_read_caches(&self) {
+        self.cached_columns.write().clear();
+        self.clear_string_read_caches();
         invalidate_global_dict_cache(self.path());
     }
 
@@ -2127,11 +2187,14 @@ impl TableStorageBackend {
             None => return Ok(None),
         };
 
+        let entry_bytes = Self::first_row_id_cache_bytes(&built);
         let mut caches = self.first_string_row_id_cache.write();
         if let Some(existing) = caches.get(col_name) {
             return Ok(Some(Arc::clone(existing)));
         }
         caches.insert(col_name.to_string(), Arc::clone(&built));
+        drop(caches);
+        self.account_string_cache(entry_bytes);
         Ok(Some(built))
     }
 
@@ -6373,8 +6436,11 @@ impl TableStorageBackend {
         // Build and cache
         if let Some((dict_strings, group_ids)) = self.storage.build_string_dict_cache(col_name)? {
             let result = (dict_strings.clone(), group_ids.clone());
+            let entry_bytes = Self::dict_cache_bytes(&dict_strings, &group_ids);
             let mut cache = self.dict_cache.write();
             cache.insert(col_name.to_string(), (dict_strings, group_ids));
+            drop(cache);
+            self.account_string_cache(entry_bytes);
             Ok(Some(result))
         } else {
             Ok(None)
@@ -7219,6 +7285,61 @@ mod tests {
         assert_eq!(
             TableStorageBackend::persisted_row_count_hint(&path).unwrap(),
             3
+        );
+    }
+
+    #[test]
+    fn string_read_caches_are_bounded_and_rebuilt_after_eviction() {
+        // The first-row-id accelerator and the dictionary cache grow with the
+        // number of distinct string values, not with the file size. A backend
+        // must drop them (and rebuild on the next miss) once they exceed the
+        // process storage budget instead of holding them for the table's life.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("string_cache_budget.apex");
+        let rows: Vec<HashMap<String, Value>> = (0..200)
+            .map(|value| {
+                HashMap::from([
+                    ("a".to_string(), Value::String(format!("alpha{value:04}"))),
+                    ("b".to_string(), Value::String(format!("beta{value:04}"))),
+                    ("c".to_string(), Value::String(format!("gamma{value:04}"))),
+                ])
+            })
+            .collect();
+        let mut backend = TableStorageBackend::create(&path).unwrap();
+        let ids = backend.insert_rows(&rows).unwrap();
+        backend.save().unwrap();
+
+        // A budget smaller than a single accelerator entry: the cache must not
+        // accumulate, but the lookup still answers (by rebuilding the cache).
+        backend.set_string_cache_budget_bytes(1024);
+        assert_eq!(
+            backend.first_row_id_for_string_eq("a", "alpha0042").unwrap(),
+            Some(ids[42])
+        );
+        assert!(
+            backend.string_cache_bytes() <= 1024,
+            "an oversized entry must not stay past the budget"
+        );
+
+        // A budget that fits both columns keeps them and accounts their bytes.
+        backend.set_string_cache_budget_bytes(4 * 1024 * 1024);
+        assert_eq!(
+            backend.first_row_id_for_string_eq("a", "alpha0042").unwrap(),
+            Some(ids[42])
+        );
+        assert_eq!(
+            backend.first_row_id_for_string_eq("b", "beta0007").unwrap(),
+            Some(ids[7])
+        );
+        assert!(backend.string_cache_bytes() > 0);
+        assert!(backend.string_cache_bytes() <= 4 * 1024 * 1024);
+
+        // `0` keeps the historical "no limit" meaning of the cache overrides:
+        // uncached columns still build an accelerator (and it is not accounted).
+        backend.set_string_cache_budget_bytes(0);
+        assert_eq!(
+            backend.first_row_id_for_string_eq("c", "gamma0199").unwrap(),
+            Some(ids[199])
         );
     }
 

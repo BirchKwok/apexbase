@@ -219,6 +219,19 @@ the embedded API / Python bindings.
 | `get_write_backend(path, durability)` | Write backend, compacts delta first |
 | `get_insert_backend(path, durability)` | Append backend reused for incremental inserts |
 
+### Memory Budgets
+
+Process-wide storage caches are bounded by `APEX_STORAGE_BUDGET_MB` (1 GiB by
+default), split into scan buffers (1/2), numeric aggregation state (1/8),
+decompressed row groups (1/16) and the per-backend string read caches (1/16).
+The scan, decompressed-row-group and string-read slices have explicit overrides:
+`APEX_SCAN_BUFFER_MB`, `APEX_DECOMPRESSED_RG_MB` and `APEX_READ_CACHE_MB`
+(`0` means unlimited). The string
+read caches — the dictionary cache and the first-row-id accelerator behind
+`WHERE <string> = 'x' LIMIT 1` — grow with the number of *distinct values*
+rather than with the file size, so a backend drops and rebuilds them when they
+exceed their slice instead of holding them for the table's lifetime.
+
 ## Smart Write Routing
 
 Write routing is decided by `StorageEngine::classify_write()`, which combines

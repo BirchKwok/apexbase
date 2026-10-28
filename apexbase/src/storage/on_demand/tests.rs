@@ -3767,13 +3767,16 @@ fn storage_budget_derives_the_cache_caps() {
     assert_eq!(defaults.scan_buffer, 512 * MB);
     assert_eq!(defaults.decompressed_rg, 64 * MB);
     assert_eq!(defaults.numeric_agg, 128 * MB);
+    assert_eq!(defaults.read_cache, 64 * MB);
     let quarter = derive_cache_caps(256 * MB);
     assert_eq!(quarter.scan_buffer, 128 * MB);
     assert_eq!(quarter.decompressed_rg, 16 * MB);
     assert_eq!(quarter.numeric_agg, 32 * MB);
+    assert_eq!(quarter.read_cache, 16 * MB);
     let tiny = derive_cache_caps(1);
     assert_eq!(tiny.scan_buffer, 1);
     assert_eq!(tiny.decompressed_rg, 1);
+    assert_eq!(tiny.read_cache, 1);
 }
 
 #[test]

@@ -49,18 +49,25 @@ pub(crate) struct CacheCaps {
     pub scan_buffer: usize,
     pub decompressed_rg: usize,
     pub numeric_agg: usize,
+    /// Per-backend string read caches (`first_string_row_id_cache` and the
+    /// dictionary cache). These are the only storage caches that grow with the
+    /// *number of distinct values* rather than with the file size, so they get
+    /// their own slice of the budget instead of being unbounded.
+    pub read_cache: usize,
 }
 
 /// Split a memory budget across the storage caches.
 ///
 /// Fractions: scan buffers 1/2, numeric aggregation 1/8, decompressed row groups
-/// 1/16. A zero budget disables the process knob and keeps today's fixed caps.
+/// 1/16, per-backend string read caches 1/16. A zero budget disables the process
+/// knob and keeps today's fixed caps.
 pub(crate) fn derive_cache_caps(budget_bytes: usize) -> CacheCaps {
     let class = |divisor: usize| (budget_bytes / divisor).max(1);
     CacheCaps {
         scan_buffer: class(2),
         numeric_agg: class(8),
         decompressed_rg: class(16),
+        read_cache: class(16),
     }
 }
 
@@ -113,6 +120,8 @@ static DECOMPRESSED_RG_BUDGET_BYTES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static NUMERIC_AGG_BUDGET: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+static READ_CACHE_BUDGET_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 fn cached_cap(
     slot: &std::sync::atomic::AtomicUsize,
@@ -142,6 +151,19 @@ pub(crate) fn decompressed_rg_budget_bytes() -> usize {
 
 pub(crate) fn numeric_agg_budget_bytes() -> usize {
     cached_cap(&NUMERIC_AGG_BUDGET, |caps| caps.numeric_agg, "")
+}
+
+/// Byte budget for one backend's string read caches.
+///
+/// Defaults to 1/16 of `APEX_STORAGE_BUDGET_MB` (64 MiB of the 1 GiB default);
+/// `APEX_READ_CACHE_MB` overrides it for a deployment that needs a tighter RSS
+/// bound. `0` means no limit, matching the other cache overrides.
+pub(crate) fn read_cache_budget_bytes() -> usize {
+    cached_cap(
+        &READ_CACHE_BUDGET_BYTES,
+        |caps| caps.read_cache,
+        "APEX_READ_CACHE_MB",
+    )
 }
 
 /// `APEX_SCAN_BUFFER_MB` parsing, kept pure so it can be tested without mutating the
