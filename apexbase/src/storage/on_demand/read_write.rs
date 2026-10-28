@@ -2528,11 +2528,11 @@ impl OnDemandStorage {
                         } else {
                             vec![]
                         },
-                        chunk_tables: if rg_i < footer.chunk_tables.len() {
+                        chunk_tables: std::sync::Arc::new(if rg_i < footer.chunk_tables.len() {
                             vec![footer.chunk_tables[rg_i].clone()]
                         } else {
                             vec![]
-                        },
+                        }),
                     };
                     let (scanned, _del, col_nulls) =
                         self.scan_columns_mmap_with_nulls(&col_indices, &single_rg_footer)?;
@@ -5630,12 +5630,15 @@ impl OnDemandStorage {
 
         // Write V4 footer
         let footer_offset = writer.stream_position()?;
+        let chunked_groups = all_chunk_tables
+            .iter()
+            .any(|cols| cols.iter().any(Option::is_some));
         let footer = V4Footer {
             schema: modified_schema,
             row_groups: rg_metas.clone(),
             zone_maps: all_zone_maps,
             col_offsets: all_rg_col_offsets,
-            chunk_tables: all_chunk_tables,
+            chunk_tables: std::sync::Arc::new(all_chunk_tables),
         };
         writer.write_all(&footer.to_bytes())?;
         writer.flush()?;
@@ -5647,7 +5650,13 @@ impl OnDemandStorage {
         // Seek back to fix header
         {
             let mut header = self.header.write();
-            header.version = self.required_format_version();
+            header.version = if chunked_groups {
+                // A chunked group is a V5-only row-group revision even when the
+                // table carries no narrow `Float32` column.
+                FORMAT_VERSION_V5
+            } else {
+                self.required_format_version()
+            };
             header.row_count = active_count as u64;
             header.column_count = col_count as u32;
             header.footer_offset = footer_offset;
@@ -5844,7 +5853,7 @@ impl OnDemandStorage {
             }],
             zone_maps: Vec::new(),
             col_offsets: Vec::new(),
-            chunk_tables: Vec::new(),
+            chunk_tables: std::sync::Arc::new(Vec::new()),
         };
         let footer_bytes = footer.to_bytes();
 
@@ -7336,13 +7345,16 @@ impl OnDemandStorage {
             } else {
                 RG_ENCODING_VERSION
             };
-            while footer.chunk_tables.len() < footer.row_groups.len() {
-                footer.chunk_tables.push(Vec::new());
+            {
+                let chunk_tables = std::sync::Arc::make_mut(&mut footer.chunk_tables);
+                while chunk_tables.len() < footer.row_groups.len() {
+                    chunk_tables.push(Vec::new());
+                }
+                chunk_tables.push(match body_chunks {
+                    Some(cols) => cols.into_iter().map(Some).collect(),
+                    None => Vec::new(),
+                });
             }
-            footer.chunk_tables.push(match body_chunks {
-                Some(cols) => cols.into_iter().map(Some).collect(),
-                None => Vec::new(),
-            });
 
             // Write RG header (32 bytes) — byte 28 = compression flag
             writer.write_all(MAGIC_ROW_GROUP)?;
@@ -7392,7 +7404,7 @@ impl OnDemandStorage {
         let writer_inner = writer.get_mut();
         {
             let mut header = self.header.write();
-            header.version = self.required_format_version();
+            header.version = self.format_version_for(&footer.chunk_tables);
             header.row_count = active_rows_after;
             header.footer_offset = new_footer_offset;
             header.row_group_count = footer.row_groups.len() as u32;

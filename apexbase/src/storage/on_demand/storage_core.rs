@@ -945,6 +945,7 @@ fn flush_streamed_out_rg<W: std::io::Write + std::io::Seek>(
     all_rg_col_offsets: &mut Vec<Vec<u32>>,
     all_chunk_tables: &mut RgChunkTables,
     compression: CompressionType,
+    layout: Option<bool>,
     written_rows: &mut u64,
     stats: &mut [StreamingColumnStats],
     implicit_ids_ok: bool,
@@ -970,6 +971,7 @@ fn flush_streamed_out_rg<W: std::io::Write + std::io::Seek>(
         all_rg_col_offsets,
         all_chunk_tables,
         compression,
+        layout,
         implicit_ids_ok,
         encoding_options,
     )?;
@@ -2035,7 +2037,7 @@ impl OnDemandStorage {
         wanted: &[usize],
         raw: &[u8],
         need_prefix: bool,
-    ) -> io::Result<Option<(Vec<u8>, Vec<(usize, std::sync::Arc<Vec<u8>>)>)>> {
+    ) -> io::Result<Option<(std::sync::Arc<Vec<u8>>, Vec<(usize, std::sync::Arc<Vec<u8>>)>)>> {
         // Borrow the chunk directory for the whole call: cloning it per row
         // group allocated one Vec of chunk refs per group on every scan.
         let footer = self.v4_footer.read();
@@ -2061,7 +2063,14 @@ impl OnDemandStorage {
             .next()
             .map(|col| col.flat_off as usize)
             .unwrap_or(0);
-        let mut prefix = Vec::new();
+        // The prefix (id section + deletion vector) is the one part of a chunked
+        // row group that is not a column. Window reads need its IDs on every call,
+        // so caching it under its own sentinel key keeps a `LIMIT` scan from
+        // decompressing the same 32 KB of IDs per query. `u64::MAX` cannot collide
+        // with a column key (those count down from `u64::MAX - 1`) or with an
+        // assembled-body key (a body length).
+        let prefix_key = (rg_offset, u64::MAX);
+        let mut prefix = std::sync::Arc::new(Vec::new());
         let mut pos = 0usize;
         if prefix_len > 0 {
             if raw.len() < CHUNK_FRAME_HEADER_LEN {
@@ -2072,11 +2081,25 @@ impl OnDemandStorage {
             if frame_end > raw.len() {
                 return Err(err_data("chunked prefix frame runs past the row group"));
             }
-            // Without deletions the id section + deletion vector are never read;
-            // decompressing the whole prefix frame (ids dominate it) would cost
-            // more than the single column the caller actually needs.
+            // Without deletions and with implicit IDs the id section + deletion
+            // vector are never read; decompressing the whole prefix frame (ids
+            // dominate it) would cost more than the columns the caller wants.
             if need_prefix {
-                prefix = decompress_column_frame(&raw[..frame_end])?;
+                // Note the separate scope: taking `.read()` and then trying to
+                // `.write()` inside the same match would deadlock the thread on
+                // its own read guard.
+                let cached_prefix = { self.decompressed_rg_cache.read().get(prefix_key) };
+                prefix = match cached_prefix {
+                    Some(cached) => cached,
+                    None => {
+                        let decoded =
+                            std::sync::Arc::new(decompress_column_frame(&raw[..frame_end])?);
+                        self.decompressed_rg_cache
+                            .write()
+                            .insert(prefix_key, std::sync::Arc::clone(&decoded));
+                        decoded
+                    }
+                };
             }
             pos = frame_end;
         }
@@ -2088,7 +2111,7 @@ impl OnDemandStorage {
             // the byte budget and the invalidation, and re-decoding a filter or
             // aggregate column on every scan is what kept repeated chunked
             // queries behind the cached flat layout.
-            let cache_key = (rg_offset, u64::MAX - index as u64);
+            let cache_key = (rg_offset, u64::MAX - 1 - index as u64);
             if take {
                 if let Some(cached) = self.decompressed_rg_cache.read().get(cache_key) {
                     out.push((index, cached));
@@ -2248,6 +2271,24 @@ impl OnDemandStorage {
             FORMAT_VERSION_V5
         } else {
             FORMAT_VERSION_V4
+        }
+    }
+
+    /// File format version to declare for a table whose groups are `chunk_tables`.
+    ///
+    /// The chunked (one compressed frame per column) encoding is a V5-only row
+    /// group revision: a build that predates it cannot parse the frames. Such a
+    /// file must therefore declare version 5 even when no narrow `Float32`
+    /// payload is present, so an older build refuses it at open with the format
+    /// version error instead of meeting an unknown row-group encoding.
+    pub(crate) fn format_version_for(&self, chunk_tables: &RgChunkTables) -> u32 {
+        if chunk_tables
+            .iter()
+            .any(|cols| cols.iter().any(Option::is_some))
+        {
+            FORMAT_VERSION_V5
+        } else {
+            self.required_format_version()
         }
     }
 
@@ -5265,6 +5306,12 @@ impl OnDemandStorage {
         // V4 enablement gate for the implicit-ID encoding (temporary tables).
         let implicit_ids_ok = implicit_ids_allowed(&self.path);
         let encoding_options = self.column_encoding_options();
+        // A rewrite republishes every row group, but it must not change the
+        // table's on-disk layout: a flat compressed table whose `DELETE` rewrote
+        // the file used to be free to switch to the chunked layout (and vice
+        // versa) whenever the process-level opt-in differed from the file's
+        // decision. The source footer is authoritative for the whole table.
+        let layout = table_uses_chunk_layout(&footer.chunk_tables);
 
         macro_rules! flush_out_rg {
             () => {{
@@ -5281,6 +5328,7 @@ impl OnDemandStorage {
                     &mut all_rg_col_offsets,
                     &mut all_chunk_tables,
                     compression,
+                    layout,
                     &mut written_rows,
                     &mut column_stats,
                     implicit_ids_ok,
@@ -5447,6 +5495,7 @@ impl OnDemandStorage {
                 &mut all_rg_col_offsets,
                 &mut all_chunk_tables,
                 compression,
+                layout,
                 implicit_ids_ok,
                 encoding_options,
             )?;
@@ -5467,18 +5516,19 @@ impl OnDemandStorage {
 
         // Write footer + trailer, then fix the header.
         let footer_offset = writer.stream_position()?;
+        let final_version = self.format_version_for(&all_chunk_tables);
         let final_footer = V4Footer {
             schema: modified_schema,
             row_groups: rg_metas.clone(),
             zone_maps: all_zone_maps,
             col_offsets: all_rg_col_offsets,
-            chunk_tables: all_chunk_tables,
+            chunk_tables: std::sync::Arc::new(all_chunk_tables),
         };
         writer.write_all(&final_footer.to_bytes())?;
         writer.flush()?;
         {
             let mut header = self.header.write();
-            header.version = FORMAT_VERSION_V4;
+            header.version = final_version;
             header.row_count = written_rows;
             header.column_count = col_count as u32;
             header.footer_offset = footer_offset;
@@ -5602,6 +5652,7 @@ impl OnDemandStorage {
         all_rg_col_offsets: &mut Vec<Vec<u32>>,
         all_chunk_tables: &mut RgChunkTables,
         compression: CompressionType,
+        layout: Option<bool>,
         implicit_ids_ok: bool,
         encoding_options: ColumnEncodingOptions,
     ) -> io::Result<()> {
@@ -5689,7 +5740,6 @@ impl OnDemandStorage {
             }
         }
 
-        let layout = table_uses_chunk_layout(all_chunk_tables);
         let (compress_flag, disk_body, body_chunks, rg_col_offsets) =
             encode_rg_body_with_layout(body_buf, &col_ranges, compression, layout)?;
         all_rg_col_offsets.push(rg_col_offsets);
@@ -5855,6 +5905,12 @@ impl OnDemandStorage {
         // V4 enablement gate for the implicit-ID encoding (temporary tables).
         let implicit_ids_ok = implicit_ids_allowed(&self.path);
         let encoding_options = self.column_encoding_options();
+        // A rewrite republishes every row group, but it must not change the
+        // table's on-disk layout: a flat compressed table whose `DELETE` rewrote
+        // the file used to be free to switch to the chunked layout (and vice
+        // versa) whenever the process-level opt-in differed from the file's
+        // decision. The source footer is authoritative for the whole table.
+        let layout = table_uses_chunk_layout(&footer.chunk_tables);
 
         macro_rules! flush_out_rg {
             () => {{
@@ -5871,6 +5927,7 @@ impl OnDemandStorage {
                     &mut all_rg_col_offsets,
                     &mut all_chunk_tables,
                     compression,
+                    layout,
                     &mut written_rows,
                     &mut column_stats,
                     implicit_ids_ok,
@@ -5967,6 +6024,7 @@ impl OnDemandStorage {
                 &mut all_rg_col_offsets,
                 &mut all_chunk_tables,
                 compression,
+                layout,
                 implicit_ids_ok,
                 encoding_options,
             )?;
@@ -5985,18 +6043,19 @@ impl OnDemandStorage {
         };
 
         let footer_offset = writer.stream_position()?;
+        let final_version = self.format_version_for(&all_chunk_tables);
         let final_footer = V4Footer {
             schema: modified_schema,
             row_groups: rg_metas.clone(),
             zone_maps: all_zone_maps,
             col_offsets: all_rg_col_offsets,
-            chunk_tables: all_chunk_tables,
+            chunk_tables: std::sync::Arc::new(all_chunk_tables),
         };
         writer.write_all(&final_footer.to_bytes())?;
         writer.flush()?;
         {
             let mut header = self.header.write();
-            header.version = FORMAT_VERSION_V4;
+            header.version = final_version;
             header.row_count = written_rows;
             header.column_count = new_col_count as u32;
             header.footer_offset = footer_offset;

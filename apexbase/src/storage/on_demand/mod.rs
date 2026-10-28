@@ -2195,20 +2195,40 @@ pub(crate) fn encode_rg_body_with_layout(
         && flat.len() >= COMPRESS_MIN_BODY_SIZE
         && !ranges.is_empty();
     if chunkable && force != Some(false) {
-        let (flag, flat_frame) = compress_rg_body(flat.clone(), compression);
-        if flag != RG_COMPRESS_NONE {
-            let columns: Vec<&[u8]> =
-                ranges.iter().map(|&(start, end)| &flat[start..end]).collect();
-            let prefix_len = ranges.first().map(|&(start, _)| start).unwrap_or(0);
-            let prefix = &flat[..prefix_len];
+        let columns: Vec<&[u8]> = ranges.iter().map(|&(start, end)| &flat[start..end]).collect();
+        let prefix_len = ranges.first().map(|&(start, _)| start).unwrap_or(0);
+        let prefix = &flat[..prefix_len];
+        if force == Some(true) {
+            // The table already committed to the chunked layout, so the size gate
+            // cannot change the answer for this group. Compressing the flat frame
+            // just to compare sizes doubled the compression work of every later
+            // group; write the frames directly instead.
             if let Some((payload, chunks)) =
                 chunk_rg_body_with_prefix(&columns, prefix, compression)?
             {
-                let growth = payload.len() as f64 / flat_frame.len() as f64;
-                if force == Some(true) || growth <= 1.0 + CHUNK_LAYOUT_MAX_GROWTH {
-                    return Ok((flag, payload, Some(chunks), flat_offsets));
+                return Ok((
+                    rg_compress_flag(compression),
+                    payload,
+                    Some(chunks),
+                    flat_offsets,
+                ));
+            }
+        } else {
+            // First group of the table: the 8% size gate needs both layouts.
+            let (flag, flat_frame) = compress_rg_body(flat.clone(), compression);
+            if flag != RG_COMPRESS_NONE {
+                if let Some((payload, chunks)) =
+                    chunk_rg_body_with_prefix(&columns, prefix, compression)?
+                {
+                    let growth = payload.len() as f64 / flat_frame.len() as f64;
+                    if growth <= 1.0 + CHUNK_LAYOUT_MAX_GROWTH {
+                        return Ok((flag, payload, Some(chunks), flat_offsets));
+                    }
                 }
             }
+            // The gate refused the chunked layout: the compressed flat frame is
+            // exactly what the plain path would produce, so publish it as is.
+            return Ok((flag, flat_frame, None, flat_offsets));
         }
     }
     let (flag, body) = compress_rg_body(flat, compression);
@@ -2351,6 +2371,15 @@ fn compress_rg_body(body: Vec<u8>, compression: CompressionType) -> (u8, Vec<u8>
             }
             (RG_COMPRESS_NONE, body)
         }
+    }
+}
+
+/// Row-group header byte 28 value for one compression algorithm.
+fn rg_compress_flag(compression: CompressionType) -> u8 {
+    match compression {
+        CompressionType::None => RG_COMPRESS_NONE,
+        CompressionType::Lz4 => RG_COMPRESS_LZ4,
+        CompressionType::Zstd => RG_COMPRESS_ZSTD,
     }
 }
 

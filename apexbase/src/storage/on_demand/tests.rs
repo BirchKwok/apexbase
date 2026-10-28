@@ -4999,7 +4999,7 @@ fn legacy_length_string_zones_never_prune_by_order() {
             is_string_tail: false,
         }]],
         col_offsets: Vec::new(),
-        chunk_tables: Vec::new(),
+        chunk_tables: std::sync::Arc::new(Vec::new()),
     };
     let disjoint = |op: ScanComparison, value: &str| {
         let predicate = ScanPredicate::Compare {
@@ -7092,4 +7092,115 @@ fn json_schema_survives_a_typed_insert() {
         .scan_string_filter_mmap("doc", "{\"a\": 1}", None)
         .unwrap();
     assert_eq!(hits, Some(vec![0]), "json equality scan");
+}
+
+#[test]
+fn chunked_row_groups_declare_the_v5_format_version() {
+    // A chunked row group carries a V5-only row-group revision, and a V4-era
+    // build refuses version-5 files at open. Declaring version 4 while writing
+    // frames made the header claim a byte compatibility the file does not have,
+    // so `format_version_for` must upgrade the declaration as soon as any group
+    // is chunked -- even when no narrow Float32 payload is present.
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("chunked_version.apex");
+    let storage = OnDemandStorage::create_with_schema_and_durability(
+        &path,
+        crate::storage::DurabilityLevel::Fast,
+        &[("k".to_string(), ColumnType::Int64)],
+    )
+    .unwrap();
+    assert_eq!(
+        storage.format_version_for(&Vec::new()),
+        FORMAT_VERSION_V4,
+        "an uncompressed, non-chunked table stays V4"
+    );
+    let chunked: RgChunkTables = vec![vec![Some(ChunkedColumn {
+        chunks: vec![ChunkRef { len: 4 }],
+        flat_len: 8,
+        flat_off: 0,
+    })]];
+    assert_eq!(storage.format_version_for(&chunked), FORMAT_VERSION_V5);
+    // A directory entry of `None` (a flat group in a chunk-capable table) does
+    // not make the file V5 by itself.
+    let flat_entry: RgChunkTables = vec![vec![None]];
+    assert_eq!(
+        storage.format_version_for(&flat_entry),
+        FORMAT_VERSION_V4
+    );
+}
+
+#[test]
+fn encode_rg_body_skips_the_size_gate_once_the_layout_is_fixed() {
+    // Only the first group of a table is compared against a flat frame. Every
+    // later group of a chunked table must go straight to frames: the gate cannot
+    // change the answer there, and compressing the flat frame anyway doubled the
+    // compression work of the write path.
+    use crate::storage::on_demand::{
+        encode_rg_body_with_layout, write_column_encoded, ColumnEncodingOptions,
+        CompressionType,
+    };
+
+    let rows = 4096usize;
+    let columns: Vec<ColumnData> = (0..4)
+        .map(|col| {
+            ColumnData::Int64(
+                (0..rows)
+                    .map(|row| {
+                        let mut x = (row as u64)
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add((col as u64).wrapping_mul(1442695040888963407));
+                        x ^= x >> 33;
+                        x as i64
+                    })
+                    .collect(),
+            )
+        })
+        .collect();
+    let mut flat: Vec<u8> = Vec::new();
+    let mut ranges: Vec<(usize, usize)> = Vec::new();
+    {
+        let mut cursor = std::io::Cursor::new(&mut flat);
+        for col in &columns {
+            let start = cursor.position() as usize;
+            write_column_encoded(
+                col,
+                ColumnType::Int64,
+                &mut cursor,
+                ColumnEncodingOptions::default(),
+            )
+            .unwrap();
+            ranges.push((start, cursor.position() as usize));
+        }
+    }
+    let flat_offsets: Vec<u32> = ranges.iter().map(|&(start, _)| start as u32).collect();
+
+    // A table that already committed to the layout: frames, no size gate.
+    let (flag, payload, chunks, offsets) =
+        encode_rg_body_with_layout(flat.clone(), &ranges, CompressionType::Zstd, Some(true))
+            .unwrap();
+    assert_eq!(
+        flag, RG_COMPRESS_ZSTD,
+        "chunked RG header keeps the algorithm"
+    );
+    assert!(chunks.is_some(), "a fixed chunked layout must keep frames");
+    assert_eq!(offsets, flat_offsets, "readers address the flat body");
+    assert!(!payload.is_empty());
+
+    // A table that committed to the flat layout: no frames, flat body only.
+    let (_, payload, chunks, offsets) =
+        encode_rg_body_with_layout(flat.clone(), &ranges, CompressionType::Zstd, Some(false))
+            .unwrap();
+    assert!(chunks.is_none(), "a flat table must stay flat");
+    assert_eq!(offsets, flat_offsets);
+    assert!(!payload.is_empty());
+
+    // The process-level default is still off: an open decision stays flat.
+    if std::env::var_os("APEX_CHUNK_INDEX").is_none() {
+        let (_, _, chunks, _) =
+            encode_rg_body_with_layout(flat, &ranges, CompressionType::Zstd, None).unwrap();
+        assert!(
+            chunks.is_none(),
+            "the chunked layout is opt-in until its read lanes are complete"
+        );
+    }
 }

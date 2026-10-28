@@ -120,6 +120,14 @@ fails the full gate even when all public tabular/vector metrics pass. The
 canary is the normal edit-time check; use full mode for final performance
 acceptance.
 
+Later rounds added dedicated phases for the V5 storage and execution work:
+`wf` (width fidelity), `zs` (string zone maps), `htap` (overlay writes), `wide`
+(16-column tables plus a zstd twin), `chunked` (independent-column zstd fixture
+for the per-column compressed layout), `hybrid` (FTS + vector fusion), `pgwire`
+(wire concurrency), `hot` (canary shapes the frozen public scoreboard cannot
+carry) and `mixed` (concurrent read/write). `run_local_perf_guard.py` and
+`test/test_local_perf_guard.py` are the source of truth for the current list.
+
 By default, reports are written under
 `local-perf-results/<timestamp>/`. A custom directory must not already exist:
 

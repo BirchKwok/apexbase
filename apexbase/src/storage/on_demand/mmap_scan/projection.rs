@@ -758,6 +758,125 @@ impl OnDemandStorage {
         }
         // === End RCIX fast path ===
 
+        // Chunked groups decode only the columns the statement asked for. A
+        // compressed chunked group has no RCIX, so without this branch a window
+        // read assembles the whole flat body (every column) even when the
+        // statement projects one: `SELECT c0 FROM t LIMIT 100` on a 200k x 16
+        // zstd table measured 0.050 ms against 0.023 ms on the flat layout,
+        // while the aggregation/filter lanes already decoded just their column.
+        let chunked = footer
+            .chunk_tables
+            .get(rg_idx)
+            .is_some_and(|cols| cols.iter().any(Option::is_some));
+        if chunked {
+            let id_encoding = rg_bytes.get(30).copied().unwrap_or(RG_IDS_PLAIN);
+            let need_prefix = has_deletes || id_encoding != RG_IDS_IMPLICIT_CONTIGUOUS;
+            if let Some((prefix, columns)) = storage.decompressed_chunked_columns(
+                rg_idx,
+                col_indices,
+                rg_bytes.get(32..).unwrap_or(&[]),
+                need_prefix,
+            )? {
+                // The deletion vector turns the window over *active* rows into
+                // physical rows; `all_ids` must stay row-aligned with the
+                // accumulators because the pending DeltaStore overlay uses it.
+                let del_vec_len = (rg_rows + 7) / 8;
+                let del_bytes: &[u8] = if has_deletes {
+                    if prefix.len() < del_vec_len {
+                        return Err(err_data("chunked RG deletion vector truncated"));
+                    }
+                    &prefix[prefix.len() - del_vec_len..]
+                } else {
+                    &[]
+                };
+                let mut window: Vec<usize> = Vec::with_capacity(rows_to_take);
+                let mut skipped = 0usize;
+                for row in 0..rg_rows {
+                    if has_deletes && (del_bytes[row / 8] >> (row % 8)) & 1 == 1 {
+                        continue;
+                    }
+                    if skipped < active_skip {
+                        skipped += 1;
+                        continue;
+                    }
+                    window.push(row);
+                    if window.len() >= rows_to_take {
+                        break;
+                    }
+                }
+                if window.len() < rows_to_take {
+                    return Err(err_data("chunked RG active row window truncated"));
+                }
+                for &row in &window {
+                    let id = if id_encoding == RG_IDS_IMPLICIT_CONTIGUOUS {
+                        rg_meta.min_id + row as u64
+                    } else {
+                        let start = row * 8;
+                        if start + 8 > prefix.len() {
+                            return Err(err_data("chunked RG ID section truncated"));
+                        }
+                        u64::from_le_bytes(prefix[start..start + 8].try_into().unwrap())
+                    };
+                    all_ids.push(id as i64);
+                }
+                let col_idx_to_out: HashMap<usize, usize> = col_indices
+                    .iter()
+                    .enumerate()
+                    .map(|(out_pos, &col_idx)| (col_idx, out_pos))
+                    .collect();
+                let mut rg_filled: Vec<bool> = vec![false; col_indices.len()];
+                for (col_idx, col_bytes) in columns {
+                    let Some(&out_pos) = col_idx_to_out.get(&col_idx) else {
+                        continue;
+                    };
+                    if col_bytes.len() < null_bitmap_len {
+                        continue;
+                    }
+                    let null_bytes = &col_bytes[..null_bitmap_len];
+                    let col_type = schema.columns[col_idx].1;
+                    let payload = &col_bytes[null_bitmap_len..];
+                    // A no-delete window that starts at row 0 can decode only the
+                    // rows it needs; every other window decodes the column and
+                    // slices (or filters) it, matching the flat sequential path.
+                    let col_data = if !has_deletes && active_skip == 0 && rows_to_take < rg_rows {
+                        read_column_encoded_partial(payload, col_type, rows_to_take)?.0
+                    } else {
+                        read_column_encoded(payload, col_type)?.0
+                    };
+                    let col_data = if matches!(&col_data, ColumnData::StringDict { .. }) {
+                        col_data.decode_string_dict()
+                    } else {
+                        col_data
+                    };
+                    let selected = if has_deletes {
+                        col_data.filter_by_indices(&window)
+                    } else if active_skip > 0 || rows_to_take < col_data.len() {
+                        col_data.slice_range(active_skip, active_skip + rows_to_take)
+                    } else {
+                        col_data
+                    };
+                    col_accumulators[out_pos].append(&selected);
+                    null_accumulators[out_pos].extend(
+                        window
+                            .iter()
+                            .map(|&row| (null_bytes[row / 8] >> (row % 8)) & 1 == 1),
+                    );
+                    rg_filled[out_pos] = true;
+                }
+                // Schema evolution: a column added after this group has no bytes.
+                for (out_pos, filled) in rg_filled.iter().enumerate() {
+                    if !filled {
+                        let col_type = schema.columns[col_indices[out_pos]].1;
+                        let default_col = Self::create_default_column(col_type, rows_to_take);
+                        col_accumulators[out_pos].append(&default_col);
+                        null_accumulators[out_pos]
+                            .extend(std::iter::repeat(true).take(rows_to_take));
+                    }
+                }
+                return Ok(());
+            }
+        }
+
         // Get the body bytes (after 32-byte RG header), decompressing if needed
         let decompressed_buf = storage.decompressed_rg_body(
             rg_meta.offset,

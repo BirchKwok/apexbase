@@ -326,8 +326,8 @@ def test_local_guard_full_mode_runs_every_dedicated_phase(local_guard):
     # Every dedicated base/current phase of --mode full must stay wired: the
     # guard's coverage is the union of these interleaved comparisons.
     for phase in (
-        "qps", "quant", "idx", "par", "wf", "zs", "htap", "wide", "hybrid",
-        "pgwire", "hot", "mixed",
+        "qps", "quant", "idx", "par", "wf", "zs", "htap", "wide", "chunked",
+        "hybrid", "pgwire", "hot", "mixed",
     ):
         assert f"collect_{phase} = make_collect(" in source
         assert f'"{phase}-comparison"' in source
@@ -335,6 +335,7 @@ def test_local_guard_full_mode_runs_every_dedicated_phase(local_guard):
     assert "string_zones_only=True" in source
     assert "htap_only=True" in source
     assert "wide_only=True" in source
+    assert "chunked_only=True" in source
     assert "hybrid_only=True" in source
     assert "pgwire_only=True" in source
     # M-21: the full perf phase is the frozen 103-metric public scoreboard, so
@@ -660,6 +661,7 @@ def test_local_guard_rechecks_every_phase(local_guard):
         "perf-recheck.txt",
         "pgwire-recheck.txt",
         "wide-recheck.txt",
+        "chunked-recheck.txt",
         "hybrid-recheck.txt",
         "htap-recheck.txt",
         "zs-recheck.txt",
@@ -874,6 +876,36 @@ def test_local_guard_wide_phase_uses_the_wide_table_script(local_guard):
     assert "--qps-only" not in command
     assert "--index-only" not in command
     assert "--skip-quantized-vector" not in command
+
+
+def test_local_guard_chunked_phase_uses_the_layout_script(local_guard):
+    command = local_guard.benchmark_arguments(
+        "full", None, None, None, "report.json", chunked_only=True
+    )
+
+    assert Path(command[0]).name == "bench_chunked_layout.py"
+    assert command[1:7] == (
+        "--rows", "200000", "--warmup", "2", "--iterations", "7",
+    )
+    assert command[-2:] == ("--output", "report.json")
+    # The phase builds and asserts its own fixtures: no canary profile flag may
+    # leak into it.
+    assert "--qps-only" not in command
+    assert "--index-only" not in command
+    assert "--skip-quantized-vector" not in command
+
+
+def test_local_guard_chunked_recheck_uses_only_metric(local_guard):
+    source = Path(local_guard.__file__).read_text(encoding="utf-8")
+    assert "chunked-recheck.txt" in source
+    assert "chunked_only=True" in source
+    command = local_guard.benchmark_arguments(
+        "canary", None, None, None, "report.json",
+        chunked_only=True, only_metric="Chunked: filter count (single column)",
+    )
+    assert command[-2:] == (
+        "--only", "Chunked: filter count (single column)",
+    )
 
 
 def test_local_guard_string_zone_phase_uses_the_zone_script(local_guard):

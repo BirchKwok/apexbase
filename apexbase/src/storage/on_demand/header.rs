@@ -361,7 +361,12 @@ pub struct V4Footer {
     pub col_offsets: RgColumnOffsets,
     /// Per-RG per-column chunk directories of chunked row groups.
     /// Empty unless a table opted into the chunked layout.
-    pub chunk_tables: RgChunkTables,
+    ///
+    /// Shared behind an `Arc` so the footer clone every read entry point makes
+    /// stays cheap: a chunked table's directory holds one `ChunkedColumn` per
+    /// column per row group, and copying it cost ~50 us per query on a
+    /// 200k x 16 table -- enough to hide the layout's own read gain.
+    pub chunk_tables: std::sync::Arc<RgChunkTables>,
 }
 
 impl V4Footer {
@@ -416,7 +421,7 @@ impl V4Footer {
         if !self.chunk_tables.is_empty() {
             buf.extend_from_slice(CHUNK_MAGIC);
             buf.extend_from_slice(&(self.chunk_tables.len() as u32).to_le_bytes());
-            for rg_cols in &self.chunk_tables {
+            for rg_cols in self.chunk_tables.iter() {
                 buf.extend_from_slice(&(rg_cols.len() as u16).to_le_bytes());
                 for col in rg_cols {
                     match col {
@@ -588,7 +593,7 @@ impl V4Footer {
             row_groups,
             zone_maps,
             col_offsets,
-            chunk_tables,
+            chunk_tables: std::sync::Arc::new(chunk_tables),
         })
     }
     

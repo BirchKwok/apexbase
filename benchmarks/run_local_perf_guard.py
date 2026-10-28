@@ -154,7 +154,7 @@ def benchmark_arguments(
     mode, rows, warmup, iterations, output, qps_only=False, quant_only=False,
     index_only=False, parallel_only=False, width_only=False, string_zones_only=False,
     htap_only=False, wide_only=False, hybrid_only=False, pgwire_only=False,
-    hot_shapes_only=False, only_metric=None, mixed_only=False,
+    hot_shapes_only=False, only_metric=None, mixed_only=False, chunked_only=False,
 ):
     if width_only:
         # The width-fidelity phase builds its own tables (one V4 full-width
@@ -179,6 +179,13 @@ def benchmark_arguments(
         # over several row groups and asserts every shape, so it is its own
         # script too.
         script = ROOT / "benchmarks" / "bench_wide_table.py"
+        defaults = (200_000, 2, 7)
+    elif chunked_only:
+        # The chunked-layout phase builds its own independent-column zstd
+        # fixture (the wide phase's correlated twin stays flat under the 8%
+        # size gate), asserts the per-column frames were actually written, and
+        # times the column-selective/window shapes the layout exists for.
+        script = ROOT / "benchmarks" / "bench_chunked_layout.py"
         defaults = (200_000, 2, 7)
     elif hybrid_only:
         # The hybrid-retrieval phase builds its own text + vector table, asserts
@@ -225,7 +232,8 @@ def benchmark_arguments(
     command += ["--output", output]
     if mode == "full" and not qps_only and not quant_only and not width_only \
             and not string_zones_only and not htap_only and not wide_only \
-            and not hybrid_only and not pgwire_only and not hot_shapes_only:
+            and not hybrid_only and not pgwire_only and not hot_shapes_only \
+            and not chunked_only:
         # Quantized base/current metrics run in the dedicated interleaved phase.
         command.insert(1, "--skip-quantized-vector")
     if qps_only:
@@ -826,6 +834,45 @@ def execute_gate(args, output_dir, evidence):
                         "wide-recheck",
                     )
                 comparison_status = max(comparison_status, wide_status)
+
+                # Chunked (per-column compressed) row-group layout: the wide
+                # phase cannot sample it (its fixture correlates its columns, so
+                # the 8% size gate keeps it flat). This phase builds an
+                # independent-column zstd fixture, asserts that the layout was
+                # actually taken, and times the column-selective/limit shapes the
+                # layout exists for. It also records the flat twin as an
+                # informational block so the report shows the layout's effect.
+                chunked_counts = {"base": 0, "current": 0}
+                chunked_reports = {"base": [], "current": []}
+                collect_chunked = make_collect(
+                    "chunked",
+                    chunked_counts,
+                    chunked_reports,
+                    lambda side, report: benchmark_arguments(
+                        "canary", None, None, None, report, chunked_only=True
+                    ),
+                )
+                collect_chunked(SAMPLE_ORDER)
+                chunked_status = run_comparison(
+                    collect_chunked, chunked_reports, "chunked-comparison"
+                )
+                if chunked_status == 1:
+                    chunked_status = recheck_marked(
+                        "chunked-comparison",
+                        chunked_reports,
+                        lambda metric, report: benchmark_arguments(
+                            "canary",
+                            None,
+                            None,
+                            None,
+                            report,
+                            chunked_only=True,
+                            only_metric=metric,
+                        ),
+                        "chunked-recheck.txt",
+                        "chunked-recheck",
+                    )
+                comparison_status = max(comparison_status, chunked_status)
 
                 # Mixed retrieval: one table carries both a text column and a
                 # 64-dimension vector column, and the phase times the BM25
