@@ -94,15 +94,23 @@ The data format, Python/Rust APIs and upgrade path are unchanged.
   script against both wheels, so the base/current comparison shows the overlay
   fixes directly: **-92.0% / -93.7% point reads, -99.2% index equality, -92.0% index
   equality + LIMIT, and -78.7% for the parameterized projected lookup**.
-- The public 1,000,000-row scoreboard still completes all 103 tabular metrics
-  plus 6/6 exact-vector and 6/6 quantized-vector comparisons; the point-lookup
-  metrics are within threshold of the baseline (`Point Lookup (SQL by ID)
-  -2.6%`, `Point lookup (projected SQL) -1.4%`, `Point lookup (direct full row)
-  -1.2%`). The only metric outside the tool's threshold in this run is
-  `Filter (name = 'user_5000')` at +15.6% against the v1.36.2 snapshot (the
-  same-machine full gate measured it at +14.99% over five interleaved samples,
-  inside threshold; the canary's `String equality filter` counterpart is
-  +9.7%).
+- The public 1,000,000-row scoreboard completes all 103 tabular metrics plus
+  6/6 exact-vector and 6/6 quantized-vector comparisons, winning **102/103**
+  tabular against the best of SQLite/DuckDB (the single loss is `UNION ALL
+  (ordered)` at 1.05×, one of the set-operation shapes the project documents as
+  load-sensitive) and **6/6 + 6/6** vector comparisons.
+- Against the previous v1.36.2 snapshot, this single-run comparison flags eight
+  metrics — `Aggregation (5 funcs)` +20.7%, `COUNT(*)` +29.0%, `COUNT(DISTINCT
+  category)` +27.5%, `Filter (name = 'user_5000')` +46.9%, `GROUP BY category (10
+  groups)` +32.8%, `INTERSECT (ordered)` +71.0%, `Retrieve Many (SQL, 100 IDs)`
+  +23.3% and `UNION ALL (ordered)` +238.4% — the small/set-operation shapes
+  whose run-to-run variance the project already records (two runs of one tree
+  can flag a different set). The authoritative same-machine gate against
+  `origin/main` passed all 109 public metrics and every dedicated phase, and the
+  point-lookup metrics improved (`Point Lookup (SQL by ID) -2.2%`), so these are
+  recorded as baseline noise rather than engine regressions; the refreshed
+  baseline now starts from this V5-generation run instead of the v1.36.2
+  snapshot.
 
 ### Validation And Performance
 

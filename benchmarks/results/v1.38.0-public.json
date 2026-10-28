@@ -1,0 +1,1937 @@
+{
+  "format_version": 1,
+  "suite": "apexbase-vs-sqlite-duckdb",
+  "git": {
+    "commit": "3375f5d09f95b801c43e3f7c874b5dc2177ce23b",
+    "branch": "main",
+    "dirty": false
+  },
+  "system": {
+    "platform": "macOS-27.0.1-arm64-arm-64bit",
+    "machine": "arm64",
+    "processor": "arm",
+    "python": "3.12.2",
+    "cpu_count": 10,
+    "memory_gb": 32.0,
+    "apexbase": "1.38.0",
+    "duckdb": "1.1.3",
+    "sqlite": "3.46.0",
+    "sqlite_vector": "1.0.0",
+    "pyarrow": "23.0.1"
+  },
+  "dependencies": {
+    "apexbase": "1.38.0",
+    "sqlite": "3.46.0",
+    "duckdb": "1.1.3",
+    "pyarrow": "23.0.1",
+    "numpy": "2.4.3",
+    "pandas": "3.0.1",
+    "polars": "1.39.3"
+  },
+  "build": {
+    "maturin": "1.9.1",
+    "rustc": "rustc 1.92.0 (ded5c06cf 2025-12-08)\nbinary: rustc\ncommit-hash: ded5c06cf21d2b93bffd5d884aa6e96934ee4234\ncommit-date: 2025-12-08\nhost: aarch64-apple-darwin\nrelease: 1.92.0\nLLVM version: 21.1.3",
+    "cargo": "cargo 1.92.0 (344c4567c 2025-10-21)"
+  },
+  "config": {
+    "profile": "public",
+    "rows": 1000000,
+    "warmup": 2,
+    "iterations": 5,
+    "vector_rows": 1000000,
+    "vector_dim": 128,
+    "vector_k": 10,
+    "skip_vector": false,
+    "quantized_vector_rows": 1000000,
+    "quantized_vector_queries": 20,
+    "quantized_vector_candidate_k": 100,
+    "quantized_vector_seed": 20260821,
+    "skip_quantized_vector": false,
+    "apex_result_cache": false
+  },
+  "results": [
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "COUNT(*)",
+      "ApexBase": 0.082591,
+      "SQLite": 8.415492,
+      "DuckDB": 0.519067
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "SELECT * LIMIT 100 (cold reopen)",
+      "ApexBase": 0.105829,
+      "SQLite": 0.139257,
+      "DuckDB": 0.557958
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "SELECT * LIMIT 100 (warm cache)",
+      "ApexBase": 0.0701,
+      "SQLite": 0.120967,
+      "DuckDB": 0.248992
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "SELECT * LIMIT 10K (cold reopen)",
+      "ApexBase": 3.89335,
+      "SQLite": 12.975358,
+      "DuckDB": 8.601708
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "SELECT * LIMIT 10K (warm cache)",
+      "ApexBase": 3.710975,
+      "SQLite": 12.854941,
+      "DuckDB": 8.147183
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Projection full scan (3 cols)",
+      "ApexBase": 212.313225,
+      "SQLite": 889.252975,
+      "DuckDB": 652.136783
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Filtered LIMIT 100 (age>30)",
+      "ApexBase": 0.052342,
+      "SQLite": 0.122867,
+      "DuckDB": 0.269533
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "LIMIT 100 OFFSET 10K",
+      "ApexBase": 0.048225,
+      "SQLite": 0.223434,
+      "DuckDB": 0.381292
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Filter (name = 'user_5000')",
+      "ApexBase": 0.211817,
+      "SQLite": 46.545708,
+      "DuckDB": 1.588167
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Filter (age BETWEEN 25 AND 35)",
+      "ApexBase": 65.32325,
+      "SQLite": 283.50935,
+      "DuckDB": 160.813759
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "GROUP BY city (10 groups)",
+      "ApexBase": 0.608333,
+      "SQLite": 361.701725,
+      "DuckDB": 3.493558
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "GROUP BY category (10 groups)",
+      "ApexBase": 0.85665,
+      "SQLite": 358.269475,
+      "DuckDB": 3.635208
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "GROUP BY city ORDER BY count",
+      "ApexBase": 0.606217,
+      "SQLite": 277.125016,
+      "DuckDB": 2.976133
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "GROUP BY category ORDER BY count",
+      "ApexBase": 0.557475,
+      "SQLite": 274.459908,
+      "DuckDB": 2.7233
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "GROUP BY + HAVING",
+      "ApexBase": 0.579042,
+      "SQLite": 362.216833,
+      "DuckDB": 3.018109
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "GROUP BY category + HAVING",
+      "ApexBase": 0.569309,
+      "SQLite": 358.771025,
+      "DuckDB": 3.144608
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Persistent VIEW select",
+      "ApexBase": 0.500458,
+      "SQLite": 362.213458,
+      "DuckDB": 2.494416
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "ORDER BY score LIMIT 100",
+      "ApexBase": 2.045492,
+      "SQLite": 55.511141,
+      "DuckDB": 4.752083
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "ORDER BY score ASC LIMIT 100",
+      "ApexBase": 1.91945,
+      "SQLite": 55.082375,
+      "DuckDB": 4.575325
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Aggregation (5 funcs)",
+      "ApexBase": 0.263475,
+      "SQLite": 86.936525,
+      "DuckDB": 1.150725
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Filtered aggregation (category)",
+      "ApexBase": 0.388975,
+      "SQLite": 61.035441,
+      "DuckDB": 1.3062
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Filtered aggregation (city)",
+      "ApexBase": 0.463041,
+      "SQLite": 60.097583,
+      "DuckDB": 1.180716
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "COUNT WHERE category",
+      "ApexBase": 0.240422,
+      "SQLite": 57.236792,
+      "DuckDB": 0.54925
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Complex (Filter+Group+Order)",
+      "ApexBase": 1.544234,
+      "SQLite": 167.445192,
+      "DuckDB": 2.372409
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "SELECT * -> pandas (full scan)",
+      "ApexBase": 23.094125,
+      "SQLite": 1372.853525,
+      "DuckDB": 201.504675
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "GROUP BY city,category (100 grp)",
+      "ApexBase": 1.115525,
+      "SQLite": 674.068041,
+      "DuckDB": 4.526566
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "LIKE filter (name LIKE user_1%)",
+      "ApexBase": 42.068667,
+      "SQLite": 206.87255,
+      "DuckDB": 97.155992
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Multi-cond (age>30 AND score>50)",
+      "ApexBase": 182.977383,
+      "SQLite": 589.720166,
+      "DuckDB": 356.596383
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "ORDER BY city,score DESC LIMIT100",
+      "ApexBase": 3.420333,
+      "SQLite": 74.822175,
+      "DuckDB": 6.4227
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "COUNT(DISTINCT city)",
+      "ApexBase": 0.2043,
+      "SQLite": 95.338567,
+      "DuckDB": 3.319275
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "COUNT(DISTINCT category)",
+      "ApexBase": 0.229508,
+      "SQLite": 96.900367,
+      "DuckDB": 4.187616
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "IN filter (city IN 3 cities)",
+      "ApexBase": 113.423367,
+      "SQLite": 498.423608,
+      "DuckDB": 265.8401
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Numeric IN (age IN 9 values)",
+      "ApexBase": 56.096967,
+      "SQLite": 269.095083,
+      "DuckDB": 139.365442
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "OR cross-col (age=25 OR city=BJ)",
+      "ApexBase": 66.218792,
+      "SQLite": 220.1067,
+      "DuckDB": 107.635909
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Boolean Filter+GROUP+HAVING+TopK",
+      "ApexBase": 4.021017,
+      "SQLite": 190.91265,
+      "DuckDB": 5.344866
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Numeric OR (age=20|30|40|50)",
+      "ApexBase": 26.600883,
+      "SQLite": 147.794416,
+      "DuckDB": 65.107167
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Window ROW_NUMBER PARTITION BY city",
+      "ApexBase": 0.491209,
+      "SQLite": 522.8375,
+      "DuckDB": 42.737225
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "JOIN GROUP BY ORDER LIMIT",
+      "ApexBase": 2.709775,
+      "SQLite": 385.60275,
+      "DuckDB": 7.210025
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "LEFT JOIN COUNT",
+      "ApexBase": 0.810533,
+      "SQLite": 158.292475,
+      "DuckDB": 4.122125
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "LEFT JOIN extra ON predicate",
+      "ApexBase": 0.831092,
+      "SQLite": 142.116433,
+      "DuckDB": 3.585033
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "FULL OUTER JOIN (bounded)",
+      "ApexBase": 0.535125,
+      "SQLite": 1.214425,
+      "DuckDB": 1.548758
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "CROSS JOIN COUNT",
+      "ApexBase": 0.593433,
+      "SQLite": 52.4226,
+      "DuckDB": 1.645075
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "UNION ALL (ordered)",
+      "ApexBase": 3.116417,
+      "SQLite": 80.60645,
+      "DuckDB": 2.969883
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "UNION DISTINCT (ordered)",
+      "ApexBase": 1.031783,
+      "SQLite": 84.682383,
+      "DuckDB": 2.441567
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "INTERSECT (ordered)",
+      "ApexBase": 2.102866,
+      "SQLite": 180.076984,
+      "DuckDB": 7.166809
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "EXCEPT (ordered)",
+      "ApexBase": 1.2365,
+      "SQLite": 171.052792,
+      "DuckDB": 5.552458
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "IN subquery COUNT",
+      "ApexBase": 0.625475,
+      "SQLite": 98.4426,
+      "DuckDB": 3.0017
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "EXISTS subquery COUNT",
+      "ApexBase": 0.661475,
+      "SQLite": 398.757775,
+      "DuckDB": 23.208759
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Derived table GROUP BY",
+      "ApexBase": 0.651025,
+      "SQLite": 281.371975,
+      "DuckDB": 3.362983
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "CTE with AVG filter",
+      "ApexBase": 1.412175,
+      "SQLite": 359.389808,
+      "DuckDB": 3.932334
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "CASE aggregate GROUP BY",
+      "ApexBase": 1.465316,
+      "SQLite": 311.55995,
+      "DuckDB": 4.01325
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "String functions (UPPER/LENGTH/SUBSTR/CONCAT/TRIM)",
+      "ApexBase": 0.796,
+      "SQLite": 1.91035,
+      "DuckDB": 1.606083
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Numeric functions (ROUND/ABS/FLOOR/CEIL/MOD)",
+      "ApexBase": 0.682442,
+      "SQLite": 1.331009,
+      "DuckDB": 1.200992
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "COALESCE/NULLIF filter",
+      "ApexBase": 0.359025,
+      "SQLite": 138.0384,
+      "DuckDB": 2.374216
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "NOT filter (age NOT BETWEEN, name NOT LIKE)",
+      "ApexBase": 2.088034,
+      "SQLite": 63.564758,
+      "DuckDB": 3.4134
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Deep offset (LIMIT 100 OFFSET 100K)",
+      "ApexBase": 6.16925,
+      "SQLite": 253.8793,
+      "DuckDB": 186.572308
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "ORDER BY expression (LENGTH)",
+      "ApexBase": 1.718583,
+      "SQLite": 69.396783,
+      "DuckDB": 5.053292
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Window SUM OVER (running)",
+      "ApexBase": 0.475967,
+      "SQLite": 454.548933,
+      "DuckDB": 41.737692
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Window RANK (partitioned)",
+      "ApexBase": 0.393033,
+      "SQLite": 474.427309,
+      "DuckDB": 38.026283
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Window LAG (partitioned)",
+      "ApexBase": 0.41915,
+      "SQLite": 431.296467,
+      "DuckDB": 33.211075
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "DISTINCT (city, category)",
+      "ApexBase": 1.907775,
+      "SQLite": 627.7943,
+      "DuckDB": 5.334675
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "GROUP BY 2 cols + HAVING",
+      "ApexBase": 0.833192,
+      "SQLite": 471.07215,
+      "DuckDB": 4.767958
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "CSV Read + COUNT(*)",
+      "ApexBase": 7.179775,
+      "DuckDB": 45.900708
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "CSV Read + Filter + GROUP BY",
+      "ApexBase": 27.802175,
+      "DuckDB": 51.057567
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "CSV Read + Full Scan LIMIT 1000",
+      "ApexBase": 0.637408,
+      "DuckDB": 21.888833
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "JSON Read + COUNT(*)",
+      "ApexBase": 4.710933,
+      "DuckDB": 65.025642
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "JSON Read + Filter",
+      "ApexBase": 8.607792,
+      "DuckDB": 79.08395
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "JSON Read + GROUP BY category",
+      "ApexBase": 54.95495,
+      "DuckDB": 87.638792
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "Temp Table (CSV) Query (filter+agg)",
+      "ApexBase": 0.507432,
+      "DuckDB": 0.72176
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "JSON Read + ORDER BY LIMIT 100",
+      "ApexBase": 43.5712,
+      "DuckDB": 101.125042
+    },
+    {
+      "category": "OLAP Fair Metrics",
+      "query": "CSV Read + ORDER BY LIMIT 100",
+      "ApexBase": 17.19315,
+      "DuckDB": 56.507617
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Bulk Insert (N rows; default fair)",
+      "ApexBase": 231.077542,
+      "SQLite": 1023.634542,
+      "DuckDB": 189094.744
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Point Lookup (SQL by ID)",
+      "ApexBase": 0.002996,
+      "SQLite": 0.0044,
+      "DuckDB": 2.616083
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Retrieve Many (SQL, 100 IDs)",
+      "ApexBase": 0.218242,
+      "SQLite": 0.314958,
+      "DuckDB": 4.566092
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "COUNT(*) (direct API)",
+      "ApexBase": 0.005833,
+      "SQLite": 8.128709,
+      "DuckDB": 0.289641
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Point lookup (projected SQL)",
+      "ApexBase": 0.002425,
+      "SQLite": 0.003434,
+      "DuckDB": 2.704917
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Point lookup (direct full row)",
+      "ApexBase": 0.002103,
+      "SQLite": 0.00424,
+      "DuckDB": 3.06075
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Missing ID lookup",
+      "ApexBase": 0.002142,
+      "SQLite": 0.002631,
+      "DuckDB": 2.506209
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Retrieve 10 IDs (projected SQL)",
+      "ApexBase": 0.00794,
+      "SQLite": 0.014402,
+      "DuckDB": 3.320083
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Retrieve 100 IDs (projected SQL)",
+      "ApexBase": 0.036183,
+      "SQLite": 0.110424,
+      "DuckDB": 4.368708
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "SELECT 3 cols LIMIT 100",
+      "ApexBase": 0.046906,
+      "SQLite": 0.081652,
+      "DuckDB": 0.201789
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "String equality (projected)",
+      "ApexBase": 0.05426,
+      "SQLite": 46.546791,
+      "DuckDB": 1.411855
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "City filter LIMIT 100",
+      "ApexBase": 0.020456,
+      "SQLite": 0.109014,
+      "DuckDB": 0.19126
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Insert 1 row (default fair)",
+      "ApexBase": 0.010998,
+      "SQLite": 0.019068,
+      "DuckDB": 0.301646
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Insert+Read own row",
+      "ApexBase": 0.014588,
+      "SQLite": 0.023626,
+      "DuckDB": 3.780291
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Insert+COUNT visible",
+      "ApexBase": 0.017514,
+      "SQLite": 8.525625,
+      "DuckDB": 0.599198
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "UPDATE by ID",
+      "ApexBase": 0.003123,
+      "SQLite": 0.004571,
+      "DuckDB": 0.719739
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "UPDATE missing ID",
+      "ApexBase": 0.003127,
+      "SQLite": 0.004108,
+      "DuckDB": 0.692104
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "UPDATE+Read by ID",
+      "ApexBase": 0.005433,
+      "SQLite": 0.007404,
+      "DuckDB": 1.223354
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Replace row by ID",
+      "ApexBase": 0.0006,
+      "SQLite": 0.004653,
+      "DuckDB": 0.741198
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Insert+DELETE by ID",
+      "ApexBase": 0.023076,
+      "SQLite": 0.029897,
+      "DuckDB": 0.90476
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "DELETE missing ID",
+      "ApexBase": 0.000401,
+      "SQLite": 0.004053,
+      "DuckDB": 0.518927
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Insert 1K rows (default fair)",
+      "ApexBase": 0.674825,
+      "SQLite": 1.764867,
+      "DuckDB": 174.330983
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "UPDATE rows (age=25; idempotent)",
+      "ApexBase": 4.0142,
+      "SQLite": 42.76125,
+      "DuckDB": 15.106742
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Store+DELETE 1K (combined)",
+      "ApexBase": 1.092925,
+      "SQLite": 41.020233,
+      "DuckDB": 180.514492
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "DELETE 1K (pure delete; setup rows)",
+      "ApexBase": 0.17675,
+      "SQLite": 39.568334,
+      "DuckDB": 0.394167
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "FTS Index Build (name,city,category)",
+      "ApexBase": 1.669791,
+      "SQLite": 1553.31025,
+      "DuckDB": 1183.432625
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "FTS Search ('Electronics')",
+      "ApexBase": 4.031509,
+      "SQLite": 29.5851,
+      "DuckDB": 21.047984
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Table CREATE (1 col)",
+      "ApexBase": 0.013125,
+      "SQLite": 0.042125,
+      "DuckDB": 0.124542
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Table DROP",
+      "ApexBase": 0.014625,
+      "SQLite": 0.033583,
+      "DuckDB": 0.111
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "Table CREATE+DROP cycle",
+      "ApexBase": 0.036417,
+      "SQLite": 0.0785,
+      "DuckDB": 0.264042
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "List tables (10)",
+      "ApexBase": 0.009042,
+      "SQLite": 0.02075,
+      "DuckDB": 2.689541
+    },
+    {
+      "category": "OLTP Fair Metrics",
+      "query": "ALTER TABLE ADD COLUMN",
+      "ApexBase": 0.049667,
+      "SQLite": 0.082,
+      "DuckDB": 0.115625
+    }
+  ],
+  "fair_workload_scoreboard": [
+    {
+      "workload": "Load & Index",
+      "metric_count": 2,
+      "metrics": [
+        "Bulk Insert (N rows; default fair)",
+        "FTS Index Build (name,city,category)"
+      ],
+      "total_ms": {
+        "ApexBase": 232.747,
+        "SQLite": 2576.945,
+        "DuckDB": 190278.177
+      },
+      "geomean_ms": {
+        "ApexBase": 19.643096,
+        "SQLite": 1260.960755,
+        "DuckDB": 14959.307781
+      },
+      "apex_vs_best_total": "0.09x (faster)",
+      "apex_wins": 2,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Point & Limited Reads",
+      "metric_count": 17,
+      "metrics": [
+        "COUNT(*)",
+        "SELECT * LIMIT 100 (cold reopen)",
+        "SELECT * LIMIT 100 (warm cache)",
+        "SELECT * LIMIT 10K (cold reopen)",
+        "SELECT * LIMIT 10K (warm cache)",
+        "Filtered LIMIT 100 (age>30)",
+        "LIMIT 100 OFFSET 10K",
+        "Point Lookup (SQL by ID)",
+        "Retrieve Many (SQL, 100 IDs)",
+        "COUNT(*) (direct API)",
+        "Point lookup (projected SQL)",
+        "Point lookup (direct full row)",
+        "Missing ID lookup",
+        "Retrieve 10 IDs (projected SQL)",
+        "Retrieve 100 IDs (projected SQL)",
+        "SELECT 3 cols LIMIT 100",
+        "City filter LIMIT 100"
+      ],
+      "total_ms": {
+        "ApexBase": 8.309,
+        "SQLite": 43.626,
+        "DuckDB": 42.551
+      },
+      "geomean_ms": {
+        "ApexBase": 0.035767,
+        "SQLite": 0.142178,
+        "DuckDB": 1.195696
+      },
+      "apex_vs_best_total": "0.20x (faster)",
+      "apex_wins": 17,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Filtering",
+      "metric_count": 11,
+      "metrics": [
+        "Filter (name = 'user_5000')",
+        "Filter (age BETWEEN 25 AND 35)",
+        "LIKE filter (name LIKE user_1%)",
+        "Multi-cond (age>30 AND score>50)",
+        "IN filter (city IN 3 cities)",
+        "Numeric IN (age IN 9 values)",
+        "OR cross-col (age=25 OR city=BJ)",
+        "Numeric OR (age=20|30|40|50)",
+        "String equality (projected)",
+        "COUNT WHERE category",
+        "NOT filter (age NOT BETWEEN, name NOT LIKE)"
+      ],
+      "total_ms": {
+        "ApexBase": 555.304,
+        "SQLite": 2429.416,
+        "DuckDB": 1199.477
+      },
+      "geomean_ms": {
+        "ApexBase": 9.029107,
+        "SQLite": 154.408168,
+        "DuckDB": 27.22117
+      },
+      "apex_vs_best_total": "0.46x (faster)",
+      "apex_wins": 11,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Aggregation",
+      "metric_count": 14,
+      "metrics": [
+        "GROUP BY city (10 groups)",
+        "GROUP BY category (10 groups)",
+        "GROUP BY city ORDER BY count",
+        "GROUP BY category ORDER BY count",
+        "GROUP BY + HAVING",
+        "GROUP BY category + HAVING",
+        "Aggregation (5 funcs)",
+        "Filtered aggregation (category)",
+        "Filtered aggregation (city)",
+        "Complex (Filter+Group+Order)",
+        "GROUP BY city,category (100 grp)",
+        "COUNT(DISTINCT city)",
+        "COUNT(DISTINCT category)",
+        "GROUP BY 2 cols + HAVING"
+      ],
+      "total_ms": {
+        "ApexBase": 8.819,
+        "SQLite": 3705.438,
+        "DuckDB": 41.802
+      },
+      "geomean_ms": {
+        "ApexBase": 0.541301,
+        "SQLite": 202.915072,
+        "DuckDB": 2.723272
+      },
+      "apex_vs_best_total": "0.21x (faster)",
+      "apex_wins": 14,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Ordering, Window, View",
+      "metric_count": 9,
+      "metrics": [
+        "Persistent VIEW select",
+        "ORDER BY score LIMIT 100",
+        "ORDER BY score ASC LIMIT 100",
+        "ORDER BY city,score DESC LIMIT100",
+        "Window ROW_NUMBER PARTITION BY city",
+        "Window SUM OVER (running)",
+        "Window RANK (partitioned)",
+        "Window LAG (partitioned)",
+        "Deep offset (LIMIT 100 OFFSET 100K)"
+      ],
+      "total_ms": {
+        "ApexBase": 15.834,
+        "SQLite": 2684.619,
+        "DuckDB": 360.529
+      },
+      "geomean_ms": {
+        "ApexBase": 1.053385,
+        "SQLite": 215.990286,
+        "DuckDB": 17.402662
+      },
+      "apex_vs_best_total": "0.04x (faster)",
+      "apex_wins": 9,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Full Materialization",
+      "metric_count": 3,
+      "metrics": [
+        "Projection full scan (3 cols)",
+        "SELECT * -> pandas (full scan)",
+        "DISTINCT (city, category)"
+      ],
+      "total_ms": {
+        "ApexBase": 237.315,
+        "SQLite": 2889.901,
+        "DuckDB": 858.976
+      },
+      "geomean_ms": {
+        "ApexBase": 21.070196,
+        "SQLite": 915.143008,
+        "DuckDB": 88.833602
+      },
+      "apex_vs_best_total": "0.28x (faster)",
+      "apex_wins": 3,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Joins",
+      "metric_count": 5,
+      "metrics": [
+        "JOIN GROUP BY ORDER LIMIT",
+        "LEFT JOIN COUNT",
+        "LEFT JOIN extra ON predicate",
+        "FULL OUTER JOIN (bounded)",
+        "CROSS JOIN COUNT"
+      ],
+      "total_ms": {
+        "ApexBase": 5.48,
+        "SQLite": 739.649,
+        "DuckDB": 18.111
+      },
+      "geomean_ms": {
+        "ApexBase": 0.896677,
+        "SQLite": 56.030796,
+        "DuckDB": 3.067214
+      },
+      "apex_vs_best_total": "0.30x (faster)",
+      "apex_wins": 5,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Set Operations",
+      "metric_count": 4,
+      "metrics": [
+        "UNION ALL (ordered)",
+        "UNION DISTINCT (ordered)",
+        "INTERSECT (ordered)",
+        "EXCEPT (ordered)"
+      ],
+      "total_ms": {
+        "ApexBase": 7.488,
+        "SQLite": 516.419,
+        "DuckDB": 18.131
+      },
+      "geomean_ms": {
+        "ApexBase": 1.700445,
+        "SQLite": 120.417002,
+        "DuckDB": 4.121495
+      },
+      "apex_vs_best_total": "0.41x (faster)",
+      "apex_wins": 3,
+      "apex_ties": 0,
+      "apex_slower": 1
+    },
+    {
+      "workload": "Subqueries & CTE",
+      "metric_count": 4,
+      "metrics": [
+        "IN subquery COUNT",
+        "EXISTS subquery COUNT",
+        "Derived table GROUP BY",
+        "CTE with AVG filter"
+      ],
+      "total_ms": {
+        "ApexBase": 3.35,
+        "SQLite": 1137.962,
+        "DuckDB": 33.506
+      },
+      "geomean_ms": {
+        "ApexBase": 0.78533,
+        "SQLite": 251.00635,
+        "DuckDB": 5.509327
+      },
+      "apex_vs_best_total": "0.10x (faster)",
+      "apex_wins": 4,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Expression Evaluation",
+      "metric_count": 5,
+      "metrics": [
+        "CASE aggregate GROUP BY",
+        "String functions (UPPER/LENGTH/SUBSTR/CONCAT/TRIM)",
+        "Numeric functions (ROUND/ABS/FLOOR/CEIL/MOD)",
+        "COALESCE/NULLIF filter",
+        "ORDER BY expression (LENGTH)"
+      ],
+      "total_ms": {
+        "ApexBase": 5.021,
+        "SQLite": 522.236,
+        "DuckDB": 14.248
+      },
+      "geomean_ms": {
+        "ApexBase": 0.867443,
+        "SQLite": 23.770315,
+        "DuckDB": 2.475026
+      },
+      "apex_vs_best_total": "0.35x (faster)",
+      "apex_wins": 5,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "File Scan",
+      "metric_count": 9,
+      "metrics": [
+        "CSV Read + COUNT(*)",
+        "CSV Read + Filter + GROUP BY",
+        "CSV Read + Full Scan LIMIT 1000",
+        "JSON Read + COUNT(*)",
+        "JSON Read + Filter",
+        "JSON Read + GROUP BY category",
+        "Temp Table (CSV) Query (filter+agg)",
+        "JSON Read + ORDER BY LIMIT 100",
+        "CSV Read + ORDER BY LIMIT 100"
+      ],
+      "total_ms": {
+        "ApexBase": 165.165,
+        "SQLite": null,
+        "DuckDB": 508.95
+      },
+      "geomean_ms": {
+        "ApexBase": 7.807376,
+        "SQLite": null,
+        "DuckDB": 35.748589
+      },
+      "apex_vs_best_total": "0.32x (faster)",
+      "apex_wins": 9,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "DML",
+      "metric_count": 13,
+      "metrics": [
+        "Insert 1K rows (default fair)",
+        "Insert 1 row (default fair)",
+        "Insert+Read own row",
+        "Insert+COUNT visible",
+        "UPDATE by ID",
+        "UPDATE missing ID",
+        "UPDATE+Read by ID",
+        "Replace row by ID",
+        "Insert+DELETE by ID",
+        "DELETE missing ID",
+        "UPDATE rows (age=25; idempotent)",
+        "Store+DELETE 1K (combined)",
+        "DELETE 1K (pure delete; setup rows)"
+      ],
+      "total_ms": {
+        "ApexBase": 6.038,
+        "SQLite": 133.738,
+        "DuckDB": 379.828
+      },
+      "geomean_ms": {
+        "ApexBase": 0.022733,
+        "SQLite": 0.157558,
+        "DuckDB": 2.193117
+      },
+      "apex_vs_best_total": "0.05x (faster)",
+      "apex_wins": 13,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Search",
+      "metric_count": 1,
+      "metrics": [
+        "FTS Search ('Electronics')"
+      ],
+      "total_ms": {
+        "ApexBase": 4.032,
+        "SQLite": 29.585,
+        "DuckDB": 21.048
+      },
+      "geomean_ms": {
+        "ApexBase": 4.031509,
+        "SQLite": 29.5851,
+        "DuckDB": 21.047984
+      },
+      "apex_vs_best_total": "0.19x (faster)",
+      "apex_wins": 1,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Table Ops",
+      "metric_count": 5,
+      "metrics": [
+        "Table CREATE (1 col)",
+        "Table DROP",
+        "Table CREATE+DROP cycle",
+        "List tables (10)",
+        "ALTER TABLE ADD COLUMN"
+      ],
+      "total_ms": {
+        "ApexBase": 0.123,
+        "SQLite": 0.257,
+        "DuckDB": 3.305
+      },
+      "geomean_ms": {
+        "ApexBase": 0.019924,
+        "SQLite": 0.045214,
+        "DuckDB": 0.257637
+      },
+      "apex_vs_best_total": "0.48x (faster)",
+      "apex_wins": 5,
+      "apex_ties": 0,
+      "apex_slower": 0
+    },
+    {
+      "workload": "Other",
+      "metric_count": 1,
+      "metrics": [
+        "Boolean Filter+GROUP+HAVING+TopK"
+      ],
+      "total_ms": {
+        "ApexBase": 4.021,
+        "SQLite": 190.913,
+        "DuckDB": 5.345
+      },
+      "geomean_ms": {
+        "ApexBase": 4.021017,
+        "SQLite": 190.91265,
+        "DuckDB": 5.344866
+      },
+      "apex_vs_best_total": "0.75x (faster)",
+      "apex_wins": 1,
+      "apex_ties": 0,
+      "apex_slower": 0
+    }
+  ],
+  "vector_similarity": {
+    "config": {
+      "rows": 1000000,
+      "dim": 128,
+      "k": 10,
+      "batch_queries": 10,
+      "sqlite_note": "SQLite rows use the sqlite-vector extension's exact vector_full_scan() top-k; without the extension installed, SQLite shows N/A for ranked vector metrics.",
+      "sqlite_vector_available": true,
+      "profile": "public"
+    },
+    "skipped": false,
+    "skip_reason": null,
+    "head_to_head": [
+      {
+        "category": "Vector Head-to-Head (single query)",
+        "query": "TopK L2",
+        "ApexBase": 5.451083,
+        "DuckDB": 31.376458,
+        "SQLite": 142.137375
+      },
+      {
+        "category": "Vector Head-to-Head (single query)",
+        "query": "TopK Cosine",
+        "ApexBase": 5.73975,
+        "DuckDB": 40.212667,
+        "SQLite": 163.595042
+      },
+      {
+        "category": "Vector Head-to-Head (single query)",
+        "query": "TopK Dot",
+        "ApexBase": 5.272291,
+        "DuckDB": 33.171667,
+        "SQLite": 138.011875
+      }
+    ],
+    "batch": [
+      {
+        "category": "Vector Head-to-Head (batch queries)",
+        "query": "Batch TopK L2 (10 queries)",
+        "ApexBase": 48.168542,
+        "DuckDB": 315.574375,
+        "SQLite": 1468.605625
+      },
+      {
+        "category": "Vector Head-to-Head (batch queries)",
+        "query": "Batch TopK Cosine (10 queries)",
+        "ApexBase": 49.727375,
+        "DuckDB": 452.580917,
+        "SQLite": 1697.403083
+      },
+      {
+        "category": "Vector Head-to-Head (batch queries)",
+        "query": "Batch TopK Dot (10 queries)",
+        "ApexBase": 47.03825,
+        "DuckDB": 315.75675,
+        "SQLite": 1419.185708
+      }
+    ],
+    "apex_only": [],
+    "summary": {
+      "wins": 6,
+      "ties": 0,
+      "slower": 0,
+      "total": 6
+    }
+  },
+  "quantized_vector_similarity": {
+    "config": {
+      "rows": 1000000,
+      "dim": 128,
+      "queries": 20,
+      "k": 10,
+      "candidate_k": 100,
+      "seed": 20260821,
+      "warmup": 2,
+      "iterations": 5
+    },
+    "skipped": false,
+    "skip_reason": null,
+    "system": {
+      "platform": "macOS-27.0.1-arm64-arm-64bit",
+      "machine": "arm64",
+      "python": "3.12.2",
+      "sqlite": "3.46.0",
+      "apexbase": "1.38.0",
+      "sqliteai_vector": "1.0.0",
+      "sqlite_vector_extension": {
+        "version": "1.0.0",
+        "backend": "NEON",
+        "turboquant_backend": "NEON"
+      }
+    },
+    "apexbase": [
+      {
+        "codec": "float16",
+        "build_ms": 718.417,
+        "exact_ms_per_query": 4.407,
+        "quantized_ms_per_query": 2.515,
+        "rescore_ms_per_query": 3.533,
+        "recall_at_k": 1.0,
+        "rescore_recall_at_k": 1.0,
+        "database_bytes": 768378853
+      },
+      {
+        "codec": "bfloat16",
+        "build_ms": 579.706,
+        "exact_ms_per_query": 4.336,
+        "quantized_ms_per_query": 10.086,
+        "rescore_ms_per_query": 19.295,
+        "recall_at_k": 1.0,
+        "rescore_recall_at_k": 1.0,
+        "database_bytes": 768378855
+      },
+      {
+        "codec": "int8",
+        "build_ms": 598.682,
+        "exact_ms_per_query": 4.217,
+        "quantized_ms_per_query": 1.247,
+        "rescore_ms_per_query": 5.446,
+        "recall_at_k": 0.975,
+        "rescore_recall_at_k": 1.0,
+        "database_bytes": 644378847
+      },
+      {
+        "codec": "uint8",
+        "build_ms": 707.424,
+        "exact_ms_per_query": 4.313,
+        "quantized_ms_per_query": 3.483,
+        "rescore_ms_per_query": 9.353,
+        "recall_at_k": 0.985,
+        "rescore_recall_at_k": 1.0,
+        "database_bytes": 648378849
+      },
+      {
+        "codec": "bit1",
+        "build_ms": 975.648,
+        "exact_ms_per_query": 4.287,
+        "quantized_ms_per_query": 0.574,
+        "rescore_ms_per_query": 2.047,
+        "recall_at_k": 0.14,
+        "rescore_recall_at_k": 0.415,
+        "database_bytes": 532378847
+      },
+      {
+        "codec": "turboquant2",
+        "build_ms": 2173.321,
+        "exact_ms_per_query": 4.41,
+        "quantized_ms_per_query": 4.9,
+        "rescore_ms_per_query": 7.547,
+        "recall_at_k": 0.45,
+        "rescore_recall_at_k": 0.87,
+        "database_bytes": 548378861
+      },
+      {
+        "codec": "turboquant3",
+        "build_ms": 2696.217,
+        "exact_ms_per_query": 4.277,
+        "quantized_ms_per_query": 21.783,
+        "rescore_ms_per_query": 32.193,
+        "recall_at_k": 0.595,
+        "rescore_recall_at_k": 0.99,
+        "database_bytes": 564378861
+      },
+      {
+        "codec": "turboquant4",
+        "build_ms": 3508.573,
+        "exact_ms_per_query": 4.435,
+        "quantized_ms_per_query": 9.205,
+        "rescore_ms_per_query": 15.517,
+        "recall_at_k": 0.76,
+        "rescore_recall_at_k": 1.0,
+        "database_bytes": 580378861
+      }
+    ],
+    "sqlite_vector": [
+      {
+        "codec": "int8",
+        "qtype": "INT8",
+        "build_ms": 731.645,
+        "exact_ms_per_query": 228.225,
+        "quantized_ms_per_query": 8.669,
+        "recall_at_k": 0.945,
+        "quantized_rows": 1000000,
+        "quantized_memory_bytes": 136000000,
+        "database_bytes": 722767872
+      },
+      {
+        "codec": "uint8",
+        "qtype": "UINT8",
+        "build_ms": 729.963,
+        "exact_ms_per_query": 226.921,
+        "quantized_ms_per_query": 8.769,
+        "recall_at_k": 0.96,
+        "quantized_rows": 1000000,
+        "quantized_memory_bytes": 136000000,
+        "database_bytes": 722767872
+      },
+      {
+        "codec": "bit1",
+        "qtype": "1BIT",
+        "build_ms": 822.483,
+        "exact_ms_per_query": 226.826,
+        "quantized_ms_per_query": 2.018,
+        "recall_at_k": 0.1,
+        "quantized_rows": 1000000,
+        "quantized_memory_bytes": 24000000,
+        "database_bytes": 610656256
+      },
+      {
+        "codec": "turboquant2",
+        "qtype": "TURBO2",
+        "build_ms": 1385.955,
+        "exact_ms_per_query": 227.474,
+        "quantized_ms_per_query": 27.091,
+        "recall_at_k": 0.535,
+        "quantized_rows": 1000000,
+        "quantized_memory_bytes": 44000000,
+        "database_bytes": 630673408
+      },
+      {
+        "codec": "turboquant3",
+        "qtype": "TURBO3",
+        "build_ms": 1428.48,
+        "exact_ms_per_query": 227.013,
+        "quantized_ms_per_query": 66.369,
+        "recall_at_k": 0.725,
+        "quantized_rows": 1000000,
+        "quantized_memory_bytes": 60000000,
+        "database_bytes": 646688768
+      },
+      {
+        "codec": "turboquant4",
+        "qtype": "TURBO4",
+        "build_ms": 1662.051,
+        "exact_ms_per_query": 226.794,
+        "quantized_ms_per_query": 51.992,
+        "recall_at_k": 0.84,
+        "quantized_rows": 1000000,
+        "quantized_memory_bytes": 76000000,
+        "database_bytes": 662712320
+      }
+    ],
+    "summary": {
+      "wins": 6,
+      "ties": 0,
+      "slower": 0,
+      "total": 6
+    }
+  },
+  "apexbase_materialization": [],
+  "qps": {},
+  "oltp_microbenchmarks": [],
+  "apexbase_oltp_diagnostics": [],
+  "oltp_durable_microbenchmarks": [],
+  "transaction_microbenchmarks": [],
+  "apexbase_transaction_diagnostics": [],
+  "apexbase_buffered_oltp": [],
+  "apexbase_memtable_oltp": [],
+  "apexbase_rss_delta_mb": {
+    "Bulk Insert (N rows; default fair)": {
+      "ApexBase": 191.75,
+      "SQLite": 2.75,
+      "DuckDB": 35.53125
+    },
+    "COUNT(*)": {
+      "ApexBase": -0.53125,
+      "SQLite": 0.015625,
+      "DuckDB": 0.34375
+    },
+    "SELECT * LIMIT 100 (cold reopen)": {
+      "ApexBase": 1.09375,
+      "SQLite": -1.078125,
+      "DuckDB": 3.71875
+    },
+    "SELECT * LIMIT 100 (warm cache)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "SELECT * LIMIT 10K (cold reopen)": {
+      "ApexBase": 2.09375,
+      "SQLite": 1.9375,
+      "DuckDB": 1.203125
+    },
+    "SELECT * LIMIT 10K (warm cache)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.1875,
+      "DuckDB": 0.0
+    },
+    "Projection full scan (3 cols)": {
+      "ApexBase": 203.09375,
+      "SQLite": 15.65625,
+      "DuckDB": 20.5625
+    },
+    "Filtered LIMIT 100 (age>30)": {
+      "ApexBase": -0.921875,
+      "SQLite": 0.0,
+      "DuckDB": 0.09375
+    },
+    "LIMIT 100 OFFSET 10K": {
+      "ApexBase": 0.09375,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Filter (name = 'user_5000')": {
+      "ApexBase": -0.890625,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Filter (age BETWEEN 25 AND 35)": {
+      "ApexBase": 102.609375,
+      "SQLite": 2.609375,
+      "DuckDB": 24.375
+    },
+    "GROUP BY city (10 groups)": {
+      "ApexBase": -2.71875,
+      "SQLite": 0.015625,
+      "DuckDB": 2.625
+    },
+    "GROUP BY category (10 groups)": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 1.421875
+    },
+    "GROUP BY city ORDER BY count": {
+      "ApexBase": 0.34375,
+      "SQLite": 0.0,
+      "DuckDB": 1.796875
+    },
+    "GROUP BY category ORDER BY count": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "GROUP BY + HAVING": {
+      "ApexBase": 0.15625,
+      "SQLite": 0.0,
+      "DuckDB": 0.46875
+    },
+    "GROUP BY category + HAVING": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.234375
+    },
+    "Persistent VIEW select": {
+      "ApexBase": 0.4375,
+      "SQLite": 0.015625,
+      "DuckDB": 0.140625
+    },
+    "ORDER BY score LIMIT 100": {
+      "ApexBase": 0.1875,
+      "SQLite": 0.0,
+      "DuckDB": 0.34375
+    },
+    "ORDER BY score ASC LIMIT 100": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 0.0625
+    },
+    "Aggregation (5 funcs)": {
+      "ApexBase": 0.046875,
+      "SQLite": 0.015625,
+      "DuckDB": 0.0625
+    },
+    "Filtered aggregation (category)": {
+      "ApexBase": 0.203125,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "Filtered aggregation (city)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "COUNT WHERE category": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Complex (Filter+Group+Order)": {
+      "ApexBase": 0.078125,
+      "SQLite": 0.0,
+      "DuckDB": 1.0625
+    },
+    "Point Lookup (SQL by ID)": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 0.4375
+    },
+    "Retrieve Many (SQL, 100 IDs)": {
+      "ApexBase": 0.046875,
+      "SQLite": 0.0,
+      "DuckDB": 0.625
+    },
+    "SELECT * -> pandas (full scan)": {
+      "ApexBase": 146.28125,
+      "SQLite": 199.640625,
+      "DuckDB": 38.234375
+    },
+    "GROUP BY city,category (100 grp)": {
+      "ApexBase": 0.03125,
+      "SQLite": 1.890625,
+      "DuckDB": 0.078125
+    },
+    "LIKE filter (name LIKE user_1%)": {
+      "ApexBase": 10.8125,
+      "SQLite": 0.375,
+      "DuckDB": -0.703125
+    },
+    "Multi-cond (age>30 AND score>50)": {
+      "ApexBase": 60.046875,
+      "SQLite": 4.515625,
+      "DuckDB": 1.328125
+    },
+    "ORDER BY city,score DESC LIMIT100": {
+      "ApexBase": -0.8125,
+      "SQLite": 0.0,
+      "DuckDB": 1.265625
+    },
+    "COUNT(DISTINCT city)": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 0.125
+    },
+    "COUNT(DISTINCT category)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.40625
+    },
+    "IN filter (city IN 3 cities)": {
+      "ApexBase": 5.84375,
+      "SQLite": 3.125,
+      "DuckDB": 3.140625
+    },
+    "Numeric IN (age IN 9 values)": {
+      "ApexBase": -0.640625,
+      "SQLite": -0.53125,
+      "DuckDB": 9.09375
+    },
+    "OR cross-col (age=25 OR city=BJ)": {
+      "ApexBase": 8.421875,
+      "SQLite": 2.828125,
+      "DuckDB": 13.515625
+    },
+    "Boolean Filter+GROUP+HAVING+TopK": {
+      "ApexBase": -0.875,
+      "SQLite": 0.0,
+      "DuckDB": 0.34375
+    },
+    "Numeric OR (age=20|30|40|50)": {
+      "ApexBase": 0.546875,
+      "SQLite": 0.390625,
+      "DuckDB": 6.375
+    },
+    "Window ROW_NUMBER PARTITION BY city": {
+      "ApexBase": 0.0,
+      "SQLite": 0.015625,
+      "DuckDB": 70.734375
+    },
+    "JOIN GROUP BY ORDER LIMIT": {
+      "ApexBase": 0.09375,
+      "SQLite": 0.0,
+      "DuckDB": 0.046875
+    },
+    "LEFT JOIN COUNT": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "LEFT JOIN extra ON predicate": {
+      "ApexBase": 0.0625,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "FULL OUTER JOIN (bounded)": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "CROSS JOIN COUNT": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "UNION ALL (ordered)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "UNION DISTINCT (ordered)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "INTERSECT (ordered)": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "EXCEPT (ordered)": {
+      "ApexBase": 0.109375,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "IN subquery COUNT": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "EXISTS subquery COUNT": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 16.09375
+    },
+    "Derived table GROUP BY": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "CTE with AVG filter": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "CASE aggregate GROUP BY": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "String functions (UPPER/LENGTH/SUBSTR/CONCAT/TRIM)": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 0.09375
+    },
+    "Numeric functions (ROUND/ABS/FLOOR/CEIL/MOD)": {
+      "ApexBase": 0.109375,
+      "SQLite": 0.0,
+      "DuckDB": 0.140625
+    },
+    "COALESCE/NULLIF filter": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "NOT filter (age NOT BETWEEN, name NOT LIKE)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.03125
+    },
+    "Deep offset (LIMIT 100 OFFSET 100K)": {
+      "ApexBase": 0.375,
+      "SQLite": 0.0,
+      "DuckDB": 24.671875
+    },
+    "ORDER BY expression (LENGTH)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.421875
+    },
+    "Window SUM OVER (running)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 11.453125
+    },
+    "Window RANK (partitioned)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 12.59375
+    },
+    "Window LAG (partitioned)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 18.5
+    },
+    "DISTINCT (city, category)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "GROUP BY 2 cols + HAVING": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "CSV Read + COUNT(*)": {
+      "ApexBase": 0.03125,
+      "DuckDB": 31.03125
+    },
+    "CSV Read + Filter + GROUP BY": {
+      "ApexBase": 14.015625,
+      "DuckDB": 0.171875
+    },
+    "CSV Read + Full Scan LIMIT 1000": {
+      "ApexBase": 0.0,
+      "DuckDB": 0.015625
+    },
+    "JSON Read + COUNT(*)": {
+      "ApexBase": 0.015625,
+      "DuckDB": 143.03125
+    },
+    "JSON Read + Filter": {
+      "ApexBase": 0.0,
+      "DuckDB": 18.859375
+    },
+    "JSON Read + GROUP BY category": {
+      "ApexBase": 8.765625,
+      "DuckDB": 0.0
+    },
+    "Temp Table (CSV) Query (filter+agg)": {
+      "ApexBase": 9.515625,
+      "DuckDB": 1.359375
+    },
+    "JSON Read + ORDER BY LIMIT 100": {
+      "ApexBase": 0.125,
+      "DuckDB": 0.015625
+    },
+    "CSV Read + ORDER BY LIMIT 100": {
+      "ApexBase": 73.03125,
+      "DuckDB": 0.0
+    },
+    "COUNT(*) (direct API)": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Point lookup (projected SQL)": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Point lookup (direct full row)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Missing ID lookup": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Retrieve 10 IDs (projected SQL)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Retrieve 100 IDs (projected SQL)": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "SELECT 3 cols LIMIT 100": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "String equality (projected)": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "City filter LIMIT 100": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Insert 1K rows (default fair)": {
+      "ApexBase": -0.046875,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "UPDATE rows (age=25; idempotent)": {
+      "ApexBase": 0.015625,
+      "SQLite": 0.0625,
+      "DuckDB": 4.1875
+    },
+    "Store+DELETE 1K (combined)": {
+      "ApexBase": 0.046875,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "DELETE 1K (pure delete; setup rows)": {
+      "ApexBase": -0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Insert 1 row (default fair)": {
+      "ApexBase": 0.046875,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Insert+Read own row": {
+      "ApexBase": 0.046875,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Insert+COUNT visible": {
+      "ApexBase": 0.046875,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "UPDATE by ID": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.015625
+    },
+    "UPDATE missing ID": {
+      "ApexBase": 0.046875,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "UPDATE+Read by ID": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Replace row by ID": {
+      "ApexBase": 0.0625,
+      "SQLite": 0.0,
+      "DuckDB": 0.3125
+    },
+    "Insert+DELETE by ID": {
+      "ApexBase": 0.046875,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "DELETE missing ID": {
+      "ApexBase": 55.734375,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "FTS Index Build (name,city,category)": {
+      "ApexBase": 0.40625,
+      "SQLite": 264.65625,
+      "DuckDB": 25.65625
+    },
+    "FTS Search ('Electronics')": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 1.140625
+    },
+    "Table CREATE (1 col)": {
+      "ApexBase": 0.03125,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Table DROP": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "Table CREATE+DROP cycle": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    },
+    "List tables (10)": {
+      "ApexBase": 0.15625,
+      "SQLite": 0.0,
+      "DuckDB": 0.046875
+    },
+    "ALTER TABLE ADD COLUMN": {
+      "ApexBase": 0.0,
+      "SQLite": 0.0,
+      "DuckDB": 0.0
+    }
+  }
+}
