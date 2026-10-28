@@ -1,13 +1,24 @@
 """Process storage budget: a small budget must not change query results (W3)."""
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
+# The child interpreter gets the in-tree package explicitly: the release
+# workflow builds the extension with `maturin develop --skip-install`, so the
+# child cannot rely on an editable install, and this test must not depend on the
+# parent's PYTHONPATH (it replaced the whole environment before, which broke
+# every CI job).
+APEXBASE_PYTHON = str(Path(__file__).resolve().parents[1] / "apexbase" / "python")
 
 SCRIPT = r"""
 import sys
+
+sys.path.insert(0, sys.argv[2])
+
 from apexbase.client import ApexClient
 
 tmp = sys.argv[1]
@@ -38,14 +49,13 @@ def test_small_storage_budget_keeps_compressed_reads_correct():
     # every read decodes it again and the results must still be identical. The
     # budget is resolved once per process, so the script runs in a subprocess.
     with tempfile.TemporaryDirectory() as tmp:
+        env = dict(os.environ)
+        env["APEX_STORAGE_BUDGET_MB"] = "64"
         completed = subprocess.run(
-            [sys.executable, "-c", SCRIPT, tmp],
+            [sys.executable, "-c", SCRIPT, tmp, APEXBASE_PYTHON],
             capture_output=True,
             text=True,
-            env={
-                "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-                "APEX_STORAGE_BUDGET_MB": "64",
-            },
+            env=env,
         )
         assert completed.returncode == 0, completed.stderr
         assert completed.stdout.strip().splitlines()[-1] == "ok"
