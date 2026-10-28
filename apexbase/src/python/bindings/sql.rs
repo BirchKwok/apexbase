@@ -1633,15 +1633,31 @@ impl ApexStorageImpl {
         let Some(backend) = maybe_backend else {
             return Ok(None);
         };
-        // The on-disk delta file is loaded into the in-memory DeltaStore when
-        // the backend is opened, so two cheap guards are sufficient: no
-        // pending delta overlay and no unflushed in-memory rows. File-stat
-        // based guards are deliberately avoided on this hot path.
-        if backend.has_pending_writes() {
+        // Unflushed appended rows are not in the persisted view these lanes
+        // read; the merged executor stays authoritative for them. A DeltaStore
+        // cell overlay is fine: the lanes read the base row and the pending
+        // overrides are applied below, which keeps `_id` point lookups on the
+        // fast path after a predicate UPDATE (they used to fall back to the
+        // full executor until REINDEX). The append-delta sidecar needs no probe
+        // here: appended rows get new ids, so a base row read is unchanged and
+        // the batch lane below already guards its own partial hits. File-stat
+        // guards are deliberately avoided on this hot path.
+        if backend.pending_v4_in_memory_rows() > 0 {
             return Ok(None);
         }
+        let pending_cells = backend.has_pending_deltas();
 
         if let Some(id) = pk_id {
+            if pending_cells {
+                let deleted = {
+                    let delta = backend.storage.delta_store();
+                    delta.is_deleted(id)
+                };
+                if deleted {
+                    // The executor reports the authoritative empty answer.
+                    return Ok(None);
+                }
+            }
             // Single-row point reads use the lean RCIX reader, and fall back to
             // the decoding reader when that lane declines.
             //
@@ -1678,7 +1694,15 @@ impl ApexStorageImpl {
                     _ => None,
                 }
             };
-            if let Some(vals) = single {
+            if let Some(mut vals) = single {
+                if pending_cells {
+                    let delta = backend.storage.delta_store();
+                    for (col_name, val) in vals.iter_mut() {
+                        if let Some(updated) = delta.get_updated_value(id, col_name) {
+                            *val = updated.clone();
+                        }
+                    }
+                }
                 let out = PyDict::new_bound(py);
                 if let Some(columns) = pk_columns {
                     if row_result {
@@ -1711,6 +1735,13 @@ impl ApexStorageImpl {
                 out.set_item("rows_affected", 0i64)?;
                 return Ok(Some(out.into()));
             }
+            return Ok(None);
+        }
+
+        // `_id IN (...)` reads raw persisted columns in bulk; with a cell overlay
+        // the merged executor is the authoritative answer (and the batch reader
+        // would return the pre-update values).
+        if pending_cells {
             return Ok(None);
         }
 

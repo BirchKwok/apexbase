@@ -436,6 +436,16 @@ plus a delete bitmap, serialized with bincode. It is used for:
 - SQL transactional INSERT batches appended via `insert_rows_to_delta()`;
 - legacy non-V4 delta appends.
 
+While an overlay is visible, read lanes stay on their fast paths where the
+overlay can be merged in place: point reads (`retrieve` / the SQL `_id` fast
+path) apply the pending cell overrides to the base row, and the executor's
+secondary-index lane unions the rows a pending update moved into the predicate
+with the postings' candidates before re-evaluating the residual `WHERE` on the
+merged values (covering index-only scans stand down). `DeltaMerger` returns a
+batch zero-copy when none of its rows are touched and reuses columns with no
+pending updates, so one-cell overlays no longer rebuild whole batches. Appended
+delta rows and unflushed buffers still take the merged lanes.
+
 ### Compaction
 
 Delta files are compacted into the base file when:

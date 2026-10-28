@@ -53,14 +53,17 @@ impl ApexExecutor {
             return Ok(None);
         }
 
-        // The index covers the persisted row groups only. While an overlay is
-        // visible — an append delta, buffered appended rows or DeltaStore cells —
-        // the index is no longer the authoritative row set: the lookup, and the
-        // covering index-only scan that never touches the table at all, would
-        // silently drop every overlay row. Merged scans see them, so stand down.
-        if backend.requires_merged_read() {
+        // The index covers the persisted row groups only. Appended overlay rows
+        // (spilled `.delta` sidecar / buffered rows) are not in the postings, so
+        // an index lookup would silently drop them; merged scans stay
+        // authoritative for that state. A DeltaStore *cell* overlay is different:
+        // the postings for non-predicate columns are still the persisted ones,
+        // and the row reader below merges the cell overrides, so the index stays
+        // usable after an UPDATE (it used to degrade to a scan until REINDEX).
+        if backend.has_delta() || backend.pending_v4_in_memory_rows() > 0 {
             return Ok(None);
         }
+        let pending_cells = backend.has_pending_deltas();
 
         // Only use index for simple queries: no GROUP BY, no aggregation, no JOIN
         if !stmt.group_by.is_empty() || !stmt.joins.is_empty() {
@@ -89,6 +92,14 @@ impl ApexExecutor {
         if predicates.is_empty() {
             return Ok(None);
         }
+
+        // A DeltaStore cell update can leave a predicate column's postings
+        // incomplete (the in-place UPDATE lanes only maintain the postings they
+        // can), so the rows it rewrote are added to the candidate set below and
+        // the residual WHERE re-evaluates their merged values. Clean reads (the
+        // overwhelmingly common case) skip the set entirely.
+        let predicate_columns: Option<std::collections::HashSet<String>> = pending_cells
+            .then(|| predicates.iter().map(|(column, _)| column.clone()).collect());
 
         // Check which predicates have indexes available
         let (bd, tname) = base_dir_and_table(storage_path);
@@ -214,10 +225,42 @@ impl ApexExecutor {
             }
         }
 
-        let row_ids = match row_ids {
+        let mut row_ids = match row_ids {
             Some(ids) => ids,
             None => return Ok(None),
         };
+
+        // DeltaStore deletes remove persisted rows without touching the
+        // postings; filter them out before reading (a deleted id must not
+        // reappear just because the index still lists it).
+        if pending_cells && backend.pending_delta_delete_count() > 0 {
+            let delta = backend.storage.delta_store();
+            row_ids.retain(|id| !delta.is_deleted(*id));
+        }
+
+        // Postings are a superset of the truth while a cell overlay exists: an
+        // updated row may now match a value its persisted posting does not
+        // carry. Add every row whose pending update touches a predicate column;
+        // the residual WHERE below re-evaluates the merged values, so extra
+        // candidates disappear and updated matches are not missed.
+        if pending_cells {
+            let mut updated_predicate_ids: Vec<u64> = Vec::new();
+            {
+                let delta = backend.storage.delta_store();
+                if let Some(predicate_columns) = predicate_columns.as_ref() {
+                    for (row_id, column, _value) in delta.updated_cells() {
+                        if predicate_columns.contains(&column) {
+                            updated_predicate_ids.push(row_id);
+                        }
+                    }
+                }
+            }
+            if !updated_predicate_ids.is_empty() {
+                row_ids.extend(updated_predicate_ids);
+                row_ids.sort_unstable();
+                row_ids.dedup();
+            }
+        }
 
         if row_ids.is_empty() {
             let empty = backend.read_columns_to_arrow(None, 0, Some(0))?;
@@ -286,6 +329,12 @@ impl ApexExecutor {
                 full_predicate_covered && composite_is_full_equality,
             ),
         };
+        // The covering (index-only) scan returns the postings' own values, not a
+        // merged row read, so a cell overlay would leak stale values. The
+        // residual filter must also run: the merged rows are what re-evaluates
+        // the overlaid predicate values (and drops the union's extra candidates).
+        let try_covering_scan = try_covering_scan && !pending_cells;
+        let skip_residual_filter = skip_residual_filter && !pending_cells;
         if try_covering_scan {
             let mut covering_preds = indexed_preds.clone();
             for (column, value) in &equality_values {
@@ -301,10 +350,63 @@ impl ApexExecutor {
             }
         }
 
+        // Indexes produce candidate rows.  The residual (full WHERE) filter
+        // keeps non-indexed predicates correct; it is skipped only when the
+        // covering decision proves full equality coverage.
+        let residual = spec.map(|spec| &spec.residual).unwrap_or(where_clause);
+
         // Batch materialization amortizes mmap/footer work. Tiny probes retain
-        // the lower-latency point path; the crossover is benchmarked.
+        // the lower-latency point path; with a cell overlay the batch reader is
+        // used even for tiny probes because it merges the pending overrides.
+        //
+        // A LIMIT (without ORDER BY/DISTINCT, where ascending-id order is the
+        // answer order) must not materialize every index candidate just because
+        // the overlay disabled the early-terminating scan lane: read candidates
+        // in id order and stop once enough rows passed the residual filter.
         const BATCH_ROW_ID_THRESHOLD: usize = 8;
-        let combined = if row_ids.len() >= BATCH_ROW_ID_THRESHOLD {
+        let limit_target = if pending_cells
+            && stmt.order_by.is_empty()
+            && !stmt.distinct
+            && stmt.distinct_on.is_none()
+        {
+            stmt.limit
+                .map(|limit| limit.saturating_add(stmt.offset.unwrap_or(0)))
+        } else {
+            None
+        };
+        let mut pre_filtered = false;
+        let combined = if let Some(target) = limit_target {
+            pre_filtered = true;
+            let chunk = target.max(64).min(1024);
+            let mut batches: Vec<RecordBatch> = Vec::new();
+            let mut accepted = 0usize;
+            let mut start = 0usize;
+            while start < row_ids.len() && accepted < target {
+                let end = (start + chunk).min(row_ids.len());
+                let batch = backend.read_rows_by_ids_to_arrow(&row_ids[start..end])?;
+                let batch = if skip_residual_filter {
+                    batch
+                } else {
+                    Self::apply_filter_with_storage(&batch, residual, storage_path)?
+                };
+                accepted += batch.num_rows();
+                if batch.num_rows() > 0 {
+                    batches.push(batch);
+                }
+                start = end;
+            }
+            if batches.is_empty() {
+                let empty = backend.read_columns_to_arrow(None, 0, Some(0))?;
+                return Ok(Some(ApexResult::Empty(empty.schema())));
+            }
+            if batches.len() == 1 {
+                batches.remove(0)
+            } else {
+                let schema = batches[0].schema();
+                arrow::compute::concat_batches(&schema, &batches)
+                    .map_err(|e| err_data(e.to_string()))?
+            }
+        } else if row_ids.len() >= BATCH_ROW_ID_THRESHOLD || pending_cells {
             backend.read_rows_by_ids_to_arrow(&row_ids)?
         } else {
             let mut batches: Vec<RecordBatch> = Vec::with_capacity(row_ids.len());
@@ -326,11 +428,7 @@ impl ApexExecutor {
             return Ok(Some(ApexResult::Empty(empty.schema())));
         }
 
-        // Indexes produce candidate rows.  The residual (full WHERE) filter
-        // keeps non-indexed predicates correct; it is skipped only when the
-        // covering decision proves full equality coverage.
-        let residual = spec.map(|spec| &spec.residual).unwrap_or(where_clause);
-        let filtered = if skip_residual_filter {
+        let filtered = if skip_residual_filter || pre_filtered {
             combined
         } else {
             Self::apply_filter_with_storage(&combined, residual, storage_path)?

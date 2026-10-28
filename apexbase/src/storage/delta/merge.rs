@@ -55,6 +55,18 @@ impl DeltaMerger {
             return Ok(base.clone());
         }
 
+        // A small overlay usually touches none of the rows a candidate read
+        // returned (an index probe under one pending UPDATE is the common case).
+        // Rebuilding every column for those batches made a projected index
+        // lookup at 200k rows ~14x slower until the overlay was merged; the
+        // probe lets the untouched case return the base batch unchanged.
+        // Large scans skip the probe (the overlay is visible there anyway and
+        // the probe would scan the batch a second time).
+        const PROBE_MAX_ROWS: usize = 8192;
+        if num_rows <= PROBE_MAX_ROWS && !Self::batch_touches_delta(base_row_ids, delta) {
+            return Ok(base.clone());
+        }
+
         // Step 1: Build a boolean mask for non-deleted rows
         let keep_mask: Vec<bool> = base_row_ids
             .iter()
@@ -75,13 +87,21 @@ impl DeltaMerger {
             .map(|(i, _)| i)
             .collect();
 
-        // Step 3: For each column, apply deletes and overlay updates
+        // Step 3: For each column, apply deletes and overlay updates. Columns
+        // that no pending cell update touches are reused zero-copy when no row
+        // is deleted, so a one-cell overlay no longer rebuilds the whole batch.
         let schema = base.schema();
+        let all_kept = kept_count == num_rows;
         let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(schema.fields().len());
 
         for (col_idx, field) in schema.fields().iter().enumerate() {
             let col_name = field.name();
             let base_col = base.column(col_idx);
+
+            if all_kept && !delta.updates_column(col_name) {
+                new_columns.push(base_col.clone());
+                continue;
+            }
 
             let new_col = Self::merge_column(
                 base_col,
@@ -115,6 +135,33 @@ impl DeltaMerger {
 
         RecordBatch::try_new(schema, new_columns)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+    }
+
+    /// Whether any row of `base_row_ids` has a pending delete or cell update.
+    ///
+    /// The overlay is usually far smaller than the candidate batch, so walk the
+    /// overlay and test membership in the batch. Small batches use a linear
+    /// scan per overlay row; larger ones build one set so a bulk update cannot
+    /// degenerate into O(batch × overlay).
+    fn batch_touches_delta(base_row_ids: &[u64], delta: &DeltaStore) -> bool {
+        let deleted = delta.delete_bitmap().deleted_ids();
+        let updated: Vec<u64> = delta.all_updates().keys().copied().collect();
+        let overlay_rows = deleted.len() + updated.len();
+        if overlay_rows == 0 {
+            return false;
+        }
+        if overlay_rows <= 8 {
+            return deleted
+                .iter()
+                .chain(updated.iter())
+                .any(|id| base_row_ids.contains(id));
+        }
+        let batch_ids: std::collections::HashSet<u64> =
+            base_row_ids.iter().copied().collect();
+        deleted
+            .iter()
+            .chain(updated.iter())
+            .any(|id| batch_ids.contains(id))
     }
 
     /// Apply deletes only (no updates) - faster path

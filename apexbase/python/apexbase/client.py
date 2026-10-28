@@ -264,6 +264,13 @@ _RE_SIMPLE_PROJECTED_POINT_LOOKUP = re.compile(
     r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)\s+where\s+_id\s*=\s*(\d+)\s*;?\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+# Parameterized form of the same shape. Binding it first would mint a fresh SQL
+# text per call, which makes every text-keyed cache in the read path miss; the
+# shape (never the id) is what gets cached by the bound-point fast path.
+_RE_BOUND_POINT_LOOKUP = re.compile(
+    r"^\s*select\s+([^?]+?)\s+from\s+([A-Za-z_][\w]*)\s+where\s+_id\s*=\s*\?\s*;?\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 _RE_SIMPLE_SCAN_SHAPE = re.compile(
     r"^\s*select\s+(.+?)\s+from\s+([A-Za-z_][\w]*)(?:\s+limit\s+(\d+)(?:\s+offset\s+(\d+))?)?\s*;?\s*$",
     re.IGNORECASE | re.DOTALL,
@@ -308,6 +315,9 @@ _RE_BOUND_TOPK = re.compile(
     re.IGNORECASE,
 )
 _SQL_NAMED_PARAM = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# Any character/sequence that makes `_bind_sql_params`' fast `?`-only path
+# unsafe: string/identifier literals, comments, or named placeholders.
+_RE_SQL_BIND_UNSAFE = re.compile(r"""['"`]|--|/\*|[:@$]""")
 
 
 def _sql_literal(value) -> str:
@@ -362,6 +372,33 @@ def _bind_sql_params(sql: str, params) -> str:
         raise ValueError(
             "params must be a list/tuple of positional values or a dict of named values"
         )
+
+    # Fast path for the hot parameterized statement: no string/identifier
+    # literal, comment or named placeholder, so the only special characters are
+    # the positional `?` markers themselves. The state machine below costs one
+    # Python bytecode step per SQL character, which dominated a parameterized
+    # point lookup (~6.5 us per call on a 50-char statement, against ~2.5 us for
+    # the whole native point read).
+    if not named and "?" in sql and _RE_SQL_BIND_UNSAFE.search(sql) is None:
+        placeholders = sql.count("?")
+        if placeholders != len(bound_params):
+            if placeholders < len(bound_params):
+                raise ValueError(
+                    "too many parameters: {} supplied for {} placeholders".format(
+                        len(bound_params), placeholders
+                    )
+                )
+            raise ValueError(
+                "not enough parameters: {} supplied for {} placeholders".format(
+                    len(bound_params), placeholders
+                )
+            )
+        parts = sql.split("?")
+        chunks = [parts[0]]
+        for index, value in enumerate(bound_params):
+            chunks.append(_sql_literal(value))
+            chunks.append(parts[index + 1])
+        return "".join(chunks)
 
     out = []
     i = 0
@@ -1008,6 +1045,10 @@ class ApexClient:
         # cached result keeps the OLTP point/batch lookup hot paths from paying
         # SELECT-list parsing on every call.
         self._show_id_cache = {}
+        # `SELECT <projection> FROM <table> WHERE _id = ?` shapes, keyed by the
+        # (stable) parameterized SQL text, so the bound point lookup does not pay
+        # regex/classification work per call.
+        self._bound_point_shapes = {}
         self._numeric_range_rows_cache = {}
         # Compact deterministic SELECT results are immutable Arrow tables.  A
         # small per-client cache avoids re-running expensive analytical scans
@@ -1369,8 +1410,76 @@ class ApexClient:
             'QUANTILE(',
         ))
 
+    def _bound_point_lookup(self, sql, params, show_internal_id):
+        """Fast path for ``SELECT <projection> FROM <table> WHERE _id = ?``.
+
+        Returns a :class:`ResultView` when the statement is exactly that shape
+        with one non-negative integer parameter, otherwise ``None`` so the
+        caller falls through to the general path.
+        """
+        if isinstance(params, dict):
+            return None
+        if not isinstance(params, (list, tuple)) or len(params) != 1:
+            return None
+        point_id = params[0]
+        if (isinstance(point_id, bool) or not isinstance(point_id, int)
+                or point_id < 0):
+            return None
+        shapes = self._bound_point_shapes
+        shape = shapes.get(sql)
+        if shape is None:
+            shape = self._parse_bound_point_shape(sql)
+            if len(shapes) >= 256:
+                shapes.clear()
+            # `()` also memoizes "not this shape".
+            shapes[sql] = shape if shape is not None else ()
+        if not shape:
+            return None
+        projection, table = shape
+        current_table = self._current_table
+        if not current_table or table != current_table.lower():
+            return None
+        try:
+            if projection == '*':
+                row = self._storage.retrieve(point_id)
+            else:
+                row = self._storage.retrieve_projected_row(
+                    point_id, list(projection)
+                )
+        except Exception:                                    # noqa: BLE001
+            return None
+        if row is None:
+            return None
+        show_flag = self._resolve_show_internal_id(sql, show_internal_id)
+        rv = ResultView(data=[row])
+        rv._show_internal_id = show_flag
+        return rv
+
+    @staticmethod
+    def _parse_bound_point_shape(sql):
+        """Return ``(projection, table)`` for a bound point lookup, else None."""
+        if sql.count('?') != 1:
+            return None
+        match = _RE_BOUND_POINT_LOOKUP.match(sql)
+        if match is None:
+            return None
+        projection = match.group(1).strip()
+        table = match.group(2).lower()
+        if projection == '*':
+            return ('*', table)
+        columns = _projection_columns_from_text(projection)
+        if not columns:
+            return None
+        return (tuple(columns), table)
+
     def _get_cached_query_result(self, sql: str, show_internal_id):
         """Return a fresh view over an immutable cached Arrow table."""
+        # `_query_result_cache_token` returns None when the cache is disabled, so
+        # the cacheability scan below would be pure per-call overhead on every
+        # statement (it is keyed by SQL text, and parameterized/literal point
+        # lookups produce a fresh text every call).
+        if not self._enable_cache:
+            return None, None, None
         cacheable = self._query_result_cacheability.get(sql)
         if cacheable is None:
             cacheable = self._is_query_result_cacheable(
@@ -2926,6 +3035,17 @@ class ApexClient:
                     id_col=id_col,
                     dist_col=dist_col,
                 )
+            # Bound point lookups: skip binding + classification entirely. The
+            # shape is cached by the parameterized text, which stays stable, and
+            # the row is read through the same native binding as the literal
+            # fast path.
+            if (not getattr(self, '_in_txn', False)
+                    and not getattr(self, '_fast_txn_active', False)):
+                bound_point = self._bound_point_lookup(
+                    sql, params, show_internal_id
+                )
+                if bound_point is not None:
+                    return bound_point
             sql = _bind_sql_params(sql, params)
             params = None
 

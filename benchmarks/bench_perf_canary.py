@@ -82,6 +82,9 @@ CANARY_SPECS = (
     ("CSV multiple COUNT DISTINCT", "bench_csv_multi_count_distinct", "mean"),
     ("Point lookup (SQL)", "bench_point_lookup", "median"),
     ("Point lookup (direct)", "bench_oltp_direct_point_lookup", "median"),
+    # The report's projected point lookup shape: `params=` binding, not a
+    # literal id. Kept with the other reads, before the mutating shapes.
+    ("Projected point lookup (params)", "bench_point_lookup_params", "mean"),
     ("Projected string equality", "bench_oltp_projected_string_eq", "median"),
     ("Projected _id string equality", "bench_oltp_projected_id_string_eq", "median"),
     ("Insert 1 row", "bench_oltp_insert_one", "median"),
@@ -109,6 +112,32 @@ CANARY_SPECS = (
         "bench_delta_filter_update_numeric_range_limit",
         "setup",
         "setup_delta_filter_update_numeric_range_limit",
+    ),
+    # Point reads used to leave their fast lanes for any visible DeltaStore cell
+    # overlay (predicate UPDATE) and only recovered after REINDEX.
+    (
+        "Point lookup (native, cell overlay)",
+        "bench_overlay_point_native",
+        "setup",
+        "setup_overlay_point_read",
+    ),
+    (
+        "Point lookup (SQL, cell overlay)",
+        "bench_overlay_point_sql",
+        "setup",
+        "setup_overlay_point_read",
+    ),
+    (
+        "Index eq (cell overlay)",
+        "bench_overlay_index_eq",
+        "setup",
+        "setup_overlay_point_read",
+    ),
+    (
+        "Index eq + LIMIT (cell overlay)",
+        "bench_overlay_index_limit",
+        "setup",
+        "setup_overlay_point_read",
     ),
 )
 
@@ -147,10 +176,17 @@ HOT_SHAPE_NAMES = (
     "COUNT(col) partial",
     "COUNT(col) string filter",
     "Prefix LIKE COUNT",
+    # Reads the shared `default` fixture, so it must run while that table is
+    # still the selected one (the overlay fixtures below switch tables).
+    "Projected point lookup (params)",
     # Both overlay shapes build their own tables, so they can run before the
     # `default` mutations below.
     "Numeric range LIMIT (delta overlay)",
     "Numeric range LIMIT (filter-column update)",
+    "Point lookup (native, cell overlay)",
+    "Point lookup (SQL, cell overlay)",
+    "Index eq (cell overlay)",
+    "Index eq + LIMIT (cell overlay)",
     # Mutating shapes run after the reads (M-13): they change the shared
     # `default` fixture.
     "String cell UPDATE (single row)",

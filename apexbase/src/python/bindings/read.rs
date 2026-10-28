@@ -263,8 +263,47 @@ impl ApexStorageImpl {
             if id_u64 >= backend.next_id_value() && !backend.has_delta() {
                 return Ok(None);
             }
-            if backend.has_pending_deltas() {
-                // Pending UPDATE overlays are applied by the Arrow executor fallback below.
+            // DeltaStore cell overlay on persisted rows: read the base row through
+            // the same lanes and apply the pending cell overrides here. Handing
+            // this shape to the SQL executor made every point read ~17-20x slower
+            // after any predicate UPDATE (until REINDEX merged the sidecar).
+            // Appended rows (spilled delta / unflushed rows) are not in the base
+            // view and still take the merged fallback below.
+            let pending_cells = backend.has_pending_deltas();
+            if pending_cells {
+                let deleted = {
+                    let delta = backend.storage.delta_store();
+                    delta.is_deleted(id_u64)
+                };
+                if deleted {
+                    return Ok(None);
+                }
+                if !backend.has_delta() && backend.pending_v4_in_memory_rows() == 0 {
+                    let base = py.allow_threads(|| -> Option<Vec<(String, Value)>> {
+                        // RCIX first (page-cached point lane); the decoding reader
+                        // serves compressed/legacy row groups.
+                        match backend.storage.retrieve_rcix(id_u64) {
+                            Ok(Some(vals)) => Some(vals),
+                            _ => backend.storage.read_row_by_id_values(id_u64).ok().flatten(),
+                        }
+                    });
+                    if let Some(mut vals) = base {
+                        {
+                            let delta = backend.storage.delta_store();
+                            for (col, val) in vals.iter_mut() {
+                                if let Some(updated) = delta.get_updated_value(id_u64, col) {
+                                    *val = updated.clone();
+                                }
+                            }
+                        }
+                        let dict = PyDict::new_bound(py);
+                        for (k, v) in vals {
+                            dict.set_item(k, value_to_py(py, &v)?)?;
+                        }
+                        return Ok(Some(dict.into()));
+                    }
+                    return Ok(None);
+                }
             } else {
                 if backend.pending_v4_in_memory_rows() > 0 {
                     let vals_result =

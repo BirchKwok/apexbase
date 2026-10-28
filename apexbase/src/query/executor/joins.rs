@@ -79,44 +79,49 @@ impl ApexExecutor {
         // General hash-join route: no fast path above matched.
         crate::query::executor::record_path("hash_join");
 
-        let mut required_columns = stmt.required_columns().unwrap_or_default();
+        // `None` means "star projection: read every column" (`required_columns`
+        // documents that).  Do not turn it into an empty set: the star is
+        // expanded after the join, so both sides must be read in full or every
+        // projected column that is not a JOIN key disappears (and a qualified
+        // reference such as `p.name` fails with "Projected column ... does not
+        // exist").  Only the explicit-column list is extended with the keys.
+        let mut required_columns = stmt.required_columns();
         // JOIN ON keys and extra ON predicates are needed by the hash join even
         // when they are not projected.  Without them a COUNT(*) join would read
         // every column of the base table just to probe the key.
-        for join_clause in &stmt.joins {
-            let left_names = Self::source_names(&stmt.from).unwrap_or_default();
-            let right_names =
-                Self::source_names(&Some(join_clause.right.clone())).unwrap_or_default();
-            if let Ok((left_key, right_key, _, _, extra_filter)) =
-                Self::extract_join_keys_with_filter(&join_clause.on, &left_names, &right_names)
-            {
-                for key in [left_key, right_key] {
-                    let plain = key
-                        .trim_matches('"')
-                        .rsplit('.')
-                        .next()
-                        .unwrap_or(key.trim_matches('"'))
-                        .to_string();
-                    if !required_columns.contains(&plain) {
-                        required_columns.push(plain);
-                    }
-                }
-                if let Some(filter) = extra_filter {
-                    for col in Self::expr_referenced_columns(&filter) {
-                        let plain = col.rsplit('.').next().unwrap_or(&col).to_string();
+        if let Some(ref mut required_columns) = required_columns {
+            for join_clause in &stmt.joins {
+                let left_names = Self::source_names(&stmt.from).unwrap_or_default();
+                let right_names =
+                    Self::source_names(&Some(join_clause.right.clone())).unwrap_or_default();
+                if let Ok((left_key, right_key, _, _, extra_filter)) =
+                    Self::extract_join_keys_with_filter(&join_clause.on, &left_names, &right_names)
+                {
+                    for key in [left_key, right_key] {
+                        let plain = key
+                            .trim_matches('"')
+                            .rsplit('.')
+                            .next()
+                            .unwrap_or(key.trim_matches('"'))
+                            .to_string();
                         if !required_columns.contains(&plain) {
                             required_columns.push(plain);
+                        }
+                    }
+                    if let Some(filter) = extra_filter {
+                        for col in Self::expr_referenced_columns(&filter) {
+                            let plain = col.rsplit('.').next().unwrap_or(&col).to_string();
+                            if !required_columns.contains(&plain) {
+                                required_columns.push(plain);
+                            }
                         }
                     }
                 }
             }
         }
-        let required_refs: Option<Vec<&str>> = Some(
-            required_columns
-                .iter()
-                .map(String::as_str)
-                .collect(),
-        );
+        let required_refs: Option<Vec<&str>> = required_columns
+            .as_ref()
+            .map(|columns| columns.iter().map(String::as_str).collect());
         // COUNT(*)-style queries have no required projection columns.  Reading
         // zero columns into a non-empty Arrow batch is invalid, so fall back to
         // a full-column read; the join still evaluates the filter correctly.

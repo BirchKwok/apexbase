@@ -3812,6 +3812,84 @@ class ApexBaseBench:
     def bench_index_covering(self):
         return self._query_all("SELECT tag FROM idxcan WHERE tag = 't5'")
 
+    def setup_overlay_point_read(self):
+        """One-time fixture for point reads under a persisted cell overlay.
+
+        The in-place eight-byte lane only covers numeric cells, so a one-row
+        string assignment has to land in the DeltaStore; the update is flushed so
+        the guard measures a persisted overlay. The indexed numeric column is
+        left untouched, so its postings stay authoritative. A separate table
+        keeps the overlay away from the other canary shapes.
+        """
+        if not getattr(self, "_overlay_point_ready", False):
+            rows = 50_000
+            self.client.execute("CREATE TABLE ovlpoint (k INT, v INT, tag TEXT)")
+            self.client.use_table("ovlpoint")
+            for start in range(0, rows, 50_000):
+                end = min(rows, start + 50_000)
+                self.client.store(
+                    {
+                        "k": list(range(start, end)),
+                        "v": list(range(start, end)),
+                        "tag": [f"t{idx % 10}" for idx in range(start, end)],
+                    }
+                )
+            self.client.flush()
+            self.client.execute("CREATE INDEX idx_ovlpoint_k ON ovlpoint(k)")
+            self.client.execute("CREATE INDEX idx_ovlpoint_tag ON ovlpoint(tag)")
+            self.client.execute("ANALYZE ovlpoint")
+            self.client.execute(
+                "UPDATE ovlpoint SET tag = 'overlay' WHERE _id = 25001"
+            )
+            self.client.flush()
+            self._overlay_point_id = 25001
+            self._overlay_point_ready = True
+        # `run_bench_with_setup` calls this before every iteration, so restore
+        # the current table for the native point-read method (outside timing).
+        self.client.use_table("ovlpoint")
+
+    def bench_overlay_point_native(self):
+        """Native point read with a persisted DeltaStore cell overlay."""
+        return self.client.retrieve(self._overlay_point_id)
+
+    def bench_overlay_point_sql(self):
+        """Projected SQL point read with a persisted DeltaStore cell overlay."""
+        return self._query_all(
+            f"SELECT k, v, tag FROM ovlpoint WHERE _id = {self._overlay_point_id}"
+        )
+
+    def bench_overlay_index_eq(self):
+        """Secondary-index equality read under a persisted cell overlay.
+
+        The predicate column (`k`) is not the updated one, so the postings are
+        still authoritative and the lane must answer from the index plus the
+        merged row read instead of scanning the table.
+        """
+        rows = self._query_all("SELECT * FROM ovlpoint WHERE k = 40000 LIMIT 10")
+        if len(rows) != 1 or rows[0]["_id"] != 40001:
+            raise AssertionError(f"index-overlay lookup wrong: {rows[:2]}")
+        return rows
+
+    def bench_overlay_index_limit(self):
+        """Indexed equality with many matches + LIMIT under a cell overlay.
+
+        The LIMIT must stop the candidate read early; while the overlay was
+        visible the statement used to leave the index lane and materialize the
+        merged scan instead.
+        """
+        rows = self._query_all("SELECT v FROM ovlpoint WHERE tag = 't3' LIMIT 100")
+        if len(rows) != 100 or rows[0]["v"] != 3:
+            raise AssertionError(f"index+limit overlay read wrong: {rows[:2]}")
+        return rows
+
+    def bench_point_lookup_params(self):
+        """Projected point lookup with a bound parameter (the issue's shape)."""
+        return self.client.execute(
+            "SELECT name, age, score FROM default WHERE _id = ?",
+            params=[self.shared_inputs["point_lookup_id"]],
+            show_internal_id=True,
+        ).to_dict()
+
     def close(self):
         if self._uncached_scan_client:
             self._uncached_scan_client.close()

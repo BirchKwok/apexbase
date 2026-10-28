@@ -3,6 +3,154 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.38.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.38.0)
+*2026-10-28*
+
+[Compare with v1.37.0](https://github.com/BirchKwok/ApexBase/compare/v1.37.0...v1.38.0)
+
+> **V5 architecture preview (second release).** v1.38.0 continues the V5 storage
+> and execution preview started in v1.37.0. The on-disk format, V4 read
+> compatibility and write-exclusion rules are unchanged; this release fixes
+> three defects reported against v1.37.0 and closes the read-path gaps they
+> exposed. Treat the format as a preview: read
+> [V5 Preview Status](#v5-preview-status) before pointing older builds at new
+> files, exactly as for v1.37.0.
+
+### Highlights
+
+This release fixes the three defects in the v1.37.0 issue report — the
+`SELECT t.* … JOIN` projection failure, the SQL point-lookup latency gap and the
+read degradation a predicate `UPDATE` used to leave behind — and keeps the
+DeltaStore overlay from pushing point/index reads onto the merged-scan lanes.
+The data format, Python/Rust APIs and upgrade path are unchanged.
+
+### Correctness
+
+- Fix `SELECT t.* … JOIN` losing every non-key column. `required_columns()`
+  returns `None` for a star projection ("read all columns"), but the general
+  hash-join route collapsed that `None` into an empty column list and only
+  appended the JOIN keys, so both sides were read with just the key columns.
+  `SELECT t.*, p.name … LEFT JOIN` therefore failed with
+  `Projected column 'p.name' does not exist`, and the forms that did not error
+  (`SELECT t.* FROM t JOIN p`, `t.*, p.*`, `t.*, 'x'`) silently returned only
+  the key columns. The star flag is now preserved, only explicit column lists
+  are extended with the ON keys, and `COUNT(*)`-style joins keep their old
+  minimal-column behaviour. `test/test_join_star_projection.py` pins the
+  reported shape plus qualified, unqualified, literal, expression, INNER/RIGHT
+  and comma-join variants and the unaffected controls. The parser expands
+  `alias.*` as a plain star, so a star result may still carry the other side's
+  columns; that pre-existing projection-scoping behaviour is unchanged.
+
+### Read Path Performance
+
+- Parameterized point lookups no longer pay for text-keyed caches. The Python
+  client computed result-cache eligibility even when the cache was disabled,
+  bound `?` parameters with a per-character state machine, and then handed the
+  Rust classifier a fresh SQL text on every call, so each `WHERE _id = ?`
+  lookup paid three separate caches that could not hit. The disabled-cache case
+  short-circuits, a literal-free binding fast path replaces the state machine,
+  and a stable per-statement shape cache feeds `SELECT <projection> FROM <table>
+  WHERE _id = ?` straight to the native point-read bindings. On the issue
+  report's own harness (50k rows, `params=`, projected columns) the lookup went
+  from **0.0124 ms (5.7× native, 4.9× SQLite) to 0.0025 ms (1.15× native,
+  0.82× SQLite)**.
+- Point reads and secondary-index lookups stay on their fast lanes while a
+  DeltaStore cell overlay is visible. A predicate `UPDATE` records cell
+  overrides in `<table>.apex.deltastore`; every read lane used to stand down and
+  hand the query to the merged executor until `REINDEX` merged the sidecar.
+  `retrieve()` and the SQL `_id` fast path now read the base row through the
+  same RCIX lanes and apply the pending overrides (deleted rows return empty);
+  appended rows and unflushed buffers still take the merged path.
+  `index_accelerated_read` now stays eligible when the overlay is cells only:
+  the postings' candidates are unioned with the rows whose pending update
+  touches a predicate column, the residual `WHERE` re-evaluates the merged
+  values, covering (index-only) scans are disabled under an overlay, and
+  DeltaStore deletions are filtered from the candidates. On the report's 17-21×
+  point-read and 20-190× index-lookup degradations, the same measurements now
+  show **~1.6× (native retrieve), ~1.0× (SQL `_id`) and ~1.1-3.4× (index
+  lookups)**, with results byte-identical to the post-`REINDEX` answers.
+- The overlay merge and the index LIMIT path stop materializing work they do
+  not need. `DeltaMerger::merge` used to rebuild every column of every batch
+  whenever a DeltaStore was visible, even if no row of the batch was touched; it
+  now probes the overlay against the batch ids (small batches), returns the
+  base batch zero-copy when untouched, and reuses unchanged columns when no row
+  is deleted. Index reads under an overlay also read candidates in id order in
+  bounded chunks and stop once `LIMIT`/`OFFSET` are satisfied instead of
+  materializing every candidate. On a 200k-row table the projected indexed
+  `WHERE age = 42 LIMIT 100` read after a one-row `UPDATE` fell from
+  **~11-15× to ~2-3×** the clean read, and the equal-shape point/aggregate
+  metrics in the canary are 91-99% lower than on `origin/main`.
+
+### Benchmarks And Tests
+
+- New regression tests: `test/test_join_star_projection.py` (17 cases) for the
+  JOIN star projection, and `test/test_overlay_read_after_update.py` for
+  correctness plus `perf`-marked guards of the post-`UPDATE` point, index and
+  indexed-LIMIT reads (the pre-fix shapes fail the guards by 11-28×).
+- New canary metrics so the overlay lanes are measured on every commit:
+  `Point lookup (native, cell overlay)`, `Point lookup (SQL, cell overlay)`,
+  `Index eq (cell overlay)`, `Index eq + LIMIT (cell overlay)` and
+  `Projected point lookup (params)`. The canary runs the current benchmark
+  script against both wheels, so the base/current comparison shows the overlay
+  fixes directly: **-92.0% / -93.7% point reads, -99.2% index equality, -92.0% index
+  equality + LIMIT, and -78.7% for the parameterized projected lookup**.
+- The public 1,000,000-row scoreboard still completes all 103 tabular metrics
+  plus 6/6 exact-vector and 6/6 quantized-vector comparisons; the point-lookup
+  metrics are within threshold of the baseline (`Point Lookup (SQL by ID)
+  -2.6%`, `Point lookup (projected SQL) -1.4%`, `Point lookup (direct full row)
+  -1.2%`). The only metric outside the tool's threshold in this run is
+  `Filter (name = 'user_5000')` at +15.6% against the v1.36.2 snapshot (the
+  same-machine full gate measured it at +14.99% over five interleaved samples,
+  inside threshold; the canary's `String equality filter` counterpart is
+  +9.7%).
+
+### Validation And Performance
+
+- Release build, the complete serial Python suite (**2,475 passed, 0 failed,
+  0 skipped**, verified from the JUnit XML the release workflow consumes) and
+  the complete Rust suites in every release configuration: **755 unit + 6
+  documentation tests** with default features, **755 + 6** core-only
+  (`--no-default-features`), **761 + 6** with `server` and **759 + 6** with
+  `flight`.
+- Same-machine canary gate against `origin/main`: **84 metrics checked, all
+  passed**; the only metric flagged by the first run
+  (`Float partial range COUNT`, +139%) re-measured at +0.18% on the repeat,
+  confirming the GC-stall noise documented for that shape in v1.37.0.
+- Same-machine full gate against `origin/main`: **passed (exit 0)** across all
+  13 phases — public scoreboard (**109 metrics**), Q/s (14), quantized (8),
+  index (4), parallel (4), wide-table (20), string-zone (4), HTAP (10),
+  hybrid (12), PG-wire (7), hot-shape (15) and mixed (2).
+- Windows release readiness was audited before tagging because the release
+  workflow builds and tests on `windows-latest`: every Unix-only syscall is
+  behind `cfg(unix)` / `cfg(target_os = "macos")` / `cfg(target_os = "linux")`
+  with a Windows or portable fallback (`flock` via `fs2`,
+  `read_exact_at`/`seek_read`, `sync_all`, the deferred-delete metadata path,
+  the Unix-only WAL fault-injection helpers that are `cfg(all(test, unix))`,
+  and Linux-only `MAP_POPULATE`/`MADV_SEQUENTIAL`), Windows has dedicated
+  `FILE_FLAG_SEQUENTIAL_SCAN` and prefault paths, and no Unix-only dependency
+  was added. This release's changes are portable Rust plus stdlib Python, and
+  the new tests run in well under a second each. (A local
+  `--target x86_64-pc-windows-msvc` check reaches only the C dependencies —
+  mimalloc/zstd need the Windows toolchain — so the Windows jobs remain the
+  authoritative check.)
+- Refresh `benchmarks/latest_public_baseline.json` from this release's
+  1,000,000-row run (kept at `benchmarks/results/v1.38.0-public.json`) so public
+  comparisons are made against the V5 generation rather than the v1.36.2
+  snapshot.
+
+### Upgrade Notes
+
+- **No API, SQL or format change** from v1.37.0: existing V4 and V5-preview
+  files open unchanged, and no migration step is needed.
+- A predicate `UPDATE` no longer requires a `REINDEX` to restore read latency;
+  `REINDEX` keeps its existing meaning (rebuild postings, materialize the
+  sidecar).
+- `SELECT alias.*` combined with a JOIN now returns the joined tables' columns
+  instead of failing or dropping them; it may carry the other side's columns as
+  before for comma joins.
+- Update the Rust crate and Python package version metadata to 1.38.0.
+
+
 ## [v1.37.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.37.0)
 *2026-10-11*
 
