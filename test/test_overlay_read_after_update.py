@@ -211,22 +211,23 @@ def test_point_and_index_reads_stay_fast_after_a_predicate_update():
         lookup_after_ms, _ = _median_ms(indexed_lookup)
         limit_after_ms, _ = _median_ms(indexed_limit)
 
-        # The bug shape is ~17-20x; these loose thresholds leave room for jitter
-        # but fail loudly on a fallback to the merged-scan lanes.
-        assert retrieve_after_ms <= 4.0 * retrieve_before_ms, (
+        # The pre-fix shapes are 11-28x; these loose thresholds stay far below
+        # them (and above the 1.5-3.4x the fixed lanes measure) so a shared CI
+        # runner's jitter cannot fail the release while a fallback still does.
+        assert retrieve_after_ms <= 6.0 * retrieve_before_ms, (
             "retrieve() fell off the point-read fast lane after UPDATE: "
             f"{retrieve_before_ms:.5f} ms -> {retrieve_after_ms:.5f} ms "
-            f"({retrieve_after_ms / retrieve_before_ms:.1f}x, allowed 4x)"
+            f"({retrieve_after_ms / retrieve_before_ms:.1f}x, allowed 6x)"
         )
         assert limit_after_ms <= 8.0 * limit_before_ms, (
             "indexed LIMIT query materialized every candidate after UPDATE: "
             f"{limit_before_ms:.5f} ms -> {limit_after_ms:.5f} ms "
             f"({limit_after_ms / limit_before_ms:.1f}x, allowed 8x)"
         )
-        assert lookup_after_ms <= 5.0 * lookup_before_ms, (
+        assert lookup_after_ms <= 8.0 * lookup_before_ms, (
             "indexed lookup fell off the index lane after UPDATE: "
             f"{lookup_before_ms:.5f} ms -> {lookup_after_ms:.5f} ms "
-            f"({lookup_after_ms / lookup_before_ms:.1f}x, allowed 5x)"
+            f"({lookup_after_ms / lookup_before_ms:.1f}x, allowed 8x)"
         )
     finally:
         client.close()
