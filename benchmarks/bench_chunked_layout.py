@@ -69,6 +69,16 @@ SHAPES = (
     ("select * limit 100", "SELECT * FROM {table} LIMIT 100"),
     ("limit 10 offset 1", "SELECT * FROM {table} LIMIT 10 OFFSET 1"),
     ("string equality count", "SELECT COUNT(*) AS n FROM {table} WHERE s1 = 'g007'"),
+    # Narrow BITPACK integer filter (i2 is 0..999): a partially covering filtered
+    # aggregation with a value column, a count-only aggregate and a NULL-bearing
+    # aggregate. These three exercised the chunked branch's per-row header
+    # re-parse, the only shape family that regressed against the flat layout.
+    ("filter count (narrow bitpack)", "SELECT COUNT(*) AS n FROM {table} WHERE i2 >= 500"),
+    ("sum over narrow bitpack filter", "SELECT SUM(f1) AS s FROM {table} WHERE i2 >= 500"),
+    (
+        "count nullable over narrow bitpack filter",
+        "SELECT COUNT(n1) AS n FROM {table} WHERE i2 >= 500",
+    ),
     ("point lookup by _id", "SELECT * FROM {table} WHERE _id = {mid}"),
     ("group by string", "SELECT s1, COUNT(*) AS n FROM {table} GROUP BY s1"),
     ("full scan", "SELECT * FROM {table}"),
@@ -118,6 +128,15 @@ def generate_rows(rows):
         "groups_s1": len(set(data["s1"])),
         "k_at": lambda index: data["k"][index],
         "k_ge": lambda lo: sum(1 for value in data["k"] if value >= lo),
+        # Narrow BITPACK column: the partially covering filtered aggregation
+        # lane used to fall back to a per-row header re-parse for this encoding.
+        "i2_ge_500": sum(1 for value in data["i2"] if value >= 500),
+        "sum_f1_i2_ge_500": float(
+            np.sum([value for value, key in zip(data["f1"], data["i2"]) if key >= 500])
+        ),
+        "count_n1_i2_ge_500": sum(
+            1 for value, key in zip(data["n1"], data["i2"]) if key >= 500 and value is not None
+        ),
     }
     return data, expected
 
@@ -186,12 +205,26 @@ def check(client, table, sql_template, expected, mid):
     result = client.execute(sql).to_dict()
     if sql_template.endswith("COUNT(*) AS n FROM {table} WHERE k >= {lo}"):
         assert result == [{"n": expected["k_ge"](1000)}], (sql, result)
+    elif sql_template.startswith("SELECT SUM(f1)") and "i2 >=" in sql_template:
+        assert abs(result[0]["s"] - expected["sum_f1_i2_ge_500"]) <= (
+            abs(expected["sum_f1_i2_ge_500"]) * 1e-9 + 1e-6
+        ), (sql, result[0])
     elif sql_template.startswith("SELECT SUM(f1)"):
         assert abs(result[0]["s"] - expected["sum_f1_k_ge_1000"]) <= (
             abs(expected["sum_f1_k_ge_1000"]) * 1e-9 + 1e-6
         ), (sql, result[0])
     elif sql_template.startswith("SELECT COUNT(*) AS n FROM {table} WHERE s1"):
         assert result == [{"n": expected["eq_g007"]}], (sql, result)
+    elif (
+        sql_template.startswith("SELECT COUNT(*) AS n FROM {table}")
+        and "i2 >=" in sql_template
+    ):
+        assert result == [{"n": expected["i2_ge_500"]}], (sql, result)
+    elif (
+        sql_template.startswith("SELECT COUNT(n1) AS n FROM {table}")
+        and "i2 >=" in sql_template
+    ):
+        assert result == [{"n": expected["count_n1_i2_ge_500"]}], (sql, result)
     elif sql_template.startswith("SELECT k, i1, f1"):
         assert len(result) == 100, (sql, len(result))
         assert [row["k"] for row in result] == [

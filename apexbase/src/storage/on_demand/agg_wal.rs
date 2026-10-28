@@ -3879,6 +3879,198 @@ impl OnDemandStorage {
                         } else {
                             &[]
                         };
+                        // Partial coverage: decode only the columns this aggregate
+                        // needs into typed vectors and scan them with concrete
+                        // loops. The `NumericView::at` path below re-parses a
+                        // BITPACK payload header for every value, which made a
+                        // partially covering filtered aggregation +26..+34%
+                        // against the flat layout on 200k x 16 even though a
+                        // PLAIN filter column already won by -51%: column-selective
+                        // partial aggregation is exactly what this layout exists for.
+                        if !fully_covered && nc <= 1 {
+                            let fast_count_only =
+                                nc == 1 && !needs_value(value_needed, value_positions[0]);
+                            let raw_column = |idx: usize| -> Option<&[u8]> {
+                                columns
+                                    .iter()
+                                    .find(|(column, _)| *column == idx)
+                                    .map(|(_, bytes)| bytes.as_slice())
+                            };
+                            let decode_column = |idx: usize| -> Option<ColumnData> {
+                                let payload = raw_column(idx)?.get(null_bitmap_len..)?;
+                                if payload.is_empty() {
+                                    return None;
+                                }
+                                read_column_encoded(payload, schema.columns[idx].1)
+                                    .ok()
+                                    .map(|(data, _)| data)
+                            };
+                            let filter_values: Option<Vec<f64>> =
+                                decode_column(filter_idx).and_then(|data| match data {
+                                    ColumnData::Int64(values) => Some(
+                                        values
+                                            .into_iter()
+                                            .map(|value| value as f64)
+                                            .collect(),
+                                    ),
+                                    ColumnData::Float64(values) => Some(values),
+                                    _ => None,
+                                });
+                            if let Some(filter_values) = filter_values {
+                                if filter_values.len() >= rg_rows {
+                                    let filter_nulls = raw_column(filter_idx)
+                                        .map(|bytes| &bytes[..null_bitmap_len])
+                                        .unwrap_or(&[]);
+                                    let filter_has_nulls =
+                                        filter_nulls.iter().any(|&byte| byte != 0);
+                                    let agg_raw = if nc == 1 {
+                                        raw_column(agg_indices[0])
+                                            .filter(|bytes| bytes.len() >= null_bitmap_len)
+                                    } else {
+                                        None
+                                    };
+                                    let agg_nulls = agg_raw
+                                        .map(|bytes| &bytes[..null_bitmap_len])
+                                        .unwrap_or(&[]);
+                                    let agg_has_nulls =
+                                        agg_nulls.iter().any(|&byte| byte != 0);
+                                    let mut complete = false;
+                                    if nc == 0 {
+                                        for row in 0..rg_rows {
+                                            if has_deletes
+                                                && (del_bytes[row / 8] >> (row % 8)) & 1 == 1
+                                            {
+                                                continue;
+                                            }
+                                            if filter_has_nulls
+                                                && (filter_nulls[row / 8] >> (row % 8)) & 1 == 1
+                                            {
+                                                continue;
+                                            }
+                                            let value = filter_values[row];
+                                            if value >= low && value <= high {
+                                                part.matches += 1;
+                                            }
+                                        }
+                                        complete = true;
+                                    } else if fast_count_only {
+                                        if agg_raw.is_some() {
+                                            for row in 0..rg_rows {
+                                                if has_deletes
+                                                    && (del_bytes[row / 8] >> (row % 8)) & 1
+                                                        == 1
+                                                {
+                                                    continue;
+                                                }
+                                                if filter_has_nulls
+                                                    && (filter_nulls[row / 8] >> (row % 8)) & 1
+                                                        == 1
+                                                {
+                                                    continue;
+                                                }
+                                                let value = filter_values[row];
+                                                if value < low || value > high {
+                                                    continue;
+                                                }
+                                                part.matches += 1;
+                                                if agg_has_nulls
+                                                    && (agg_nulls[row / 8] >> (row % 8)) & 1
+                                                        == 1
+                                                {
+                                                    continue;
+                                                }
+                                                part.count += 1;
+                                            }
+                                            complete = true;
+                                        }
+                                    } else if let Some(agg_data) =
+                                        decode_column(agg_indices[0])
+                                    {
+                                        match agg_data {
+                                            ColumnData::Int64(values)
+                                                if values.len() >= rg_rows =>
+                                            {
+                                                part.is_int = true;
+                                                for row in 0..rg_rows {
+                                                    if has_deletes
+                                                        && (del_bytes[row / 8]
+                                                            >> (row % 8))
+                                                            & 1
+                                                            == 1
+                                                    {
+                                                        continue;
+                                                    }
+                                                    if filter_has_nulls
+                                                        && (filter_nulls[row / 8]
+                                                            >> (row % 8))
+                                                            & 1
+                                                            == 1
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let value = filter_values[row];
+                                                    if value < low || value > high {
+                                                        continue;
+                                                    }
+                                                    part.matches += 1;
+                                                    if agg_has_nulls
+                                                        && (agg_nulls[row / 8]
+                                                            >> (row % 8))
+                                                            & 1
+                                                            == 1
+                                                    {
+                                                        continue;
+                                                    }
+                                                    part.add_f64(values[row] as f64);
+                                                }
+                                                complete = true;
+                                            }
+                                            ColumnData::Float64(values)
+                                                if values.len() >= rg_rows =>
+                                            {
+                                                for row in 0..rg_rows {
+                                                    if has_deletes
+                                                        && (del_bytes[row / 8]
+                                                            >> (row % 8))
+                                                            & 1
+                                                            == 1
+                                                    {
+                                                        continue;
+                                                    }
+                                                    if filter_has_nulls
+                                                        && (filter_nulls[row / 8]
+                                                            >> (row % 8))
+                                                            & 1
+                                                            == 1
+                                                    {
+                                                        continue;
+                                                    }
+                                                    let value = filter_values[row];
+                                                    if value < low || value > high {
+                                                        continue;
+                                                    }
+                                                    part.matches += 1;
+                                                    if agg_has_nulls
+                                                        && (agg_nulls[row / 8]
+                                                            >> (row % 8))
+                                                            & 1
+                                                            == 1
+                                                    {
+                                                        continue;
+                                                    }
+                                                    part.add_f64(values[row]);
+                                                }
+                                                complete = true;
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    if complete {
+                                        return Some(part);
+                                    }
+                                }
+                            }
+                        }
                         let filter_parts = if fully_covered {
                             None
                         } else {
