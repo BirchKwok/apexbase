@@ -141,6 +141,18 @@ The data format, Python/Rust APIs and upgrade path are unchanged.
   `--target x86_64-pc-windows-msvc` check reaches only the C dependencies —
   mimalloc/zstd need the Windows toolchain — so the Windows jobs remain the
   authoritative check.)
+- Fix two release-matrix blockers in the branch's new tests before tagging.
+  `test_storage_budget` replaced the child interpreter's whole environment, so
+  the child could not import the in-tree package on CI (`maturin develop
+  --skip-install` leaves no editable install) and every Linux/macOS/Windows
+  pytest job failed with `ModuleNotFoundError: No module named
+  'apexbase.client'`; the child now prepends `apexbase/python` to `sys.path` and
+  inherits the environment (Windows needs `SYSTEMROOT`). The multi-predicate
+  `COUNT(v)`-vs-`SUM(v)` guard in `test_count_column_plan` assumed the count
+  lane costs half the sum lane plus 0.5 ms, while both lanes materialize the
+  predicate column and the shared runners measure ~0.82-0.86x; a 0.95x band
+  still catches a value-column decode (the ratio then approaches 1.0) and keeps
+  the matrix green.
 - Refresh `benchmarks/latest_public_baseline.json` from this release's
   1,000,000-row run (kept at `benchmarks/results/v1.38.0-public.json`) so public
   comparisons are made against the V5 generation rather than the v1.36.2
@@ -454,6 +466,18 @@ a version-5 file.
   3.19 ms (1.1×), the load-sensitive file-I/O shape that a single public run also
   flagged in v1.36.2 and that the interleaved gate has repeatedly placed inside
   threshold
+- Fix two release-matrix blockers in the branch's new tests before tagging.
+  `test_storage_budget` replaced the child interpreter's whole environment, so
+  the child could not import the in-tree package on CI (`maturin develop
+  --skip-install` leaves no editable install) and every Linux/macOS/Windows
+  pytest job failed with `ModuleNotFoundError: No module named
+  'apexbase.client'`; the child now prepends `apexbase/python` to `sys.path` and
+  inherits the environment (Windows needs `SYSTEMROOT`). The multi-predicate
+  `COUNT(v)`-vs-`SUM(v)` guard in `test_count_column_plan` assumed the count
+  lane costs half the sum lane plus 0.5 ms, while both lanes materialize the
+  predicate column and the shared runners measure ~0.82-0.86x; a 0.95x band
+  still catches a value-column decode (the ratio then approaches 1.0) and keeps
+  the matrix green.
 - Refresh `benchmarks/latest_public_baseline.json` from this release's full
   1,000,000-row run (the report is kept at
   `benchmarks/results/v1.37.0-public.json`) so public comparisons are made
