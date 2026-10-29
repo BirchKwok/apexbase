@@ -41,6 +41,9 @@ pub enum ColumnType {
     /// conversion). Arrow projects it as UTF-8, like the string type it shares its
     /// column storage with.
     Json = TYPE_JSON,
+    /// Fixed 16-byte UUID; the encoded payload reuses the `Binary` layout and
+    /// `LogicalType::Uuid` carries the parameterised type for Arrow/SQL.
+    Uuid = TYPE_UUID,
 }
 
 impl ColumnType {
@@ -104,6 +107,7 @@ impl ColumnType {
             TYPE_TURBOQUANT4_VECTOR => Some(ColumnType::TurboQuant4Vector),
             TYPE_BLOB => Some(ColumnType::Blob),
             TYPE_JSON => Some(ColumnType::Json),
+            TYPE_UUID => Some(ColumnType::Uuid),
             _ => None,
         }
     }
@@ -150,6 +154,7 @@ impl ColumnType {
             ColumnType::Int64 | ColumnType::UInt64 | ColumnType::Float64 | ColumnType::Timestamp | ColumnType::Date => 8,
             ColumnType::String
             | ColumnType::Binary
+            | ColumnType::Uuid
             | ColumnType::StringDict
             | ColumnType::FixedList
             | ColumnType::Float16List
@@ -559,7 +564,7 @@ impl ColumnData {
                 offsets: vec![0u64],
                 data: Vec::new(),
             },
-            ColumnType::Binary | ColumnType::Blob => ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => ColumnData::Binary {
                 offsets: vec![0u64],
                 data: Vec::new(),
             },
@@ -1119,7 +1124,7 @@ impl ColumnData {
                 pos += data_len;
                 Ok((ColumnData::String { offsets, data }, pos))
             }
-            ColumnType::Binary | ColumnType::Blob => {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 if pos + offsets_len > bytes.len() {
@@ -1277,7 +1282,7 @@ impl ColumnData {
                 let count = read_u64!() as usize;
                 pos += count * 8;
             }
-            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 pos += offsets_len;

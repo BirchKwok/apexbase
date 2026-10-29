@@ -2430,6 +2430,7 @@ const TYPE_TURBOQUANT2_VECTOR: u8 = 24;
 const TYPE_TURBOQUANT3_VECTOR: u8 = 25;
 const TYPE_TURBOQUANT4_VECTOR: u8 = 26;
 const TYPE_JSON: u8 = 27; // JSON document stored as canonical JSON text
+const TYPE_UUID: u8 = 28; // Fixed 16-byte UUID; payload uses the Binary encoding
 
 // ============================================================================
 // Data Types

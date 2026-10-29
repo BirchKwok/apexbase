@@ -4455,7 +4455,7 @@ impl OnDemandStorage {
                 ColumnType::String | ColumnType::StringDict | ColumnType::Json => {
                     string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
-                ColumnType::Binary | ColumnType::Blob => {
+                ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => {
                     binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
                 ColumnType::FixedList
@@ -4534,7 +4534,7 @@ impl OnDemandStorage {
                             .unwrap_or_default();
                         string_columns.get_mut(col_name).unwrap().push(v);
                     }
-                    ColumnType::Binary | ColumnType::Blob => {
+                    ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => {
                         let v = val
                             .and_then(|v| match v.as_delta_column_value_ref() {
                                 ColumnValueRef::Binary(b) | ColumnValueRef::Blob(b) => {
@@ -5152,6 +5152,7 @@ impl OnDemandStorage {
                 }
                 ColumnType::Binary
                 | ColumnType::Blob
+                | ColumnType::Uuid
                 | ColumnType::FixedList
                 | ColumnType::Float16List
                 | ColumnType::BFloat16List
@@ -6221,7 +6222,7 @@ impl OnDemandStorage {
                 offsets: vec![0u64; count + 1],
                 data: Vec::new(),
             },
-            ColumnType::Binary | ColumnType::Blob => ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => ColumnData::Binary {
                 offsets: vec![0u64; count + 1],
                 data: Vec::new(),
             },

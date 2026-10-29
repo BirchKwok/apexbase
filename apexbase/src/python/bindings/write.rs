@@ -434,7 +434,7 @@ impl ApexStorageImpl {
                     string_columns.insert(col_name.clone(), vec![v]);
                     null_positions.insert(col_name, vec![value.is_none()]);
                 }
-                ColumnType::Binary => {
+                ColumnType::Binary | ColumnType::Uuid => {
                     let v = if value.is_none() {
                         Vec::new()
                     } else if let Ok(v) = value.extract::<Vec<u8>>() {

@@ -526,7 +526,7 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::String | ColumnType::StringDict => DataType::String,
         ColumnType::Json => DataType::Json,
         ColumnType::Bool => DataType::Bool,
-        ColumnType::Binary => DataType::Binary,
+        ColumnType::Binary | ColumnType::Uuid => DataType::Binary,
         ColumnType::Blob => DataType::Blob,
         ColumnType::FixedList => DataType::Binary,
         ColumnType::Float16List => DataType::Float16Vector,

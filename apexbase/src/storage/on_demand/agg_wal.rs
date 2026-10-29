@@ -9588,7 +9588,7 @@ impl OnDemandStorage {
                     ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::Null => {
                         string_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
-                    ColumnType::Binary => {
+                    ColumnType::Binary | ColumnType::Uuid => {
                         binary_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
                     ColumnType::Blob => {

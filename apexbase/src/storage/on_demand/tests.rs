@@ -7304,3 +7304,31 @@ fn legacy_bytes_for(columns: &[(String, ColumnType)]) -> Vec<u8> {
     }
     schema.to_bytes()
 }
+
+#[test]
+fn uuid_column_round_trips_through_the_binary_payload() {
+    // TYPE_UUID reuses the Binary payload layout (offset table + 16-byte rows);
+    // this pins the encode/decode pair before the SQL/Arrow surface lands.
+    let data: Vec<u8> = (0u8..48).collect();
+    let column = ColumnData::Binary {
+        offsets: vec![0, 16, 32, 48],
+        data: data.clone(),
+    };
+    let bytes = column.to_bytes();
+    let (decoded, consumed) = ColumnData::from_bytes_typed(&bytes, ColumnType::Uuid).unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        ColumnData::Binary { offsets, data: decoded } => {
+            assert_eq!(offsets, vec![0, 16, 32, 48]);
+            assert_eq!(decoded, data);
+        }
+        other => panic!("Uuid payload must decode as Binary, got {other:?}"),
+    }
+    // The type tag survives a schema round trip and carries a logical type.
+    let mut schema = OnDemandSchema::new();
+    schema.add_column("id", ColumnType::Uuid);
+    schema.set_logical_type(0, Some(LogicalType::Uuid));
+    let parsed = OnDemandSchema::from_bytes(&schema.to_bytes()).unwrap();
+    assert_eq!(parsed.columns[0].1, ColumnType::Uuid);
+    assert_eq!(parsed.logical_type(0), Some(&LogicalType::Uuid));
+}

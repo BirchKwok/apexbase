@@ -1723,7 +1723,7 @@ impl StorageEngine {
                                                 });
                                             }
                                         }
-                                        ColumnType::Binary | ColumnType::Blob => {
+                                        ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => {
                                             if let Some(vals) = binary_columns.get(col_name) {
                                                 let mut offsets =
                                                     Vec::with_capacity(vals.len() + 1);
@@ -2129,7 +2129,7 @@ impl StorageEngine {
                                                 len: row_count,
                                             });
                                         }
-                                        ColumnType::Binary | ColumnType::Blob => match col {
+                                        ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => match col {
                                             Some(ColumnData::Binary { offsets, data }) => {
                                                 if *col_type == ColumnType::Blob {
                                                     // Blob schema: values are raw bytes in the

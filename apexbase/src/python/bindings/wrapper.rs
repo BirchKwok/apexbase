@@ -762,7 +762,7 @@ impl ApexStorageImpl {
                     };
                     ordered_values.push(SchemaStableValue::Str(v));
                 }
-                ColumnType::Binary => {
+                ColumnType::Binary | ColumnType::Uuid => {
                     let Ok(v) = value.downcast::<PyBytes>() else {
                         return Ok(None);
                     };

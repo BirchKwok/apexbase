@@ -2451,7 +2451,7 @@ impl OnDemandStorage {
                     len: row_count,
                 })
             }
-            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => {
                 // Variable-length type: need to read offsets first
                 self.read_variable_column_range_mmap(
                     mmap_cache, file, index, dtype, start_row, row_count,
@@ -3164,7 +3164,7 @@ impl OnDemandStorage {
                 )
                 .map(ColumnData::Float64)
             }
-            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => {
                 // Optimized scattered read for variable-length types
                 self.read_variable_column_scattered_mmap(
                     mmap_cache,
