@@ -3108,6 +3108,46 @@ mod tests {
     }
 
     #[test]
+    fn reversed_computer_keeps_the_farthest_rows() {
+        // The bounded heap keeps the smallest top-k ordering score. A distance
+        // metric's normal ordering is the distance itself, so reversing must
+        // make the farthest row the smallest score.
+        let nearest = DistanceComputer::new(DistanceMetric::L2, vec![0.0, 0.0]);
+        let close = nearest.compute_topk_ordering(&[1.0, 0.0]);
+        let far = nearest.compute_topk_ordering(&[3.0, 0.0]);
+        assert!(close < far);
+
+        let reversed = DistanceComputer::new(DistanceMetric::L2, vec![0.0, 0.0]).reversed();
+        assert!(reversed.is_reversed());
+        assert!(reversed.compute_topk_ordering(&[3.0, 0.0]) < reversed.compute_topk_ordering(&[1.0, 0.0]));
+
+        // For a similarity-valued metric the normal ordering is the negated
+        // similarity (most similar first); reversing keeps the least similar.
+        let sim = DistanceComputer::new(DistanceMetric::CosineSimilarity, vec![1.0, 0.0]);
+        let same = sim.compute_topk_ordering(&[1.0, 0.0]);
+        let opposite = sim.compute_topk_ordering(&[-1.0, 0.0]);
+        assert!(same < opposite);
+
+        let sim_reversed =
+            DistanceComputer::new(DistanceMetric::CosineSimilarity, vec![1.0, 0.0]).reversed();
+        assert!(
+            sim_reversed.compute_topk_ordering(&[-1.0, 0.0])
+                < sim_reversed.compute_topk_ordering(&[1.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn reversed_computer_reports_the_raw_score() {
+        // The reversed lane only needs row indices; the caller re-evaluates the
+        // SQL expression on the surviving rows, so no distance transform is
+        // applied (a transform would turn the negated score into NaN/wrong data).
+        let reversed = DistanceComputer::new(DistanceMetric::L2, vec![0.0, 0.0]).reversed();
+        let score = reversed.compute_topk_ordering(&[3.0, 0.0]);
+        assert_eq!(reversed.finalize_topk_distance(score), score);
+        assert!(score.is_finite() && score < 0.0);
+    }
+
+    #[test]
     fn test_cosine_similarity() {
         let a = vec![1.0f32, 0.0];
         let b = vec![1.0f32, 0.0];
