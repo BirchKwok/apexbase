@@ -14,7 +14,7 @@ enum WalOp {
 enum PostingDocs {
     Empty,
     One(u64),
-    Roaring(Box<RoaringTreemap>),
+    Roaring(Arc<RoaringTreemap>),
 }
 
 impl Default for PostingDocs {
@@ -28,7 +28,7 @@ impl PostingDocs {
         match docs.len() {
             0 => Self::Empty,
             1 => Self::One(docs.iter().next().unwrap()),
-            _ => Self::Roaring(Box::new(docs)),
+            _ => Self::Roaring(Arc::new(docs)),
         }
     }
 
@@ -43,10 +43,10 @@ impl PostingDocs {
                 let mut docs = RoaringTreemap::new();
                 docs.insert(*existing);
                 docs.insert(doc_id);
-                *self = Self::Roaring(Box::new(docs));
+                *self = Self::Roaring(Arc::new(docs));
                 true
             }
-            Self::Roaring(docs) => docs.insert(doc_id),
+            Self::Roaring(docs) => Arc::make_mut(docs).insert(doc_id),
         }
     }
 
@@ -59,7 +59,7 @@ impl PostingDocs {
             }
             Self::One(_) => false,
             Self::Roaring(docs) => {
-                if !docs.remove(doc_id) {
+                if !Arc::make_mut(docs).remove(doc_id) {
                     return false;
                 }
                 if docs.len() == 1 {
@@ -78,7 +78,7 @@ impl PostingDocs {
         match self {
             Self::Empty => RoaringTreemap::new(),
             Self::One(doc_id) => RoaringTreemap::from_iter([*doc_id]),
-            Self::Roaring(docs) => (**docs).clone(),
+            Self::Roaring(docs) => docs.as_ref().clone(),
         }
     }
 
@@ -103,10 +103,10 @@ impl PostingDocs {
                 Self::One(doc_id) => {
                     let doc_id = *doc_id;
                     let mut other_docs = other_docs;
-                    other_docs.insert(doc_id);
+                    Arc::make_mut(&mut other_docs).insert(doc_id);
                     *self = Self::Roaring(other_docs);
                 }
-                Self::Roaring(docs) => **docs |= other_docs.as_ref(),
+                Self::Roaring(docs) => *Arc::make_mut(docs) |= other_docs.as_ref(),
             },
         }
     }
@@ -120,7 +120,7 @@ impl PostingDocs {
                 }
             }
             Self::Roaring(docs) => {
-                **docs -= removed;
+                *Arc::make_mut(docs) -= removed;
                 match docs.len() {
                     0 => *self = Self::Empty,
                     1 => *self = Self::One(docs.iter().next().unwrap()),
