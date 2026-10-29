@@ -69,7 +69,7 @@ def test_hybrid_gates_the_pipeline_and_asserts_correctness(hybrid_bench):
     results, detail = hybrid_bench.run_hybrid_retrieval(rows=5_000, warmup=1, iterations=2)
 
     names = [row["query"] for row in results]
-    assert len(names) == len(set(names)) == 12
+    assert len(names) == len(set(names)) == 14
     assert names[0].startswith("Hybrid: BM25")
     assert "Hybrid: vector top-50" in names[1]
     assert names[2].startswith("Hybrid: fused top-10")
@@ -79,9 +79,14 @@ def test_hybrid_gates_the_pipeline_and_asserts_correctness(hybrid_bench):
     assert names[6] == "Hybrid: SQL MATCH row selection (dense term, page)"
     assert names[7] == "Hybrid: SQL ORDER BY cosine_distance LIMIT 10"
     assert names[8] == "Hybrid: SQL ORDER BY distance alias LIMIT 10"
-    assert names[9] == "Hybrid: SQL MATCH + ORDER BY distance LIMIT 10"
-    assert names[10] == "Hybrid: SQL filter + ORDER BY distance LIMIT 10"
-    assert names[11] == "Hybrid: SQL MATCH row selection (vector table)"
+    assert names[9] == "Hybrid: SQL ORDER BY distance LIMIT 10 OFFSET 5"
+    assert (
+        names[10]
+        == "Hybrid: SQL ORDER BY cosine_similarity DESC LIMIT 10 OFFSET 5"
+    )
+    assert names[11] == "Hybrid: SQL MATCH + ORDER BY distance LIMIT 10"
+    assert names[12] == "Hybrid: SQL filter + ORDER BY distance LIMIT 10"
+    assert names[13] == "Hybrid: SQL MATCH row selection (vector table)"
     for row in results:
         assert row["category"] == "ApexBase hybrid retrieval"
         assert row["ApexBase"] > 0
@@ -112,7 +117,7 @@ def test_hybrid_gates_the_pipeline_and_asserts_correctness(hybrid_bench):
         "docs": 5_000 // hybrid_bench.NEEDLE_EVERY,
         "vectors_match": True,
     }
-    assert len(detail["shapes"]) == 12
+    assert len(detail["shapes"]) == 14
 
 
 def test_hybrid_rrf_fusion_is_deterministic(hybrid_bench):

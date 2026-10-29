@@ -428,14 +428,12 @@ impl ApexExecutor {
     /// spelling. `None` when the clause is anything else.
     fn order_by_distance_spec(
         stmt: &SelectStatement,
-    ) -> Option<(String, Vec<f32>, crate::query::vector_ops::DistanceMetric)> {
+    ) -> Option<(String, Vec<f32>, crate::query::vector_ops::DistanceMetric, bool)> {
         if stmt.order_by.len() != 1 {
             return None;
         }
         let clause = &stmt.order_by[0];
-        if clause.descending {
-            return None;
-        }
+        let descending = clause.descending;
         let expression = match clause.expr.as_ref() {
             Some(expression) => expression,
             None => {
@@ -476,7 +474,12 @@ impl ApexExecutor {
         if query.is_empty() || query.iter().any(|value| !value.is_finite()) {
             return None;
         }
-        Some((column.trim_matches('"').to_string(), query, metric))
+        Some((
+            column.trim_matches('"').to_string(),
+            query,
+            metric,
+            descending,
+        ))
     }
 
     /// Rows for `SELECT ... ORDER BY <distance>(col, [q]) LIMIT k` over a table.
@@ -498,17 +501,18 @@ impl ApexExecutor {
         };
         use arrow::array::{BinaryArray, FixedSizeListArray, UInt32Array};
 
-        // Grouping, DISTINCT (including `DISTINCT ON`), OFFSET, a window or an
+        // Grouping, DISTINCT (including `DISTINCT ON`), a window or an
         // aggregate has to run over the whole relation before the TopK is
         // meaningful — or would change meaning if only the surviving rows reached
-        // it. A WHERE is allowed: the predicate is applied to the candidate rows
-        // before the heap below.
+        // it. An OFFSET is served by widening the heap to `limit + offset` and
+        // letting the shared tail slice it (it re-applies ORDER BY and
+        // LIMIT/OFFSET anyway). A WHERE is allowed: the predicate is applied to
+        // the candidate rows before the heap below.
         if !stmt.group_by.is_empty()
             || stmt.having.is_some()
             || stmt.distinct
             || stmt.distinct_on.is_some()
             || stmt.window_row_number_limit.is_some()
-            || stmt.offset.unwrap_or(0) > 0
             || stmt
                 .columns
                 .iter()
@@ -527,21 +531,26 @@ impl ApexExecutor {
         if limit == 0 {
             return Ok(None);
         }
-        let Some((column, query, metric)) = Self::order_by_distance_spec(stmt) else {
+        let Some((column, query, metric, descending)) = Self::order_by_distance_spec(stmt) else {
             return Ok(None);
         };
-        // The heap lane returns the rows *nearest* in the metric's own sense,
-        // while `ORDER BY <fn> ASC` means "smallest function value". The two
-        // agree for distances and for `negative_inner_product` (whose value
-        // already negates the dot product), but the similarity-valued functions
-        // would come back in the opposite order.
-        if matches!(
+        // The heap lane returns the rows *nearest* in the metric's own sense: for
+        // a distance metric that is the smallest value (`ORDER BY ... ASC`), for
+        // a similarity-valued metric the largest (`ORDER BY ... DESC`). The
+        // opposite direction needs the farthest rows, which this heap does not
+        // produce, so it keeps the general path.
+        let similarity_valued = matches!(
             metric,
             crate::query::vector_ops::DistanceMetric::InnerProduct
                 | crate::query::vector_ops::DistanceMetric::CosineSimilarity
-        ) {
+        );
+        if similarity_valued != descending {
             return Ok(None);
         }
+        // The tail re-applies ORDER BY and LIMIT/OFFSET on the rows this lane
+        // returns, so it needs the first `limit + offset` rows, not the first
+        // `limit`.
+        let wanted = limit.saturating_add(stmt.offset.unwrap_or(0));
 
         // Only the columns the statement needs: the TopK keeps `k` rows, so
         // decoding an unprojected wide column (a long text or blob column) for
@@ -569,7 +578,7 @@ impl ApexExecutor {
                 &column,
                 &computer,
                 col_refs_vec.as_deref(),
-                limit,
+                wanted,
             );
         }
 
@@ -580,12 +589,12 @@ impl ApexExecutor {
         // rows need materializing instead of the whole vector column.
         if backend.overlay_state().is_clean_view() {
             let direct = backend
-                .topk_fixedlist_direct(&column, &computer, limit)
+                .topk_fixedlist_direct(&column, &computer, wanted)
                 .ok()
                 .flatten()
                 .or_else(|| {
                     backend
-                        .topk_binary_direct(&column, &computer, limit)
+                        .topk_binary_direct(&column, &computer, wanted)
                         .ok()
                         .flatten()
                 });
@@ -608,7 +617,7 @@ impl ApexExecutor {
         let Some(values) = batch.column_by_name(&column) else {
             return Ok(None);
         };
-        let effective_k = limit.min(batch.num_rows());
+        let effective_k = wanted.min(batch.num_rows());
         let topk = if let Some(fixed) = values.as_any().downcast_ref::<FixedSizeListArray>() {
             // The heap kernel reads the flat child values, so a NULL row would
             // be scored as zeros; the general path sorts NULL distances last and

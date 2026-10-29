@@ -159,11 +159,15 @@ def test_star_projection_keeps_the_distance_order(client):
 def test_shapes_outside_the_fast_path_keep_the_general_plan(client):
     literal = _literal(client._query)
     plain = f"cosine_distance(emb, {literal})"
+    # A distance ordered DESC asks for the farthest rows (the heap produces the
+    # nearest); no LIMIT and a non-selective predicate also keep the general
+    # path. Similarity ASC is the same "farthest" direction in value space.
+    similarity = f"cosine_similarity(emb, {literal})"
     for sql in (
         f"SELECT doc FROM docs ORDER BY {plain} DESC LIMIT 5",
-        f"SELECT doc FROM docs ORDER BY {plain} LIMIT 5 OFFSET 3",
         f"SELECT doc FROM docs ORDER BY {plain}",
         f"SELECT doc FROM docs WHERE doc >= 0 ORDER BY {plain} LIMIT 5",
+        f"SELECT doc FROM docs ORDER BY {similarity} ASC LIMIT 5",
     ):
         assert _path(client, sql) == "generic_executor", sql
         assert len(client.execute(sql).to_dict()) > 0
@@ -176,6 +180,51 @@ def test_shapes_outside_the_fast_path_keep_the_general_plan(client):
     assert [row["dist"] for row in descending] == sorted(
         (row["dist"] for row in descending), reverse=True
     )
+
+
+def test_offset_and_similarity_desc_use_the_bounded_lane(client):
+    vectors, query = client._vectors, client._query
+    literal = _literal(query)
+    order, _distances = _cosine_order(vectors, query)
+    expected_offset = [int(index) for index in order[3:8]]
+    expected_desc = [int(index) for index in order[:5]]
+
+    offset_sql = (
+        f"SELECT doc FROM docs ORDER BY cosine_distance(emb, {literal}) "
+        "LIMIT 5 OFFSET 3"
+    )
+    similarity_sql = (
+        f"SELECT doc FROM docs ORDER BY cosine_similarity(emb, {literal}) DESC "
+        "LIMIT 5"
+    )
+    similarity_offset_sql = (
+        f"SELECT doc FROM docs ORDER BY cosine_similarity(emb, {literal}) DESC "
+        "LIMIT 5 OFFSET 3"
+    )
+    for sql, expected in (
+        (offset_sql, expected_offset),
+        (similarity_sql, expected_desc),
+        (similarity_offset_sql, expected_offset),
+    ):
+        assert _path(client, sql) == "order_by_distance_topk_direct", sql
+        # A `WHERE 1 = 1` forces the general path for the same answer.
+        parity = client.execute(sql.replace("SELECT doc FROM docs", "SELECT doc FROM docs WHERE 1 = 1")).to_dict()
+        assert [int(row["doc"]) for row in parity] == expected, sql
+        assert [int(row["doc"]) for row in client.execute(sql).to_dict()] == expected, sql
+
+    # Inner product is the other similarity-valued metric: DESC is the heap's
+    # own sense, and the offset widens the candidate set.
+    values = vectors.astype(np.float64)
+    query64 = query.astype(np.float64)
+    inner_order = np.argsort(-(values @ query64), kind="stable")
+    inner_sql = (
+        f"SELECT doc FROM docs ORDER BY inner_product(emb, {literal}) "
+        "DESC LIMIT 5 OFFSET 2"
+    )
+    assert _path(client, inner_sql) == "order_by_distance_topk_direct"
+    assert [int(row["doc"]) for row in client.execute(inner_sql).to_dict()] == [
+        int(index) for index in inner_order[2:7]
+    ]
 
 
 def test_invalid_distance_inputs_still_report_an_error(client):

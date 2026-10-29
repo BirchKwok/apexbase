@@ -6866,21 +6866,35 @@ fn order_by_distance_spec_resolves_both_spellings_and_rejects_the_rest() {
         ApexExecutor::order_by_distance_spec(&stmt)
     };
 
-    let (column, query, metric) = spec(
+    let (column, query, metric, descending) = spec(
         "SELECT doc FROM t ORDER BY cosine_distance(emb, [0.5, 0.25]) LIMIT 5",
     )
     .expect("expression form must resolve");
     assert_eq!(column, "emb");
     assert_eq!(query, vec![0.5f32, 0.25]);
     assert_eq!(metric, crate::query::vector_ops::DistanceMetric::CosineDistance);
+    assert!(!descending);
 
-    let (column, query, metric) = spec(
+    let (column, query, metric, descending) = spec(
         "SELECT doc, array_distance(emb, [1.0, 2.0]) AS dist FROM t ORDER BY dist LIMIT 5",
     )
     .expect("alias form must resolve");
     assert_eq!(column, "emb");
     assert_eq!(query, vec![1.0f32, 2.0]);
     assert_eq!(metric, crate::query::vector_ops::DistanceMetric::L2);
+    assert!(!descending);
+
+    // The spec resolves every direction; the lane decides which direction the
+    // nearest-first heap can serve.
+    let (_, _, metric, descending) = spec(
+        "SELECT doc FROM t ORDER BY cosine_similarity(emb, [1.0, 2.0]) DESC LIMIT 5",
+    )
+    .expect("descending similarity form must resolve");
+    assert_eq!(
+        metric,
+        crate::query::vector_ops::DistanceMetric::CosineSimilarity
+    );
+    assert!(descending);
 
     // A string literal query vector is accepted as well.
     assert!(spec(
@@ -6889,8 +6903,8 @@ fn order_by_distance_spec_resolves_both_spellings_and_rejects_the_rest() {
     .is_some());
 
     for rejected in [
-        // Descending order asks for the opposite end of the heap.
-        "SELECT doc FROM t ORDER BY cosine_distance(emb, [1.0, 2.0]) DESC LIMIT 5",
+        // (Descending order resolves; whether the heap can serve it is the
+        // lane's decision, covered by the Python path tests.)
         // More than one ordering term has to be honoured together.
         "SELECT doc FROM t ORDER BY cosine_distance(emb, [1.0, 2.0]), doc LIMIT 5",
         // Not a distance function.

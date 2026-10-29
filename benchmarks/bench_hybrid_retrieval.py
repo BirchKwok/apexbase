@@ -130,6 +130,8 @@ def hybrid_metric_names(rows):
         "SQL MATCH row selection (dense term, page)",
         "SQL ORDER BY cosine_distance LIMIT 10",
         "SQL ORDER BY distance alias LIMIT 10",
+        "SQL ORDER BY distance LIMIT 10 OFFSET 5",
+        "SQL ORDER BY cosine_similarity DESC LIMIT 10 OFFSET 5",
         "SQL MATCH + ORDER BY distance LIMIT 10",
         "SQL filter + ORDER BY distance LIMIT 10",
         "SQL MATCH row selection (vector table)",
@@ -369,9 +371,41 @@ def run_hybrid_retrieval(rows, warmup, iterations, only=None):
             int(row["doc"]) for row in client.execute(plain_ordered_sql).to_dict()
         ] == expected_docs
         detail["sql_order_by_distance"] = {"top_k": TOP_K, "docs_match": True}
+
+        # Similarity-valued DESC and an OFFSET both used to fall back to the
+        # general path (full relation sort). The bounded heap can serve them by
+        # widening to `limit + offset`: the heap's "nearest" is the largest
+        # similarity, so `ORDER BY cosine_similarity(...) DESC` shares its
+        # candidate set with the ASC distance ranking, and the tail re-applies
+        # ORDER BY + OFFSET on those rows.
+        order_offset = 5
+        offset_expected, _ = cosine_top_k(vecs, query, TOP_K + order_offset)
+        offset_expected = offset_expected[order_offset:]
+        offset_distance_sql = (
+            f"SELECT doc FROM docs ORDER BY cosine_distance(emb, {literal}) "
+            f"LIMIT {TOP_K} OFFSET {order_offset}"
+        )
+        offset_similarity_sql = (
+            f"SELECT doc FROM docs ORDER BY cosine_similarity(emb, {literal}) DESC "
+            f"LIMIT {TOP_K} OFFSET {order_offset}"
+        )
+        offset_distance = [
+            int(row["doc"]) for row in client.execute(offset_distance_sql).to_dict()
+        ]
+        offset_similarity = [
+            int(row["doc"]) for row in client.execute(offset_similarity_sql).to_dict()
+        ]
+        assert offset_distance == offset_expected, (offset_distance, offset_expected)
+        assert offset_similarity == offset_expected, (offset_similarity, offset_expected)
+        detail["sql_order_by_distance_offset"] = {
+            "offset": order_offset,
+            "docs_match": True,
+        }
         for label, sql in (
             ("SQL ORDER BY cosine_distance LIMIT 10", plain_ordered_sql),
             ("SQL ORDER BY distance alias LIMIT 10", ordered_sql),
+            ("SQL ORDER BY distance LIMIT 10 OFFSET 5", offset_distance_sql),
+            ("SQL ORDER BY cosine_similarity DESC LIMIT 10 OFFSET 5", offset_similarity_sql),
         ):
             metric = f"Hybrid: {label}"
             if not want(metric):
