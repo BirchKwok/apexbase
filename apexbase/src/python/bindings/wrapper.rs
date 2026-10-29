@@ -871,6 +871,17 @@ impl ApexStorageImpl {
         drop(lock_file);
     }
 
+    /// `APEX_LOGICAL_TYPES=0` disables parameterised column types (UUID today;
+    /// Decimal and the time family later). Unlike the cache-budget overrides this
+    /// must fail loudly: silently downgrading a UUID column to raw binary would
+    /// change what the table means.
+    fn logical_types_disabled() -> bool {
+        matches!(
+            std::env::var("APEX_LOGICAL_TYPES").ok().as_deref(),
+            Some("0") | Some("false") | Some("FALSE") | Some("False") | Some("no") | Some("off")
+        )
+    }
+
     /// Parse a Python dict {col_name: type_str} into Vec<(String, ColumnType)>
     fn parse_schema_dict(
         dict: &Bound<'_, PyDict>,
@@ -894,7 +905,15 @@ impl ApexStorageImpl {
                 "bool" | "boolean" => ColumnType::Bool,
                 "str" | "string" | "text" | "varchar" => ColumnType::String,
                 "bytes" | "binary" => ColumnType::Binary,
-                "uuid" => ColumnType::Uuid,
+                "uuid" => {
+                    if Self::logical_types_disabled() {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}' is uuid: parameterised column types are disabled by APEX_LOGICAL_TYPES=0",
+                            col_name
+                        )));
+                    }
+                    ColumnType::Uuid
+                }
                 "blob" | "large_binary" | "largebinary" => ColumnType::Blob,
                 "float16_vector" | "float16vector" | "f16_vector" => ColumnType::Float16List,
                 "float32_vector" | "f32_vector" => ColumnType::FixedList,

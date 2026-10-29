@@ -7,6 +7,8 @@ bytes and project as ``bytes`` (D4 decision: no list/string conversion).
 """
 
 import os
+
+import pytest
 import tempfile
 import uuid
 
@@ -57,3 +59,19 @@ def test_uuid_column_accepts_the_exact_sixteen_byte_form(tmp_path):
     client.flush()
     assert client.execute("SELECT u FROM t").to_dict() == [{"u": b"\x00" * 16}]
     client.close()
+
+
+def test_uuid_columns_can_be_disabled_by_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEX_LOGICAL_TYPES", "0")
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    try:
+        with pytest.raises(ValueError, match="APEX_LOGICAL_TYPES"):
+            client.create_table("t", {"u": "uuid"})
+    finally:
+        client.close()
+    monkeypatch.delenv("APEX_LOGICAL_TYPES")
+    client = ApexClient(str(tmp_path), drop_if_exists=False, enable_cache=False)
+    try:
+        client.create_table("t", {"u": "uuid"})
+    finally:
+        client.close()
