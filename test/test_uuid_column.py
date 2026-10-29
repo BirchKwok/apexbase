@@ -75,3 +75,16 @@ def test_uuid_columns_can_be_disabled_by_environment(tmp_path, monkeypatch):
         client.create_table("t", {"u": "uuid"})
     finally:
         client.close()
+
+
+def test_uuid_row_insert_validates_the_sixteen_byte_contract(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"id": "int64", "u": "uuid"})
+    client.use_table("t")
+    # The row-wise insert path rejects a value the declared type cannot hold.
+    with pytest.raises((RuntimeError, OSError), match="16-byte"):
+        client.store([{"id": 1, "u": b"short"}])
+    client.store([{"id": 1, "u": b"\x01" * 16}])
+    client.flush()
+    assert client.execute("SELECT u FROM t").to_dict() == [{"u": b"\x01" * 16}]
+    client.close()
