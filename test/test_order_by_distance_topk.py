@@ -138,13 +138,18 @@ def test_every_distance_metric_matches_the_general_path(client):
         )
         assert _path(client, fast) == "order_by_distance_topk_direct", function
 
-    # The similarity-valued functions must keep the general path: the vector
-    # TopK heap returns the *most* similar rows, while `ORDER BY ... ASC` asks for
-    # the least similar ones.
+    # Similarity-valued functions are served in both directions: DESC is the
+    # heap's own sense and ASC (least similar) uses the reversed heap.
     for function in ("cosine_similarity", "inner_product"):
-        sql = f"SELECT doc FROM docs ORDER BY {function}(emb, {literal}) LIMIT 7"
-        assert _path(client, sql) == "generic_executor", function
-        assert len(client.execute(sql).to_dict()) == 7, function
+        fast = f"SELECT doc FROM docs ORDER BY {function}(emb, {literal}) LIMIT 7"
+        baseline = (
+            f"SELECT doc FROM docs WHERE 1 = 1 "
+            f"ORDER BY {function}(emb, {literal}) LIMIT 7"
+        )
+        assert client.execute(fast).to_dict() == client.execute(baseline).to_dict(), (
+            function
+        )
+        assert _path(client, fast) == "order_by_distance_topk_direct", function
 
 
 def test_star_projection_keeps_the_distance_order(client):
@@ -159,15 +164,11 @@ def test_star_projection_keeps_the_distance_order(client):
 def test_shapes_outside_the_fast_path_keep_the_general_plan(client):
     literal = _literal(client._query)
     plain = f"cosine_distance(emb, {literal})"
-    # A distance ordered DESC asks for the farthest rows (the heap produces the
-    # nearest); no LIMIT and a non-selective predicate also keep the general
-    # path. Similarity ASC is the same "farthest" direction in value space.
-    similarity = f"cosine_similarity(emb, {literal})"
+    # No LIMIT and a non-selective predicate keep the general path; both
+    # directions are served by the bounded heap since round 277.
     for sql in (
-        f"SELECT doc FROM docs ORDER BY {plain} DESC LIMIT 5",
         f"SELECT doc FROM docs ORDER BY {plain}",
         f"SELECT doc FROM docs WHERE doc >= 0 ORDER BY {plain} LIMIT 5",
-        f"SELECT doc FROM docs ORDER BY {similarity} ASC LIMIT 5",
     ):
         assert _path(client, sql) == "generic_executor", sql
         assert len(client.execute(sql).to_dict()) > 0
@@ -225,6 +226,27 @@ def test_offset_and_similarity_desc_use_the_bounded_lane(client):
     assert [int(row["doc"]) for row in client.execute(inner_sql).to_dict()] == [
         int(index) for index in inner_order[2:7]
     ]
+
+    # The opposite directions (farthest rows) use the reversed heap instead of
+    # the general path: distance DESC and similarity ASC ask for the same rows.
+    distances = np.linalg.norm(values - query64, axis=1)
+    farthest = [int(index) for index in np.argsort(-distances, kind="stable")[:5]]
+    for sql in (
+        f"SELECT doc FROM docs ORDER BY l2_distance(emb, {literal}) DESC LIMIT 5",
+        f"SELECT doc FROM docs ORDER BY cosine_similarity(emb, {literal}) ASC LIMIT 5",
+    ):
+        assert _path(client, sql) == "order_by_distance_topk_direct", sql
+        parity = client.execute(
+            sql.replace("SELECT doc FROM docs", "SELECT doc FROM docs WHERE 1 = 1")
+        ).to_dict()
+        if "cosine_similarity" in sql:
+            # Sequence ASC = least similar first = the reverse of the nearest
+            # cosine order.
+            expected = [int(index) for index in _cosine_order(vectors, query)[0][::-1][:5]]
+        else:
+            expected = farthest
+        assert [int(row["doc"]) for row in parity] == expected, sql
+        assert [int(row["doc"]) for row in client.execute(sql).to_dict()] == expected, sql
 
 
 def test_invalid_distance_inputs_still_report_an_error(client):

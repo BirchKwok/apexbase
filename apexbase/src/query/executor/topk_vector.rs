@@ -537,16 +537,14 @@ impl ApexExecutor {
         // The heap lane returns the rows *nearest* in the metric's own sense: for
         // a distance metric that is the smallest value (`ORDER BY ... ASC`), for
         // a similarity-valued metric the largest (`ORDER BY ... DESC`). The
-        // opposite direction needs the farthest rows, which this heap does not
-        // produce, so it keeps the general path.
+        // opposite direction asks for the farthest rows, which the reversed
+        // computer produces by negating the top-k ordering score.
         let similarity_valued = matches!(
             metric,
             crate::query::vector_ops::DistanceMetric::InnerProduct
                 | crate::query::vector_ops::DistanceMetric::CosineSimilarity
         );
-        if similarity_valued != descending {
-            return Ok(None);
-        }
+        let reversed = similarity_valued != descending;
         // The tail re-applies ORDER BY and LIMIT/OFFSET on the rows this lane
         // returns, so it needs the first `limit + offset` rows, not the first
         // `limit`.
@@ -564,6 +562,7 @@ impl ApexExecutor {
             .map(|refs| refs.iter().map(|name| name.as_str()).collect());
 
         let computer = DistanceComputer::new(metric, query);
+        let computer = if reversed { computer.reversed() } else { computer };
 
         // Filter-aware pass (V5 §6.4 item 16): when the predicate selects a
         // minority, read only those rows and score just them. The predicate runs

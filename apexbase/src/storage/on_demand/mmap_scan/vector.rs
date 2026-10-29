@@ -508,6 +508,11 @@ impl OnDemandStorage {
         if column_type != ColumnType::FixedList && !is_f16 && quant_codec.is_none() {
             return Ok(None);
         }
+        // The encoded scorer is nearest-only; the reversed (farthest) SQL lanes
+        // fall back to the decoded batch path.
+        if computer.is_reversed() && quant_codec.is_some() {
+            return Ok(None);
+        }
 
         let query_dim = computer.query.len();
 

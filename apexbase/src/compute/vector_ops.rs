@@ -1168,6 +1168,12 @@ pub struct DistanceComputer {
     query_norm_sq: f32,
     /// Pre-computed 1/‖query‖ for cosine metrics (0.0 for others).
     query_norm_recip: f32,
+    /// Keep the *farthest* rows instead of the nearest ones by negating the
+    /// top-k ordering score. Used by the SQL distance lane for
+    /// `ORDER BY <distance> DESC` and `ORDER BY <similarity> ASC`; the caller
+    /// re-applies the real ORDER BY on the surviving rows, so only the candidate
+    /// set matters.
+    reversed: bool,
 }
 
 impl DistanceComputer {
@@ -1187,7 +1193,19 @@ impl DistanceComputer {
             query,
             query_norm_sq,
             query_norm_recip,
+            reversed: false,
         }
+    }
+
+    /// Return a computer whose top-k ordering keeps the farthest rows.
+    pub fn reversed(mut self) -> Self {
+        self.reversed = true;
+        self
+    }
+
+    #[inline(always)]
+    pub fn is_reversed(&self) -> bool {
+        self.reversed
     }
 
     #[inline(always)]
@@ -1210,7 +1228,7 @@ impl DistanceComputer {
 
     #[inline(always)]
     pub fn compute_topk_ordering(&self, a: &[f32]) -> f32 {
-        match self.metric {
+        let value = match self.metric {
             DistanceMetric::L2 => l2_squared(a, &self.query),
             DistanceMetric::InnerProduct | DistanceMetric::NegInnerProduct => {
                 -inner_product(a, &self.query)
@@ -1219,11 +1237,21 @@ impl DistanceComputer {
                 -cosine_similarity_fused(a, &self.query, self.query_norm_recip)
             }
             _ => self.compute(a),
+        };
+        if self.reversed {
+            -value
+        } else {
+            value
         }
     }
 
     #[inline(always)]
     pub fn finalize_topk_distance(&self, score: f32) -> f32 {
+        if self.reversed {
+            // The reversed lane only needs the surviving row indices; callers
+            // re-evaluate the real ordering expression on those rows.
+            return score;
+        }
         match self.metric {
             DistanceMetric::L2 => score.sqrt(),
             DistanceMetric::CosineSimilarity => -score,
@@ -1238,10 +1266,15 @@ impl DistanceComputer {
         } else {
             dot * row_norm_recip * self.query_norm_recip
         };
-        match self.metric {
+        let value = match self.metric {
             DistanceMetric::CosineSimilarity => -sim,
             DistanceMetric::CosineDistance => (1.0 - sim).clamp(0.0, 2.0),
             _ => unreachable!("cosine helper only valid for cosine metrics"),
+        };
+        if self.reversed {
+            -value
+        } else {
+            value
         }
     }
 
@@ -1958,7 +1991,14 @@ fn topk_heap_on_floats_impl(
                         break;
                     }
                     let vec = unsafe { floats.get_unchecked(off..off + dim) };
-                    insert_topk_score(&mut entries, k_capped, -inner_product(vec, query), i);
+                    // compute_topk_ordering handles the inner-product sign and the
+                    // reversed (farthest) direction.
+                    insert_topk_score(
+                        &mut entries,
+                        k_capped,
+                        computer.compute_topk_ordering(vec),
+                        i,
+                    );
                 }
                 entries
             })
@@ -2025,7 +2065,13 @@ fn topk_heap_on_floats_impl(
                 }
                 let vec = unsafe { floats.get_unchecked(off..off + dim) };
                 let score = computer.compute_topk_ordering(vec);
-                insert_topk_bits(&mut entries, k_capped, score.to_bits(), i);
+                if computer.reversed {
+                    // Reversed scores are negative; the raw-bit ordering used by
+                    // the ascending path would order them backwards.
+                    insert_topk_score(&mut entries, k_capped, score, i);
+                } else {
+                    insert_topk_bits(&mut entries, k_capped, score.to_bits(), i);
+                }
             }
             entries
         })

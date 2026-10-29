@@ -132,6 +132,8 @@ def hybrid_metric_names(rows):
         "SQL ORDER BY distance alias LIMIT 10",
         "SQL ORDER BY distance LIMIT 10 OFFSET 5",
         "SQL ORDER BY cosine_similarity DESC LIMIT 10 OFFSET 5",
+        "SQL ORDER BY cosine_distance DESC LIMIT 10",
+        "SQL ORDER BY cosine_similarity ASC LIMIT 10",
         "SQL MATCH + ORDER BY distance LIMIT 10",
         "SQL filter + ORDER BY distance LIMIT 10",
         "SQL MATCH row selection (vector table)",
@@ -342,7 +344,7 @@ def run_hybrid_retrieval(rows, warmup, iterations, only=None):
         expected_docs, expected_distance = cosine_top_k(vecs, query, TOP_K)
         # A tie at the cut would make the expected order ambiguous; the fixture is
         # random, so the margin only guards a future fixture change.
-        _, full_distance = cosine_top_k(vecs, query, len(vecs))
+        full_docs, full_distance = cosine_top_k(vecs, query, len(vecs))
         assert full_distance[TOP_K] - full_distance[TOP_K - 1] > 1e-6, (
             "the fixture must separate the k-th and (k+1)-th neighbour"
         )
@@ -401,11 +403,38 @@ def run_hybrid_retrieval(rows, warmup, iterations, only=None):
             "offset": order_offset,
             "docs_match": True,
         }
+
+        # The opposite direction (farthest rows) uses the reversed heap since
+        # round 277: distance DESC and similarity ASC select the same rows, and
+        # both used to evaluate a distance per row and fully sort the relation.
+        farthest_expected = list(reversed(full_docs[-TOP_K:]))
+        farthest_distance_sql = (
+            f"SELECT doc FROM docs ORDER BY cosine_distance(emb, {literal}) "
+            f"DESC LIMIT {TOP_K}"
+        )
+        similar_asc_sql = (
+            f"SELECT doc FROM docs ORDER BY cosine_similarity(emb, {literal}) "
+            f"ASC LIMIT {TOP_K}"
+        )
+        farthest_distance = [
+            int(row["doc"]) for row in client.execute(farthest_distance_sql).to_dict()
+        ]
+        similar_asc = [
+            int(row["doc"]) for row in client.execute(similar_asc_sql).to_dict()
+        ]
+        assert farthest_distance == farthest_expected, (
+            farthest_distance,
+            farthest_expected,
+        )
+        assert similar_asc == farthest_expected, (similar_asc, farthest_expected)
+        detail["sql_order_by_distance_reverse"] = {"docs_match": True}
         for label, sql in (
             ("SQL ORDER BY cosine_distance LIMIT 10", plain_ordered_sql),
             ("SQL ORDER BY distance alias LIMIT 10", ordered_sql),
             ("SQL ORDER BY distance LIMIT 10 OFFSET 5", offset_distance_sql),
             ("SQL ORDER BY cosine_similarity DESC LIMIT 10 OFFSET 5", offset_similarity_sql),
+            ("SQL ORDER BY cosine_distance DESC LIMIT 10", farthest_distance_sql),
+            ("SQL ORDER BY cosine_similarity ASC LIMIT 10", similar_asc_sql),
         ):
             metric = f"Hybrid: {label}"
             if not want(metric):
