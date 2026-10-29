@@ -2310,10 +2310,15 @@ impl OnDemandStorage {
     /// so the file declares version 5. Layouts that stay within V4 rules keep
     /// declaring version 4 and remain readable by older builds.
     pub(crate) fn required_format_version(&self) -> u32 {
+        // A parameterised (logical) column type is carried in a schema section
+        // an older build does not know how to interpret for writes, so such a
+        // table declares format version 6 even when nothing else needs it.
+        let schema = self.schema.read();
+        if schema.logical_types.iter().any(Option::is_some) {
+            return FORMAT_VERSION_V6;
+        }
         let narrow_float = self.width_fidelity()
-            && self
-                .schema
-                .read()
+            && schema
                 .columns
                 .iter()
                 .any(|(_, column_type)| matches!(column_type, ColumnType::Float32));

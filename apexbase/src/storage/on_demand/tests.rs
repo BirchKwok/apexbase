@@ -7332,3 +7332,20 @@ fn uuid_column_round_trips_through_the_binary_payload() {
     assert_eq!(parsed.columns[0].1, ColumnType::Uuid);
     assert_eq!(parsed.logical_type(0), Some(&LogicalType::Uuid));
 }
+
+#[test]
+fn logical_types_declare_format_version_six() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("logical_version.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    assert!(storage.required_format_version() <= FORMAT_VERSION_V5);
+    {
+        let mut schema = storage.schema.write();
+        schema.add_column("id", ColumnType::Uuid);
+        schema.set_logical_type(0, Some(LogicalType::Uuid));
+    }
+    assert_eq!(storage.required_format_version(), FORMAT_VERSION_V6);
+    // Clearing the parameterised type returns the table to its legacy version.
+    storage.schema.write().set_logical_type(0, None);
+    assert!(storage.required_format_version() <= FORMAT_VERSION_V5);
+}
