@@ -677,6 +677,8 @@ pub struct ColumnConstraints {
 #[derive(Debug, Clone, Default)]
 pub struct OnDemandSchema {
     pub columns: Vec<(String, ColumnType)>,
+    /// Optional parameterised type per column, aligned with `columns`.
+    pub logical_types: Vec<Option<LogicalType>>,
     name_to_idx: HashMap<String, usize>,
     /// Per-column constraints (indexed same as columns)
     pub constraints: Vec<ColumnConstraints>,
@@ -691,10 +693,74 @@ pub struct VectorDerivation {
     pub codec_version: u16,
 }
 
+/// Logical (parameterised) type of a column.
+///
+/// `ColumnType` is a flat u8 tag, so it cannot carry precision/scale/timezone
+/// parameters. A schema may store one optional `LogicalType` per column in an
+/// append-only section; schemas without one keep the plain `ColumnType`
+/// semantics and remain byte-compatible with older readers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LogicalType {
+    /// Fixed 16-byte UUID column; physical storage is `ColumnType::Binary`-like.
+    Uuid,
+    /// Fixed-point decimal: `precision` total digits, `scale` fractional digits.
+    Decimal { precision: u8, scale: i8 },
+    /// Timestamp with an explicit fixed UTC offset in minutes.
+    TimestampTz { offset_minutes: i16 },
+}
+
+impl LogicalType {
+    fn to_bytes(&self, out: &mut Vec<u8>) {
+        match self {
+            Self::Uuid => out.push(1),
+            Self::Decimal { precision, scale } => {
+                out.push(2);
+                out.push(*precision);
+                out.push(*scale as u8);
+            }
+            Self::TimestampTz { offset_minutes } => {
+                out.push(3);
+                out.extend_from_slice(&offset_minutes.to_le_bytes());
+            }
+        }
+    }
+
+    fn from_bytes(bytes: &[u8], pos: &mut usize) -> io::Result<Self> {
+        if *pos >= bytes.len() {
+            return Err(err_data("Truncated logical type"));
+        }
+        let tag = bytes[*pos];
+        *pos += 1;
+        match tag {
+            1 => Ok(Self::Uuid),
+            2 => {
+                if *pos + 2 > bytes.len() {
+                    return Err(err_data("Truncated decimal logical type"));
+                }
+                let precision = bytes[*pos];
+                let scale = bytes[*pos + 1] as i8;
+                *pos += 2;
+                Ok(Self::Decimal { precision, scale })
+            }
+            3 => {
+                if *pos + 2 > bytes.len() {
+                    return Err(err_data("Truncated timestamptz logical type"));
+                }
+                let offset_minutes =
+                    i16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap());
+                *pos += 2;
+                Ok(Self::TimestampTz { offset_minutes })
+            }
+            _ => Err(err_data("Unknown logical type tag")),
+        }
+    }
+}
+
 impl OnDemandSchema {
     pub fn new() -> Self {
         Self {
             columns: Vec::new(),
+            logical_types: Vec::new(),
             name_to_idx: HashMap::new(),
             constraints: Vec::new(),
             vector_derivations: Vec::new(),
@@ -707,6 +773,7 @@ impl OnDemandSchema {
         }
         let idx = self.columns.len();
         self.columns.push((name.to_string(), dtype));
+        self.logical_types.push(None);
         self.name_to_idx.insert(name.to_string(), idx);
         self.constraints.push(ColumnConstraints::default());
         idx
@@ -722,6 +789,7 @@ impl OnDemandSchema {
         }
         let idx = self.columns.len();
         self.columns.push((name.to_string(), dtype));
+        self.logical_types.push(None);
         self.name_to_idx.insert(name.to_string(), idx);
         self.constraints.push(cons);
         idx
@@ -734,6 +802,21 @@ impl OnDemandSchema {
 
     pub fn get_index(&self, name: &str) -> Option<usize> {
         self.name_to_idx.get(name).copied()
+    }
+
+    /// Attach (or clear) the parameterised type of one column.
+    pub fn set_logical_type(&mut self, index: usize, logical: Option<LogicalType>) {
+        if index >= self.columns.len() {
+            return;
+        }
+        if self.logical_types.len() < self.columns.len() {
+            self.logical_types.resize(self.columns.len(), None);
+        }
+        self.logical_types[index] = logical;
+    }
+
+    pub fn logical_type(&self, index: usize) -> Option<&LogicalType> {
+        self.logical_types.get(index).and_then(Option::as_ref)
     }
 
     pub fn add_vector_derivation(
@@ -976,6 +1059,13 @@ impl OnDemandSchema {
             self.append_vector_derivations(&mut buf);
         }
 
+        // Optional logical-type section, appended last for the same reason:
+        // schemas written before this feature stay byte-for-byte readable and a
+        // reader that does not know the section ignores the trailing bytes.
+        if self.logical_types.iter().any(Option::is_some) {
+            self.append_logical_types(&mut buf);
+        }
+
         buf
     }
 
@@ -1140,10 +1230,14 @@ impl OnDemandSchema {
             }
         }
 
-        if pos < bytes.len() && bytes[pos] == 0xA7 {
-            Self::parse_vector_derivations(bytes, pos + 1, &mut schema)?;
+        let mut cursor = pos;
+        if cursor < bytes.len() && bytes[cursor] == 0xA7 {
+            cursor = Self::parse_vector_derivations(bytes, cursor + 1, &mut schema)?;
         }
-        
+        if cursor < bytes.len() && bytes[cursor] == 0x4C {
+            Self::parse_logical_types(bytes, cursor + 1, &mut schema)?;
+        }
+
         Ok(schema)
     }
 
@@ -1168,7 +1262,7 @@ impl OnDemandSchema {
         bytes: &[u8],
         mut pos: usize,
         schema: &mut Self,
-    ) -> io::Result<()> {
+    ) -> io::Result<usize> {
         if pos + 2 > bytes.len() {
             return Err(err_data("Truncated vector derivation count"));
         }
@@ -1199,6 +1293,53 @@ impl OnDemandSchema {
             let codec_version = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap());
             pos += 2;
             schema.add_vector_derivation(&source, &target, codec_version)?;
+        }
+        Ok(pos)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn append_logical_types(&self, buf: &mut Vec<u8>) {
+        buf.push(0x4C);
+        buf.push(1); // logical-type section version
+        buf.extend_from_slice(&(self.columns.len() as u32).to_le_bytes());
+        for index in 0..self.columns.len() {
+            match self.logical_type(index) {
+                Some(logical) => {
+                    buf.push(1);
+                    logical.to_bytes(buf);
+                }
+                None => buf.push(0),
+            }
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn parse_logical_types(bytes: &[u8], mut pos: usize, schema: &mut Self) -> io::Result<()> {
+        if pos + 5 > bytes.len() {
+            return Err(err_data("Truncated logical-type section"));
+        }
+        let version = bytes[pos];
+        pos += 1;
+        if version != 1 {
+            return Err(err_data("Unsupported logical-type section version"));
+        }
+        let count = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if count != schema.columns.len() {
+            return Err(err_data("Logical-type section column count mismatch"));
+        }
+        for index in 0..count {
+            if pos >= bytes.len() {
+                return Err(err_data("Truncated logical-type entry"));
+            }
+            let present = bytes[pos];
+            pos += 1;
+            if present == 1 {
+                let logical = LogicalType::from_bytes(bytes, &mut pos)?;
+                schema.set_logical_type(index, Some(logical));
+            }
         }
         Ok(())
     }

@@ -7245,3 +7245,62 @@ fn invalidating_the_page_cache_releases_oversized_scan_buffers() {
     storage.invalidate_page_cache();
     assert!(storage.scan_buf.lock().unwrap().len() == 64);
 }
+
+#[test]
+fn schema_round_trips_logical_types_without_changing_legacy_schemas() {
+    // A schema with no parameterised types must stay byte-compatible: the
+    // logical-type section is only appended when at least one column has one.
+    let mut legacy = OnDemandSchema::new();
+    legacy.add_column("id", ColumnType::Int64);
+    legacy.add_column("s", ColumnType::String);
+    let legacy_bytes = legacy.to_bytes();
+    let legacy_back = OnDemandSchema::from_bytes(&legacy_bytes).unwrap();
+    assert_eq!(legacy_back.columns, legacy.columns);
+    assert!(legacy_back.logical_types.iter().all(Option::is_none));
+
+    let mut schema = OnDemandSchema::new();
+    schema.add_column("id", ColumnType::Int64);
+    schema.add_column("u", ColumnType::Binary);
+    schema.add_column("amount", ColumnType::Int64);
+    schema.add_column("ts", ColumnType::Timestamp);
+    schema.set_logical_type(1, Some(LogicalType::Uuid));
+    schema.set_logical_type(
+        2,
+        Some(LogicalType::Decimal {
+            precision: 12,
+            scale: 2,
+        }),
+    );
+    schema.set_logical_type(3, Some(LogicalType::TimestampTz { offset_minutes: -300 }));
+
+    let bytes = schema.to_bytes();
+    let mut parsed = OnDemandSchema::from_bytes(&bytes).unwrap();
+    assert_eq!(parsed.columns, schema.columns);
+    assert_eq!(parsed.logical_type(0), None);
+    assert_eq!(parsed.logical_type(1), Some(&LogicalType::Uuid));
+    assert_eq!(
+        parsed.logical_type(2),
+        Some(&LogicalType::Decimal {
+            precision: 12,
+            scale: 2
+        })
+    );
+    assert_eq!(
+        parsed.logical_type(3),
+        Some(&LogicalType::TimestampTz { offset_minutes: -300 })
+    );
+
+    // Clearing a logical type returns the schema to the legacy byte layout.
+    for index in 0..parsed.columns.len() {
+        parsed.set_logical_type(index, None);
+    }
+    assert_eq!(parsed.to_bytes(), legacy_bytes_for(&parsed.columns));
+}
+
+fn legacy_bytes_for(columns: &[(String, ColumnType)]) -> Vec<u8> {
+    let mut schema = OnDemandSchema::new();
+    for (name, dtype) in columns {
+        schema.add_column(name, *dtype);
+    }
+    schema.to_bytes()
+}
