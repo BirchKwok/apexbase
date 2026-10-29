@@ -537,8 +537,16 @@ struct TableLock {
 static TABLE_WRITE_LOCKS: Lazy<RwLock<AHashMap<PathBuf, Arc<TableLock>>>> =
     Lazy::new(|| RwLock::new(AHashMap::with_capacity(32)));
 
+/// Upper bound on distinct tables tracked by `TABLE_WRITE_LOCKS`.
+///
+/// One entry per table path ever written would grow with the catalog rather
+/// than with the live workload, so the registry is pruned on insertion. The
+/// cap is far above the number of tables a process writes concurrently, and a
+/// live entry is never pruned (see `get_table_lock`).
+pub(crate) const MAX_TABLE_WRITE_LOCKS: usize = 1024;
+
 /// Get or create a per-table lock entry (Mutex + cached fs2 file handle).
-fn get_table_lock(table_path: &Path) -> Arc<TableLock> {
+pub(crate) fn get_table_lock(table_path: &Path) -> Arc<TableLock> {
     // Fast path: read-lock the map
     {
         let locks = TABLE_WRITE_LOCKS.read();
@@ -551,6 +559,12 @@ fn get_table_lock(table_path: &Path) -> Arc<TableLock> {
         mutex: parking_lot::Mutex::new(()),
     });
     let mut locks = TABLE_WRITE_LOCKS.write();
+    if !locks.contains_key(table_path) && locks.len() >= MAX_TABLE_WRITE_LOCKS {
+        // Dropping an entry whose Arc is only held by the map is safe: any
+        // writer that looked it up before this point still holds a clone
+        // (strong_count > 1) and is kept, so pruning cannot split the lock.
+        locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+    }
     locks
         .entry(table_path.to_path_buf())
         .or_insert_with(|| entry.clone());

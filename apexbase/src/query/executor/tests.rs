@@ -7337,3 +7337,42 @@ fn order_by_reads_only_the_active_rows_after_a_persisted_delete() {
         "the filtered aggregate must sum only surviving rows"
     );
 }
+
+
+#[test]
+fn table_write_locks_registry_is_bounded_by_the_cap() {
+    let dir = tempdir().unwrap();
+    let held_path = dir.path().join("held.apex");
+    let held = get_table_lock(&held_path);
+    // A live lock (the map Arc + `held`) must survive the prune and stay the
+    // same entry, so two writers cannot end up on different mutexes.
+    for index in 0..(MAX_TABLE_WRITE_LOCKS + 32) {
+        let path = dir.path().join(format!("table-{index}.apex"));
+        drop(get_table_lock(&path));
+    }
+    assert!(
+        TABLE_WRITE_LOCKS.read().len() <= MAX_TABLE_WRITE_LOCKS,
+        "the registry must not grow past its cap"
+    );
+    let again = get_table_lock(&held_path);
+    assert!(Arc::ptr_eq(&held, &again));
+    assert!(TABLE_WRITE_LOCKS.read().contains_key(&held_path));
+}
+
+#[test]
+fn table_write_locks_registry_prunes_only_unused_entries() {
+    let dir = tempdir().unwrap();
+    let busy_path = dir.path().join("busy.apex");
+    let busy = get_table_lock(&busy_path);
+    for index in 0..(MAX_TABLE_WRITE_LOCKS + 8) {
+        let path = dir.path().join(format!("filler-{index}.apex"));
+        drop(get_table_lock(&path));
+    }
+    // The busy entry is still referenced by `busy` (strong_count > 1), so it was
+    // never pruned even when the registry was trimmed.
+    assert!(TABLE_WRITE_LOCKS.read().contains_key(&busy_path));
+    drop(busy);
+    let probe = get_table_lock(&busy_path);
+    assert!(!TABLE_WRITE_LOCKS.read().is_empty());
+    drop(probe);
+}
