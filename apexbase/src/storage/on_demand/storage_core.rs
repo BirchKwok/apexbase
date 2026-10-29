@@ -2314,7 +2314,12 @@ impl OnDemandStorage {
         // an older build does not know how to interpret for writes, so such a
         // table declares format version 6 even when nothing else needs it.
         let schema = self.schema.read();
-        if schema.logical_types.iter().any(Option::is_some) {
+        if schema.logical_types.iter().any(Option::is_some)
+            || schema
+                .columns
+                .iter()
+                .any(|(_, column_type)| matches!(column_type, ColumnType::Uuid))
+        {
             return FORMAT_VERSION_V6;
         }
         let narrow_float = self.width_fidelity()

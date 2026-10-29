@@ -7345,7 +7345,13 @@ fn logical_types_declare_format_version_six() {
         schema.set_logical_type(0, Some(LogicalType::Uuid));
     }
     assert_eq!(storage.required_format_version(), FORMAT_VERSION_V6);
-    // Clearing the parameterised type returns the table to its legacy version.
+    // The UUID column type itself requires v6 even without the logical type.
     storage.schema.write().set_logical_type(0, None);
-    assert!(storage.required_format_version() <= FORMAT_VERSION_V5);
+    assert_eq!(storage.required_format_version(), FORMAT_VERSION_V6);
+
+    // A plain legacy schema keeps the old version.
+    let legacy_path = dir.path().join("legacy_version.apex");
+    let legacy = OnDemandStorage::create(&legacy_path).unwrap();
+    legacy.schema.write().add_column("id", ColumnType::Int64);
+    assert!(legacy.required_format_version() <= FORMAT_VERSION_V5);
 }

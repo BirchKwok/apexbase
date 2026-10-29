@@ -1773,7 +1773,8 @@ class ApexClient:
                 ``float16_vector``, ``bfloat16_vector``, ``int8_vector``,
                 ``uint8_vector``, ``bit1_vector``, ``turboquant2_vector`` /
                 ``turboquant3_vector`` / ``turboquant4_vector``, ``timestamp``,
-                ``date`` and ``json``. A ``json`` column stores canonical JSON
+                ``date``, ``json`` and ``uuid`` (16-byte fixed value, projected as ``bytes``).
+                A ``json`` column stores canonical JSON
                 text and projects as UTF-8 (comparisons/order use that text).
                 Example: ``{"name": "string", "age": "int64"}``.
 
