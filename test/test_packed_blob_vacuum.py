@@ -186,3 +186,36 @@ def test_crashed_packed_vacuum_recovers_after_first_rename():
         assert os.path.isfile(paths["packed"])
         for key in ("journal", "table_copy", "new_packed", "old_packed"):
             assert not os.path.exists(paths[key]), key
+
+
+def test_packed_blob_point_reads_reuse_and_revalidate_the_cached_handle():
+    """Single-row packed reads share one open handle; a vacuum rewrite reopens it.
+
+    ``read_blob_value`` used to open ``packed.blob`` per row. The point-read path
+    now reuses a cached handle while the file's length/mtime are unchanged, and
+    must notice the rewrite performed by ``vacuum_packed_blobs`` (which shrinks
+    and replaces the file) before serving another payload.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        payloads = [_payload(seed) for seed in range(4)]
+        client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
+        client.create_table("files", {"payload": "blob"})
+        client.use_table("files")
+        client.store({"payload": payloads})
+        client.flush()
+        client.close()
+
+        client = _open(tmp)
+        try:
+            sql = "SELECT payload FROM files WHERE _id = 2"
+            assert client.execute(sql).to_dict() == [{"payload": payloads[1]}]
+            # Second read hits the cached handle; the bytes must be identical.
+            assert client.execute(sql).to_dict() == [{"payload": payloads[1]}]
+
+            client.execute("DELETE FROM files WHERE _id = 1")
+            assert client.vacuum_packed_blobs() > 0
+            # The rewrite changed the file's length/mtime, so the handle is
+            # reopened and the surviving payload still matches exactly.
+            assert client.execute(sql).to_dict() == [{"payload": payloads[1]}]
+        finally:
+            client.close()

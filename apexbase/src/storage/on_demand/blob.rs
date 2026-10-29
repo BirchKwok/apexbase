@@ -47,6 +47,44 @@ static BLOB_PACKED_DEDUP: once_cell::sync::Lazy<
     parking_lot::RwLock<std::collections::HashMap<(PathBuf, u64, u32), u64>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(std::collections::HashMap::new()));
 
+/// Open `packed.blob` once per (file length, mtime) and reuse the handle across
+/// point reads.
+///
+/// `read_blob_value` used to `File::open` the packed sidecar for every packed
+/// blob, so a batch of N single-row reads paid N opens on the same file.
+/// Rewrites (vacuum/compaction) change its length or mtime, which invalidates
+/// the cached handle before it is used again; the cache is capped so many
+/// tables cannot grow it without bound.
+static BLOB_PACKED_FILES: once_cell::sync::Lazy<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, (u64, std::time::SystemTime, File)>>,
+> = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+const BLOB_PACKED_FILE_CACHE_MAX: usize = 64;
+
+fn read_packed_blob_at(path: &Path, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+    let meta = std::fs::metadata(path)?;
+    let file_len = meta.len();
+    let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+    let mut cache = BLOB_PACKED_FILES.lock();
+    let stale = cache
+        .get(path)
+        .map_or(true, |(len, time, _)| *len != file_len || *time != modified);
+    if stale {
+        if cache.len() >= BLOB_PACKED_FILE_CACHE_MAX {
+            cache.clear();
+        }
+        cache.insert(path.to_path_buf(), (file_len, modified, File::open(path)?));
+    }
+    let file = &mut cache
+        .get_mut(path)
+        .expect("packed blob cache entry was just inserted")
+        .2;
+    file.seek(SeekFrom::Start(offset))?;
+    let mut data = vec![0u8; len];
+    file.read_exact(&mut data)?;
+    Ok(data)
+}
+
 pub(crate) fn forget_blob_packed_dedup(path: &Path) {
     BLOB_PACKED_DEDUP.write().retain(|(table, _, _), _| table != path);
 }
@@ -760,11 +798,7 @@ impl OnDemandStorage {
                 }
                 let offset = u64::from_le_bytes(desc.locator[..8].try_into().unwrap());
                 let packed_path = self.blob_sidecar_dir().join("packed.blob");
-                let mut file = File::open(&packed_path)?;
-                file.seek(SeekFrom::Start(offset))?;
-                let mut data = vec![0u8; desc.len as usize];
-                file.read_exact(&mut data)?;
-                data
+                read_packed_blob_at(&packed_path, offset, desc.len as usize)?
             }
             BLOB_MODE_DEDICATED => {
                 let object_id = std::str::from_utf8(&desc.locator)
