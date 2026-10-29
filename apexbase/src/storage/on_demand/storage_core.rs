@@ -169,6 +169,11 @@ pub(crate) fn read_cache_budget_bytes() -> usize {
 /// `APEX_SCAN_BUFFER_MB` parsing, kept pure so it can be tested without mutating the
 /// process environment: `0` means unlimited, an unparsable value falls back to the
 /// default budget.
+/// Vector-scan staging buffers larger than this are released when the page
+/// cache is invalidated; smaller ones are kept to avoid re-allocating on the
+/// common write-then-read cycle.
+const SCAN_BUF_RETAIN_BYTES: usize = 8 * 1024 * 1024;
+
 pub(crate) fn parse_scan_buffer_budget(raw: Option<&str>) -> usize {
     match raw {
         Some(value) => match value.trim().parse::<usize>() {
@@ -2211,6 +2216,29 @@ impl OnDemandStorage {
             .store(0, std::sync::atomic::Ordering::Release);
         self.scan_buf_f16_file_size
             .store(0, std::sync::atomic::Ordering::Release);
+        self.release_oversized_scan_buffers();
+    }
+
+    /// Drop the vector-scan staging buffers once they grew past a small
+    /// retention size.
+    ///
+    /// The f32/f16 buffers are sized by the largest vector column scan and are
+    /// only ever grown; a single scan of a wide/long vector column would keep
+    /// that allocation for the lifetime of the backend even after a write
+    /// invalidated the data they hold. Invalidations are rare (a write, a schema
+    /// change), so releasing here is cheap, and a small buffer (below
+    /// `SCAN_BUF_RETAIN_BYTES`) is kept to avoid re-allocating on the common
+    /// "write then read" cycle.
+    fn release_oversized_scan_buffers(&self) {
+        let mut buf = self.scan_buf.lock().unwrap();
+        if buf.capacity() * std::mem::size_of::<f32>() > SCAN_BUF_RETAIN_BYTES {
+            *buf = Vec::new();
+        }
+        drop(buf);
+        let mut f16 = self.scan_buf_f16.lock().unwrap();
+        if f16.capacity() > SCAN_BUF_RETAIN_BYTES {
+            *f16 = Vec::new();
+        }
     }
 
     /// Check if auto-flush is needed and perform it if so

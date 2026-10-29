@@ -7220,3 +7220,28 @@ fn decompress_column_frame_accepts_an_uncompressed_frame() {
     assert_eq!(frame.len(), CHUNK_FRAME_HEADER_LEN + body.len());
     assert_eq!(decompress_column_frame(&frame).unwrap(), body);
 }
+
+
+#[test]
+fn invalidating_the_page_cache_releases_oversized_scan_buffers() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("scan_buf_release.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    // Oversized staging buffers (a single wide/long vector scan leaves these
+    // behind) must not outlive the data they were built from.
+    let big = SCAN_BUF_RETAIN_BYTES / std::mem::size_of::<f32>() + 1024;
+    storage.scan_buf.lock().unwrap().resize(big, 0.0);
+    storage
+        .scan_buf_f16
+        .lock()
+        .unwrap()
+        .resize(SCAN_BUF_RETAIN_BYTES + 1024, 0);
+    storage.invalidate_page_cache();
+    assert_eq!(storage.scan_buf.lock().unwrap().capacity(), 0);
+    assert_eq!(storage.scan_buf_f16.lock().unwrap().capacity(), 0);
+
+    // A small buffer is retained so a write-then-read cycle does not reallocate.
+    storage.scan_buf.lock().unwrap().resize(64, 0.0);
+    storage.invalidate_page_cache();
+    assert!(storage.scan_buf.lock().unwrap().len() == 64);
+}
