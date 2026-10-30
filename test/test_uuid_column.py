@@ -88,3 +88,18 @@ def test_uuid_row_insert_validates_the_sixteen_byte_contract(tmp_path):
     client.flush()
     assert client.execute("SELECT u FROM t").to_dict() == [{"u": b"\x01" * 16}]
     client.close()
+
+
+def test_decimal128_column_round_trips_bytes_and_declares_v6(tmp_path):
+    path = str(tmp_path)
+    client = ApexClient(path, drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"id": "int64", "d": "decimal128"})
+    client.use_table("t")
+    # Unscaled 128-bit values (bytes16) until Decimal(p,s) semantics land.
+    values = [b"\x00" * 15 + bytes([i]) for i in range(1, 4)]
+    client.store([{"id": index + 1, "d": value} for index, value in enumerate(values)])
+    client.flush()
+    rows = client.execute("SELECT id, d FROM t ORDER BY id").to_dict()
+    assert [row["d"] for row in rows] == values
+    assert _file_version(os.path.join(path, "t.apex")) == 6
+    client.close()

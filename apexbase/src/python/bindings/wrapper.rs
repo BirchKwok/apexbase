@@ -914,6 +914,15 @@ impl ApexStorageImpl {
                     }
                     ColumnType::Uuid
                 }
+                "decimal128" | "decimal" => {
+                    if Self::logical_types_disabled() {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}' is decimal: parameterised column types are disabled by APEX_LOGICAL_TYPES=0",
+                            col_name
+                        )));
+                    }
+                    ColumnType::Decimal128
+                }
                 "blob" | "large_binary" | "largebinary" => ColumnType::Blob,
                 "float16_vector" | "float16vector" | "f16_vector" => ColumnType::Float16List,
                 "float32_vector" | "f32_vector" => ColumnType::FixedList,
@@ -931,7 +940,7 @@ impl ApexStorageImpl {
                     "Unknown column type '{}' for column '{}'. Supported: int8, int16, int32, int64, \
                      uint8, uint16, uint32, uint64, float32, float64, bool, string, binary, blob, \
                      float32_vector, float16_vector, bfloat16_vector, int8_vector, uint8_vector, \
-                     bit1_vector, turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, date, json, uuid",
+                     bit1_vector, turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, date, json, uuid, decimal128",
                     type_str, col_name
                 ))),
             };

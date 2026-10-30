@@ -9573,7 +9573,7 @@ impl OnDemandStorage {
 
         // CRITICAL: Include ALL existing schema columns to ensure proper alignment
         // This fixes the partial column insert bug where missing columns don't get padded
-        let uuid_columns: std::collections::HashSet<String> = {
+        let fixed16_columns: std::collections::HashSet<String> = {
             let schema = self.schema.read();
             for (col_name, col_type) in &schema.columns {
                 match col_type {
@@ -9708,11 +9708,11 @@ impl OnDemandStorage {
                     Some(ColumnValueRef::Null) | None => (Vec::new(), true),
                     _ => (Vec::new(), true),
                 };
-                if !is_null && uuid_columns.contains(key) && val.len() != 16 {
+                if !is_null && fixed16_columns.contains(key) && val.len() != 16 {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
-                            "column '{}' is uuid: expected a 16-byte value, got {} bytes",
+                            "column '{}' is a fixed-width 16-byte type; got {} bytes",
                             key,
                             val.len()
                         ),
