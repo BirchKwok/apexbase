@@ -893,10 +893,14 @@ pub fn materialize_table_backend(
         let _publish_guard = crate::storage::table_save_lock::rewrite_lock(path);
         if !path.exists() {
             if let Some(schema) = &schema {
-                crate::storage::TableStorageBackend::create_with_schema_and_durability(
+                // Publish the full schema object, not just the column list: the
+                // footer must keep the logical-type section (uuid/decimal(p,s)),
+                // otherwise a materialized table forgets its parameterised types
+                // and a reopened client cannot scale Decimal values.
+                crate::storage::TableStorageBackend::create_with_schema_object_and_durability(
                     path,
                     durability,
-                    &schema.columns,
+                    schema.clone(),
                 )?;
             } else {
                 crate::storage::TableStorageBackend::create_with_durability(path, durability)?;
@@ -1401,4 +1405,41 @@ mod tests {
         let _ = fs::remove_file(&other);
         let _ = fs::remove_dir_all(&dir);
     }
+    #[test]
+    fn materialized_table_keeps_its_logical_types() {
+        use crate::storage::on_demand::{ColumnType, LogicalType};
+        use crate::storage::OnDemandSchema;
+
+        let dir = temp_dir("materialize_logical_types");
+        let mut schema = OnDemandSchema::new();
+        schema.add_column("d", ColumnType::Decimal128);
+        schema.set_logical_type(
+            0,
+            Some(LogicalType::Decimal {
+                precision: 38,
+                scale: 2,
+            }),
+        );
+        {
+            let lock = lock(&dir).unwrap();
+            lock.insert("t").unwrap();
+            lock.set_schema("t", &schema.to_bytes()).unwrap();
+        }
+        let backend = materialize_table_backend(
+            &dir.join("t.apex"),
+            crate::storage::DurabilityLevel::Fast,
+        )
+        .unwrap();
+        let restored = backend.storage.schema_snapshot();
+        assert_eq!(restored.columns.len(), 1);
+        assert_eq!(
+            restored.logical_type(0),
+            Some(&LogicalType::Decimal {
+                precision: 38,
+                scale: 2
+            })
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
 }
