@@ -1163,6 +1163,9 @@ class ApexClient:
         self._query_result_dependencies = {}
         self._schemaless_tables = set()
         self._table_schemas = {}
+        # Parsed decimal(p,s) declarations per table, computed once so the hot
+        # store path does not regex-match the schema on every batch.
+        self._table_decimal_scales = {}
         # Tables whose declared schema was already requested from storage (even
         # if it turned out to be empty); avoids a catalog read on every store of
         # a schemaless table.
@@ -1912,9 +1915,11 @@ class ApexClient:
         if schema is None:
             self._schemaless_tables.add(table_name)
             self._table_schemas.pop(table_name, None)
+            self._table_decimal_scales.pop(table_name, None)
         else:
             self._schemaless_tables.discard(table_name)
             self._table_schemas[table_name] = dict(schema)
+            self._table_decimal_scales[table_name] = _decimal_columns(self._table_schemas[table_name])
 
     def create_quantized_column(
         self,
@@ -1994,6 +1999,7 @@ class ApexClient:
         # A dropped table's declared schema must not leak into a recreated table:
         # stale (p,s) would scale Decimal values with the wrong factor.
         self._table_schemas.pop(table_name, None)
+        self._table_decimal_scales.pop(table_name, None)
         self._schema_fetch_attempted.discard(table_name)
 
         if table_name in self._fts_tables:
@@ -2629,28 +2635,29 @@ class ApexClient:
         with self._lock:
             # Decimal(p,s) columns accept decimal.Decimal/str/int/bytes: encode
             # them to their 16-byte i128 payload before the regular store paths.
-            schema = self._table_schemas.get(self._current_table)
-            if (
-                schema is None
-                and self._current_table
-                and self._current_table not in self._schema_fetch_attempted
-            ):
+            table = self._current_table
+            decimals = self._table_decimal_scales.get(table)
+            if decimals is None and table and table not in self._schema_fetch_attempted:
                 # A table created in another process still has a declared schema:
                 # ask the storage layer once so decimal scale (and the other
                 # parameterised types) become known to this client.
-                self._schema_fetch_attempted.add(self._current_table)
+                self._schema_fetch_attempted.add(table)
                 try:
-                    fetched = self._storage.table_types(self._current_table)
+                    fetched = self._storage.table_types(table)
                 except Exception:
                     fetched = None
                 if fetched:
                     schema = dict(fetched)
-                    self._table_schemas[self._current_table] = schema
-            decimals = _decimal_columns(schema)
+                    self._table_schemas[table] = schema
+                    self._table_decimal_scales[table] = _decimal_columns(schema)
+                    decimals = self._table_decimal_scales[table]
             if decimals:
                 data = _coerce_decimal_columns(data, decimals)
-            else:
-                data = _reject_unknown_decimal_values(data, decimals)
+            elif table not in self._table_schemas:
+                # Declared types unknown (schemaless): a Decimal here would be
+                # stored as NULL, so reject the first value loudly. Tables whose
+                # schema is known to have no decimal columns skip this entirely.
+                data = _reject_unknown_decimal_values(data, decimals or {})
 
             # 1. Columnar data Dict[str, list/ndarray]
             if isinstance(data, dict):
