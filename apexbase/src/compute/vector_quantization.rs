@@ -917,6 +917,7 @@ fn push_topk(heap: &mut BinaryHeap<TopKEntry>, k: usize, entry: TopKEntry) {
     }
 }
 
+#[inline(never)]
 fn scan_encoded_chunk(
     data: &[u8],
     row_base: usize,
@@ -1131,6 +1132,7 @@ pub fn topk_encoded_rows(
     topk_encoded_rows_impl(data, dim, codec, computer, k, true)
 }
 
+#[inline(never)]
 fn topk_encoded_rows_impl(
     data: &[u8],
     dim: usize,
@@ -1185,6 +1187,7 @@ fn topk_encoded_rows_impl(
     Ok(result)
 }
 
+#[inline(never)]
 pub fn batch_topk_encoded_rows(
     data: &[u8],
     dim: usize,
