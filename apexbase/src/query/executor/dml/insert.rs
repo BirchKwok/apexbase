@@ -6,6 +6,66 @@ impl ApexExecutor {
         (date - epoch).num_days() as i32
     }
 
+    /// Encode a decimal literal ("1.23", "-45.60", "7") into the 16-byte
+    /// little-endian two's-complement i128 payload at the column's scale.
+    fn encode_decimal_literal(text: &str, scale: i8) -> Result<Vec<u8>, String> {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return Err("Cannot store an empty string in a DECIMAL column".to_string());
+        }
+        let (negative, unsigned) = match trimmed.strip_prefix('-') {
+            Some(rest) => (true, rest),
+            None => (false, trimmed.strip_prefix('+').unwrap_or(trimmed)),
+        };
+        let (int_part, frac_part) = match unsigned.split_once('.') {
+            Some((int_part, frac_part)) => (int_part, frac_part),
+            None => (unsigned, ""),
+        };
+        if int_part.is_empty() && frac_part.is_empty() {
+            return Err(format!("'{}' is not a valid DECIMAL literal", text));
+        }
+        if !int_part.bytes().all(|b| b.is_ascii_digit())
+            || !frac_part.bytes().all(|b| b.is_ascii_digit())
+        {
+            return Err(format!("'{}' is not a valid DECIMAL literal", text));
+        }
+        if scale < 0 {
+            return Err("negative DECIMAL scales are not supported yet".to_string());
+        }
+        let scale = scale as usize;
+        if frac_part.len() > scale {
+            return Err(format!(
+                "'{}' has more fractional digits than the column scale {}",
+                text, scale
+            ));
+        }
+        let mut digits = String::with_capacity(int_part.len() + scale);
+        digits.push_str(if int_part.is_empty() { "0" } else { int_part });
+        digits.push_str(frac_part);
+        for _ in frac_part.len()..scale {
+            digits.push('0');
+        }
+        let magnitude: i128 = digits
+            .parse()
+            .map_err(|_| format!("'{}' does not fit a 128-bit DECIMAL", text))?;
+        let value = if negative { -magnitude } else { magnitude };
+        Ok(value.to_le_bytes().to_vec())
+    }
+
+    /// Encode an exact integer literal for a DECIMAL column at the given scale.
+    fn encode_decimal_integer(number: i64, scale: i8) -> Result<Vec<u8>, String> {
+        if scale < 0 {
+            return Err("negative DECIMAL scales are not supported yet".to_string());
+        }
+        let factor = 10i128
+            .checked_pow(scale as u32)
+            .ok_or_else(|| "DECIMAL scale is too large".to_string())?;
+        let value = (number as i128)
+            .checked_mul(factor)
+            .ok_or_else(|| format!("{} does not fit a 128-bit DECIMAL", number))?;
+        Ok(value.to_le_bytes().to_vec())
+    }
+
     pub(in crate::query::executor) fn default_value_to_value(
         default: &crate::storage::on_demand::DefaultValue,
         col_type: Option<crate::storage::on_demand::ColumnType>,
@@ -384,6 +444,31 @@ impl ApexExecutor {
                 .collect()
         };
 
+        // Declared scale per Decimal128 column, used to encode numeric literals
+        // into the fixed 16-byte payload (the SQL DECIMAL opt-in path).
+        let decimal_scales: std::collections::HashMap<String, i8> = {
+            let snapshot = storage.storage.schema_snapshot();
+            snapshot
+                .columns
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, (name, column_type))| {
+                    if !matches!(
+                        column_type,
+                        crate::storage::on_demand::ColumnType::Decimal128
+                    ) {
+                        return None;
+                    }
+                    match snapshot.logical_type(idx) {
+                        Some(crate::storage::LogicalType::Decimal { scale, .. }) => {
+                            Some((name.clone(), *scale))
+                        }
+                        _ => None,
+                    }
+                })
+                .collect()
+        };
+
         // Build row-based data with proper NULL handling via Value::Null
         // Auto-coerce string→timestamp/date based on schema type
         let mut rows: Vec<HashMap<String, Value>> = Vec::with_capacity(values.len());
@@ -421,6 +506,14 @@ impl ApexExecutor {
                                 Some(crate::storage::on_demand::ColumnType::Date) => {
                                     Value::Date(Self::parse_date_string(v) as i32)
                                 }
+                                Some(crate::storage::on_demand::ColumnType::Decimal128) => {
+                                    let scale =
+                                        decimal_scales.get(col_name).copied().unwrap_or(0);
+                                    match Self::encode_decimal_literal(v, scale) {
+                                        Ok(bytes) => Value::Binary(bytes),
+                                        Err(message) => return Err(err_input(message)),
+                                    }
+                                }
                                 Some(crate::storage::on_demand::ColumnType::Binary) => {
                                     // Auto-encode JSON-style float array string '[1.0,2.0,…]' as binary vector
                                     match Self::try_parse_vector_string(v) {
@@ -444,6 +537,29 @@ impl ApexExecutor {
                                 }
                                 _ => value.clone(),
                             }
+                        }
+                        Value::Int64(number)
+                            if matches!(
+                                col_schema_type,
+                                Some(crate::storage::on_demand::ColumnType::Decimal128)
+                            ) =>
+                        {
+                            let scale = decimal_scales.get(col_name).copied().unwrap_or(0);
+                            match Self::encode_decimal_integer(*number, scale) {
+                                Ok(bytes) => Value::Binary(bytes),
+                                Err(message) => return Err(err_input(message)),
+                            }
+                        }
+                        Value::Float64(_) | Value::Float32(_)
+                            if matches!(
+                                col_schema_type,
+                                Some(crate::storage::on_demand::ColumnType::Decimal128)
+                            ) =>
+                        {
+                            return Err(err_input(format!(
+                                "Column '{}' is DECIMAL: use a string or integer literal so the scale is exact",
+                                col_name
+                            )))
                         }
                         // Same rule for BLOB columns, which have no vector-string form.
                         other

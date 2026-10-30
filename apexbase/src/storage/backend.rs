@@ -527,7 +527,10 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::String | ColumnType::StringDict => DataType::String,
         ColumnType::Json => DataType::Json,
         ColumnType::Bool => DataType::Bool,
-        ColumnType::Binary | ColumnType::Uuid | ColumnType::Decimal128 => DataType::Binary,
+        ColumnType::Binary | ColumnType::Uuid => DataType::Binary,
+        // Report the parameterised decimal type so DML coercion can see it;
+        // precision/scale travel through the storage schema's LogicalType.
+        ColumnType::Decimal128 => DataType::Decimal,
         ColumnType::Blob => DataType::Blob,
         ColumnType::FixedList => DataType::Binary,
         ColumnType::Float16List => DataType::Float16Vector,

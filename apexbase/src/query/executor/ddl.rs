@@ -163,6 +163,17 @@ impl ApexExecutor {
     /// Execute CREATE TABLE statement
     /// High-performance: O(1) - records the full schema in the catalog and
     /// defers the `.apex` file write until the first real access.
+    /// Opt-in switch for storing SQL DECIMAL(p,s) columns as the fixed 16-byte
+    /// Decimal128 type with a LogicalType. Off by default in this batch so the
+    /// existing text fallback and its pinned test keep working; the INSERT
+    /// literal conversion lands with it.
+    fn sql_decimal_enabled() -> bool {
+        matches!(
+            std::env::var("APEX_SQL_DECIMAL").ok().as_deref(),
+            Some("1") | Some("true") | Some("TRUE") | Some("True") | Some("yes") | Some("on")
+        )
+    }
+
     fn execute_create_table(
         table_path: &Path,
         table: &str,
@@ -229,10 +240,23 @@ impl ApexExecutor {
                     format!("Column '{}' already exists", col_def.name),
                 ));
             }
-            let idx = schema.add_column(
-                &col_def.name,
-                crate::storage::ColumnType::from_data_type(col_def.data_type.clone()),
-            );
+            let mut column_type =
+                crate::storage::ColumnType::from_data_type(col_def.data_type.clone());
+            let decimal_params = if Self::sql_decimal_enabled() {
+                col_def.decimal_params
+            } else {
+                None
+            };
+            if decimal_params.is_some() {
+                column_type = crate::storage::ColumnType::Decimal128;
+            }
+            let idx = schema.add_column(&col_def.name, column_type);
+            if let Some((precision, scale)) = decimal_params {
+                schema.set_logical_type(
+                    idx,
+                    Some(crate::storage::LogicalType::Decimal { precision, scale }),
+                );
+            }
             let default_val = col_def.constraints.iter().find_map(|c| match c {
                 ColumnConstraintKind::Default(v) => Some(match v {
                     Value::Int64(n) => DefaultValue::Int64(*n),
@@ -307,10 +331,23 @@ impl ApexExecutor {
                     format!("Column '{}' already exists", col_def.name),
                 ));
             }
-            let idx = schema.add_column(
-                &col_def.name,
-                crate::storage::ColumnType::from_data_type(col_def.data_type.clone()),
-            );
+            let mut column_type =
+                crate::storage::ColumnType::from_data_type(col_def.data_type.clone());
+            let decimal_params = if Self::sql_decimal_enabled() {
+                col_def.decimal_params
+            } else {
+                None
+            };
+            if decimal_params.is_some() {
+                column_type = crate::storage::ColumnType::Decimal128;
+            }
+            let idx = schema.add_column(&col_def.name, column_type);
+            if let Some((precision, scale)) = decimal_params {
+                schema.set_logical_type(
+                    idx,
+                    Some(crate::storage::LogicalType::Decimal { precision, scale }),
+                );
+            }
             let default_value = col_def.constraints.iter().find_map(|constraint| match constraint {
                 ColumnConstraintKind::Default(value) => Some(match value {
                     Value::Int64(value) => DefaultValue::Int64(*value),
