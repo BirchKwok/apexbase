@@ -927,10 +927,10 @@ def _reject_unknown_decimal_values(data, decimals):
     """Fail loudly when Decimal values are written to columns without known scale.
 
     The client only knows a column's ``decimal(p,s)`` declaration for tables it
-    created in this process (the catalog schema is not fetched on ``use_table``).
-    Passing the Decimal through to the storage layer used to store NULL, which is
-    silent data loss; require the caller to pass the 16-byte payload instead (or
-    create the table through this client).
+    created in this process unless ``use_table`` fetched it from storage. Passing
+    the Decimal through to the storage layer would store NULL (silent data loss),
+    so probe the *first* value of each column instead of walking every row (the
+    columnar bulk path must not pay an O(rows) Python scan per store).
     """
     import decimal
 
@@ -942,18 +942,22 @@ def _reject_unknown_decimal_values(data, decimals):
                 "another process); pass the 16-byte scaled payload instead"
             )
 
+    def check_columns(pairs):
+        for name, values in pairs:
+            for value in values:
+                if value is not None:
+                    check(name, value)
+                    break
+
     if isinstance(data, dict):
         for name, value in data.items():
             if isinstance(value, (list, tuple)):
-                for item in value:
-                    check(name, item)
+                check_columns([(name, value)])
             else:
                 check(name, value)
-    elif isinstance(data, list):
-        for row in data:
-            if isinstance(row, dict):
-                for name, value in row.items():
-                    check(name, value)
+    elif isinstance(data, list) and data and isinstance(data[0], dict):
+        first = data[0]
+        check_columns([(name, [value]) for name, value in first.items()])
     return data
 
 
@@ -1159,6 +1163,10 @@ class ApexClient:
         self._query_result_dependencies = {}
         self._schemaless_tables = set()
         self._table_schemas = {}
+        # Tables whose declared schema was already requested from storage (even
+        # if it turned out to be empty); avoids a catalog read on every store of
+        # a schemaless table.
+        self._schema_fetch_attempted = set()
         self._buffered_writes_enabled = False
         self._buffered_write_rows = []
         self._buffered_write_table = None
@@ -2616,10 +2624,15 @@ class ApexClient:
             # Decimal(p,s) columns accept decimal.Decimal/str/int/bytes: encode
             # them to their 16-byte i128 payload before the regular store paths.
             schema = self._table_schemas.get(self._current_table)
-            if schema is None and self._current_table:
+            if (
+                schema is None
+                and self._current_table
+                and self._current_table not in self._schema_fetch_attempted
+            ):
                 # A table created in another process still has a declared schema:
                 # ask the storage layer once so decimal scale (and the other
                 # parameterised types) become known to this client.
+                self._schema_fetch_attempted.add(self._current_table)
                 try:
                     fetched = self._storage.table_types(self._current_table)
                 except Exception:
