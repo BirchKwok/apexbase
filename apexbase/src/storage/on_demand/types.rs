@@ -132,6 +132,10 @@ impl ColumnType {
             DataType::Binary => ColumnType::Binary,
             DataType::Blob => ColumnType::Blob,
             DataType::Json => ColumnType::Json,
+            // SQL DECIMAL maps to the fixed 16-byte decimal storage; precision
+            // and scale travel separately as LogicalType::Decimal once the DDL
+            // schema path carries them (see V5 §129).
+            DataType::Decimal => ColumnType::Decimal128,
             DataType::Timestamp => ColumnType::Timestamp,
             DataType::Date => ColumnType::Date,
             DataType::Float16Vector => ColumnType::Float16List,

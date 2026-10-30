@@ -7400,3 +7400,18 @@ fn decimal128_column_round_trips_and_declares_v6() {
         })
     );
 }
+
+#[test]
+fn decimal_data_type_maps_to_the_fixed_width_column_type() {
+    // The SQL DECIMAL type is parameterised, but its physical storage is the
+    // fixed 16-byte Decimal128 column; precision/scale travel as LogicalType
+    // when the DDL path learns to carry them.
+    assert_eq!(
+        ColumnType::from_data_type(crate::data::DataType::Decimal),
+        ColumnType::Decimal128
+    );
+    assert_eq!(
+        crate::storage::backend::datatype_to_column_type(&crate::data::DataType::Decimal),
+        ColumnType::Decimal128
+    );
+}

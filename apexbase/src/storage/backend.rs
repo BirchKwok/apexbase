@@ -496,6 +496,7 @@ pub fn datatype_to_column_type(dt: &DataType) -> ColumnType {
         DataType::Binary => ColumnType::Binary,
         DataType::Blob => ColumnType::Blob,
         DataType::Json => ColumnType::Json,
+        DataType::Decimal => ColumnType::Decimal128,
         DataType::Timestamp => ColumnType::Timestamp,
         DataType::Date => ColumnType::Date,
         DataType::Float32Vector => ColumnType::FixedList,
