@@ -883,6 +883,73 @@ def _parse_simple_insert_values(sql: str):
     return table, rows
 
 
+_DECIMAL_TYPE_RE = re.compile(r"decimal\s*\(\s*(\d+)\s*,\s*(-?\d+)\s*\)", re.IGNORECASE)
+
+
+def _decimal_columns(schema):
+    """Map column name -> (precision, scale) for decimal(p,s) declarations."""
+    if not schema:
+        return {}
+    out = {}
+    for name, declared in schema.items():
+        if not isinstance(declared, str):
+            continue
+        match = _DECIMAL_TYPE_RE.fullmatch(declared.strip())
+        if match:
+            out[name] = (int(match.group(1)), int(match.group(2)))
+    return out
+
+
+def _decimal_to_fixed16(value, scale):
+    """Encode a Decimal/str/int/bytes value as a 16-byte i128 at *scale*."""
+    import decimal
+
+    if value is None or isinstance(value, (bytes, bytearray)):
+        return value
+    if isinstance(value, (int, str)):
+        value = decimal.Decimal(value)
+    if not isinstance(value, decimal.Decimal):
+        raise TypeError(
+            f"decimal column values must be Decimal, int, str or 16 raw bytes; got {type(value).__name__}"
+        )
+    scaled = value.scaleb(scale)
+    if scaled != scaled.to_integral_value():
+        raise ValueError(
+            f"value {value} has more fractional digits than the column scale {scale}"
+        )
+    integer = int(scaled)
+    if not -(1 << 127) <= integer < (1 << 127):
+        raise ValueError(f"value {value} does not fit the 128-bit decimal payload")
+    return integer.to_bytes(16, "little", signed=True)
+
+
+def _coerce_decimal_columns(data, decimals):
+    """Replace Decimal values in *data* with their 16-byte payloads."""
+    if not decimals:
+        return data
+
+    def convert_row(row):
+        converted = dict(row)
+        for name, (_precision, scale) in decimals.items():
+            if name in converted:
+                converted[name] = _decimal_to_fixed16(converted[name], scale)
+        return converted
+
+    if isinstance(data, dict):
+        if data and all(isinstance(value, (list, tuple)) for value in data.values()):
+            converted = {key: list(value) for key, value in data.items()}
+            for name, (_precision, scale) in decimals.items():
+                if name in converted:
+                    converted[name] = [
+                        _decimal_to_fixed16(value, scale) for value in converted[name]
+                    ]
+            return converted
+        return convert_row(data)
+    if isinstance(data, list) and data and all(isinstance(row, dict) for row in data):
+        return [convert_row(row) for row in data]
+    return data
+
+
 class ApexClient:
     """
     High-performance embedded database client for ApexBase.
@@ -1057,6 +1124,7 @@ class ApexClient:
         self._query_result_cacheability = {}
         self._query_result_dependencies = {}
         self._schemaless_tables = set()
+        self._table_schemas = {}
         self._buffered_writes_enabled = False
         self._buffered_write_rows = []
         self._buffered_write_table = None
@@ -1800,8 +1868,10 @@ class ApexClient:
         self._current_table = table_name
         if schema is None:
             self._schemaless_tables.add(table_name)
+            self._table_schemas.pop(table_name, None)
         else:
             self._schemaless_tables.discard(table_name)
+            self._table_schemas[table_name] = dict(schema)
 
     def create_quantized_column(
         self,
@@ -2509,6 +2579,12 @@ class ApexClient:
             ValueError: If *data* is not a supported type.
         """
         with self._lock:
+            # Decimal(p,s) columns accept decimal.Decimal/str/int/bytes: encode
+            # them to their 16-byte i128 payload before the regular store paths.
+            decimals = _decimal_columns(self._table_schemas.get(self._current_table))
+            if decimals:
+                data = _coerce_decimal_columns(data, decimals)
+
             # 1. Columnar data Dict[str, list/ndarray]
             if isinstance(data, dict):
                 if self._is_columnar_dict(data):
