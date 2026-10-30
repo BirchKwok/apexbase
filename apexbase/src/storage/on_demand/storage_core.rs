@@ -2310,6 +2310,16 @@ impl OnDemandStorage {
     /// so the file declares version 5. Layouts that stay within V4 rules keep
     /// declaring version 4 and remain readable by older builds.
     /// Snapshot of the table schema, including parameterised (logical) types.
+    /// Attach a logical (parameterised) type to an existing column, used by the
+    /// cold materialization path to restore catalog types after the file exists.
+    pub(crate) fn set_logical_type_at(
+        &self,
+        index: usize,
+        logical: Option<LogicalType>,
+    ) {
+        self.schema.write().set_logical_type(index, logical);
+    }
+
     pub(crate) fn schema_snapshot(&self) -> OnDemandSchema {
         self.schema.read().clone()
     }

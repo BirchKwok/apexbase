@@ -893,14 +893,10 @@ pub fn materialize_table_backend(
         let _publish_guard = crate::storage::table_save_lock::rewrite_lock(path);
         if !path.exists() {
             if let Some(schema) = &schema {
-                // Publish the full schema object, not just the column list: the
-                // footer must keep the logical-type section (uuid/decimal(p,s)),
-                // otherwise a materialized table forgets its parameterised types
-                // and a reopened client cannot scale Decimal values.
-                crate::storage::TableStorageBackend::create_with_schema_object_and_durability(
+                crate::storage::TableStorageBackend::create_with_schema_and_durability(
                     path,
                     durability,
-                    schema.clone(),
+                    &schema.columns,
                 )?;
             } else {
                 crate::storage::TableStorageBackend::create_with_durability(path, durability)?;
@@ -913,16 +909,28 @@ pub fn materialize_table_backend(
         path,
         durability,
     )?;
-    if has_constraints {
+    // The create path above publishes only the column list. Restore the rest of
+    // the catalog schema (logical types such as uuid/decimal(p,s), and column
+    // constraints) into the footer. Doing it here keeps the shared creation
+    // path byte-identical for ordinary tables.
+    let has_logical_types = schema.as_ref().is_some_and(|s| {
+        s.logical_types.iter().any(|logical| logical.is_some())
+    });
+    if has_constraints || has_logical_types {
         if let Some(schema) = &schema {
             for (idx, (column, _)) in schema.columns.iter().enumerate() {
                 if let Some(cons) = schema.constraints.get(idx) {
                     backend.storage.set_column_constraints(column, cons.clone());
                 }
+                if schema.logical_types.get(idx).is_some_and(Option::is_some) {
+                    backend
+                        .storage
+                        .set_logical_type_at(idx, schema.logical_types[idx].clone());
+                }
             }
-            // Persist the constraints into the footer schema (save_v4). This path
-            // is reached from the write entry points, which already hold the
-            // table's write lock, so only take it when it is free.
+            // Persist the restored schema into the footer (save_v4). This path is
+            // reached from the write entry points, which already hold the table's
+            // write lock, so only take it when it is free.
             let _write_guard = crate::storage::table_save_lock::try_write_lock(path);
             backend.save()?;
         }
