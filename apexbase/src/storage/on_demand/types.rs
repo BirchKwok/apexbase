@@ -44,6 +44,9 @@ pub enum ColumnType {
     /// Fixed 16-byte UUID; the encoded payload reuses the `Binary` layout and
     /// `LogicalType::Uuid` carries the parameterised type for Arrow/SQL.
     Uuid = TYPE_UUID,
+    /// Fixed 16-byte decimal: an i128 two's-complement little-endian value whose
+    /// precision/scale live in `LogicalType::Decimal`.
+    Decimal128 = TYPE_DECIMAL128,
 }
 
 impl ColumnType {
@@ -108,6 +111,7 @@ impl ColumnType {
             TYPE_BLOB => Some(ColumnType::Blob),
             TYPE_JSON => Some(ColumnType::Json),
             TYPE_UUID => Some(ColumnType::Uuid),
+            TYPE_DECIMAL128 => Some(ColumnType::Decimal128),
             _ => None,
         }
     }
@@ -154,7 +158,7 @@ impl ColumnType {
             ColumnType::Int64 | ColumnType::UInt64 | ColumnType::Float64 | ColumnType::Timestamp | ColumnType::Date => 8,
             ColumnType::String
             | ColumnType::Binary
-            | ColumnType::Uuid
+            | ColumnType::Uuid | ColumnType::Decimal128
             | ColumnType::StringDict
             | ColumnType::FixedList
             | ColumnType::Float16List
@@ -564,7 +568,7 @@ impl ColumnData {
                 offsets: vec![0u64],
                 data: Vec::new(),
             },
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => ColumnData::Binary {
                 offsets: vec![0u64],
                 data: Vec::new(),
             },
@@ -1124,7 +1128,7 @@ impl ColumnData {
                 pos += data_len;
                 Ok((ColumnData::String { offsets, data }, pos))
             }
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 if pos + offsets_len > bytes.len() {
@@ -1282,7 +1286,7 @@ impl ColumnData {
                 let count = read_u64!() as usize;
                 pos += count * 8;
             }
-            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 pos += offsets_len;

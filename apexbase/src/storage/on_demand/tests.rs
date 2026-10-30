@@ -7355,3 +7355,48 @@ fn logical_types_declare_format_version_six() {
     legacy.schema.write().add_column("id", ColumnType::Int64);
     assert!(legacy.required_format_version() <= FORMAT_VERSION_V5);
 }
+
+#[test]
+fn decimal128_column_round_trips_and_declares_v6() {
+    // TYPE_DECIMAL128 reuses the Binary payload (16-byte i128 two's complement
+    // rows) until the SQL/Arrow surface lands.
+    let data: Vec<u8> = (0u8..48).collect();
+    let column = ColumnData::Binary {
+        offsets: vec![0, 16, 32, 48],
+        data: data.clone(),
+    };
+    let bytes = column.to_bytes();
+    let (decoded, consumed) = ColumnData::from_bytes_typed(&bytes, ColumnType::Decimal128).unwrap();
+    assert_eq!(consumed, bytes.len());
+    match decoded {
+        ColumnData::Binary { offsets, data: decoded } => {
+            assert_eq!(offsets, vec![0, 16, 32, 48]);
+            assert_eq!(decoded, data);
+        }
+        other => panic!("Decimal128 payload must decode as Binary, got {other:?}"),
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let storage = OnDemandStorage::create(&dir.path().join("decimal128.apex")).unwrap();
+    {
+        let mut schema = storage.schema.write();
+        schema.add_column("amount", ColumnType::Decimal128);
+        schema.set_logical_type(
+            0,
+            Some(LogicalType::Decimal {
+                precision: 38,
+                scale: 2,
+            }),
+        );
+    }
+    assert_eq!(storage.required_format_version(), FORMAT_VERSION_V6);
+    let parsed = OnDemandSchema::from_bytes(&storage.schema.read().to_bytes()).unwrap();
+    assert_eq!(parsed.columns[0].1, ColumnType::Decimal128);
+    assert_eq!(
+        parsed.logical_type(0),
+        Some(&LogicalType::Decimal {
+            precision: 38,
+            scale: 2
+        })
+    );
+}

@@ -172,7 +172,11 @@ def test_local_guard_keeps_release_build_and_system_match(local_guard):
     assert '"maturin", "build", "--release"' in source
     assert '"--require-system-match"' in source
     assert 'target_dirs[side]' in source
-    assert 'shutil.copy2(base_tree / "Cargo.lock", current_tree / "Cargo.lock")' in source
+    # Both worktrees must build against the workspace's pinned dependency graph:
+    # an older base ref has no tracked Cargo.lock and cargo would otherwise
+    # re-resolve crates from the registry at build time.
+    assert 'shutil.copy2(ROOT / "Cargo.lock", base_tree / "Cargo.lock")' in source
+    assert 'shutil.copy2(ROOT / "Cargo.lock", current_tree / "Cargo.lock")' in source
     assert '"APEXBASE_BENCHMARK_DIRTY": "0"' in source
 
 

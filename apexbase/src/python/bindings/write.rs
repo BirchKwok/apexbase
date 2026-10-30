@@ -434,7 +434,7 @@ impl ApexStorageImpl {
                     string_columns.insert(col_name.clone(), vec![v]);
                     null_positions.insert(col_name, vec![value.is_none()]);
                 }
-                ColumnType::Binary | ColumnType::Uuid => {
+                ColumnType::Binary | ColumnType::Uuid | ColumnType::Decimal128 => {
                     let v = if value.is_none() {
                         Vec::new()
                     } else if let Ok(v) = value.extract::<Vec<u8>>() {
@@ -444,7 +444,10 @@ impl ApexStorageImpl {
                     };
                     // A UUID is a fixed 16-byte value; accepting any length would
                     // silently store a value the declared type cannot represent.
-                    if *col_type == ColumnType::Uuid && !v.is_empty() && v.len() != 16 {
+                    if matches!(*col_type, ColumnType::Uuid | ColumnType::Decimal128)
+                        && !v.is_empty()
+                        && v.len() != 16
+                    {
                         return Err(PyValueError::new_err(format!(
                             "column '{}' is uuid: expected a 16-byte value, got {} bytes",
                             col_name,
