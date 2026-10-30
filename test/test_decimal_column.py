@@ -37,3 +37,20 @@ def test_decimal_rejects_more_fractional_digits_than_the_scale(tmp_path):
     client.flush()
     assert _unscaled(client.execute("SELECT d FROM t").to_dict()[0]["d"]) == 123
     client.close()
+
+
+def test_decimal_columns_can_be_disabled_by_environment(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEX_LOGICAL_TYPES", "0")
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    try:
+        for declared in ("decimal(38,2)", "decimal128"):
+            with pytest.raises(ValueError, match="APEX_LOGICAL_TYPES"):
+                client.create_table("t", {"d": declared})
+    finally:
+        client.close()
+    monkeypatch.delenv("APEX_LOGICAL_TYPES")
+    client = ApexClient(str(tmp_path), drop_if_exists=False, enable_cache=False)
+    try:
+        client.create_table("t", {"d": "decimal(38,2)"})
+    finally:
+        client.close()
