@@ -1310,6 +1310,73 @@ impl ApexStorageImpl {
         Ok(())
     }
 
+    /// Column name -> declared type string for one table (including `uuid` and
+    /// `decimal(p,s)`), so a client that did not create the table can still know
+    /// the parameterised types (e.g. the scale needed to encode Decimal values).
+    fn table_types(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
+        use crate::storage::on_demand::ColumnType;
+        let base_dir = self.current_base_dir();
+        // A lazily materialized table keeps the authoritative (logical-type
+        // carrying) schema in the catalog until the first write publishes the
+        // file; read it first, then fall back to the materialized backend.
+        let catalog_schema = py
+            .allow_threads(|| crate::storage::table_catalog::schema_bytes(&base_dir, name))
+            .ok()
+            .flatten()
+            .and_then(|bytes| crate::storage::OnDemandSchema::from_bytes(&bytes).ok());
+        let schema = if let Some(schema) = catalog_schema {
+            schema
+        } else {
+            let table_path = base_dir.join(format!("{}.apex", name));
+            let backend = py
+                .allow_threads(|| crate::Database::read_backend(&table_path))
+                .map_err(|e| PyIOError::new_err(e.to_string()))?;
+            backend.storage.schema_snapshot()
+        };
+        let out = PyDict::new_bound(py);
+        for (index, (column, column_type)) in schema.columns.iter().enumerate() {
+            let declared = if let Some(crate::storage::LogicalType::Decimal { precision, scale }) =
+                schema.logical_type(index)
+            {
+                format!("decimal({precision},{scale})")
+            } else {
+                match column_type {
+                    ColumnType::Uuid => "uuid".to_string(),
+                    ColumnType::Decimal128 => "decimal128".to_string(),
+                    ColumnType::Json => "json".to_string(),
+                    ColumnType::Blob => "blob".to_string(),
+                    ColumnType::Binary => "binary".to_string(),
+                    ColumnType::String | ColumnType::StringDict => "string".to_string(),
+                    ColumnType::Bool => "bool".to_string(),
+                    ColumnType::Int8 => "int8".to_string(),
+                    ColumnType::Int16 => "int16".to_string(),
+                    ColumnType::Int32 => "int32".to_string(),
+                    ColumnType::Int64 => "int64".to_string(),
+                    ColumnType::UInt8 => "uint8".to_string(),
+                    ColumnType::UInt16 => "uint16".to_string(),
+                    ColumnType::UInt32 => "uint32".to_string(),
+                    ColumnType::UInt64 => "uint64".to_string(),
+                    ColumnType::Float32 => "float32".to_string(),
+                    ColumnType::Float64 => "float64".to_string(),
+                    ColumnType::Timestamp => "timestamp".to_string(),
+                    ColumnType::Date => "date".to_string(),
+                    ColumnType::FixedList => "float32_vector".to_string(),
+                    ColumnType::Float16List => "float16_vector".to_string(),
+                    ColumnType::BFloat16List => "bfloat16_vector".to_string(),
+                    ColumnType::Int8Vector => "int8_vector".to_string(),
+                    ColumnType::UInt8Vector => "uint8_vector".to_string(),
+                    ColumnType::Bit1Vector => "bit1_vector".to_string(),
+                    ColumnType::TurboQuant2Vector => "turboquant2_vector".to_string(),
+                    ColumnType::TurboQuant3Vector => "turboquant3_vector".to_string(),
+                    ColumnType::TurboQuant4Vector => "turboquant4_vector".to_string(),
+                    ColumnType::Null => "string".to_string(),
+                }
+            };
+            out.set_item(column, declared)?;
+        }
+        Ok(out.into())
+    }
+
     fn drop_table(&self, py: Python<'_>, name: &str) -> PyResult<()> {
         // Invalidate cached backend first (releases file lock)
         self.invalidate_backend(name);

@@ -2309,6 +2309,11 @@ impl OnDemandStorage {
     /// A `Float32` column stored at its declared width uses a V5-only payload,
     /// so the file declares version 5. Layouts that stay within V4 rules keep
     /// declaring version 4 and remain readable by older builds.
+    /// Snapshot of the table schema, including parameterised (logical) types.
+    pub(crate) fn schema_snapshot(&self) -> OnDemandSchema {
+        self.schema.read().clone()
+    }
+
     pub(crate) fn required_format_version(&self) -> u32 {
         // A parameterised (logical) column type is carried in a schema section
         // an older build does not know how to interpret for writes, so such a

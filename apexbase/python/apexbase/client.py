@@ -2615,7 +2615,19 @@ class ApexClient:
         with self._lock:
             # Decimal(p,s) columns accept decimal.Decimal/str/int/bytes: encode
             # them to their 16-byte i128 payload before the regular store paths.
-            decimals = _decimal_columns(self._table_schemas.get(self._current_table))
+            schema = self._table_schemas.get(self._current_table)
+            if schema is None and self._current_table:
+                # A table created in another process still has a declared schema:
+                # ask the storage layer once so decimal scale (and the other
+                # parameterised types) become known to this client.
+                try:
+                    fetched = self._storage.table_types(self._current_table)
+                except Exception:
+                    fetched = None
+                if fetched:
+                    schema = dict(fetched)
+                    self._table_schemas[self._current_table] = schema
+            decimals = _decimal_columns(schema)
             if decimals:
                 data = _coerce_decimal_columns(data, decimals)
             else:

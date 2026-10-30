@@ -56,12 +56,11 @@ def test_decimal_columns_can_be_disabled_by_environment(tmp_path, monkeypatch):
         client.close()
 
 
-def test_decimal_values_are_not_silently_dropped_after_client_reopen(tmp_path):
-    """A fresh client does not know the declared scale, so it must refuse Decimals.
+def test_decimal_scale_survives_a_client_reopen(tmp_path):
+    """A fresh client fetches decimal(p,s) from the catalog, so Decimal keeps working.
 
-    Previously the value fell through to the storage layer and became NULL
-    (silent data loss). The 16-byte payload keeps working because it needs no
-    scale.
+    Before that fetch existed the client could not scale the value, and the write
+    silently became NULL (round 343 made it fail loudly in the meantime).
     """
     client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
     client.create_table("t", {"d": "decimal(38,2)"})
@@ -72,9 +71,7 @@ def test_decimal_values_are_not_silently_dropped_after_client_reopen(tmp_path):
 
     reopened = ApexClient(str(tmp_path), drop_if_exists=False, enable_cache=False)
     reopened.use_table("t")
-    with pytest.raises(ValueError, match="decimal\\(p,s\\) declaration is not known"):
-        reopened.store({"d": [Decimal("4.56")]})
-    reopened.store({"d": [(456).to_bytes(16, "little", signed=True)]})
+    reopened.store({"d": [Decimal("4.56")]})
     reopened.flush()
     rows = reopened.execute("SELECT d FROM t ORDER BY _id").to_dict()
     assert [_unscaled(row["d"]) for row in rows] == [123, 456]
