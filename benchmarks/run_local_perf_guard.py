@@ -398,6 +398,15 @@ def execute_gate(args, output_dir, evidence):
             run(("git", "worktree", "add", "--detach", current_tree, current_commit))
             worktrees.append(current_tree)
             copy_workspace_changes(current_tree)
+            # Both sides must build against the workspace's pinned dependency
+            # graph. A worktree of an older base ref has no tracked Cargo.lock
+            # (the file is only recent), so without this copy cargo re-resolved
+            # every crate from crates.io for both sides and the same commit could
+            # measure different dependency sets between runs (a stable 30% swing
+            # in the quantized batch TopK metric was traced to exactly this).
+            if (ROOT / "Cargo.lock").exists():
+                shutil.copy2(ROOT / "Cargo.lock", base_tree / "Cargo.lock")
+                shutil.copy2(ROOT / "Cargo.lock", current_tree / "Cargo.lock")
             evidence.source("base", base_tree)
             evidence.source("current", current_tree)
             run((sys.executable, "-m", "venv", "--system-site-packages", venv))
@@ -406,8 +415,6 @@ def execute_gate(args, output_dir, evidence):
             build_env.setdefault("RUSTFLAGS", "-C target-cpu=native")
 
             for side, source in (("base", base_tree), ("current", current_tree)):
-                if side == "current":
-                    shutil.copy2(base_tree / "Cargo.lock", current_tree / "Cargo.lock")
                 env = {**build_env, "CARGO_TARGET_DIR": str(target_dirs[side])}
                 run(
                     (
