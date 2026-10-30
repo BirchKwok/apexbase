@@ -3854,6 +3854,7 @@ impl ApexExecutor {
                     name: field.name().clone(),
                     data_type: apex_type,
                     constraints: vec![],
+                    decimal_params: None,
                 }
             })
             .collect();

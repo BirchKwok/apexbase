@@ -74,6 +74,11 @@ pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub constraints: Vec<ColumnConstraintKind>,
+    /// Precision/scale captured from `DECIMAL(p,s)`/`NUMERIC(p,s)`. The data
+    /// type itself is still the text fallback until the SQL DECIMAL batch lands
+    /// (V5 §129.3); carrying the parameters here keeps the DDL path able to
+    /// build LogicalType::Decimal when it switches.
+    pub decimal_params: Option<(u8, i8)>,
 }
 
 /// ALTER TABLE operation types
@@ -952,6 +957,9 @@ pub struct SqlParser {
     sql_chars: Option<Vec<char>>,
     tokens: Vec<SpannedToken>,
     pos: usize,
+    /// Parameters consumed by the most recent `parse_data_type` call for
+    /// DECIMAL/NUMERIC, attached to the column definition that follows.
+    last_decimal_params: Option<(u8, i8)>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1210,6 +1218,7 @@ impl SqlParser {
             sql_chars: None,
             tokens,
             pos: 0,
+            last_decimal_params: None,
         };
         let stmt = parser.parse_statement()?;
         // Skip trailing semicolons
@@ -1237,6 +1246,7 @@ impl SqlParser {
             sql_chars: None,
             tokens,
             pos: 0,
+            last_decimal_params: None,
         };
         parser.parse_statements()
     }
@@ -1251,6 +1261,7 @@ impl SqlParser {
             sql_chars: None,
             tokens,
             pos: 0,
+            last_decimal_params: None,
         };
         let e = parser.parse_expr()?;
 
@@ -6075,6 +6086,7 @@ impl SqlParser {
                 name,
                 data_type,
                 constraints,
+                decimal_params: self.last_decimal_params.take(),
             });
 
             if matches!(self.current(), Token::Comma) {
@@ -6484,6 +6496,7 @@ impl SqlParser {
 
     /// Parse data type for column definition
     fn parse_data_type(&mut self) -> Result<DataType, ApexError> {
+        self.last_decimal_params = None;
         match self.current().clone() {
             Token::Identifier(s) => {
                 self.advance();
@@ -6504,23 +6517,26 @@ impl SqlParser {
                     "BYTES" | "BINARY" | "VARBINARY" | "BYTEA" => Ok(DataType::Binary),
                     "JSON" => Ok(DataType::Json),
                     "DECIMAL" | "NUMERIC" => {
-                        // Skip optional (precision, scale) parameters
+                        let mut precision: u8 = 38;
+                        let mut scale: i8 = 0;
                         if matches!(self.current(), Token::LParen) {
                             self.advance(); // skip '('
-                                            // precision
-                            if matches!(self.current(), Token::IntLit(_)) {
+                            if let Token::IntLit(value) = self.current().clone() {
+                                precision = u8::try_from(value).unwrap_or(38);
                                 self.advance();
                             }
                             // optional comma + scale
                             if matches!(self.current(), Token::Comma) {
                                 self.advance();
-                                if matches!(self.current(), Token::IntLit(_)) {
+                                if let Token::IntLit(value) = self.current().clone() {
+                                    scale = i8::try_from(value).unwrap_or(0);
                                     self.advance();
                                 }
                             }
                             self.expect(Token::RParen)?;
                         }
-                        Ok(DataType::String) // Store DECIMAL as String for now (preserves precision)
+                        self.last_decimal_params = Some((precision, scale));
+                        Ok(DataType::String) // text fallback until the SQL DECIMAL batch (§129.3)
                     }
                     "TIMESTAMP" | "DATETIME" => Ok(DataType::Timestamp),
                     "DATE" => Ok(DataType::Date),
@@ -7114,6 +7130,25 @@ mod tests {
                 assert!(options.iter().any(|(k, v)| k == "header" && v == "false"));
             }
             other => panic!("Expected CopyExport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_decimal_parameters_are_captured_on_the_column() {
+        let stmt = SqlParser::parse(
+            "CREATE TABLE t (a DECIMAL(10,2), b NUMERIC, c DECIMAL(38, 0))",
+        )
+        .unwrap();
+        match stmt {
+            SqlStatement::CreateTable { columns, .. } => {
+                assert_eq!(columns[0].decimal_params, Some((10, 2)));
+                assert_eq!(columns[1].decimal_params, Some((38, 0)));
+                assert_eq!(columns[2].decimal_params, Some((38, 0)));
+                // The text fallback keeps today's storage behaviour until the
+                // SQL DECIMAL batch switches it to ColumnType::Decimal128.
+                assert_eq!(columns[0].data_type, DataType::String);
+            }
+            other => panic!("Expected CreateTable, got {:?}", other),
         }
     }
 
