@@ -136,3 +136,23 @@ def test_columnar_store_rejects_wrong_width_for_fixed_16_byte_columns(tmp_path):
     client.flush()
     assert client.execute("SELECT d FROM t").to_dict() == [{"d": b"\x00" * 16}]
     client.close()
+
+
+def test_arrow_representation_is_still_binary_pending_the_metadata_batch(tmp_path):
+    """Pin the current Arrow projection of fixed-width columns.
+
+    ``QueryResult.to_arrow`` builds the table in Python from the lazy pydict, so
+    the 16-byte UUID/Decimal payloads currently surface as plain ``binary``
+    columns. The metadata batch (V5 §127.2) will render them as
+    ``fixed_size_binary(16)`` / ``decimal128(p,s)``; this test should be updated
+    with that change and keeps the current contract pinned until then.
+    """
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"u": "uuid", "d": "decimal(38,2)"})
+    client.use_table("t")
+    client.store({"u": [b"\x00" * 16], "d": [b"\x00" * 16]})
+    client.flush()
+    table = client.execute("SELECT u, d FROM t").to_arrow()
+    assert str(table.schema.field("u").type) == "binary"
+    assert str(table.schema.field("d").type) == "binary"
+    client.close()
