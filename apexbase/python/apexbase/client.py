@@ -923,6 +923,40 @@ def _decimal_to_fixed16(value, scale):
     return integer.to_bytes(16, "little", signed=True)
 
 
+def _reject_unknown_decimal_values(data, decimals):
+    """Fail loudly when Decimal values are written to columns without known scale.
+
+    The client only knows a column's ``decimal(p,s)`` declaration for tables it
+    created in this process (the catalog schema is not fetched on ``use_table``).
+    Passing the Decimal through to the storage layer used to store NULL, which is
+    silent data loss; require the caller to pass the 16-byte payload instead (or
+    create the table through this client).
+    """
+    import decimal
+
+    def check(name, value):
+        if isinstance(value, decimal.Decimal) and name not in decimals:
+            raise ValueError(
+                f"cannot encode Decimal for column '{name}': its decimal(p,s) "
+                "declaration is not known to this client (tables created in "
+                "another process); pass the 16-byte scaled payload instead"
+            )
+
+    if isinstance(data, dict):
+        for name, value in data.items():
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    check(name, item)
+            else:
+                check(name, value)
+    elif isinstance(data, list):
+        for row in data:
+            if isinstance(row, dict):
+                for name, value in row.items():
+                    check(name, value)
+    return data
+
+
 def _coerce_decimal_columns(data, decimals):
     """Replace Decimal values in *data* with their 16-byte payloads."""
     if not decimals:
@@ -2584,6 +2618,8 @@ class ApexClient:
             decimals = _decimal_columns(self._table_schemas.get(self._current_table))
             if decimals:
                 data = _coerce_decimal_columns(data, decimals)
+            else:
+                data = _reject_unknown_decimal_values(data, decimals)
 
             # 1. Columnar data Dict[str, list/ndarray]
             if isinstance(data, dict):

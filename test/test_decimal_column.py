@@ -54,3 +54,28 @@ def test_decimal_columns_can_be_disabled_by_environment(tmp_path, monkeypatch):
         client.create_table("t", {"d": "decimal(38,2)"})
     finally:
         client.close()
+
+
+def test_decimal_values_are_not_silently_dropped_after_client_reopen(tmp_path):
+    """A fresh client does not know the declared scale, so it must refuse Decimals.
+
+    Previously the value fell through to the storage layer and became NULL
+    (silent data loss). The 16-byte payload keeps working because it needs no
+    scale.
+    """
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"d": "decimal(38,2)"})
+    client.use_table("t")
+    client.store({"d": [Decimal("1.23")]})
+    client.flush()
+    client.close()
+
+    reopened = ApexClient(str(tmp_path), drop_if_exists=False, enable_cache=False)
+    reopened.use_table("t")
+    with pytest.raises(ValueError, match="decimal\\(p,s\\) declaration is not known"):
+        reopened.store({"d": [Decimal("4.56")]})
+    reopened.store({"d": [(456).to_bytes(16, "little", signed=True)]})
+    reopened.flush()
+    rows = reopened.execute("SELECT d FROM t ORDER BY _id").to_dict()
+    assert [_unscaled(row["d"]) for row in rows] == [123, 456]
+    reopened.close()
