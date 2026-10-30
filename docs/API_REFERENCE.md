@@ -686,6 +686,10 @@ The value is matched case-insensitively. An unrecognized name raises
 `ValueError` listing the supported names, matching `create_table`; pass an
 explicit type when the value comes from user input.
 
+`add_column` does not support `uuid`, `decimal128` or `decimal(p,s)` yet: the
+ALTER path carries a plain `DataType` and has no channel for the parameterised
+(logical) type. Declare those columns when the table is created instead.
+
 **Example:**
 ```python
 client.add_column("email", "String")
