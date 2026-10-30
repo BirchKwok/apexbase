@@ -1213,8 +1213,10 @@ impl ApexStorageImpl {
         name: &str,
         schema: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<()> {
-        let schema_cols = if let Some(schema_dict) = schema {
-            Some(Self::parse_schema_dict(schema_dict)?)
+        // Build the full schema object so parameterised types (decimal(p,s))
+        // travel into the catalog/footer as LogicalType entries.
+        let schema_object = if let Some(schema_dict) = schema {
+            Some(Self::parse_schema_object(schema_dict)?)
         } else {
             None
         };
@@ -1228,11 +1230,11 @@ impl ApexStorageImpl {
                     name
                 )));
             }
-            let result = if let Some(schema_cols) = schema_cols.as_ref() {
-                crate::Database::create_table_with_schema(
+            let result = if let Some(schema) = schema_object.as_ref() {
+                crate::Database::create_table_with_schema_object(
                     &table_path,
                     self.durability,
-                    schema_cols,
+                    schema.clone(),
                 )
             } else {
                 crate::Database::create_table(&table_path, self.durability)
@@ -1269,11 +1271,7 @@ impl ApexStorageImpl {
             // Lazy materialization: CREATE records the name (and schema) in the
             // catalog without paying a per-table file write. The `.apex` file
             // is created on first real access with the recorded schema.
-            let result = if let Some(schema_cols) = schema_cols.as_ref() {
-                let mut schema = crate::storage::OnDemandSchema::new();
-                for (name, col_type) in schema_cols {
-                    schema.add_column(name, *col_type);
-                }
+            let result = if let Some(schema) = schema_object.as_ref() {
                 registry_lock.insert(name)?;
                 registry_lock
                     .set_schema(name, &schema.to_bytes())

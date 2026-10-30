@@ -102,6 +102,7 @@ pub use on_demand::{
     CompressionType,
     FileSchema,
     OnDemandHeader,
+    LogicalType,
     OnDemandSchema,
     // Storage engine
     OnDemandStorage,

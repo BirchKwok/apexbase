@@ -103,3 +103,24 @@ def test_decimal128_column_round_trips_bytes_and_declares_v6(tmp_path):
     assert [row["d"] for row in rows] == values
     assert _file_version(os.path.join(path, "t.apex")) == 6
     client.close()
+
+
+def test_decimal_with_precision_and_scale_round_trips(tmp_path):
+    path = str(tmp_path)
+    client = ApexClient(path, drop_if_exists=True, enable_cache=False)
+    # decimal(p,s) carries precision/scale as a LogicalType in the schema bytes;
+    # the physical payload stays an unscaled 16-byte i128 for now.
+    client.create_table("t", {"id": "int64", "d": "decimal(38,2)"})
+    client.use_table("t")
+    values = [b"\x00" * 15 + bytes([index]) for index in range(1, 4)]
+    client.store([{"id": index + 1, "d": value} for index, value in enumerate(values)])
+    client.flush()
+    rows = client.execute("SELECT id, d FROM t ORDER BY id").to_dict()
+    assert [row["d"] for row in rows] == values
+    assert _file_version(os.path.join(path, "t.apex")) == 6
+    client.close()
+
+    reopened = ApexClient(path, drop_if_exists=False, enable_cache=False)
+    reopened.use_table("t")
+    assert [row["d"] for row in reopened.execute("SELECT d FROM t ORDER BY id").to_dict()] == values
+    reopened.close()

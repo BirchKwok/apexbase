@@ -882,6 +882,42 @@ impl ApexStorageImpl {
         )
     }
 
+    /// Parse `{col: type}` into a schema object that carries parameterised
+    /// types: `decimal(p,s)` maps to `ColumnType::Decimal128` plus
+    /// `LogicalType::Decimal { precision, scale }`.
+    fn parse_schema_object(
+        dict: &Bound<'_, PyDict>,
+    ) -> PyResult<crate::storage::OnDemandSchema> {
+        let columns = Self::parse_schema_dict(dict)?;
+        let mut schema = crate::storage::OnDemandSchema::new();
+        for (name, column_type) in &columns {
+            schema.add_column(name, *column_type);
+        }
+        for (index, (_, column_type)) in columns.iter().enumerate() {
+            if *column_type != crate::storage::ColumnType::Decimal128 {
+                continue;
+            }
+            let declared = dict
+                .get_item(&columns[index].0)?
+                .and_then(|value| value.extract::<String>().ok())
+                .unwrap_or_default()
+                .to_lowercase();
+            if let Some(open) = declared.find('(') {
+                let inner = declared[open + 1..].trim_end_matches(')');
+                let mut parts = inner.split(',').map(|part| part.trim());
+                let precision = parts.next().and_then(|part| part.parse::<u8>().ok());
+                let scale = parts.next().and_then(|part| part.parse::<i8>().ok());
+                if let (Some(precision), Some(scale)) = (precision, scale) {
+                    schema.set_logical_type(
+                        index,
+                        Some(crate::storage::LogicalType::Decimal { precision, scale }),
+                    );
+                }
+            }
+        }
+        Ok(schema)
+    }
+
     /// Parse a Python dict {col_name: type_str} into Vec<(String, ColumnType)>
     fn parse_schema_dict(
         dict: &Bound<'_, PyDict>,
@@ -913,6 +949,15 @@ impl ApexStorageImpl {
                         )));
                     }
                     ColumnType::Uuid
+                }
+                _ if type_str.to_lowercase().starts_with("decimal") => {
+                    if Self::logical_types_disabled() {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}' is decimal: parameterised column types are disabled by APEX_LOGICAL_TYPES=0",
+                            col_name
+                        )));
+                    }
+                    ColumnType::Decimal128
                 }
                 "decimal128" | "decimal" => {
                     if Self::logical_types_disabled() {
