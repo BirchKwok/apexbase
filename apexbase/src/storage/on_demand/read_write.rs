@@ -1855,6 +1855,38 @@ impl OnDemandStorage {
         {
             let schema = self.schema.read();
             let columns = self.columns.read();
+            // Fixed-width 16-byte columns (UUID, Decimal128) reject any other
+            // width here: both the row-wise and the column-oriented store paths
+            // funnel through this function, and a short value would otherwise be
+            // written as-is.
+            for (name, values) in &binary_columns {
+                let Some(index) = schema.get_index(name) else { continue };
+                if !matches!(
+                    schema.columns[index].1,
+                    ColumnType::Uuid | ColumnType::Decimal128
+                ) {
+                    continue;
+                }
+                let nulls = null_positions.get(name);
+                for (row, bytes) in values.iter().enumerate() {
+                    let is_null = nulls
+                        .and_then(|mask| mask.get(row))
+                        .copied()
+                        .unwrap_or(false);
+                    if !is_null && !bytes.is_empty() && bytes.len() != 16 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "column '{}' is a fixed-width 16-byte type; got {} bytes at row {}",
+                                name,
+                                bytes.len(),
+                                row
+                            ),
+                        ));
+                    }
+                }
+            }
+
             for (name, values) in &fixedlist_columns {
                 let existing_dim = schema
                     .get_index(name)

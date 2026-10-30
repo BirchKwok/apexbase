@@ -2684,3 +2684,4 @@ mod tests {
         assert_eq!(categories.value(4), "e");
     }
 }
+

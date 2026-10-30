@@ -124,3 +124,15 @@ def test_decimal_with_precision_and_scale_round_trips(tmp_path):
     reopened.use_table("t")
     assert [row["d"] for row in reopened.execute("SELECT d FROM t ORDER BY id").to_dict()] == values
     reopened.close()
+
+
+def test_columnar_store_rejects_wrong_width_for_fixed_16_byte_columns(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"d": "decimal(38,2)"})
+    client.use_table("t")
+    with pytest.raises((RuntimeError, OSError), match="fixed-width 16-byte"):
+        client.store({"d": [b"short"]})
+    client.store({"d": [b"\x00" * 16]})
+    client.flush()
+    assert client.execute("SELECT d FROM t").to_dict() == [{"d": b"\x00" * 16}]
+    client.close()
