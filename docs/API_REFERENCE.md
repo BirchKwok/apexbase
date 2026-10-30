@@ -228,7 +228,16 @@ Create a new table, optionally with a pre-defined schema.
 - `table_name`: Name of the table to create.
 - `schema`: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.
 
-**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp`, `date`
+**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp`, `date`, `json`, `uuid`, `decimal128`, `decimal(p,s)` (for example `decimal(38,2)`).
+
+`uuid` and `decimal128` values are fixed 16-byte payloads. They are written and
+projected as `bytes` (no implicit list/string conversion); `decimal(p,s)` also
+accepts `decimal.Decimal`, `int` and `str` on write and scales them to the
+declared scale (`Decimal("1.23")` in a `decimal(38,2)` column is stored as the
+integer `123`). Values with more fractional digits than the scale raise
+`ValueError`. Tables containing these types declare on-disk format version 6;
+set `APEX_LOGICAL_TYPES=0` to refuse creating such columns (it is an explicit
+error, never a silent downgrade).
 
 An unrecognized type string raises `ValueError` listing the supported names.
 
@@ -671,7 +680,7 @@ add_column(column_name: str, column_type: str) -> None
 ```
 Add a new column to the current table.
 
-**Types:** `int` / `int64` / `i64` / `integer`, `float` / `float64` / `f64` / `double`, `bool` / `boolean`, `str` / `string` / `text`, `bytes` / `binary`, `blob` / `large_binary` / `largebinary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp` / `datetime`, `date`.
+**Types:** `int` / `int64` / `i64` / `integer`, `float` / `float64` / `f64` / `double`, `bool` / `boolean`, `str` / `string` / `text`, `bytes` / `binary`, `blob` / `large_binary` / `largebinary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp` / `datetime`, `date`, `json`, `uuid`, `decimal128`, `decimal(p,s)`.
 
 The value is matched case-insensitively. An unrecognized name raises
 `ValueError` listing the supported names, matching `create_table`; pass an
