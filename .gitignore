@@ -80,6 +80,11 @@ AGENTS.md
 *.parquet
 
 *.lock
+# Cargo.lock is committed: the perf guard builds base/current in fresh worktrees
+# and otherwise re-resolves every dependency from crates.io, so the same commit
+# measures different crate versions from one run to the next (a 30% swing was
+# observed in the quantized batch TopK metric).
+!Cargo.lock
 *.stats
 
 *.apex_tables
