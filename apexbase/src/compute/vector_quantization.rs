@@ -1063,6 +1063,7 @@ fn scan_bit1_hamming_chunk(
 }
 
 #[inline]
+#[inline(never)]
 fn scan_encoded_chunk_direct(
     data: &[u8],
     row_base: usize,
@@ -1122,6 +1123,7 @@ impl DirectTopK {
 
 /// Parallel heap TopK over fixed-width compressed rows. Dot-product-compatible
 /// metrics are scored directly from encoded bytes; only L1/Linf decode rows.
+#[inline(never)]
 pub fn topk_encoded_rows(
     data: &[u8],
     dim: usize,
