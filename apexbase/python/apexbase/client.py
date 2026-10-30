@@ -1908,6 +1908,7 @@ class ApexClient:
                     raise ValueError(str(e)) from e
                 self._invalidate_replace_cache()
         self._current_table = table_name
+        self._schema_fetch_attempted.discard(table_name)
         if schema is None:
             self._schemaless_tables.add(table_name)
             self._table_schemas.pop(table_name, None)
@@ -1989,6 +1990,11 @@ class ApexClient:
                 except (ValueError, RuntimeError):
                     pass
                 self._invalidate_replace_cache()
+
+        # A dropped table's declared schema must not leak into a recreated table:
+        # stale (p,s) would scale Decimal values with the wrong factor.
+        self._table_schemas.pop(table_name, None)
+        self._schema_fetch_attempted.discard(table_name)
 
         if table_name in self._fts_tables:
             # Best-effort Python-side cleanup in case the engine keeps files

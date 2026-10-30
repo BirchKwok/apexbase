@@ -76,3 +76,17 @@ def test_decimal_scale_survives_a_client_reopen(tmp_path):
     rows = reopened.execute("SELECT d FROM t ORDER BY _id").to_dict()
     assert [_unscaled(row["d"]) for row in rows] == [123, 456]
     reopened.close()
+
+
+def test_recreated_table_does_not_reuse_the_dropped_tables_scale(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"d": "decimal(38,2)"})
+    client.use_table("t")
+    client.drop_table("t")
+    client.create_table("t", {"d": "decimal(38,4)"})
+    client.use_table("t")
+    client.store({"d": [Decimal("1.23")]})
+    client.flush()
+    row = client.execute("SELECT d FROM t").to_dict()[0]
+    assert _unscaled(row["d"]) == 12300
+    client.close()
