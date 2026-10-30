@@ -870,6 +870,35 @@ pub fn file_exists_or_registered(table_path: &Path) -> io::Result<bool> {
 /// moment a reader materializes it. The file is therefore only created while it
 /// is still absent, under the base-file publication lock: an empty materialized
 /// file must never replace rows that are already on disk.
+/// Restore the catalog-only parts of a lazily materialized table's schema
+/// (column constraints and logical types) into the footer. Cold path: called at
+/// most once per table, so it stays out of line to keep insert/scan layout
+/// stable.
+#[cold]
+#[inline(never)]
+fn restore_materialized_schema_metadata(
+    path: &Path,
+    backend: &crate::storage::TableStorageBackend,
+    schema: &crate::storage::OnDemandSchema,
+) -> io::Result<()> {
+    for (idx, (column, _)) in schema.columns.iter().enumerate() {
+        if let Some(cons) = schema.constraints.get(idx) {
+            backend.storage.set_column_constraints(column, cons.clone());
+        }
+        if schema.logical_types.get(idx).is_some_and(Option::is_some) {
+            backend
+                .storage
+                .set_logical_type_at(idx, schema.logical_types[idx].clone());
+        }
+    }
+    // Persist the restored schema into the footer (save_v4). This path is
+    // reached from the write entry points, which already hold the table's write
+    // lock, so only take it when it is free.
+    let _write_guard = crate::storage::table_save_lock::try_write_lock(path);
+    backend.save()?;
+    Ok(())
+}
+
 pub fn materialize_table_backend(
     path: &Path,
     durability: crate::storage::DurabilityLevel,
@@ -911,28 +940,16 @@ pub fn materialize_table_backend(
     )?;
     // The create path above publishes only the column list. Restore the rest of
     // the catalog schema (logical types such as uuid/decimal(p,s), and column
-    // constraints) into the footer. Doing it here keeps the shared creation
-    // path byte-identical for ordinary tables.
-    let has_logical_types = schema.as_ref().is_some_and(|s| {
-        s.logical_types.iter().any(|logical| logical.is_some())
-    });
-    if has_constraints || has_logical_types {
+    // constraints) into the footer. Kept out of line and cold: this runs once
+    // per lazily materialized table and must not perturb the hot insert path's
+    // code layout.
+    if has_constraints
+        || schema.as_ref().is_some_and(|s| {
+            s.logical_types.iter().any(|logical| logical.is_some())
+        })
+    {
         if let Some(schema) = &schema {
-            for (idx, (column, _)) in schema.columns.iter().enumerate() {
-                if let Some(cons) = schema.constraints.get(idx) {
-                    backend.storage.set_column_constraints(column, cons.clone());
-                }
-                if schema.logical_types.get(idx).is_some_and(Option::is_some) {
-                    backend
-                        .storage
-                        .set_logical_type_at(idx, schema.logical_types[idx].clone());
-                }
-            }
-            // Persist the restored schema into the footer (save_v4). This path is
-            // reached from the write entry points, which already hold the table's
-            // write lock, so only take it when it is free.
-            let _write_guard = crate::storage::table_save_lock::try_write_lock(path);
-            backend.save()?;
+            restore_materialized_schema_metadata(path, &backend, schema)?;
         }
     }
     Ok(backend)
