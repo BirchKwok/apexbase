@@ -1251,28 +1251,10 @@ impl OnDemandStorage {
     /// Execute simple aggregation (no GROUP BY, no WHERE) directly on V4 columns.
     /// Supports both in-memory and mmap-only paths.
     /// Returns (count, sum, min, max, is_int) for each requested column
-    /// True when any aggregation column stores a DECIMAL(p,s) payload.
-    ///
-    /// The simple aggregation scanner accumulates numeric columns as f64 and has
-    /// no decimal branch yet; returning None makes the caller fall back to the
-    /// Arrow path, where a non-numeric SUM raises an explicit error instead of
-    /// silently reporting 0.0.
-    fn agg_has_decimal_column(&self, cols: &[&str]) -> bool {
-        let schema = self.schema.read();
-        cols.iter().any(|name| {
-            schema
-                .get_index(name)
-                .is_some_and(|index| matches!(schema.columns[index].1, crate::storage::on_demand::ColumnType::Decimal128))
-        })
-    }
-
     pub fn execute_simple_agg(
         &self,
         agg_cols: &[&str],
     ) -> io::Result<Option<Vec<(i64, f64, f64, f64, bool)>>> {
-        if self.agg_has_decimal_column(agg_cols) {
-            return Ok(None);
-        }
         // Check if in-memory data is available for fast path
         let columns = self.columns.read();
         let has_in_memory = !columns.is_empty() && columns.iter().any(|c| c.len() > 0);
@@ -1284,6 +1266,16 @@ impl OnDemandStorage {
         }
 
         let schema = self.schema.read();
+        if agg_cols.iter().any(|name| {
+            schema.get_index(name).is_some_and(|index| {
+                matches!(
+                    schema.columns[index].1,
+                    crate::storage::on_demand::ColumnType::Decimal128
+                )
+            })
+        }) {
+            return Ok(None);
+        }
         let deleted = self.deleted.read();
         let nulls = self.nulls.read();
         let total_rows = columns.first().map(|c| c.len()).unwrap_or(0);
@@ -1393,6 +1385,16 @@ impl OnDemandStorage {
         };
 
         let schema = &footer.schema;
+        if agg_cols.iter().any(|name| {
+            schema.get_index(name).is_some_and(|index| {
+                matches!(
+                    schema.columns[index].1,
+                    crate::storage::on_demand::ColumnType::Decimal128
+                )
+            })
+        }) {
+            return Ok(None);
+        }
         let non_star: Vec<&str> = agg_cols.iter()
             .filter(|&&n| n != "*" && n != "1" && !n.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false))
             .copied()
