@@ -135,7 +135,8 @@ impl ColumnType {
             // SQL DECIMAL maps to the fixed 16-byte decimal storage; precision
             // and scale travel separately as LogicalType::Decimal once the DDL
             // schema path carries them (see V5 §129).
-            DataType::Decimal => ColumnType::Decimal128,
+            DataType::Decimal | DataType::Decimal128 => ColumnType::Decimal128,
+            DataType::Uuid => ColumnType::Uuid,
             DataType::Timestamp => ColumnType::Timestamp,
             DataType::Date => ColumnType::Date,
             DataType::Float16Vector => ColumnType::Float16List,

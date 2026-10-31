@@ -35,6 +35,8 @@ pub enum DataType {
     TurboQuant2Vector = 26,
     TurboQuant3Vector = 27,
     TurboQuant4Vector = 28,
+    Uuid = 29,
+    Decimal128 = 30,
 }
 
 impl DataType {
@@ -48,7 +50,7 @@ impl DataType {
             DataType::Int32 | DataType::UInt32 | DataType::Float32 => Some(4),
             DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp => Some(8),
             DataType::Date => Some(4),
-            DataType::Decimal => Some(16), // i128 for decimal storage
+            DataType::Decimal | DataType::Uuid | DataType::Decimal128 => Some(16), // i128/16-byte payloads
             DataType::String
             | DataType::Binary
             | DataType::Json
@@ -155,6 +157,8 @@ impl DataType {
             DataType::Date => "DATE",
             DataType::Array => "ARRAY",
             DataType::Decimal => "DECIMAL",
+            DataType::Uuid => "UUID",
+            DataType::Decimal128 => "DECIMAL128",
             DataType::Float16Vector => "FLOAT16_VECTOR",
             DataType::Float32Vector => "FLOAT32_VECTOR",
             DataType::BFloat16Vector => "BFLOAT16_VECTOR",

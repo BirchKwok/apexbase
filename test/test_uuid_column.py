@@ -153,3 +153,30 @@ def test_arrow_projection_is_typed_when_the_schema_is_known(tmp_path):
     assert str(table.schema.field("u").type) == "fixed_size_binary[16]"
     assert str(table.schema.field("d").type) == "decimal128(38, 2)"
     client.close()
+
+
+def test_add_column_supports_uuid_and_decimal128(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"id": "int64"})
+    client.use_table("t")
+    client.store({"id": [1]})
+    client.flush()
+    client.add_column("u", "uuid")
+    client.add_column("d", "decimal128")
+    payload = (123).to_bytes(16, "little", signed=True)
+    client.store([{"id": 2, "u": b"\x00" * 16, "d": payload}])
+    client.flush()
+    assert client.describe_table() == {
+        "id": "int64",
+        "u": "uuid",
+        "d": "decimal128",
+    }
+    rows = client.execute("SELECT id, u, d FROM t ORDER BY id").to_dict()
+    assert rows[0]["u"] is None and rows[0]["d"] is None
+    assert rows[1]["u"] == b"\x00" * 16
+    assert rows[1]["d"] == payload
+    assert _file_version(os.path.join(str(tmp_path), "t.apex")) == 6
+    # ALTER-created fixed-width columns keep the 16-byte contract.
+    with pytest.raises((RuntimeError, OSError), match="fixed-width 16-byte"):
+        client.store([{"id": 3, "u": b"short"}])
+    client.close()

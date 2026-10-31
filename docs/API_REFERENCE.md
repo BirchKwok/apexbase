@@ -690,15 +690,15 @@ add_column(column_name: str, column_type: str) -> None
 ```
 Add a new column to the current table.
 
-**Types:** `int` / `int64` / `i64` / `integer`, `float` / `float64` / `f64` / `double`, `bool` / `boolean`, `str` / `string` / `text`, `bytes` / `binary`, `blob` / `large_binary` / `largebinary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp` / `datetime`, `date`, `json`, `uuid`, `decimal128`, `decimal(p,s)`.
+**Types:** `int` / `int64` / `i64` / `integer`, `float` / `float64` / `f64` / `double`, `bool` / `boolean`, `str` / `string` / `text`, `bytes` / `binary`, `blob` / `large_binary` / `largebinary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp` / `datetime`, `date`, `json`, `uuid`, `decimal128`.
 
 The value is matched case-insensitively. An unrecognized name raises
 `ValueError` listing the supported names, matching `create_table`; pass an
 explicit type when the value comes from user input.
 
-`add_column` does not support `uuid`, `decimal128` or `decimal(p,s)` yet: the
-ALTER path carries a plain `DataType` and has no channel for the parameterised
-(logical) type. Declare those columns when the table is created instead.
+`add_column` accepts `uuid` and `decimal128` (raw 16-byte payloads). It has no
+channel for the parameterised form yet, so `decimal(p,s)` precision/scale can
+only be declared when the table is created.
 
 **Example:**
 ```python

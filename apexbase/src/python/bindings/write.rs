@@ -1901,6 +1901,8 @@ impl ApexStorageImpl {
             "turboquant4_vector" | "tq4_vector" => crate::data::DataType::TurboQuant4Vector,
             "timestamp" | "datetime" => crate::data::DataType::Timestamp,
             "date" => crate::data::DataType::Date,
+            "uuid" => crate::data::DataType::Uuid,
+            "decimal128" | "decimal" => crate::data::DataType::Decimal128,
             "json" | "jsonb" => crate::data::DataType::Json,
             other => {
                 // Silently creating a String column here used to hide typos in
@@ -1911,7 +1913,7 @@ impl ApexStorageImpl {
                      bytes, binary, blob, large_binary, float16_vector, float32_vector, \
                      bfloat16_vector, int8_vector, uint8_vector, bit1_vector, \
                      turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, \
-                     datetime, date, json",
+                     datetime, date, json, uuid, decimal128",
                     other, column_name
                 )))
             }
