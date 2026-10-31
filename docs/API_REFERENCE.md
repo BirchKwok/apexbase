@@ -1255,24 +1255,31 @@ df = results.to_pandas(zero_copy=False)  # Traditional NumPy types
 
 #### to_polars
 ```python
-to_polars() -> pl.DataFrame
+to_polars(declared_types: dict = None) -> pl.DataFrame
 ```
-Convert to polars DataFrame.
+Convert to polars DataFrame. Pass `client.describe_table()` to keep the
+parameterised `uuid` / `decimal(p,s)` column types (see *to_arrow*).
 
 **Example:**
 ```python
-df = results.to_polars()
+df = results.to_polars(client.describe_table())
 ```
 
 #### to_arrow
 ```python
-to_arrow() -> pa.Table
+to_arrow(declared_types: dict = None) -> pa.Table
 ```
 Convert to PyArrow Table.
 
+**Typed projection:** with `declared_types=client.describe_table()`, 16-byte
+`uuid` columns become `fixed_size_binary(16)` and `decimal(p,s)` columns become
+`decimal128(p,s)`; without the map they stay plain `binary` (a query result does
+not carry column type metadata yet). A client that already knows the table schema
+(it created the table) gets the typed projection automatically.
+
 **Example:**
 ```python
-table = results.to_arrow()
+table = results.to_arrow(client.describe_table())
 ```
 
 #### to_dict
