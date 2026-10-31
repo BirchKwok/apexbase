@@ -330,7 +330,9 @@ def _apply_declared_arrow_types(pa_mod, table, declared_types):
         if declared in ("uuid",) or declared.startswith("decimal"):
             if not _fixed16_values(column):
                 declared = ""
-        if declared == "uuid":
+        if declared in ("uuid", "decimal128"):
+            # Raw 16-byte payloads without a declared scale are exposed as
+            # fixed_size_binary(16); decimal(p,s) below decodes to decimal128.
             arrow_type = pa_mod.binary(16)
             values = [
                 None if value is None else bytes(value) for value in column.to_pylist()

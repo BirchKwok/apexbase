@@ -79,3 +79,15 @@ def test_to_polars_keeps_typed_decimal_columns(tmp_path):
     dtype = str(frame.schema["d"])
     assert "Decimal" in dtype or "decimal" in dtype.lower()
     client.close()
+
+
+def test_to_arrow_projects_raw_decimal128_as_fixed_size_binary(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"d": "decimal128"})
+    client.use_table("t")
+    client.store({"d": [(123).to_bytes(16, "little", signed=True)]})
+    client.flush()
+    table = client.execute("SELECT d FROM t").to_arrow()
+    assert str(table.schema.field("d").type) == "fixed_size_binary[16]"
+    assert table.column("d").to_pylist() == [(123).to_bytes(16, "little", signed=True)]
+    client.close()
