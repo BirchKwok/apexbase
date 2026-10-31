@@ -606,9 +606,6 @@ class ResultView:
             if '_id' in table.column_names and not getattr(self, "_show_internal_id", False):
                 table = table.drop(['_id'])
         if declared_types is None:
-            # The owning client attaches the current table's declared types when
-            # it builds the view, so plain SELECTs from the current table get the
-            # typed projection without an explicit map.
             declared_types = getattr(self, "_declared_types", None)
         if declared_types:
             return _apply_declared_arrow_types(pa_mod, table, declared_types)
