@@ -1924,133 +1924,10 @@ impl ApexExecutor {
         // execute_simple_agg uses the RCIX streaming path: one mmap pass for all columns
         let col_refs: Vec<&str> = unique_cols.iter().map(|s| s.as_str()).collect();
 
-        // DECIMAL value aggregates: i128 math over unscaled payloads, emitted as
-        // Decimal128 so the Python conversion can restore the 16-byte payload.
-        if !unique_cols.is_empty() {
-            use arrow::array::Decimal128Array;
-            // Cheap per-column test first: cloning the whole schema here showed up
-            // as a group-by regression on the full gate.
-            let all_decimal = unique_cols
-                .iter()
-                .all(|name| backend.storage.column_is_decimal128(name));
-            if all_decimal {
-                let snapshot = backend.storage.schema_snapshot();
-                if let Some(stats) = backend.execute_decimal_agg(&col_refs)? {
-                    let mut fields: Vec<Field> = Vec::new();
-                    let mut arrays: Vec<ArrayRef> = Vec::new();
-                    let mut supported = true;
-                    for col in &stmt.columns {
-                        let SelectColumn::Aggregate {
-                            func,
-                            column,
-                            alias,
-                            ..
-                        } = col
-                        else {
-                            supported = false;
-                            break;
-                        };
-                        let fn_name = match func {
-                            AggregateFunc::Count => "COUNT",
-                            AggregateFunc::Sum => "SUM",
-                            AggregateFunc::Avg => "AVG",
-                            AggregateFunc::Min => "MIN",
-                            AggregateFunc::Max => "MAX",
-                        };
-                        let output_name = alias.clone().unwrap_or_else(|| {
-                            if let Some(c) = column {
-                                format!("{}({})", fn_name, c)
-                            } else {
-                                format!("{}(*)", fn_name)
-                            }
-                        });
-                        match func {
-                            AggregateFunc::Count => {
-                                let is_star = column.as_deref() == Some("*")
-                                    || column.is_none()
-                                    || column
-                                        .as_ref()
-                                        .map(|c| {
-                                            c.chars()
-                                                .next()
-                                                .map(|ch| ch.is_ascii_digit())
-                                                .unwrap_or(false)
-                                        })
-                                        .unwrap_or(false);
-                                let count = if is_star {
-                                    active_count
-                                } else {
-                                    let col_name = column.as_ref().unwrap().as_str();
-                                    unique_cols
-                                        .iter()
-                                        .position(|name| name == col_name)
-                                        .map(|index| stats[index].0)
-                                        .unwrap_or(0)
-                                };
-                                fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
-                                arrays.push(Arc::new(Int64Array::from(vec![count])));
-                            }
-                            AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => {
-                                let col_name = column.as_ref().unwrap().as_str();
-                                let Some(index) = unique_cols.iter().position(|name| name == col_name)
-                                else {
-                                    supported = false;
-                                    break;
-                                };
-                                let snapshot_index = snapshot.get_index(col_name).unwrap();
-                                let (precision, scale) =
-                                    match snapshot.logical_type(snapshot_index) {
-                                        Some(crate::storage::LogicalType::Decimal {
-                                            precision,
-                                            scale,
-                                        }) => (*precision, *scale),
-                                        _ => (38, 0),
-                                    };
-                                let value = match func {
-                                    AggregateFunc::Sum => stats[index].1,
-                                    AggregateFunc::Min => stats[index].2,
-                                    _ => stats[index].3,
-                                };
-                                let array = Decimal128Array::from(vec![Some(value)])
-                                    .with_precision_and_scale(precision, scale)
-                                    .map_err(|e| err_data(e.to_string()))?;
-                                fields.push(Field::new(
-                                    &output_name,
-                                    ArrowDataType::Decimal128(precision, scale),
-                                    true,
-                                ));
-                                arrays.push(Arc::new(array));
-                            }
-                            AggregateFunc::Avg => {
-                                let col_name = column.as_ref().unwrap().as_str();
-                                let Some(index) = unique_cols.iter().position(|name| name == col_name)
-                                else {
-                                    supported = false;
-                                    break;
-                                };
-                                let snapshot_index = snapshot.get_index(col_name).unwrap();
-                                let scale = match snapshot.logical_type(snapshot_index) {
-                                    Some(crate::storage::LogicalType::Decimal { scale, .. }) => *scale,
-                                    _ => catalog_decimal_scale(backend, col_name).unwrap_or(0),
-                                };
-                                let divisor = stats[index].0.max(1) as f64;
-                                let value =
-                                    stats[index].1 as f64 / 10f64.powi(scale as i32) / divisor;
-                                fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
-                                arrays.push(Arc::new(Float64Array::from(vec![value])));
-                            }
-                        }
-                    }
-                    if supported {
-                        let batch = RecordBatch::try_new(
-                            Arc::new(Schema::new(fields)),
-                            arrays,
-                        )
-                        .map_err(|e| err_data(e.to_string()))?;
-                        return Ok(Some(ApexResult::Data(batch)));
-                    }
-                }
-            }
+        if let Some(result) =
+            try_decimal_aggregation(backend, stmt, &unique_cols, &col_refs, active_count)?
+        {
+            return Ok(Some(result));
         }
 
         // (count: i64, sum: f64, min: f64, max: f64, is_int: bool)
@@ -2221,6 +2098,146 @@ pub(super) fn strip_column_qualifier(name: &str) -> &str {
     }
 }
 
+
+/// DECIMAL value aggregates (i128 over unscaled payloads). Kept out of line and
+/// cold so the hot aggregation dispatch keeps its original code shape.
+#[inline(never)]
+fn try_decimal_aggregation(
+        backend: &crate::storage::TableStorageBackend,
+        stmt: &crate::query::SelectStatement,
+        unique_cols: &[String],
+        col_refs: &[&str],
+        active_count: i64,
+    ) -> io::Result<Option<ApexResult>> {
+        if !unique_cols.is_empty() {
+            use arrow::array::Decimal128Array;
+            // Cheap per-column test first: cloning the whole schema here showed up
+            // as a group-by regression on the full gate.
+            let all_decimal = unique_cols
+                .iter()
+                .all(|name| backend.storage.column_is_decimal128(name));
+            if all_decimal {
+                let snapshot = backend.storage.schema_snapshot();
+                if let Some(stats) = backend.execute_decimal_agg(&col_refs)? {
+                    let mut fields: Vec<Field> = Vec::new();
+                    let mut arrays: Vec<ArrayRef> = Vec::new();
+                    let mut supported = true;
+                    for col in &stmt.columns {
+                        let SelectColumn::Aggregate {
+                            func,
+                            column,
+                            alias,
+                            ..
+                        } = col
+                        else {
+                            supported = false;
+                            break;
+                        };
+                        let fn_name = match func {
+                            AggregateFunc::Count => "COUNT",
+                            AggregateFunc::Sum => "SUM",
+                            AggregateFunc::Avg => "AVG",
+                            AggregateFunc::Min => "MIN",
+                            AggregateFunc::Max => "MAX",
+                        };
+                        let output_name = alias.clone().unwrap_or_else(|| {
+                            if let Some(c) = column {
+                                format!("{}({})", fn_name, c)
+                            } else {
+                                format!("{}(*)", fn_name)
+                            }
+                        });
+                        match func {
+                            AggregateFunc::Count => {
+                                let is_star = column.as_deref() == Some("*")
+                                    || column.is_none()
+                                    || column
+                                        .as_ref()
+                                        .map(|c| {
+                                            c.chars()
+                                                .next()
+                                                .map(|ch| ch.is_ascii_digit())
+                                                .unwrap_or(false)
+                                        })
+                                        .unwrap_or(false);
+                                let count = if is_star {
+                                    active_count
+                                } else {
+                                    let col_name = column.as_ref().unwrap().as_str();
+                                    unique_cols
+                                        .iter()
+                                        .position(|name| name == col_name)
+                                        .map(|index| stats[index].0)
+                                        .unwrap_or(0)
+                                };
+                                fields.push(Field::new(&output_name, ArrowDataType::Int64, false));
+                                arrays.push(Arc::new(Int64Array::from(vec![count])));
+                            }
+                            AggregateFunc::Sum | AggregateFunc::Min | AggregateFunc::Max => {
+                                let col_name = column.as_ref().unwrap().as_str();
+                                let Some(index) = unique_cols.iter().position(|name| name == col_name)
+                                else {
+                                    supported = false;
+                                    break;
+                                };
+                                let snapshot_index = snapshot.get_index(col_name).unwrap();
+                                let (precision, scale) =
+                                    match snapshot.logical_type(snapshot_index) {
+                                        Some(crate::storage::LogicalType::Decimal {
+                                            precision,
+                                            scale,
+                                        }) => (*precision, *scale),
+                                        _ => (38, 0),
+                                    };
+                                let value = match func {
+                                    AggregateFunc::Sum => stats[index].1,
+                                    AggregateFunc::Min => stats[index].2,
+                                    _ => stats[index].3,
+                                };
+                                let array = Decimal128Array::from(vec![Some(value)])
+                                    .with_precision_and_scale(precision, scale)
+                                    .map_err(|e| err_data(e.to_string()))?;
+                                fields.push(Field::new(
+                                    &output_name,
+                                    ArrowDataType::Decimal128(precision, scale),
+                                    true,
+                                ));
+                                arrays.push(Arc::new(array));
+                            }
+                            AggregateFunc::Avg => {
+                                let col_name = column.as_ref().unwrap().as_str();
+                                let Some(index) = unique_cols.iter().position(|name| name == col_name)
+                                else {
+                                    supported = false;
+                                    break;
+                                };
+                                let snapshot_index = snapshot.get_index(col_name).unwrap();
+                                let scale = match snapshot.logical_type(snapshot_index) {
+                                    Some(crate::storage::LogicalType::Decimal { scale, .. }) => *scale,
+                                    _ => catalog_decimal_scale(backend, col_name).unwrap_or(0),
+                                };
+                                let divisor = stats[index].0.max(1) as f64;
+                                let value =
+                                    stats[index].1 as f64 / 10f64.powi(scale as i32) / divisor;
+                                fields.push(Field::new(&output_name, ArrowDataType::Float64, true));
+                                arrays.push(Arc::new(Float64Array::from(vec![value])));
+                            }
+                        }
+                    }
+                    if supported {
+                        let batch = RecordBatch::try_new(
+                            Arc::new(Schema::new(fields)),
+                            arrays,
+                        )
+                        .map_err(|e| err_data(e.to_string()))?;
+                        return Ok(Some(ApexResult::Data(batch)));
+                    }
+                }
+            }
+        }
+
+        Ok(None)
+    }
 
 /// Look up a DECIMAL column's scale in the catalog schema (the materialized file
 /// created by a write path may not carry the logical-type section).
