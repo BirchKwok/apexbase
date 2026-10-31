@@ -124,3 +124,18 @@ def test_describe_table_caches_and_tracks_ddl_changes(tmp_path):
     client.add_column("n", "int64")
     assert client.describe_table() == {"d": "decimal(38,2)", "n": "int64"}
     client.close()
+
+
+def test_decimal_rejects_values_outside_the_128_bit_range(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"d": "decimal(38,2)"})
+    client.use_table("t")
+    with pytest.raises(ValueError, match="128-bit"):
+        client.store({"d": [Decimal("1e40")]})
+    # The 128-bit boundary payload is accepted as raw bytes (Decimal arithmetic
+    # would round it at the default 28-digit precision, so pass the payload).
+    limit = (2**127 - 1).to_bytes(16, "little", signed=True)
+    client.store({"d": [limit]})
+    client.flush()
+    assert _unscaled(client.execute("SELECT d FROM t").to_dict()[0]["d"]) == 2**127 - 1
+    client.close()
