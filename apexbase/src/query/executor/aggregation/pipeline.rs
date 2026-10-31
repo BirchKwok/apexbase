@@ -1928,16 +1928,13 @@ impl ApexExecutor {
         // Decimal128 so the Python conversion can restore the 16-byte payload.
         if !unique_cols.is_empty() {
             use arrow::array::Decimal128Array;
-            let snapshot = backend.storage.schema_snapshot();
-            let all_decimal = unique_cols.iter().all(|name| {
-                snapshot.get_index(name).is_some_and(|index| {
-                    matches!(
-                        snapshot.columns[index].1,
-                        crate::storage::on_demand::ColumnType::Decimal128
-                    )
-                })
-            });
+            // Cheap per-column test first: cloning the whole schema here showed up
+            // as a group-by regression on the full gate.
+            let all_decimal = unique_cols
+                .iter()
+                .all(|name| backend.storage.column_is_decimal128(name));
             if all_decimal {
+                let snapshot = backend.storage.schema_snapshot();
                 if let Some(stats) = backend.execute_decimal_agg(&col_refs)? {
                     let mut fields: Vec<Field> = Vec::new();
                     let mut arrays: Vec<ArrayRef> = Vec::new();

@@ -2320,6 +2320,14 @@ impl OnDemandStorage {
         self.schema.write().set_logical_type(index, logical);
     }
 
+    /// Cheap DECIMAL128 test for one column, without cloning the schema.
+    pub(crate) fn column_is_decimal128(&self, name: &str) -> bool {
+        let schema = self.schema.read();
+        schema.get_index(name).is_some_and(|index| {
+            matches!(schema.columns[index].1, ColumnType::Decimal128)
+        })
+    }
+
     pub(crate) fn schema_snapshot(&self) -> OnDemandSchema {
         self.schema.read().clone()
     }
