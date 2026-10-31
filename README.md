@@ -139,14 +139,17 @@ streaming overlay reads, and a per-query aggregation memory budget on top of it.
 See [Scan & Physical Execution](https://birchkwok.github.io/apexbase/latest/SCAN_EXECUTION_ARCHITECTURE/)
 and [Resource Ownership](https://birchkwok.github.io/apexbase/latest/RESOURCE_OWNERSHIP/).
 
-v1.37.0 and v1.38.0 are the **V5 architecture preview** releases. Files may
-declare format version `5`
-and carry V5-only column encodings, `_id` ranges are reserved against a shared
+v1.37.0–v1.39.0 are the **V5 architecture preview** releases. Files may declare
+format version `5`, or `6` when the schema carries parameterised types (`uuid`,
+`decimal(p,s)`), and carry V5-only column encodings, `_id` ranges are reserved
+against a shared
 on-disk high-water mark so several processes can write one table, and new read
 lanes cover direct point reads, executor index lookups, full-text row-selection
 pushdown, and distance TopK. v1.38.0 keeps the same format and fixes the
 `SELECT t.* … JOIN` projection failure, the SQL point-lookup latency gap and the
-read degradation a predicate `UPDATE` used to leave behind. V5 builds read V4
+read degradation a predicate `UPDATE` used to leave behind. v1.39.0 adds format
+version 6 with the optional logical-type section (`uuid`, `decimal(p,s)`), the
+matching Python/Arrow projections and an opt-in SQL `DECIMAL` path. V5 builds read V4
 files; to keep a file readable by
 a pre-V5 build, set `APEX_WIDTH_FIDELITY=0` to write the V4 layout. Compressed
 tables now store one compressed frame per column by default (so a

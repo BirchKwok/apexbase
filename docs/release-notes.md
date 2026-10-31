@@ -3,6 +3,114 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v1.39.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.39.0)
+*2026-11-01*
+
+[Compare with v1.38.0](https://github.com/BirchKwok/ApexBase/compare/v1.38.0...v1.39.0)
+
+> **V5 architecture preview (third release).** v1.39.0 adds on-disk format
+> version 6, an *optional* logical-type section for `UUID` and `DECIMAL(p,s)`
+> columns. Tables without logical types keep writing version 5/4 exactly as
+> before, so existing files and older builds are unaffected; a build that
+> predates the section refuses a version-6 file at open instead of misreading it.
+
+### Highlights
+
+- `uuid` and `decimal(p,s)` column types end to end: storage payloads, Python
+  types, schema metadata, typed Arrow/polars projection and 16-byte validation.
+- SQL `DECIMAL(p,s)` support behind `APEX_SQL_DECIMAL=1` (opt-in until the
+  remaining query semantics land): DDL records precision/scale as a logical type,
+  `INSERT` encodes exact string/integer literals, and `SUM`/`MIN`/`MAX`/`AVG`
+  aggregate over the unscaled `i128` payloads.
+- The per-column ("chunked") compressed frame becomes the default for new
+  tables; vector/quantized tables are forced back to one flat frame when the
+  layout is still undecided, because those columns are read as a contiguous run
+  (batch TopK lost ~28% otherwise).
+
+### Storage Format (version 6)
+
+- New append-only logical-type section in the schema (`0x4C`): one entry per
+  column, currently `Uuid`, `Decimal { precision, scale }` (and the timestamp
+  family to come). A table declares version 6 only when a logical type is
+  present, or when it contains a `Uuid`/`Decimal128` column whose semantics live
+  in the type tag; everything else keeps writing version 5/4.
+- Reading a version-6 file works from the catalog bytes or the file footer;
+  lazily materialized tables restore their logical types through a cold path, so
+  a reopened process sees the same parameterised types.
+- `APEX_LOGICAL_TYPES=0` refuses to create these columns (explicit error, never a
+  silent downgrade).
+
+### Python API
+
+- `create_table` accepts `uuid`, `decimal128` and `decimal(p,s)`; `add_column`
+  now accepts `uuid` and `decimal128` (`decimal(p,s)` parameters are create-time
+  only). Fixed-width values are written and projected as 16 raw bytes, and
+  `Decimal`/`int`/`str` inputs are scaled to the declared scale (too many
+  fractional digits or a value outside the 128-bit range raises).
+- A client that did not create the table fetches the declared types from the
+  catalog on `use_table`/first write, so reopened processes can still scale
+  `Decimal` values.
+- New `client.describe_table()` returns `{column: declared type}`, including the
+  parameterised types that result columns cannot carry yet.
+- `to_arrow(declared_types=client.describe_table())` and
+  `to_polars(declared_types=...)` project `uuid` as `fixed_size_binary(16)` and
+  `decimal(p,s)` as `decimal128(p,s)`; without the map the payload stays `binary`.
+
+### SQL
+
+- `CREATE TABLE … (d DECIMAL(p,s))` / `NUMERIC(p,s)` still defaults to the text
+  representation. With `APEX_SQL_DECIMAL=1` the column is stored as the 16-byte
+  `Decimal128` with its precision/scale, `INSERT` accepts exact string and
+  integer literals (extra fractional digits rejected, float literals refused),
+  and `SUM`/`MIN`/`MAX` return the unscaled `i128` payload while `AVG` returns the
+  scaled float. `WHERE`/`ORDER BY` on these columns do not have decimal semantics
+  yet (documented limitation until the next release).
+- `DECIMAL` aggregation no longer silently reports `0.0`: the f64 scanner
+  declines decimal columns, so unsupported shapes raise an explicit error.
+
+### Performance
+
+- The per-column compressed frame is the default for new tables
+  (`APEX_CHUNK_INDEX=0` keeps the flat frame). An 8% size gate keeps correlated
+  tables flat; a gate run with the default layout was 10.4% faster than the flat
+  layout on the same workload.
+- Bounded distance TopK covers `ORDER BY distance DESC`, `OFFSET`, and the
+  farthest/similarity shapes without materialising the distance column
+  (benchmark gate shapes: −96%).
+- Point-read caches stay bounded: `APEX_READ_CACHE_MB` bounds the string cache,
+  the table write-lock map is capped, and oversized scan buffers are released
+  after a scan.
+- The local perf guard now builds both sides against the committed `Cargo.lock`.
+  Previously a fresh worktree had no lock file, so cargo re-resolved every
+  dependency from crates.io and the same commit could measure different crate
+  versions between runs (a reproducible ~30% swing in the quantized batch TopK
+  metric). Committing the lock file and copying it into both worktrees makes a
+  gate run measure code changes only.
+- Quantized batch-TopK kernels got stable `#[inline(never)]` boundaries so build
+  layout changes no longer move that metric by ~30%.
+
+### Correctness
+
+- `store({"u": [b"short"]})` no longer writes a short value into a 16-byte
+  column: the fixed-width check lives in the typed-insert funnel, which sees both
+  the row-wise and column-oriented callers and the first write of a lazily created
+  table.
+- Decimal inputs whose column scale is unknown are refused instead of being
+  written as `NULL` (silent data loss), and the scale learned on `use_table`
+  makes them work again for reopened processes.
+- `describe_table` reads the materialized file first (it carries `ALTER`
+  results and the logical-type section) and fills in any logical types that only
+  the catalog still has; DDL invalidates the client cache.
+- `column_type_to_datatype(Decimal128)` reports `DataType::Decimal` instead of
+  `Binary`, which is what lets DML see the column type.
+
+### Upgrade Notes
+
+- Files written by v1.39.0 without logical types are byte-compatible with
+  v1.38.0. Files containing `uuid`/`decimal(p,s)` columns declare version 6 and
+  must not be opened by older builds.
+- `uuid`/decimal APIs are additive; the text fallback for SQL `DECIMAL` stays the
+  default.
 ## [v1.38.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.38.0)
 *2026-10-28*
 
