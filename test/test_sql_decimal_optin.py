@@ -37,3 +37,24 @@ def test_sql_decimal_opt_in_rejects_extra_fractional_digits(tmp_path, monkeypatc
     client.flush()
     assert _unscaled(client.execute("SELECT d FROM t").to_dict()[0]["d"]) == 123
     client.close()
+
+
+def test_decimal_aggregates_fail_loudly_instead_of_reporting_zero(tmp_path, monkeypatch):
+    """SUM on DECIMAL must not silently return 0.0.
+
+    The simple f64 aggregation scanner has no decimal branch, so it declines and
+    the Arrow fallback reports that the column is not numeric; COUNT keeps working.
+    """
+    monkeypatch.setenv("APEX_SQL_DECIMAL", "1")
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.execute("CREATE TABLE t (d DECIMAL(10,2))")
+    client.use_table("t")
+    client.execute("INSERT INTO t (d) VALUES ('1.23'), ('2.50')")
+    client.flush()
+    import pytest
+
+    with pytest.raises(RuntimeError, match="numeric"):
+        client.execute("SELECT SUM(d) AS s FROM t")
+    assert client.execute("SELECT COUNT(d) AS n FROM t").to_dict() == [{"n": 2}]
+    assert client.execute("SELECT COUNT(*) AS n FROM t").to_dict() == [{"n": 2}]
+    client.close()
