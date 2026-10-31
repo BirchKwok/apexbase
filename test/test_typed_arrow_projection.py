@@ -23,12 +23,29 @@ def test_to_arrow_applies_declared_uuid_and_decimal_types(tmp_path):
     client.close()
 
 
-def test_to_arrow_without_declared_types_stays_binary(tmp_path):
+def test_to_arrow_uses_the_clients_declared_types_automatically(tmp_path):
     client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
     client.create_table("t", {"u": "uuid"})
     client.use_table("t")
     client.store({"u": [b"\x00" * 16]})
     client.flush()
+    # The creating client knows the schema, so no explicit map is needed.
     table = client.execute("SELECT u FROM t").to_arrow()
-    assert str(table.schema.field("u").type) == "binary"
+    assert str(table.schema.field("u").type) == "fixed_size_binary[16]"
     client.close()
+
+
+def test_to_arrow_stays_binary_when_the_client_never_saw_the_schema(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"u": "uuid"})
+    client.use_table("t")
+    client.store({"u": [b"\x00" * 16]})
+    client.flush()
+    client.close()
+
+    reopened = ApexClient(str(tmp_path), drop_if_exists=False, enable_cache=False)
+    reopened.use_table("t")
+    # No store yet, so the schema has not been fetched from the catalog.
+    table = reopened.execute("SELECT u FROM t").to_arrow()
+    assert str(table.schema.field("u").type) == "binary"
+    reopened.close()

@@ -1615,6 +1615,7 @@ class ApexClient:
         view = (ResultView(lazy_pydict=payload) if representation == 'pydict'
                 else ResultView(arrow_table=payload))
         view._show_internal_id = show_flag
+        view._declared_types = dict(self._table_schemas.get(self._current_table) or {}) or None
         return view, key, token
 
     def _cache_query_result(self, key, token, result) -> None:
@@ -1736,6 +1737,7 @@ class ApexClient:
         """
         rv = ResultView(lazy_pydict=columns_dict)
         rv._show_internal_id = show_internal_id
+        rv._declared_types = dict(self._table_schemas.get(self._current_table) or {}) or None
         return rv
     
     def _ensure_table_selected(self):

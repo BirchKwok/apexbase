@@ -138,14 +138,11 @@ def test_columnar_store_rejects_wrong_width_for_fixed_16_byte_columns(tmp_path):
     client.close()
 
 
-def test_arrow_representation_is_still_binary_pending_the_metadata_batch(tmp_path):
-    """Pin the current Arrow projection of fixed-width columns.
+def test_arrow_projection_is_typed_when_the_schema_is_known(tmp_path):
+    """The creating client attaches declared types, so uuid projects as binary(16).
 
-    ``QueryResult.to_arrow`` builds the table in Python from the lazy pydict, so
-    the 16-byte UUID/Decimal payloads currently surface as plain ``binary``
-    columns. ``to_arrow(declared_types)`` already renders them as
-    ``fixed_size_binary(16)`` / ``decimal128(p,s)``; this test pins the default
-    (no metadata) contract until query results carry column types themselves.
+    A client that never fetched the schema still gets the plain ``binary``
+    fallback until query results carry column type metadata themselves.
     """
     client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
     client.create_table("t", {"u": "uuid", "d": "decimal(38,2)"})
@@ -153,6 +150,6 @@ def test_arrow_representation_is_still_binary_pending_the_metadata_batch(tmp_pat
     client.store({"u": [b"\x00" * 16], "d": [b"\x00" * 16]})
     client.flush()
     table = client.execute("SELECT u, d FROM t").to_arrow()
-    assert str(table.schema.field("u").type) == "binary"
-    assert str(table.schema.field("d").type) == "binary"
+    assert str(table.schema.field("u").type) == "fixed_size_binary[16]"
+    assert str(table.schema.field("d").type) == "decimal128(38, 2)"
     client.close()
