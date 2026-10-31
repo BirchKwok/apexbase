@@ -2038,6 +2038,21 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
             }
             Ok(list.into())
         }
+        ArrowDT::Decimal128(_, _) => {
+            // DECIMAL values are surfaced as their 16-byte little-endian payload
+            // (D4); Decimal128 arrays only exist for query-layer numeric math.
+            let a = arr.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            let list = PyList::empty_bound(py);
+            for i in 0..n {
+                if a.is_null(i) {
+                    list.append(py.None())?;
+                } else {
+                    let bytes = a.value(i).to_le_bytes();
+                    list.append(pyo3::types::PyBytes::new_bound(py, &bytes))?;
+                }
+            }
+            Ok(list.into())
+        }
         _ => {
             // Fallback: per-element generic path
             let list = PyList::empty_bound(py);

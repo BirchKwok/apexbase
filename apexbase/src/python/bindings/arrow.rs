@@ -19,6 +19,7 @@ pub(super) fn pylist_representable(dtype: &arrow::datatypes::DataType) -> bool {
             | ArrowDT::Boolean
             | ArrowDT::Binary
             | ArrowDT::LargeBinary
+            | ArrowDT::Decimal128(_, _)
             | ArrowDT::Dictionary(_, _)
     )
 }

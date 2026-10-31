@@ -39,26 +39,21 @@ def test_sql_decimal_opt_in_rejects_extra_fractional_digits(tmp_path, monkeypatc
     client.close()
 
 
-def test_decimal_aggregates_fail_loudly_instead_of_reporting_zero(tmp_path, monkeypatch):
-    """SUM on DECIMAL must not silently return 0.0.
-
-    The simple f64 aggregation scanner has no decimal branch, so it declines and
-    the Arrow fallback reports that the column is not numeric; COUNT keeps working.
-    """
+def test_decimal_aggregates_use_scaled_i128_semantics(tmp_path, monkeypatch):
+    """SUM/MIN/MAX return unscaled bytes; AVG is a scaled float."""
     monkeypatch.setenv("APEX_SQL_DECIMAL", "1")
     client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
     client.execute("CREATE TABLE t (d DECIMAL(10,2))")
     client.use_table("t")
-    client.execute("INSERT INTO t (d) VALUES ('1.23'), ('2.50')")
+    client.execute("INSERT INTO t (d) VALUES ('1.23'), ('2.50'), ('-0.25')")
     client.flush()
-    import pytest
-
-    with pytest.raises(RuntimeError, match="numeric"):
-        client.execute("SELECT SUM(d) AS s FROM t")
-    assert client.execute("SELECT COUNT(d) AS n FROM t").to_dict() == [{"n": 2}]
-    assert client.execute("SELECT COUNT(*) AS n FROM t").to_dict() == [{"n": 2}]
+    row = client.execute("SELECT SUM(d) AS s, MIN(d) AS m, MAX(d) AS x, AVG(d) AS a, COUNT(d) AS n FROM t").to_dict()[0]
+    assert _unscaled(row["s"]) == 348
+    assert _unscaled(row["m"]) == -25
+    assert _unscaled(row["x"]) == 250
+    assert row["a"] == 1.16
+    assert row["n"] == 3
     client.close()
-
 
 def test_decimal_aggregates_decline_on_large_flushed_tables(tmp_path, monkeypatch):
     """The mmap aggregation path must also decline DECIMAL value aggregates."""
@@ -75,7 +70,8 @@ def test_decimal_aggregates_decline_on_large_flushed_tables(tmp_path, monkeypatc
     reopened.use_table("t")
     import pytest
 
-    with pytest.raises(RuntimeError, match="numeric"):
-        reopened.execute("SELECT SUM(d) AS s FROM t")
-    assert reopened.execute("SELECT COUNT(*) AS n FROM t").to_dict() == [{"n": 200_000}]
+    row = reopened.execute("SELECT SUM(d) AS s, COUNT(*) AS n FROM t").to_dict()[0]
+    # sum over 200 x (0..=999) unscaled payloads.
+    assert _unscaled(row["s"]) == 200 * (999 * 1000 // 2)
+    assert row["n"] == 200_000
     reopened.close()

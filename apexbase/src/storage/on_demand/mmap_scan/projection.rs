@@ -2579,7 +2579,7 @@ impl OnDemandStorage {
 
         match dtype {
             ColumnType::String | ColumnType::Json => Ok(ColumnData::String { offsets, data }),
-            ColumnType::Binary | ColumnType::Blob => Ok(ColumnData::Binary { offsets, data }),
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => Ok(ColumnData::Binary { offsets, data }),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Not a variable type",
@@ -2914,7 +2914,7 @@ impl OnDemandStorage {
                 offsets: result_offsets,
                 data: result_data,
             }),
-            ColumnType::Binary | ColumnType::Blob => Ok(ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => Ok(ColumnData::Binary {
                 offsets: result_offsets,
                 data: result_data,
             }),

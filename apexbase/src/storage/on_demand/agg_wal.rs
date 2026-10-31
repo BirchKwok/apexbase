@@ -1372,6 +1372,102 @@ impl OnDemandStorage {
         Ok(Some(results))
     }
 
+    /// DECIMAL(p,s) count/sum/min/max over unscaled i128 payloads.
+    ///
+    /// The f64 simple-aggregation scanner cannot represent decimal payloads, so
+    /// this separate entry point handles the opt-in DECIMAL type. It covers
+    /// in-memory rows and the mmap scan; compressed/chunked groups are served by
+    /// `scan_columns_mmap` as well.
+    pub fn execute_decimal_agg(
+        &self,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, i128, i128, i128)>>> {
+        let columns = self.columns.read();
+        let in_memory = !columns.is_empty() && columns.iter().any(|column| column.len() > 0);
+        if in_memory {
+            let schema = self.schema.read();
+            let deleted = self.deleted.read();
+            if deleted.iter().any(|&byte| byte != 0) {
+                return Ok(None);
+            }
+            let nulls = self.nulls.read();
+            let mut results = Vec::with_capacity(agg_cols.len());
+            for &col_name in agg_cols {
+                let Some(col_idx) = schema.get_index(col_name) else {
+                    return Ok(None);
+                };
+                if col_idx >= columns.len()
+                    || !matches!(
+                        schema.columns[col_idx].1,
+                        crate::storage::on_demand::ColumnType::Decimal128
+                    )
+                {
+                    return Ok(None);
+                }
+                let null_bm: &[u8] =
+                    if col_idx < nulls.len() { &nulls[col_idx] } else { &[] };
+                let ColumnData::Binary { offsets, data } = &columns[col_idx] else {
+                    return Ok(None);
+                };
+                results.push(decimal_stats_from_binary(offsets, data, null_bm, None));
+            }
+            return Ok(Some(results));
+        }
+        drop(columns);
+
+        let Some(footer) = self.get_or_load_footer()? else {
+            return Ok(None);
+        };
+        let schema = &footer.schema;
+        let mut col_indices: Vec<Option<usize>> = Vec::with_capacity(agg_cols.len());
+        for &name in agg_cols {
+            if name == "*" || name == "1" {
+                col_indices.push(None);
+                continue;
+            }
+            let Some(index) = schema.get_index(name) else {
+                return Ok(None);
+            };
+            if !matches!(
+                schema.columns[index].1,
+                crate::storage::on_demand::ColumnType::Decimal128
+            ) {
+                return Ok(None);
+            }
+            col_indices.push(Some(index));
+        }
+        let real: Vec<usize> = col_indices.iter().flatten().copied().collect();
+        if real.is_empty() {
+            let total_active: i64 = footer.row_groups.iter().map(|rg| rg.active_rows() as i64).sum();
+            return Ok(Some(agg_cols.iter().map(|_| (total_active, 0, 0, 0)).collect()));
+        }
+        let (scanned, deleted) = self.scan_columns_mmap(&real, &footer)?;
+        let has_deleted = deleted.iter().any(|&byte| byte != 0);
+        let total_active: i64 = footer.row_groups.iter().map(|rg| rg.active_rows() as i64).sum();
+        let mut results = Vec::with_capacity(agg_cols.len());
+        let mut scan_idx = 0usize;
+        for index in col_indices {
+            let Some(_) = index else {
+                results.push((total_active, 0, 0, 0));
+                continue;
+            };
+            let Some(column) = scanned.get(scan_idx) else {
+                return Ok(None);
+            };
+            scan_idx += 1;
+            let ColumnData::Binary { offsets, data } = column else {
+                return Ok(None);
+            };
+            results.push(decimal_stats_from_binary(
+                offsets,
+                data,
+                &[],
+                if has_deleted { Some(&deleted) } else { None },
+            ));
+        }
+        Ok(Some(results))
+    }
+
     /// MMAP PATH: Execute simple aggregation by scanning V4 RGs via mmap.
     /// Uses per-RG streaming to avoid building a full 1M-element Vec.
     /// PLAIN-encoded columns are processed zero-copy from mmap; RLE/BITPACK decoded per-RG.
@@ -10139,4 +10235,42 @@ mod bulk_shortcut_tests {
         invalid[8] = 64;
         assert!(!bitpack_bulk_shortcut_applies(&invalid));
     }
+}
+
+
+/// Count/sum/min/max over 16-byte little-endian decimal payloads.
+fn decimal_stats_from_binary(
+    offsets: &[u64],
+    data: &[u8],
+    null_bitmap: &[u8],
+    deleted: Option<&[u8]>,
+) -> (i64, i128, i128, i128) {
+    let rows = offsets.len().saturating_sub(1);
+    let mut count = 0i64;
+    let mut sum: i128 = 0;
+    let mut min_value: Option<i128> = None;
+    let mut max_value: Option<i128> = None;
+    for row in 0..rows {
+        if let Some(bitmap) = deleted {
+            if row / 8 < bitmap.len() && (bitmap[row / 8] >> (row % 8)) & 1 == 1 {
+                continue;
+            }
+        }
+        if row / 8 < null_bitmap.len() && (null_bitmap[row / 8] >> (row % 8)) & 1 == 1 {
+            continue;
+        }
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+        if end != start + 16 || end > data.len() {
+            continue;
+        }
+        let mut buf = [0u8; 16];
+        buf.copy_from_slice(&data[start..end]);
+        let value = i128::from_le_bytes(buf);
+        count += 1;
+        sum += value;
+        min_value = Some(min_value.map_or(value, |current| current.min(value)));
+        max_value = Some(max_value.map_or(value, |current| current.max(value)));
+    }
+    (count, sum, min_value.unwrap_or(0), max_value.unwrap_or(0))
 }

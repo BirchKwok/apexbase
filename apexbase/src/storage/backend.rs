@@ -6460,6 +6460,14 @@ impl TableStorageBackend {
         self.storage.execute_simple_agg(agg_cols)
     }
 
+    /// DECIMAL aggregation over unscaled i128 payloads.
+    pub fn execute_decimal_agg(
+        &self,
+        agg_cols: &[&str],
+    ) -> io::Result<Option<Vec<(i64, i128, i128, i128)>>> {
+        self.storage.execute_decimal_agg(agg_cols)
+    }
+
     /// Single-pass filtered string aggregation: scan string column and aggregate
     /// numeric columns in one sequential pass per row group.
     pub fn execute_filtered_string_agg_mmap(

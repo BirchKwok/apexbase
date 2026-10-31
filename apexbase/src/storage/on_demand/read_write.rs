@@ -914,7 +914,7 @@ fn decode_point_column_value(
                             })
                             .unwrap_or(Value::Null)
                     }
-                    (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob) => {
+                    (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128) => {
                         // [count:u64][(start:u32,end:u32) × count][data_len:u64][data]
                         if data_bytes.len() >= 8 {
                             let count =
@@ -2924,7 +2924,7 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut str_buf)?;
                     Value::String(std::str::from_utf8(&str_buf).unwrap_or("").to_string())
                 }
-                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob) => {
+                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128) => {
                     let mut count_buf = [0u8; 8];
                     self.read_cached_bytes(data_base, &mut count_buf)?;
                     let count = u64::from_le_bytes(count_buf) as usize;
@@ -3304,7 +3304,7 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut str_buf)?;
                     Value::String(std::str::from_utf8(&str_buf).unwrap_or("").to_string())
                 }
-                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob) => {
+                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128) => {
                     let mut count_buf = [0u8; 8];
                     self.read_cached_bytes(data_base, &mut count_buf)?;
                     let count = u64::from_le_bytes(count_buf) as usize;
