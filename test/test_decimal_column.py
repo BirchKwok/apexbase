@@ -102,3 +102,13 @@ def test_describe_table_reports_parameterised_types(tmp_path):
         "n": "int64",
     }
     client.close()
+
+
+def test_describe_table_rejects_unknown_tables(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    with pytest.raises(ValueError):
+        client.describe_table("missing")
+    client.create_table("t", {"d": "int64"})
+    # An explicit name works even while the table has not been written yet.
+    assert client.describe_table("t") == {"d": "int64"}
+    client.close()
