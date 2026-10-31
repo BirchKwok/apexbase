@@ -738,6 +738,25 @@ Get the data type of a column.
 dtype = client.get_column_dtype("age")  # 'Int64'
 ```
 
+#### describe_table
+```python
+describe_table(table_name: str = None) -> dict
+```
+Return ``{column: declared type}`` for a table (defaults to the current table).
+Unlike query results, the mapping includes parameterised types such as `uuid`
+and `decimal(p,s)`. It reads the catalog schema and falls back to the
+materialized file, so it also describes tables created by another process.
+
+**Example:**
+```python
+client.create_table("t", {"u": "uuid", "d": "decimal(38,2)", "n": "int64"})
+client.use_table("t")
+client.describe_table()
+# {'u': 'uuid', 'd': 'decimal(38,2)', 'n': 'int64'}
+```
+
+**Raises:** `ValueError` when no table is selected or the table cannot be read.
+
 #### list_fields
 ```python
 list_fields() -> List[str]
