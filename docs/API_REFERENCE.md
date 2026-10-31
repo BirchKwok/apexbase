@@ -239,6 +239,15 @@ integer `123`). Values with more fractional digits than the scale raise
 set `APEX_LOGICAL_TYPES=0` to refuse creating such columns (it is an explicit
 error, never a silent downgrade).
 
+SQL `DECIMAL(p,s)` / `NUMERIC(p,s)` columns are still projected as text by
+default. Setting `APEX_SQL_DECIMAL=1` makes `CREATE TABLE` store them as the same
+16-byte `Decimal128` payload with the declared precision/scale, and `INSERT`
+accepts exact string/integer literals (extra fractional digits are rejected;
+float literals are refused so nothing is rounded implicitly). This is opt-in
+while the query side is incomplete: `WHERE`, `ORDER BY`, joins and aggregates on
+such columns do not have DECIMAL semantics yet, so read the payload back as
+bytes or cast explicitly.
+
 An unrecognized type string raises `ValueError` listing the supported names.
 
 **Examples:**
