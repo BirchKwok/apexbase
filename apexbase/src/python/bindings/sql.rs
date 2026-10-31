@@ -1316,23 +1316,47 @@ impl ApexStorageImpl {
     fn table_types(&self, py: Python<'_>, name: &str) -> PyResult<PyObject> {
         use crate::storage::on_demand::ColumnType;
         let base_dir = self.current_base_dir();
-        // A lazily materialized table keeps the authoritative (logical-type
-        // carrying) schema in the catalog until the first write publishes the
-        // file; read it first, then fall back to the materialized backend.
+        // A materialized file is authoritative (it carries the logical-type
+        // section and any ALTER changes); a lazily created table that has not
+        // been written yet only has the catalog schema.
+        let table_path = base_dir.join(format!("{}.apex", name));
+        let backend_schema = if table_path.exists() {
+            Some(
+                py.allow_threads(|| crate::Database::read_backend(&table_path))
+                    .map_err(|e| PyIOError::new_err(e.to_string()))?
+                    .storage
+                    .schema_snapshot(),
+            )
+        } else {
+            None
+        };
         let catalog_schema = py
             .allow_threads(|| crate::storage::table_catalog::schema_bytes(&base_dir, name))
             .ok()
             .flatten()
             .and_then(|bytes| crate::storage::OnDemandSchema::from_bytes(&bytes).ok());
-        let schema = if let Some(schema) = catalog_schema {
+        let mut schema = if let Some(schema) = backend_schema {
             schema
         } else {
-            let table_path = base_dir.join(format!("{}.apex", name));
-            let backend = py
-                .allow_threads(|| crate::Database::read_backend(&table_path))
-                .map_err(|e| PyIOError::new_err(e.to_string()))?;
-            backend.storage.schema_snapshot()
+            catalog_schema.clone().ok_or_else(|| {
+                PyIOError::new_err(format!("Table '{}' has no readable schema", name))
+            })?
         };
+        // The materialized file can be created by a write path that only knows
+        // the column list, so parameterised types may live only in the catalog.
+        // Copy them across by column name when the footer lacks them.
+        if let Some(catalog) = &catalog_schema {
+            for (index, (column, _)) in schema.columns.clone().iter().enumerate() {
+                if schema.logical_type(index).is_some() {
+                    continue;
+                }
+                if let Some(catalog_index) = catalog.get_index(column) {
+                    if let Some(logical) = catalog.logical_type(catalog_index) {
+                        schema.set_logical_type(index, Some(logical.clone()));
+                    }
+                }
+            }
+        }
         let out = PyDict::new_bound(py);
         for (index, (column, column_type)) in schema.columns.iter().enumerate() {
             let declared = if let Some(crate::storage::LogicalType::Decimal { precision, scale }) =

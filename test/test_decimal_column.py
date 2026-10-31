@@ -112,3 +112,15 @@ def test_describe_table_rejects_unknown_tables(tmp_path):
     # An explicit name works even while the table has not been written yet.
     assert client.describe_table("t") == {"d": "int64"}
     client.close()
+
+
+def test_describe_table_caches_and_tracks_ddl_changes(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"d": "decimal(38,2)"})
+    client.use_table("t")
+    assert client.describe_table() == {"d": "decimal(38,2)"}
+    # Cached: no catalog read needed, and identical result.
+    assert client.describe_table() == {"d": "decimal(38,2)"}
+    client.add_column("n", "int64")
+    assert client.describe_table() == {"d": "decimal(38,2)", "n": "int64"}
+    client.close()

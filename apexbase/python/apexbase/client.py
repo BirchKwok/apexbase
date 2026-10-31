@@ -6071,10 +6071,19 @@ class ApexClient:
         table = table_name or self._current_table
         if not table:
             raise ValueError("describe_table requires a table name or a current table")
+        cached = self._table_schemas.get(table)
+        if cached is not None:
+            return dict(cached)
         try:
-            return dict(self._storage.table_types(table))
+            types = dict(self._storage.table_types(table))
         except Exception as exc:
             raise ValueError(str(exc)) from exc
+        # Cache like _store_impl does, so repeated describes do not touch the
+        # catalog and DDL invalidation keeps it coherent.
+        self._table_schemas[table] = dict(types)
+        self._table_decimal_scales[table] = _decimal_columns(types)
+        self._schema_fetch_attempted.add(table)
+        return dict(types)
 
     def _invalidate_table_schema_cache(self):
         """Forget cached declared types of the current table (after DDL)."""
