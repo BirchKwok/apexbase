@@ -34,7 +34,7 @@ def test_to_arrow_uses_the_clients_declared_types_when_available(tmp_path):
     client.close()
 
 
-def test_to_arrow_without_metadata_stays_binary_after_reopen(tmp_path):
+def test_to_arrow_is_typed_after_reopen_thanks_to_use_table_schema_fetch(tmp_path):
     client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
     client.create_table("t", {"u": "uuid"})
     client.use_table("t")
@@ -45,7 +45,7 @@ def test_to_arrow_without_metadata_stays_binary_after_reopen(tmp_path):
     reopened = ApexClient(str(tmp_path), drop_if_exists=False, enable_cache=False)
     reopened.use_table("t")
     table = reopened.execute("SELECT u FROM t").to_arrow()
-    assert str(table.schema.field("u").type) == "binary"
+    assert str(table.schema.field("u").type) == "fixed_size_binary[16]"
     reopened.close()
 
 

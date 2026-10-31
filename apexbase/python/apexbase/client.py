@@ -1827,6 +1827,19 @@ class ApexClient:
 
     # ============ Table Management ============
 
+    def _fetch_table_schema(self, table_name: str) -> None:
+        """Fetch and cache one table's declared types (catalog/file schema)."""
+        if table_name in self._table_schemas or table_name in self._schema_fetch_attempted:
+            return
+        self._schema_fetch_attempted.add(table_name)
+        try:
+            types = dict(self._storage.table_types(table_name))
+        except Exception:
+            return
+        if types:
+            self._table_schemas[table_name] = types
+            self._table_decimal_scales[table_name] = _decimal_columns(types)
+
     def use_table(self, table_name: str):
         """
         Switch the active table used by subsequent read/write operations.
@@ -1860,6 +1873,9 @@ class ApexClient:
                 if self._current_table != table_name:
                     self._invalidate_replace_cache()
         self._current_table = table_name
+        # Learn the declared types once per table so reopened clients can scale
+        # Decimal values and project typed Arrow without an extra describe call.
+        self._fetch_table_schema(table_name)
         if self._fts_config_known_present or self._fts_tables:
             self._sync_fts_config_from_disk()
 
