@@ -244,9 +244,10 @@ default. Setting `APEX_SQL_DECIMAL=1` makes `CREATE TABLE` store them as the sam
 16-byte `Decimal128` payload with the declared precision/scale, and `INSERT`
 accepts exact string/integer literals (extra fractional digits are rejected;
 float literals are refused so nothing is rounded implicitly). This is opt-in
-while the query side is incomplete: `WHERE`, `ORDER BY`, joins and aggregates on
-such columns do not have DECIMAL semantics yet, so read the payload back as
-bytes or cast explicitly.
+while the query side is incomplete: `WHERE`, `ORDER BY` and joins on such columns
+do not have DECIMAL semantics yet, so read the payload back as bytes or cast
+explicitly. `SUM`/`MIN`/`MAX` on a DECIMAL column raise
+`SUM requires numeric column` (they used to return a silent `0.0`); `COUNT` works.
 
 An unrecognized type string raises `ValueError` listing the supported names.
 
