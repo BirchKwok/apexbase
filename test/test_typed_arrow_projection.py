@@ -49,3 +49,22 @@ def test_to_arrow_stays_binary_when_the_client_never_saw_the_schema(tmp_path):
     table = reopened.execute("SELECT u FROM t").to_arrow()
     assert str(table.schema.field("u").type) == "binary"
     reopened.close()
+
+
+def test_declared_types_do_not_mistype_same_named_columns_from_other_tables(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("dec", {"d": "decimal(38,2)"})
+    client.use_table("dec")
+    client.store({"d": [(123).to_bytes(16, "little", signed=True)]})
+    client.flush()
+    client.create_table("txt", {"d": "string"})
+    client.use_table("txt")
+    client.store({"d": ["hello"]})
+    client.flush()
+    client.use_table("dec")
+    # The current table has a decimal column named d, but this result reads the
+    # string column of another table: keep it as string, not decimal128.
+    table = client.execute("SELECT d FROM txt").to_arrow()
+    assert str(table.schema.field("d").type) == "string"
+    assert table.column("d").to_pylist() == ["hello"]
+    client.close()

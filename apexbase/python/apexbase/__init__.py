@@ -316,9 +316,20 @@ def _apply_declared_arrow_types(pa_mod, table, declared_types):
     arrays = []
     fields = []
     changed = False
+    def _fixed16_values(column):
+        return all(
+            value is None or isinstance(value, (bytes, bytearray))
+            for value in column.to_pylist()
+        )
+
     for name in table.column_names:
         column = table.column(name)
         declared = str(declared_types.get(name, "")).strip().lower()
+        # A query may project a same-named column from another table; only apply
+        # the fixed-width decoding when the values actually are 16-byte payloads.
+        if declared in ("uuid",) or declared.startswith("decimal"):
+            if not _fixed16_values(column):
+                declared = ""
         if declared == "uuid":
             arrow_type = pa_mod.binary(16)
             values = [
