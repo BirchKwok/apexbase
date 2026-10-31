@@ -58,3 +58,24 @@ def test_decimal_aggregates_fail_loudly_instead_of_reporting_zero(tmp_path, monk
     assert client.execute("SELECT COUNT(d) AS n FROM t").to_dict() == [{"n": 2}]
     assert client.execute("SELECT COUNT(*) AS n FROM t").to_dict() == [{"n": 2}]
     client.close()
+
+
+def test_decimal_aggregates_decline_on_large_flushed_tables(tmp_path, monkeypatch):
+    """The mmap aggregation path must also decline DECIMAL value aggregates."""
+    monkeypatch.setenv("APEX_SQL_DECIMAL", "1")
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.execute("CREATE TABLE t (d DECIMAL(18,2))")
+    client.use_table("t")
+    payload = [(index % 1000).to_bytes(16, "little", signed=True) for index in range(200_000)]
+    client.store({"d": payload})
+    client.flush()
+    client.close()
+
+    reopened = ApexClient(str(tmp_path), drop_if_exists=False, enable_cache=False)
+    reopened.use_table("t")
+    import pytest
+
+    with pytest.raises(RuntimeError, match="numeric"):
+        reopened.execute("SELECT SUM(d) AS s FROM t")
+    assert reopened.execute("SELECT COUNT(*) AS n FROM t").to_dict() == [{"n": 200_000}]
+    reopened.close()
