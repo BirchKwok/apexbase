@@ -1389,6 +1389,10 @@ first = results[0]
 second = results[1]
 ```
 
+**Typed projection:** ``to_arrow(declared_types=client.describe_table())`` projects
+16-byte ``uuid`` columns as ``fixed_size_binary(16)`` and ``decimal(p,s)`` columns
+as ``decimal128(p,s)`` instead of plain ``binary``.
+
 ---
 
 ## Constants

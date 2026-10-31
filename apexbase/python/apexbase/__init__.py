@@ -7,6 +7,7 @@ Uses custom single-file storage format (.apex) to provide efficient data storage
 from __future__ import annotations
 
 import importlib.util
+import re
 import weakref
 import atexit
 import threading
@@ -307,6 +308,51 @@ def _close_default_connection():
 atexit.register(_close_default_connection)
 
 
+def _apply_declared_arrow_types(pa_mod, table, declared_types):
+    """Rebuild table columns that carry parameterised storage types."""
+    decimal_re = re.compile(
+        r"decimal\s*\(\s*(\d+)\s*,\s*(-?\d+)\s*\)", re.IGNORECASE
+    )
+    arrays = []
+    fields = []
+    changed = False
+    for name in table.column_names:
+        column = table.column(name)
+        declared = str(declared_types.get(name, "")).strip().lower()
+        if declared == "uuid":
+            arrow_type = pa_mod.binary(16)
+            values = [
+                None if value is None else bytes(value) for value in column.to_pylist()
+            ]
+            arrays.append(pa_mod.array(values, type=arrow_type))
+            fields.append(pa_mod.field(name, arrow_type))
+            changed = True
+            continue
+        match = decimal_re.fullmatch(declared)
+        if match:
+            import decimal as decimal_module
+
+            precision, scale = int(match.group(1)), int(match.group(2))
+            arrow_type = pa_mod.decimal128(precision, scale)
+            values = [
+                None
+                if value is None
+                else decimal_module.Decimal(
+                    int.from_bytes(bytes(value), "little", signed=True)
+                ).scaleb(-scale)
+                for value in column.to_pylist()
+            ]
+            arrays.append(pa_mod.array(values, type=arrow_type))
+            fields.append(pa_mod.field(name, arrow_type))
+            changed = True
+            continue
+        arrays.append(column)
+        fields.append(table.schema.field(name))
+    if not changed:
+        return table
+    return pa_mod.Table.from_arrays(arrays, schema=pa_mod.schema(fields))
+
+
 class ResultView:
     """Query result view - Arrow-first high-performance implementation"""
     
@@ -514,28 +560,39 @@ class ResultView:
             return df
         return pl_mod.DataFrame(self._ensure_data())
     
-    def to_arrow(self):
+    def to_arrow(self, declared_types=None):
         """Convert results to a PyArrow Table.
-        
+
+        Args:
+            declared_types: Optional ``{column: type string}`` map (usually from
+                :meth:`ApexClient.describe_table`). 16-byte fixed-width columns
+                (``uuid``, ``decimal(p,s)``) are projected as ``fixed_size_binary(16)``
+                and ``decimal128(p,s)`` respectively; without the map they stay
+                plain ``binary`` columns because a query result does not carry
+                column type metadata yet.
+
         Returns:
             pyarrow.Table: Arrow Table containing the query results.
-            
+
         Raises:
             ImportError: If pyarrow is not available.
         """
         if not ARROW_AVAILABLE:
-            raise ImportError("pyarrow not available. Install with: pip install pyarrow")
+            raise ImportError("pyarrow not available. Install with `pip install pyarrow`")
         pa_mod = _ensure_pyarrow()
-        
+
         self._ensure_arrow()
         if self._arrow_table is not None:
-            show_id = bool(getattr(self, "_show_internal_id", False))
-            if not show_id:
-                # Remove _id column
-                if '_id' in self._arrow_table.column_names:
-                    return self._arrow_table.drop(['_id'])
-            return self._arrow_table
-        return pa_mod.Table.from_pylist(self._ensure_data())
+            table = self._arrow_table
+            if not getattr(self, "_show_internal_id", False) and '_id' in table.column_names:
+                table = table.drop(['_id'])
+        else:
+            table = pa_mod.Table.from_pylist(self._ensure_data())
+            if '_id' in table.column_names and not getattr(self, "_show_internal_id", False):
+                table = table.drop(['_id'])
+        if declared_types:
+            return _apply_declared_arrow_types(pa_mod, table, declared_types)
+        return table
 
     def to_record_batches(self, max_chunksize: int = None):
         """Split the materialized Arrow result into record batches.

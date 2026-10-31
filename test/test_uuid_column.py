@@ -143,9 +143,9 @@ def test_arrow_representation_is_still_binary_pending_the_metadata_batch(tmp_pat
 
     ``QueryResult.to_arrow`` builds the table in Python from the lazy pydict, so
     the 16-byte UUID/Decimal payloads currently surface as plain ``binary``
-    columns. The metadata batch (V5 §127.2) will render them as
-    ``fixed_size_binary(16)`` / ``decimal128(p,s)``; this test should be updated
-    with that change and keeps the current contract pinned until then.
+    columns. ``to_arrow(declared_types)`` already renders them as
+    ``fixed_size_binary(16)`` / ``decimal128(p,s)``; this test pins the default
+    (no metadata) contract until query results carry column types themselves.
     """
     client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
     client.create_table("t", {"u": "uuid", "d": "decimal(38,2)"})
