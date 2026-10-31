@@ -6048,6 +6048,32 @@ class ApexClient:
         self._invalidate_table_schema_cache()
         self._storage.drop_column(column_name)
 
+    def describe_table(self, table_name: str = None) -> dict:
+        """Return ``{column: declared type}`` for a table.
+
+        The mapping includes the parameterised types that plain result columns
+        cannot expose: ``uuid`` and ``decimal(p,s)``. It reads the catalog schema,
+        falling back to the materialized file, so it also works for tables this
+        client did not create.
+
+        Args:
+            table_name: Table to describe; defaults to the current table.
+
+        Returns:
+            Dict of column name to type string.
+
+        Raises:
+            ValueError: If no table is selected or the table cannot be read.
+        """
+        self._check_connection()
+        table = table_name or self._current_table
+        if not table:
+            raise ValueError("describe_table requires a table name or a current table")
+        try:
+            return dict(self._storage.table_types(table))
+        except Exception as exc:
+            raise ValueError(str(exc)) from exc
+
     def _invalidate_table_schema_cache(self):
         """Forget cached declared types of the current table (after DDL)."""
         table = self._current_table

@@ -115,6 +115,7 @@ PUBLIC_API_CASES = (
     "ApexClient.retrieve_many",
     "ApexClient.retrieve_all",
     "ApexClient.list_fields",
+    "ApexClient.describe_table",
     "ApexClient.delete",
     "ApexClient.replace",
     "ApexClient.batch_replace",
@@ -387,7 +388,7 @@ class Fixture:
                 c.create_quantized_column("vec", "vec_tq4", "turboquant4")
         elif name.startswith("read_blob"):
             self.prepared["payload"] = self._blob_ready()
-        elif name in {"retrieve", "retrieve_many", "retrieve_all", "list_fields", "delete", "replace", "batch_replace", "execute", "execute_batch", "execute_batch_parallel", "query", "count_rows"}:
+        elif name in {"retrieve", "retrieve_many", "retrieve_all", "list_fields", "describe_table", "delete", "replace", "batch_replace", "execute", "execute_batch", "execute_batch_parallel", "query", "count_rows"}:
             c.use_table("main")
         elif name in {"from_pandas", "from_pyarrow", "from_polars", "from_lance"}:
             data = _columnar()
@@ -607,6 +608,9 @@ class Fixture:
         if name == "list_fields":
             c.use_table("main")
             return c.list_fields()
+        if name == "describe_table":
+            c.use_table("main")
+            return c.describe_table()
         if name == "delete":
             c.use_table("main")
             self.repeatable = False

@@ -90,3 +90,15 @@ def test_recreated_table_does_not_reuse_the_dropped_tables_scale(tmp_path):
     row = client.execute("SELECT d FROM t").to_dict()[0]
     assert _unscaled(row["d"]) == 12300
     client.close()
+
+
+def test_describe_table_reports_parameterised_types(tmp_path):
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"u": "uuid", "d": "decimal(38,2)", "n": "int64"})
+    client.use_table("t")
+    assert client.describe_table() == {
+        "u": "uuid",
+        "d": "decimal(38,2)",
+        "n": "int64",
+    }
+    client.close()
