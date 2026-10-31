@@ -68,3 +68,16 @@ def test_declared_types_do_not_mistype_same_named_columns_from_other_tables(tmp_
     assert str(table.schema.field("d").type) == "string"
     assert table.column("d").to_pylist() == ["hello"]
     client.close()
+
+
+def test_to_polars_keeps_typed_decimal_columns(tmp_path):
+    polars = __import__("pytest").importorskip("polars")
+    client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
+    client.create_table("t", {"d": "decimal(38,2)"})
+    client.use_table("t")
+    client.store({"d": [(123).to_bytes(16, "little", signed=True)]})
+    client.flush()
+    frame = client.execute("SELECT d FROM t").to_polars(client.describe_table())
+    dtype = str(frame.schema["d"])
+    assert "Decimal" in dtype or "decimal" in dtype.lower()
+    client.close()

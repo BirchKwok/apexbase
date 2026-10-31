@@ -544,7 +544,7 @@ class ResultView:
             df.index.name = None
         return df
     
-    def to_polars(self):
+    def to_polars(self, declared_types=None):
         """Convert results to a polars DataFrame.
         
         Returns:
@@ -556,6 +556,10 @@ class ResultView:
         if not POLARS_AVAILABLE:
             raise ImportError("polars not available. Install with: pip install polars")
         pl_mod = _ensure_polars()
+
+        if declared_types is not None:
+            # Typed Arrow keeps uuid/decimal(p,s) columns instead of plain binary.
+            return pl_mod.from_arrow(self.to_arrow(declared_types))
         
         if self._lazy_pydict is not None:
             show_id = bool(getattr(self, "_show_internal_id", False))
