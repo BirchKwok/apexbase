@@ -1034,6 +1034,9 @@ pub struct OnDemandStorage {
     mmap_cache: RwLock<MmapCache>,
     header: RwLock<OnDemandHeader>,
     schema: RwLock<OnDemandSchema>,
+    /// Lazily memoized "does this table have a DECIMAL128 column" flag
+    /// (0 unknown, 1 no, 2 yes). Avoids a schema lock on every aggregate query.
+    decimal_present: std::sync::atomic::AtomicU8,
     column_index: RwLock<Vec<ColumnIndexEntry>>,
     /// In-memory column data (legacy: used as write buffer for pending inserts)
     columns: RwLock<Vec<ColumnData>>,
@@ -1279,6 +1282,7 @@ impl OnDemandStorage {
             mmap_cache: RwLock::new(MmapCache::new()),
             header: RwLock::new(header),
             schema: RwLock::new(schema),
+            decimal_present: std::sync::atomic::AtomicU8::new(0),
             column_index: RwLock::new(Vec::new()),
             columns: RwLock::new(columns),
             ids: RwLock::new(Vec::new()),
@@ -1528,6 +1532,7 @@ impl OnDemandStorage {
             mmap_cache: RwLock::new(mmap_cache),
             header: RwLock::new(header),
             schema: RwLock::new(schema),
+            decimal_present: std::sync::atomic::AtomicU8::new(0),
             column_index: RwLock::new(column_index),
             columns: RwLock::new(columns),
             ids: RwLock::new(Vec::new()), // Empty - lazy loaded when needed
@@ -1733,6 +1738,7 @@ impl OnDemandStorage {
             mmap_cache: RwLock::new(mmap_cache),
             header: RwLock::new(header),
             schema: RwLock::new(schema),
+            decimal_present: std::sync::atomic::AtomicU8::new(0),
             column_index: RwLock::new(column_index),
             columns: RwLock::new(columns),
             ids: RwLock::new(Vec::new()),
@@ -2321,6 +2327,27 @@ impl OnDemandStorage {
     }
 
     /// Cheap DECIMAL128 test for one column, without cloning the schema.
+    /// Cheap "any DECIMAL128 column?" test; memoized per storage instance.
+    pub(crate) fn has_any_decimal_column(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        match self.decimal_present.load(Ordering::Relaxed) {
+            2 => true,
+            1 => false,
+            _ => {
+                let present = {
+                    let schema = self.schema.read();
+                    schema
+                        .columns
+                        .iter()
+                        .any(|(_, column_type)| matches!(column_type, ColumnType::Decimal128))
+                };
+                self.decimal_present
+                    .store(if present { 2 } else { 1 }, Ordering::Relaxed);
+                present
+            }
+        }
+    }
+
     pub(crate) fn column_is_decimal128(&self, name: &str) -> bool {
         let schema = self.schema.read();
         schema.get_index(name).is_some_and(|index| {

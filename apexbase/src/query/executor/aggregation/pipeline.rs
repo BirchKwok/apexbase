@@ -1924,10 +1924,13 @@ impl ApexExecutor {
         // execute_simple_agg uses the RCIX streaming path: one mmap pass for all columns
         let col_refs: Vec<&str> = unique_cols.iter().map(|s| s.as_str()).collect();
 
-        if let Some(result) =
-            try_decimal_aggregation(backend, stmt, &unique_cols, &col_refs, active_count)?
-        {
-            return Ok(Some(result));
+        // Memoized schema flag: ordinary tables never take the schema lock here.
+        if !unique_cols.is_empty() && backend.storage.has_any_decimal_column() {
+            if let Some(result) =
+                try_decimal_aggregation(backend, stmt, &unique_cols, &col_refs, active_count)?
+            {
+                return Ok(Some(result));
+            }
         }
 
         // (count: i64, sum: f64, min: f64, max: f64, is_int: bool)
