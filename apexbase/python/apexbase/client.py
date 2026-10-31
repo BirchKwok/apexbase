@@ -6045,7 +6045,17 @@ class ApexClient:
         if column_name == '_id':
             raise ValueError("Cannot drop _id column")
         self._invalidate_replace_cache()
+        self._invalidate_table_schema_cache()
         self._storage.drop_column(column_name)
+
+    def _invalidate_table_schema_cache(self):
+        """Forget cached declared types of the current table (after DDL)."""
+        table = self._current_table
+        if not table:
+            return
+        self._table_schemas.pop(table, None)
+        self._table_decimal_scales.pop(table, None)
+        self._schema_fetch_attempted.discard(table)
 
     def add_column(self, column_name: str, column_type: str):
         """
@@ -6060,6 +6070,7 @@ class ApexClient:
         """
         self._check_connection()
         self._invalidate_replace_cache()
+        self._invalidate_table_schema_cache()
         self._storage.add_column(column_name, column_type)
 
     def rename_column(self, old_column_name: str, new_column_name: str):
@@ -6082,6 +6093,7 @@ class ApexClient:
         if new_column_name in self.list_fields():
             raise ValueError(f"Column '{new_column_name}' already exists")
         self._invalidate_replace_cache()
+        self._invalidate_table_schema_cache()
         self._storage.rename_column(old_column_name, new_column_name)
 
     def get_column_dtype(self, column_name: str) -> str:
