@@ -1372,6 +1372,20 @@ class SQLiteBench:
             "EXCEPT SELECT city FROM bench WHERE age BETWEEN 25 AND 35 ORDER BY city"
         )
 
+    def bench_intersect_equal(self):
+        """INTERSECT with equality (set) semantics: no ORDER BY, only the set matters."""
+        return self._query_all(
+            "SELECT city FROM bench WHERE age BETWEEN 20 AND 30 "
+            "INTERSECT SELECT city FROM bench WHERE age BETWEEN 25 AND 35"
+        )
+
+    def bench_except_equal(self):
+        """EXCEPT with equality (set) semantics: no ORDER BY, only the set matters."""
+        return self._query_all(
+            "SELECT city FROM bench WHERE age BETWEEN 20 AND 30 "
+            "EXCEPT SELECT city FROM bench WHERE age BETWEEN 25 AND 35"
+        )
+
     def bench_in_subquery(self):
         return self._scalar(
             "SELECT COUNT(*) AS c FROM bench "
@@ -3529,6 +3543,20 @@ class ApexBaseBench:
             "EXCEPT SELECT city FROM default WHERE age BETWEEN 25 AND 35 ORDER BY city"
         )
 
+    def bench_intersect_equal(self):
+        """INTERSECT with equality (set) semantics: no ORDER BY, only the set matters."""
+        return self._query_all(
+            "SELECT city FROM default WHERE age BETWEEN 20 AND 30 "
+            "INTERSECT SELECT city FROM default WHERE age BETWEEN 25 AND 35"
+        )
+
+    def bench_except_equal(self):
+        """EXCEPT with equality (set) semantics: no ORDER BY, only the set matters."""
+        return self._query_all(
+            "SELECT city FROM default WHERE age BETWEEN 20 AND 30 "
+            "EXCEPT SELECT city FROM default WHERE age BETWEEN 25 AND 35"
+        )
+
     def bench_in_subquery(self):
         return self._scalar(
             "SELECT COUNT(*) AS c FROM default "
@@ -3960,6 +3988,8 @@ BENCHMARKS = [
     ("UNION DISTINCT (ordered)",         "bench_union_distinct",            False, False, False, None),
     ("INTERSECT (ordered)",              "bench_intersect",                 False, False, False, None),
     ("EXCEPT (ordered)",                 "bench_except",                    False, False, False, None),
+    ("INTERSECT (equal)",                "bench_intersect_equal",           False, False, False, None),
+    ("EXCEPT (equal)",                   "bench_except_equal",              False, False, False, None),
     ("IN subquery COUNT",                "bench_in_subquery",               False, False, False, None),
     ("EXISTS subquery COUNT",            "bench_exists_subquery",           False, False, False, None),
     ("Derived table GROUP BY",           "bench_derived_table",             False, False, False, None),
@@ -4071,6 +4101,8 @@ OLAP_BENCHMARK_NAMES = [
     "UNION DISTINCT (ordered)",
     "INTERSECT (ordered)",
     "EXCEPT (ordered)",
+    "INTERSECT (equal)",
+    "EXCEPT (equal)",
     "IN subquery COUNT",
     "EXISTS subquery COUNT",
     "Derived table GROUP BY",
@@ -4253,6 +4285,8 @@ FAIR_WORKLOAD_GROUPS = [
             "UNION DISTINCT (ordered)",
             "INTERSECT (ordered)",
             "EXCEPT (ordered)",
+            "INTERSECT (equal)",
+            "EXCEPT (equal)",
         ],
     ),
     (

@@ -1716,6 +1716,251 @@ impl ApexExecutor {
         }
     }
 
+    /// Split `a = b` into its two sides (parentheses unwrapped).
+    fn split_equality_expr(expr: &SqlExpr) -> Option<(&SqlExpr, &SqlExpr)> {
+        match expr {
+            SqlExpr::Paren(inner) => Self::split_equality_expr(inner),
+            SqlExpr::BinaryOp { left, op, right } => {
+                if matches!(op, crate::query::sql_parser::BinaryOperator::Eq) {
+                    Some((left.as_ref(), right.as_ref()))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Encode one array value into a canonical key (join equality domain).
+    fn encode_join_key(array: &ArrayRef, row: usize, out: &mut Vec<u8>) -> bool {
+        use arrow::array::*;
+        use arrow::datatypes::DataType as ArrowDT;
+        out.clear();
+        match array.data_type() {
+            ArrowDT::Int64 => {
+                let a = array.as_any().downcast_ref::<Int64Array>().unwrap();
+                out.extend_from_slice(&a.value(row).to_le_bytes());
+                true
+            }
+            ArrowDT::Int32 => {
+                let a = array.as_any().downcast_ref::<Int32Array>().unwrap();
+                out.extend_from_slice(&(a.value(row) as i64).to_le_bytes());
+                true
+            }
+            ArrowDT::Int16 => {
+                let a = array.as_any().downcast_ref::<Int16Array>().unwrap();
+                out.extend_from_slice(&(a.value(row) as i64).to_le_bytes());
+                true
+            }
+            ArrowDT::Int8 => {
+                let a = array.as_any().downcast_ref::<Int8Array>().unwrap();
+                out.extend_from_slice(&(a.value(row) as i64).to_le_bytes());
+                true
+            }
+            ArrowDT::UInt64 => {
+                let a = array.as_any().downcast_ref::<UInt64Array>().unwrap();
+                out.extend_from_slice(&a.value(row).to_le_bytes());
+                true
+            }
+            ArrowDT::Float64 => {
+                let a = array.as_any().downcast_ref::<Float64Array>().unwrap();
+                out.extend_from_slice(&a.value(row).to_bits().to_le_bytes());
+                true
+            }
+            ArrowDT::Float32 => {
+                let a = array.as_any().downcast_ref::<Float32Array>().unwrap();
+                out.extend_from_slice(&(a.value(row) as f64).to_bits().to_le_bytes());
+                true
+            }
+            ArrowDT::Utf8 => {
+                let a = array.as_any().downcast_ref::<StringArray>().unwrap();
+                let text = a.value(row).as_bytes();
+                out.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                out.extend_from_slice(text);
+                true
+            }
+            ArrowDT::Boolean => {
+                let a = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+                out.push(u8::from(a.value(row)));
+                true
+            }
+            ArrowDT::Date32 => {
+                let a = array.as_any().downcast_ref::<Date32Array>().unwrap();
+                out.extend_from_slice(&(a.value(row) as i64).to_le_bytes());
+                true
+            }
+            ArrowDT::Timestamp(_, _) => {
+                match array
+                    .as_any()
+                    .downcast_ref::<TimestampMicrosecondArray>()
+                {
+                    Some(a) => {
+                        out.extend_from_slice(&a.value(row).to_le_bytes());
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// `(probe rows with at least one match, total matches)` for a hash-key join.
+    fn count_join_key_matches(
+        probe: &ArrayRef,
+        build: &ArrayRef,
+    ) -> Option<(usize, usize)> {
+        // ahash (not the std SipHash map): the probe side is one lookup per left
+        // row, which dominated the shape before.
+        let mut counts: ahash::AHashMap<Vec<u8>, usize> =
+            ahash::AHashMap::with_capacity(build.len());
+        let mut key = Vec::with_capacity(32);
+        for row in 0..build.len() {
+            if build.is_null(row) {
+                continue;
+            }
+            if !Self::encode_join_key(build, row, &mut key) {
+                return None;
+            }
+            *counts.entry(key.clone()).or_insert(0) += 1;
+        }
+        let mut matched = 0usize;
+        let mut total = 0usize;
+        for row in 0..probe.len() {
+            if probe.is_null(row) {
+                continue;
+            }
+            if !Self::encode_join_key(probe, row, &mut key) {
+                return None;
+            }
+            if let Some(count) = counts.get(&key) {
+                matched += 1;
+                total += *count;
+            }
+        }
+        Some((matched, total))
+    }
+
+    /// COUNT(*) over a single join whose ON clause is an equality between two
+    /// side-local expressions, with no WHERE clause (V5 S7 D13).
+    fn try_count_only_expression_join(
+        stmt: &SelectStatement,
+        join: &JoinClause,
+        left_names: &[String],
+        right_names: &[String],
+        left_path: &Path,
+        right_path: &Path,
+    ) -> io::Result<Option<i64>> {
+        if stmt.where_clause.is_some()
+            || !matches!(
+                join.join_type,
+                JoinType::Inner | JoinType::Left | JoinType::Right
+            )
+        {
+            return Ok(None);
+        }
+        let Some((lhs, rhs)) = Self::split_equality_expr(&join.on) else {
+            return Ok(None);
+        };
+        let left_backend = get_cached_backend(left_path)?;
+        let right_backend = get_cached_backend(right_path)?;
+        // A side-local expression references only columns that side owns. A
+        // qualifier names the table alias; an unqualified column is resolved by
+        // which side actually has it (present on both sides is ambiguous).
+        let local_side = |expr: &SqlExpr| -> Option<bool> {
+            // true = left, false = right
+            let refs = Self::expr_referenced_columns(expr);
+            if refs.is_empty() {
+                return None;
+            }
+            let mut side: Option<bool> = None;
+            for col in refs {
+                let (qualifier, bare) = match col.rsplit_once('.') {
+                    Some((qualifier, bare)) => (Some(qualifier), bare),
+                    None => (None, col.as_str()),
+                };
+                let on_left_alias = qualifier
+                    .map(|q| left_names.iter().any(|name| name == q))
+                    .unwrap_or(false);
+                let on_right_alias = qualifier
+                    .map(|q| right_names.iter().any(|name| name == q))
+                    .unwrap_or(false);
+                let (has_left, has_right) = if qualifier.is_some() {
+                    (
+                        on_left_alias && left_backend.get_column_type(bare).is_some(),
+                        on_right_alias && right_backend.get_column_type(bare).is_some(),
+                    )
+                } else {
+                    (
+                        left_backend.get_column_type(bare).is_some(),
+                        right_backend.get_column_type(bare).is_some(),
+                    )
+                };
+                let ref_side = match (has_left, has_right) {
+                    (true, false) => true,
+                    (false, true) => false,
+                    _ => return None,
+                };
+                match side {
+                    None => side = Some(ref_side),
+                    Some(existing) if existing == ref_side => {}
+                    Some(_) => return None,
+                }
+            }
+            side
+        };
+        let (left_expr, right_expr) = match (local_side(lhs), local_side(rhs)) {
+            (Some(true), Some(false)) => (lhs, rhs),
+            (Some(false), Some(true)) => (rhs, lhs),
+            _ => return Ok(None),
+        };
+        let plain_cols = |expr: &SqlExpr| -> Vec<String> {
+            let mut cols = Vec::new();
+            for col in Self::expr_referenced_columns(expr) {
+                let plain = col
+                    .trim_matches('"')
+                    .rsplit('.')
+                    .next()
+                    .unwrap_or(col.trim_matches('"'))
+                    .to_string();
+                if !cols.contains(&plain) {
+                    cols.push(plain);
+                }
+            }
+            cols
+        };
+        let left_cols = plain_cols(left_expr);
+        let right_cols = plain_cols(right_expr);
+        if left_cols.is_empty() || right_cols.is_empty() {
+            return Ok(None);
+        }
+        let left_refs_vec: Vec<&str> = left_cols.iter().map(|s| s.as_str()).collect();
+        let right_refs_vec: Vec<&str> = right_cols.iter().map(|s| s.as_str()).collect();
+        let left_refs = Self::filter_columns_for_backend(&left_backend, &left_refs_vec);
+        let right_refs = Self::filter_columns_for_backend(&right_backend, &right_refs_vec);
+        let left_batch = left_backend.read_columns_to_arrow(left_refs.as_deref(), 0, None)?;
+        let right_batch = right_backend.read_columns_to_arrow(right_refs.as_deref(), 0, None)?;
+        let left_keys = Self::evaluate_expr_to_array(&left_batch, left_expr)?;
+        let right_keys = Self::evaluate_expr_to_array(&right_batch, right_expr)?;
+
+        // INNER and LEFT probe the left side; RIGHT probes the right side.
+        let (probe_keys, build_keys) = if join.join_type == JoinType::Right {
+            (&right_keys, &left_keys)
+        } else {
+            (&left_keys, &right_keys)
+        };
+        let Some((matched, matches)) = Self::count_join_key_matches(probe_keys, build_keys) else {
+            return Ok(None);
+        };
+        let probe_rows = probe_keys.len();
+        let total = match join.join_type {
+            JoinType::Inner => matches,
+            // Every unmatched probe row still contributes its null-extended row.
+            _ => probe_rows - matched + matches,
+        };
+        Ok(Some(total as i64))
+    }
+
     fn try_count_only_join(        stmt: &SelectStatement,        joins: &[JoinClause],
         base_dir: &Path,
         default_table_path: &Path,
@@ -1773,7 +2018,24 @@ impl ApexExecutor {
         } else {
             match Self::extract_join_keys_with_filter(&join.on, &left_names, &right_names) {
                 Ok((lk, rk, _, _, extra)) => (lk, rk, extra),
-                Err(_) => return Ok(None),
+                Err(_) => {
+                    // V5 S7 D13: a COUNT(*) join whose ON clause is an equality
+                    // between two side-local expressions (e.g. `b.k + 1 = d.k`)
+                    // is answered by evaluating only the referenced columns into
+                    // keys and counting matches, instead of materializing the
+                    // joined rows (the wide-table 13.4 ms shape).
+                    if let Some(total) = Self::try_count_only_expression_join(
+                        stmt,
+                        join,
+                        &left_names,
+                        &right_names,
+                        &left_path,
+                        &right_path,
+                    )? {
+                        return Ok(Some(total));
+                    }
+                    return Ok(None);
+                }
             }
         };
         let plain_key = |key: &str| {

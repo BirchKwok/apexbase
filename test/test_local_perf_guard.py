@@ -342,7 +342,7 @@ def test_local_guard_full_mode_runs_every_dedicated_phase(local_guard):
     assert "chunked_only=True" in source
     assert "hybrid_only=True" in source
     assert "pgwire_only=True" in source
-    # M-21: the full perf phase is the frozen 103-metric public scoreboard, so
+    # M-21: the full perf phase is the frozen 105-metric public scoreboard, so
     # the DELETE/UPDATE/count-only/overlay shapes run as their own phase.
     assert "hot_shapes_only=True" in source
     assert "mixed_only=True" in source

@@ -89,10 +89,10 @@ def test_build_duckdb_vector_sql_uses_expected_functions():
 def test_public_profile_matches_readme_scoreboard_shape():
     module = load_benchmark_module()
 
-    assert len(module.PUBLIC_OLAP_BENCHMARK_NAMES) == 71
+    assert len(module.PUBLIC_OLAP_BENCHMARK_NAMES) == 73
     assert len(module.OLTP_FAIR_BENCHMARK_NAMES) == 32
-    assert len(module.benchmark_specs_for_profile(module.PROFILE_PUBLIC)) == 103
-    assert module.module_metric_counts(module.PROFILE_PUBLIC) == (71, 32, 14)
+    assert len(module.benchmark_specs_for_profile(module.PROFILE_PUBLIC)) == 105
+    assert module.module_metric_counts(module.PROFILE_PUBLIC) == (73, 32, 14)
     assert module.vector_metric_sets(module.PROFILE_PUBLIC) == (
         [
             ("TopK L2", "l2"),
@@ -113,8 +113,8 @@ def test_public_profile_matches_readme_scoreboard_shape():
 def test_extended_profile_keeps_diagnostics_available():
     module = load_benchmark_module()
 
-    assert len(module.benchmark_specs_for_profile(module.PROFILE_EXTENDED)) == 103
-    assert module.module_metric_counts(module.PROFILE_EXTENDED) == (79, 53, 17)
+    assert len(module.benchmark_specs_for_profile(module.PROFILE_EXTENDED)) == 105
+    assert module.module_metric_counts(module.PROFILE_EXTENDED) == (81, 53, 17)
     assert module.vector_metric_count(module.PROFILE_EXTENDED) == 9
 
 
