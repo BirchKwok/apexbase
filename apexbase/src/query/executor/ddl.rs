@@ -163,14 +163,13 @@ impl ApexExecutor {
     /// Execute CREATE TABLE statement
     /// High-performance: O(1) - records the full schema in the catalog and
     /// defers the `.apex` file write until the first real access.
-    /// Opt-in switch for storing SQL DECIMAL(p,s) columns as the fixed 16-byte
-    /// Decimal128 type with a LogicalType. Off by default in this batch so the
-    /// existing text fallback and its pinned test keep working; the INSERT
-    /// literal conversion lands with it.
+    /// SQL DECIMAL(p,s) columns are stored as the fixed 16-byte Decimal128 type
+    /// with a LogicalType by default (V5). `APEX_SQL_DECIMAL=0` restores the
+    /// legacy text column representation and its text comparison semantics.
     fn sql_decimal_enabled() -> bool {
-        matches!(
+        !matches!(
             std::env::var("APEX_SQL_DECIMAL").ok().as_deref(),
-            Some("1") | Some("true") | Some("TRUE") | Some("True") | Some("yes") | Some("on")
+            Some("0") | Some("false") | Some("FALSE") | Some("False") | Some("no") | Some("off")
         )
     }
 

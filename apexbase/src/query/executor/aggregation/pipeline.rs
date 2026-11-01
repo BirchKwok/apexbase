@@ -340,6 +340,10 @@ impl ApexExecutor {
         batch: &RecordBatch,
         order_by: &[crate::query::OrderByClause],
     ) -> io::Result<RecordBatch> {
+        // DECIMAL sort keys are 16-byte little-endian payloads; sort them as
+        // scaled i128 values so the ordering is numeric.
+        let decimal_sorted = crate::query::executor::decimal_sort_batch(batch, order_by)?;
+        let batch: &RecordBatch = decimal_sorted.as_ref().unwrap_or(batch);
         // ORDER BY materialises a sort key per row plus the permutation indices. Charge that
         // footprint to the query budget: GROUP BY state was already budgeted, while ORDER BY
         // (and JOIN/DISTINCT) could grow without any limit at all (out-of-core item OOC-3).
@@ -774,6 +778,11 @@ impl ApexExecutor {
         order_by: &[crate::query::OrderByClause],
         k: Option<usize>,
     ) -> io::Result<RecordBatch> {        use std::cmp::Ordering;
+
+        // DECIMAL sort keys keep their 16-byte payload in the scan batch; sort
+        // them as scaled i128 values so the ordering is numeric.
+        let decimal_sorted = crate::query::executor::decimal_sort_batch(batch, order_by)?;
+        let batch: &RecordBatch = decimal_sorted.as_ref().unwrap_or(batch);
 
         // Pre-evaluate any expression-based ORDER BY columns not yet in the batch.
         // e.g. ORDER BY array_distance(vec, [1,2,3]) — expression not in SELECT output yet.

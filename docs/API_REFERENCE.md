@@ -239,15 +239,17 @@ integer `123`). Values with more fractional digits than the scale raise
 set `APEX_LOGICAL_TYPES=0` to refuse creating such columns (it is an explicit
 error, never a silent downgrade).
 
-SQL `DECIMAL(p,s)` / `NUMERIC(p,s)` columns are still projected as text by
-default. Setting `APEX_SQL_DECIMAL=1` makes `CREATE TABLE` store them as the same
-16-byte `Decimal128` payload with the declared precision/scale, and `INSERT`
-accepts exact string/integer literals (extra fractional digits are rejected;
-float literals are refused so nothing is rounded implicitly). This is opt-in
-while the query side is incomplete: `WHERE`, `ORDER BY` and joins on such columns
-do not have DECIMAL semantics yet, so read the payload back as bytes or cast
-explicitly. `SUM`/`MIN`/`MAX` on a DECIMAL column raise
-`SUM requires numeric column` (they used to return a silent `0.0`); `COUNT` works.
+SQL `DECIMAL(p,s)` / `NUMERIC(p,s)` columns are stored as the same 16-byte
+`Decimal128` payload with the declared precision/scale by default (V5).
+`INSERT` accepts exact string/integer literals (extra fractional digits are
+rejected; float literals are refused so nothing is rounded implicitly) and
+`SUM`/`MIN`/`MAX` return the unscaled `i128` payload while `AVG` returns the
+scaled float. `WHERE`/`ORDER BY`/`IN`/`BETWEEN` compare the scaled values
+numerically (a non-numeric literal is an explicit error), and reading a column
+back still yields its 16-byte payload (D4) unless a typed projection is
+requested. Set `APEX_SQL_DECIMAL=0` to restore the legacy text representation
+with text comparison semantics. `GROUP BY` accepts a DECIMAL key; joins and
+DECIMAL expressions outside the forms above are out of scope for V5.
 
 An unrecognized type string raises `ValueError` listing the supported names.
 

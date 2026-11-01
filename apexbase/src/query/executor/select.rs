@@ -425,6 +425,41 @@ impl ApexExecutor {
 
     /// Execute SELECT statement with base_dir for proper subquery table resolution
     fn execute_select_with_base_dir(
+        stmt: SelectStatement,
+        storage_path: &Path,
+        base_dir: &Path,
+        default_table_path: &Path,
+    ) -> io::Result<ApexResult> {
+        // DECIMAL comparisons and ORDER BY keys need the column scale, which the
+        // table catalog owns. Install it once per statement so the predicate
+        // kernels and the sort-key rewrite can read it without a schema lookup
+        // per row; statements that cannot touch a DECIMAL column skip the cost.
+        let _decimal_hints = if matches!(stmt.from, Some(FromItem::Table { .. }))
+            && (stmt.where_clause.is_some()
+                || !stmt.order_by.is_empty()
+                || stmt.having.is_some()
+                || !stmt.group_by.is_empty()
+                || stmt
+                    .columns
+                    .iter()
+                    .any(|column| matches!(column, SelectColumn::Aggregate { .. })))
+        {
+            crate::query::executor::install_decimal_hints(storage_path)
+        } else {
+            crate::query::executor::DecimalHintGuard::none()
+        };
+        let result = Self::execute_select_with_base_dir_inner(
+            stmt,
+            storage_path,
+            base_dir,
+            default_table_path,
+        )?;
+        // Internal numeric math uses Arrow Decimal128; the public surface keeps
+        // the fixed 16-byte payload (D4).
+        Ok(crate::query::executor::decimal_result_to_payload(result))
+    }
+
+    fn execute_select_with_base_dir_inner(
         mut stmt: SelectStatement,
         storage_path: &Path,
         base_dir: &Path,

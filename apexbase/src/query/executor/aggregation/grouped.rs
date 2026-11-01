@@ -4827,6 +4827,98 @@ impl ApexExecutor {
         }
     }
 
+    /// Per-group DECIMAL value aggregates over decoded i128 payloads.
+    fn decimal_group_aggregate(
+        func: &crate::query::AggregateFunc,
+        output_name: &str,
+        values: &[Option<i128>],
+        scale: i8,
+        group_indices: &[Vec<usize>],
+    ) -> io::Result<(Field, ArrayRef)> {
+        use crate::query::AggregateFunc;
+        use arrow::array::{Decimal128Array, Float64Array};
+
+        let decimal_field = |field_name: &str, entries: Vec<Option<i128>>| {
+            let array = Decimal128Array::from(entries)
+                .with_precision_and_scale(38, scale)
+                .map_err(|_| err_data("DECIMAL value exceeds the 38-digit range"))?;
+            Ok((
+                Field::new(field_name, ArrowDataType::Decimal128(38, scale), true),
+                Arc::new(array) as ArrayRef,
+            ))
+        };
+
+        match func {
+            AggregateFunc::Sum => {
+                let mut sums: Vec<Option<i128>> = Vec::with_capacity(group_indices.len());
+                for group in group_indices {
+                    let mut sum: i128 = 0;
+                    let mut seen = false;
+                    for &index in group {
+                        if let Some(value) = values.get(index).copied().flatten() {
+                            sum = sum
+                                .checked_add(value)
+                                .ok_or_else(|| err_data("DECIMAL SUM overflow"))?;
+                            seen = true;
+                        }
+                    }
+                    sums.push(seen.then_some(sum));
+                }
+                decimal_field(output_name, sums)
+            }
+            AggregateFunc::Avg => {
+                let averages: Vec<f64> = group_indices
+                    .iter()
+                    .map(|group| {
+                        let mut sum: i128 = 0;
+                        let mut count: i64 = 0;
+                        for &index in group {
+                            if let Some(value) = values.get(index).copied().flatten() {
+                                sum = sum.wrapping_add(value);
+                                count += 1;
+                            }
+                        }
+                        if count == 0 {
+                            0.0
+                        } else {
+                            sum as f64 / 10f64.powi(scale as i32) / count as f64
+                        }
+                    })
+                    .collect();
+                Ok((
+                    Field::new(output_name, ArrowDataType::Float64, false),
+                    Arc::new(Float64Array::from(averages)),
+                ))
+            }
+            AggregateFunc::Min | AggregateFunc::Max => {
+                let is_min = matches!(func, AggregateFunc::Min);
+                let best: Vec<Option<i128>> = group_indices
+                    .iter()
+                    .map(|group| {
+                        let mut best: Option<i128> = None;
+                        for &index in group {
+                            if let Some(value) = values.get(index).copied().flatten() {
+                                best = Some(match best {
+                                    None => value,
+                                    Some(current) => {
+                                        if is_min {
+                                            current.min(value)
+                                        } else {
+                                            current.max(value)
+                                        }
+                                    }
+                                });
+                            }
+                        }
+                        best
+                    })
+                    .collect();
+                decimal_field(output_name, best)
+            }
+            _ => Err(err_data("unsupported DECIMAL group aggregate")),
+        }
+    }
+
     pub(in crate::query::executor) fn compute_aggregate_for_groups(
         batch: &RecordBatch,
         func: &crate::query::AggregateFunc,
@@ -4860,6 +4952,29 @@ impl ApexExecutor {
             let trimmed = c.trim_matches('"');
             strip_column_qualifier(trimmed).to_string()
         });
+
+        // DECIMAL value aggregates accumulate the decoded i128 payloads per
+        // group; the 16-byte payloads are not f64/int64 arrays, so they cannot
+        // take the numeric branches below.
+        if !distinct && !matches!(func, AggregateFunc::Count) {
+            if let Some(col_name) = &actual_column {
+                if let Some(scale) = crate::query::executor::decimal_scale_hint(col_name) {
+                    if let Some(array) = batch.column_by_name(col_name) {
+                        if let Some(values) =
+                            crate::query::executor::decimal_column_values(array)
+                        {
+                            return Self::decimal_group_aggregate(
+                                func,
+                                &output_name,
+                                &values,
+                                scale,
+                                group_indices,
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         match func {
             AggregateFunc::Count => {

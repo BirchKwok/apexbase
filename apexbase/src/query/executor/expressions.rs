@@ -304,6 +304,11 @@ impl ApexExecutor {
                 high,
                 negated,
             } => {
+                if let Some(result) = crate::query::executor::decimal_between_mask(
+                    batch, column, low, high, *negated,
+                )? {
+                    return Ok(result);
+                }
                 let col_name = column.trim_matches('"');
                 let val = Self::get_column_by_name(batch, col_name)
                     .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
@@ -1198,6 +1203,15 @@ impl ApexExecutor {
             || matches!(right, SqlExpr::Literal(Value::Null))
         {
             return Ok(BooleanArray::new_null(batch.num_rows()));
+        }
+
+        // DECIMAL columns keep their 16-byte payload in the scan batch, so a
+        // comparison against a numeric literal has to be evaluated over the
+        // scaled i128 values rather than byte-wise.
+        if let Some(result) =
+            crate::query::executor::decimal_comparison_mask(batch, left, op, right)?
+        {
+            return Ok(result);
         }
 
         // OPTIMIZATION: Fast path for column vs literal comparisons using scalar ops
@@ -6315,6 +6329,11 @@ impl ApexExecutor {
         use ahash::AHashSet;
         use arrow::array::DictionaryArray;
         use arrow::datatypes::UInt32Type;
+
+        if let Some(result) = crate::query::executor::decimal_in_mask(batch, column, values, negated)?
+        {
+            return Ok(result);
+        }
 
         let col_name = column.trim_matches('"');
         let target = Self::get_column_by_name(batch, col_name)

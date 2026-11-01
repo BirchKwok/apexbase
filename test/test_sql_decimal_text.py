@@ -1,16 +1,16 @@
-"""Pin the current SQL DECIMAL representation.
+"""`APEX_SQL_DECIMAL=0` restores the legacy text representation.
 
-The SQL parser (V5 §128/§129) maps ``DECIMAL(p,s)``/``NUMERIC(p,s)`` to a text
-column: the parameters are parsed and dropped and values are stored as their
-decimal string. The dedicated batch that turns this into ``ColumnType::Decimal128``
-plus ``LogicalType::Decimal`` must update this test together with the INSERT
-literal conversion, SELECT representation and aggregate semantics.
+The V5 default stores ``DECIMAL(p,s)`` as the fixed 16-byte ``Decimal128``
+payload with numeric comparison/ordering semantics (``test_sql_decimal_semantics``
+pins those). This test keeps the explicit opt-out honest so older deployments
+that still compare the decimal string can keep that behaviour.
 """
 
 from apexbase.client import ApexClient
 
 
-def test_sql_decimal_column_is_stored_as_text_today(tmp_path):
+def test_sql_decimal_column_falls_back_to_text(tmp_path, monkeypatch):
+    monkeypatch.setenv("APEX_SQL_DECIMAL", "0")
     client = ApexClient(str(tmp_path), drop_if_exists=True, enable_cache=False)
     client.execute("CREATE TABLE t (id INT64, d DECIMAL(10,2))")
     client.use_table("t")
@@ -18,7 +18,8 @@ def test_sql_decimal_column_is_stored_as_text_today(tmp_path):
     client.flush()
     rows = client.execute("SELECT id, d FROM t ORDER BY id").to_dict()
     assert rows == [{"id": 1, "d": "1.23"}, {"id": 2, "d": "45.60"}]
-    # Numeric comparison on the text column follows text ordering, which is the
-    # behaviour the Decimal batch will change.
+    # Text-ordering comparison is what the opt-out keeps.
     assert client.execute("SELECT COUNT(*) AS n FROM t WHERE d > '1.2'").to_dict() == [{"n": 2}]
+    # A DECIMAL declared while the switch is off must not gain the logical type.
+    assert client._storage.table_types("t")["d"] != "decimal(10,2)"
     client.close()

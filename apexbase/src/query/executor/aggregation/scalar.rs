@@ -18,6 +18,33 @@ impl ApexExecutor {
             .column_by_name(written)
             .or_else(|| batch.column_by_name(written.rsplit('.').next().unwrap_or(written)))
     }
+
+    /// Decoded DECIMAL payloads plus the column scale for a value aggregate.
+    /// `None` when the aggregate's column is not a DECIMAL column.
+    fn decimal_aggregate_values(
+        batch: &RecordBatch,
+        column: &Option<String>,
+    ) -> Option<(Vec<Option<i128>>, i8)> {
+        let col_name = column.as_ref()?;
+        let scale = crate::query::executor::decimal_scale_hint(col_name)?;
+        let array = Self::aggregate_column(batch, col_name)?;
+        crate::query::executor::decimal_column_values(array).map(|values| (values, scale))
+    }
+
+    fn decimal_aggregate_field(
+        output_name: &str,
+        value: Option<i128>,
+        scale: i8,
+    ) -> io::Result<(Field, ArrayRef)> {
+        use arrow::array::Decimal128Array;
+        let array = Decimal128Array::from(vec![value])
+            .with_precision_and_scale(38, scale)
+            .map_err(|_| err_data("DECIMAL value exceeds the 38-digit range"))?;
+        Ok((
+            Field::new(output_name, ArrowDataType::Decimal128(38, scale), true),
+            Arc::new(array),
+        ))
+    }
     pub(in crate::query::executor) fn execute_aggregation(
         batch: &RecordBatch,
         stmt: &SelectStatement,
@@ -124,6 +151,20 @@ impl ApexExecutor {
                 let col_name = column
                     .as_ref()
                     .ok_or_else(|| err_input("SUM requires column"))?;
+                if let Some((values, scale)) = Self::decimal_aggregate_values(batch, column) {
+                    let mut sum: i128 = 0;
+                    for value in values.iter().flatten() {
+                        sum = sum
+                            .checked_add(*value)
+                            .ok_or_else(|| err_data("DECIMAL SUM overflow"))?;
+                    }
+                    let sum = if values.iter().all(Option::is_none) {
+                        None
+                    } else {
+                        Some(sum)
+                    };
+                    return Self::decimal_aggregate_field(&output_name, sum, scale);
+                }
                 let clean_name = col_name.trim_matches('"');
                 let bare_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
                 let array = Self::aggregate_column(batch, col_name)
@@ -165,6 +206,25 @@ impl ApexExecutor {
                 let col_name = column
                     .as_ref()
                     .ok_or_else(|| err_input("AVG requires column"))?;
+                if let Some((values, scale)) = Self::decimal_aggregate_values(batch, column) {
+                    let mut sum: i128 = 0;
+                    let mut count: i64 = 0;
+                    for value in values.iter().flatten() {
+                        sum = sum
+                            .checked_add(*value)
+                            .ok_or_else(|| err_data("DECIMAL SUM overflow"))?;
+                        count += 1;
+                    }
+                    let avg = if count == 0 {
+                        0.0
+                    } else {
+                        sum as f64 / 10f64.powi(scale as i32) / count as f64
+                    };
+                    return Ok((
+                        Field::new(&output_name, ArrowDataType::Float64, false),
+                        Arc::new(Float64Array::from(vec![avg])),
+                    ));
+                }
                 let clean_name = col_name.trim_matches('"');
                 let bare_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
                 let array = Self::aggregate_column(batch, col_name)
@@ -221,6 +281,22 @@ impl ApexExecutor {
                 let col_name = column
                     .as_ref()
                     .ok_or_else(|| err_input(format!("{} requires column", fn_name)))?;
+                if let Some((values, scale)) = Self::decimal_aggregate_values(batch, column) {
+                    let mut best: Option<i128> = None;
+                    for value in values.iter().flatten() {
+                        best = Some(match best {
+                            None => *value,
+                            Some(current) => {
+                                if is_min {
+                                    current.min(*value)
+                                } else {
+                                    current.max(*value)
+                                }
+                            }
+                        });
+                    }
+                    return Self::decimal_aggregate_field(&output_name, best, scale);
+                }
                 let clean_name = col_name.trim_matches('"');
                 let bare_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
                 let array = Self::aggregate_column(batch, col_name)

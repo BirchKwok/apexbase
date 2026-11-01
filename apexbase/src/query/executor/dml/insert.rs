@@ -445,28 +445,40 @@ impl ApexExecutor {
         };
 
         // Declared scale per Decimal128 column, used to encode numeric literals
-        // into the fixed 16-byte payload (the SQL DECIMAL opt-in path).
+        // into the fixed 16-byte payload. The catalog is authoritative: a file a
+        // write path re-materialized may have lost the logical-type section, and
+        // reading the scale from it would encode every later INSERT at scale 0.
         let decimal_scales: std::collections::HashMap<String, i8> = {
+            let mut scales = std::collections::HashMap::new();
+            if let Some(catalog) =
+                crate::query::executor::catalog_schema_snapshot(storage.path())
+            {
+                for (idx, (name, _)) in catalog.columns.iter().enumerate() {
+                    if let Some(crate::storage::LogicalType::Decimal { scale, .. }) =
+                        catalog.logical_type(idx)
+                    {
+                        scales.insert(name.clone(), *scale);
+                    }
+                }
+            }
             let snapshot = storage.storage.schema_snapshot();
-            snapshot
-                .columns
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, (name, column_type))| {
-                    if !matches!(
-                        column_type,
-                        crate::storage::on_demand::ColumnType::Decimal128
-                    ) {
-                        return None;
-                    }
-                    match snapshot.logical_type(idx) {
-                        Some(crate::storage::LogicalType::Decimal { scale, .. }) => {
-                            Some((name.clone(), *scale))
-                        }
-                        _ => None,
-                    }
-                })
-                .collect()
+            for (idx, (name, column_type)) in snapshot.columns.iter().enumerate() {
+                if scales.contains_key(name) {
+                    continue;
+                }
+                if !matches!(
+                    column_type,
+                    crate::storage::on_demand::ColumnType::Decimal128
+                ) {
+                    continue;
+                }
+                if let Some(crate::storage::LogicalType::Decimal { scale, .. }) =
+                    snapshot.logical_type(idx)
+                {
+                    scales.insert(name.clone(), *scale);
+                }
+            }
+            scales
         };
 
         // Build row-based data with proper NULL handling via Value::Null
