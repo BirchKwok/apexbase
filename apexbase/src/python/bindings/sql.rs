@@ -1310,6 +1310,50 @@ impl ApexStorageImpl {
         Ok(())
     }
 
+    /// Whether the table declares any column that needs the typed Arrow reader
+    /// (time family, list or extension). This is the cheap probe behind the
+    /// Python fast-path bypass: it reads only the stored schema bytes (catalog
+    /// first) instead of formatting every declared type name.
+    fn has_typed_read_columns(&self, py: Python<'_>, name: &str) -> PyResult<bool> {
+        use crate::storage::on_demand::ColumnType;
+        let base_dir = self.current_base_dir();
+        // Catalog first: a lazily-created table may not have a data file yet, and
+        // a cold-reopen table does not need to be mapped just to answer this.
+        let catalog_schema = py
+            .allow_threads(|| crate::storage::table_catalog::schema_bytes(&base_dir, name))
+            .ok()
+            .flatten()
+            .and_then(|bytes| crate::storage::OnDemandSchema::from_bytes(&bytes).ok());
+        let schema = match catalog_schema {
+            Some(schema) => Some(schema),
+            None => {
+                let table_path = base_dir.join(format!("{}.apex", name));
+                if !table_path.exists() {
+                    None
+                } else {
+                    py.allow_threads(|| crate::Database::read_backend(&table_path))
+                        .ok()
+                        .map(|backend| backend.storage.schema_snapshot())
+                }
+            }
+        };
+        let Some(schema) = schema else {
+            return Ok(false);
+        };
+        Ok(schema.columns.iter().any(|(_, column_type)| {
+            matches!(
+                column_type,
+                ColumnType::Timestamp
+                    | ColumnType::TimestampTz
+                    | ColumnType::Date
+                    | ColumnType::Time
+                    | ColumnType::Interval
+                    | ColumnType::List
+                    | ColumnType::Extension
+            )
+        }))
+    }
+
     /// Column name -> declared type string for one table (including `uuid` and
     /// `decimal(p,s)`), so a client that did not create the table can still know
     /// the parameterised types (e.g. the scale needed to encode Decimal values).

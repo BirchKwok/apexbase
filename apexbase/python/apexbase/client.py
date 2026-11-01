@@ -1229,6 +1229,7 @@ class ApexClient:
         # Tables that declare a time-family column: their point/short-read hot
         # paths read raw 8-byte payloads, so D5 presentation requires the Arrow
         # executor path instead.
+        self._typed_read_cache = {}
         self._declared_types_cache = {}
         self._time_family_columns_cache = {}
         self._list_columns_cache = {}
@@ -1611,30 +1612,22 @@ class ApexClient:
             declared = self._table_schemas.get(table) or {}
         if not declared:
             return row
+        time_columns = self._table_time_family_columns()
+        extensions = self._table_extension_columns()
+        if not time_columns and not extensions:
+            return row
         converted = None
-        for name, value in row.items():
+        for name, converter in time_columns.items():
+            value = row.get(name)
             if isinstance(value, bool) or not isinstance(value, int):
-                continue
-            kind = str(declared.get(name, "")).split("(", 1)[0].strip().lower()
-            converter = self._TIME_FAMILY_PY_CONVERTERS.get(kind)
-            if converter is None:
                 continue
             if converted is None:
                 converted = dict(row)
             converted[name] = converter(value)
-        # V5 S4: extension columns decode through the registered codec. Skip the
-        # registry lookup entirely unless the cached declared schema has one.
-        if any(
-            str(value).strip().lower().startswith('extension<')
-            for value in declared.values()
-        ):
-            extensions = self._table_extension_columns()
-        else:
-            extensions = {}
-        for name, value in row.items():
-            if name not in extensions or not isinstance(value, (bytes, bytearray)):
+        for name, (codec, version) in extensions.items():
+            value = row.get(name)
+            if not isinstance(value, (bytes, bytearray)):
                 continue
-            codec, version = extensions[name]
             if converted is None:
                 converted = dict(row)
             converted[name] = _decode_extension_value_checked(codec, version, value)
@@ -1653,18 +1646,15 @@ class ApexClient:
             declared = self._table_schemas.get(table) or {}
         if not declared:
             return columns_dict
-        for name, values in list(columns_dict.items()):
-            kind = str(declared.get(name, "")).split("(", 1)[0].strip().lower()
-            converter = self._TIME_FAMILY_PY_CONVERTERS.get(kind)
-            if converter is None:
+        time_columns = self._table_time_family_columns()
+        extensions = self._table_extension_columns()
+        if not time_columns and not extensions:
+            return columns_dict
+        for name, converter in time_columns.items():
+            values = columns_dict.get(name)
+            if values is None:
                 continue
             columns_dict[name] = [None if value is None else converter(value) for value in values]
-        if not any(
-            str(value).strip().lower().startswith('extension<')
-            for value in declared.values()
-        ):
-            return columns_dict
-        extensions = self._table_extension_columns()
         for name, (codec, version) in extensions.items():
             values = columns_dict.get(name)
             if values is None:
@@ -1709,14 +1699,13 @@ class ApexClient:
         if cached is not None:
             return cached
         declared = self._table_declared_types()
-        kinds = frozenset()
+        kinds = {}
         if declared:
-            kinds = frozenset(
-                name
-                for name, value in declared.items()
-                if str(value).split("(", 1)[0].strip().lower()
-                in self._TIME_FAMILY_DECLARED_TYPES
-            )
+            for name, value in declared.items():
+                kind = str(value).split("(", 1)[0].strip().lower()
+                converter = self._TIME_FAMILY_PY_CONVERTERS.get(kind)
+                if converter is not None:
+                    kinds[name] = converter
         self._time_family_columns_cache[table] = kinds
         return kinds
 
@@ -1849,9 +1838,39 @@ class ApexClient:
         return data
 
     def _table_typed_read_columns(self):
-        """Columns that need the typed Arrow reader (time family + lists + extension)."""
+        """Columns that need the typed Arrow reader (time family + lists + extension).
+
+        The boolean probe reads the stored schema bytes only; the full declared
+        type strings are fetched lazily only when the table actually has a typed
+        column. This keeps the first query after a cold reopen from paying the
+        full `table_types()` formatting cost.
+        """
+        table = self._current_table
+        if not table:
+            return frozenset()
+        needs_typed = self._typed_read_cache.get(table)
+        if needs_typed is None:
+            declared = self._table_schemas.get(table)
+            if declared is None:
+                self._fetch_table_schema(table)
+                declared = self._table_schemas.get(table)
+            if declared is not None:
+                needs_typed = any(
+                    str(value).strip().lower().startswith(("timestamp", "timestamptz", "date", "time", "interval", "duration", "list<", "extension<"))
+                    for value in declared.values()
+                )
+            else:
+                try:
+                    needs_typed = bool(self._storage.has_typed_read_columns(table))
+                except Exception:
+                    # Conservative: an unknown schema uses the typed reader so a
+                    # typed column can never be served through a raw-payload path.
+                    needs_typed = True
+            self._typed_read_cache[table] = needs_typed
+        if not needs_typed:
+            return frozenset()
         return (
-            self._table_time_family_columns()
+            frozenset(self._table_time_family_columns())
             | self._table_list_columns()
             | frozenset(self._table_extension_columns())
         )
@@ -2111,6 +2130,7 @@ class ApexClient:
             self._storage.use_database_(database)
             self._current_database = database if database else 'default'
             self._current_table = None
+            self._typed_read_cache.clear()
             self._declared_types_cache.clear()
             self._time_family_columns_cache.clear()
             self._list_columns_cache.clear()
@@ -2201,6 +2221,7 @@ class ApexClient:
         # caches: benchmark/transaction loops call use_table() before every
         # operation, and a redundant pop forced a native schema fetch each time.
         if self._current_table != table_name:
+            self._typed_read_cache.pop(table_name, None)
             self._declared_types_cache.pop(table_name, None)
             self._time_family_columns_cache.pop(table_name, None)
             self._list_columns_cache.pop(table_name, None)
@@ -2303,6 +2324,7 @@ class ApexClient:
                 except OSError as e:
                     raise ValueError(str(e)) from e
                 self._invalidate_replace_cache()
+                self._typed_read_cache.pop(table_name, None)
                 self._declared_types_cache.pop(table_name, None)
                 self._time_family_columns_cache.pop(table_name, None)
                 self._list_columns_cache.pop(table_name, None)
@@ -6568,6 +6590,7 @@ class ApexClient:
             return
         self._table_schemas.pop(table, None)
         self._table_decimal_scales.pop(table, None)
+        self._typed_read_cache.pop(table, None)
         self._declared_types_cache.pop(table, None)
         self._time_family_columns_cache.pop(table, None)
         self._list_columns_cache.pop(table, None)
