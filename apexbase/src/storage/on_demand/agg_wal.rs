@@ -200,7 +200,10 @@ fn numeric_view_of<'a>(
         | ColumnType::UInt32
         | ColumnType::UInt64
         | ColumnType::Timestamp
-        | ColumnType::Date => {
+        | ColumnType::Date
+        | ColumnType::TimestampTz
+        | ColumnType::Time
+        | ColumnType::Interval => {
             if encoding == COL_ENCODING_BITPACK {
                 Some((NumericView::Bitpack(body), true))
             } else if encoding == COL_ENCODING_PLAIN && body.len() >= 8 {
@@ -288,6 +291,9 @@ impl OnDemandStorage {
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
                 | ColumnType::Date
+                | ColumnType::TimestampTz
+                | ColumnType::Time
+                | ColumnType::Interval
                 | ColumnType::Bool
         ) {
             return Ok(None);
@@ -523,6 +529,9 @@ impl OnDemandStorage {
                     | ColumnType::UInt64
                     | ColumnType::Timestamp
                     | ColumnType::Date
+                    | ColumnType::TimestampTz
+                    | ColumnType::Time
+                    | ColumnType::Interval
                     | ColumnType::Float64
                     | ColumnType::Float32
                     | ColumnType::Bool
@@ -800,6 +809,9 @@ impl OnDemandStorage {
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
                 | ColumnType::Date
+                | ColumnType::TimestampTz
+                | ColumnType::Time
+                | ColumnType::Interval
                 | ColumnType::Bool
         ) {
             return Ok(None);
@@ -826,6 +838,9 @@ impl OnDemandStorage {
                     | ColumnType::UInt64
                     | ColumnType::Timestamp
                     | ColumnType::Date
+                    | ColumnType::TimestampTz
+                    | ColumnType::Time
+                    | ColumnType::Interval
                     | ColumnType::Float64
                     | ColumnType::Float32
                     | ColumnType::Bool
@@ -2152,7 +2167,10 @@ impl OnDemandStorage {
                         | ColumnType::UInt32
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
-                        | ColumnType::Date => {
+                        | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval => {
                             part.is_int = true;
                             view.for_each_index_eq(tdi, scan_n, |i| {
                                 if has_deletes && (del_bytes[i / 8] >> (i % 8)) & 1 == 1 {
@@ -2435,6 +2453,9 @@ impl OnDemandStorage {
                                                         | ColumnType::UInt64
                                                         | ColumnType::Timestamp
                                                         | ColumnType::Date
+                                                        | ColumnType::TimestampTz
+                                                        | ColumnType::Time
+                                                        | ColumnType::Interval
                                                 ) {
                                                     col_is_int[0] = true;
                                                     let vals =
@@ -3599,6 +3620,9 @@ impl OnDemandStorage {
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
                         | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval
                         | ColumnType::Float64
                         | ColumnType::Float32
                 )
@@ -3779,6 +3803,9 @@ impl OnDemandStorage {
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
                 | ColumnType::Date
+                | ColumnType::TimestampTz
+                | ColumnType::Time
+                | ColumnType::Interval
                 | ColumnType::Bool
         );
         let filter_is_float = matches!(filter_type, ColumnType::Float64 | ColumnType::Float32);
@@ -3817,6 +3844,9 @@ impl OnDemandStorage {
                     | ColumnType::UInt64
                     | ColumnType::Timestamp
                     | ColumnType::Date
+                    | ColumnType::TimestampTz
+                    | ColumnType::Time
+                    | ColumnType::Interval
                     | ColumnType::Float64
                     | ColumnType::Float32
                     | ColumnType::Bool
@@ -4450,6 +4480,9 @@ impl OnDemandStorage {
                             | ColumnType::UInt64
                             | ColumnType::Timestamp
                             | ColumnType::Date
+                            | ColumnType::TimestampTz
+                            | ColumnType::Time
+                            | ColumnType::Interval
                             | ColumnType::Bool => {
                                 part.is_int = true;
                                 AggView::I64(agg_values, agg_n)
@@ -4754,7 +4787,10 @@ impl OnDemandStorage {
                         | ColumnType::UInt32
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
-                        | ColumnType::Date => {
+                        | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval => {
                             if filter_encoding == COL_ENCODING_BITPACK {
                                 if filter_payload.len() < 17 {
                                     return None;
@@ -5273,7 +5309,10 @@ impl OnDemandStorage {
                                 | ColumnType::UInt32
                                 | ColumnType::UInt64
                                 | ColumnType::Timestamp
-                                | ColumnType::Date => {
+                                | ColumnType::Date
+                                | ColumnType::TimestampTz
+                                | ColumnType::Time
+                                | ColumnType::Interval => {
                                     if encoding == COL_ENCODING_PLAIN && payload.len() >= 8 {
                                         let count =
                                             u64::from_le_bytes(payload[0..8].try_into().unwrap())
@@ -6708,6 +6747,9 @@ impl OnDemandStorage {
                     | ColumnType::UInt64
                     | ColumnType::Timestamp
                     | ColumnType::Date
+                    | ColumnType::TimestampTz
+                    | ColumnType::Time
+                    | ColumnType::Interval
                     | ColumnType::Float64
                     | ColumnType::Float32
             ) {
@@ -6891,6 +6933,9 @@ impl OnDemandStorage {
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
                         | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval
                         | ColumnType::Float64
                         | ColumnType::Float32
                 )
@@ -7058,6 +7103,9 @@ impl OnDemandStorage {
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
                         | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval
                         | ColumnType::Float64
                         | ColumnType::Float32
                 )
@@ -7233,6 +7281,9 @@ impl OnDemandStorage {
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
                         | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval
                         | ColumnType::Float64
                         | ColumnType::Float32
                 )
@@ -7410,6 +7461,9 @@ impl OnDemandStorage {
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
                         | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval
                         | ColumnType::Float64
                         | ColumnType::Float32
                 )
@@ -9695,7 +9749,8 @@ impl OnDemandStorage {
                 match col_type {
                     ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
                     ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
-                    ColumnType::Timestamp | ColumnType::Date => {
+                    ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date |
+                    ColumnType::Time | ColumnType::Interval => {
                         int_columns.insert(col_name.clone(), Vec::with_capacity(num_rows));
                     }
                     ColumnType::Float64 | ColumnType::Float32 => {
@@ -10060,6 +10115,9 @@ impl OnDemandStorage {
                     | ColumnType::Float64
                     | ColumnType::Timestamp
                     | ColumnType::Date
+                    | ColumnType::TimestampTz
+                    | ColumnType::Time
+                    | ColumnType::Interval
             );
             let Some(array) = batch.column_by_name(name) else {
                 return Ok(None);

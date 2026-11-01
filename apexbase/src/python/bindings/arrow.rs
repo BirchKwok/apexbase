@@ -20,6 +20,10 @@ pub(super) fn pylist_representable(dtype: &arrow::datatypes::DataType) -> bool {
             | ArrowDT::Binary
             | ArrowDT::LargeBinary
             | ArrowDT::Decimal128(_, _)
+            | ArrowDT::Timestamp(_, _)
+            | ArrowDT::Date32
+            | ArrowDT::Time64(_)
+            | ArrowDT::Duration(_)
             | ArrowDT::Dictionary(_, _)
     )
 }

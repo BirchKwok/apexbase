@@ -182,6 +182,57 @@ fn reject_out_of_range_integer_element(item: &Bound<'_, PyAny>) -> PyResult<()> 
     Ok(())
 }
 
+
+/// Convert a Python `datetime`/`date`/`time`/`timedelta` (or None) to a `Value`.
+///
+/// Aware datetimes are normalized to UTC microseconds (V5 has no time-zone
+/// database); naive datetimes are treated as UTC, matching `TIMESTAMP`.
+fn py_time_value(obj: &Bound<'_, PyAny>) -> PyResult<Option<Value>> {
+    use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+
+    let type_name = obj
+        .get_type()
+        .name()
+        .map(|name| name.to_string())
+        .unwrap_or_default();
+    match type_name.as_str() {
+        "datetime" => {
+            if let Ok(moment) = obj.extract::<DateTime<FixedOffset>>() {
+                return Ok(Some(Value::Timestamp(
+                    moment.with_timezone(&chrono::Utc).timestamp_micros(),
+                )));
+            }
+            let moment = obj.extract::<NaiveDateTime>().map_err(|_| {
+                PyValueError::new_err("cannot convert Python datetime to a timestamp")
+            })?;
+            Ok(Some(Value::Timestamp(moment.and_utc().timestamp_micros())))
+        }
+        "date" => {
+            let date = obj.extract::<NaiveDate>().map_err(|_| {
+                PyValueError::new_err("cannot convert Python date to a DATE value")
+            })?;
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+            Ok(Some(Value::Date((date - epoch).num_days() as i32)))
+        }
+        "time" => {
+            let time = obj.extract::<NaiveTime>().map_err(|_| {
+                PyValueError::new_err("cannot convert Python time to a TIME value")
+            })?;
+            let micros = time.num_seconds_from_midnight() as i64 * 1_000_000
+                + time.nanosecond() as i64 / 1_000;
+            Ok(Some(Value::Time(micros)))
+        }
+        "timedelta" => {
+            let duration = obj.extract::<ChronoDuration>().map_err(|_| {
+                PyValueError::new_err("cannot convert Python timedelta to an INTERVAL value")
+            })?;
+            let micros = duration.num_microseconds().unwrap_or(i64::MAX);
+            Ok(Some(Value::Interval(micros)))
+        }
+        _ => Ok(None),
+    }
+}
+
 fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
     use pyo3::types::PyBytes;
 
@@ -257,6 +308,11 @@ fn py_to_value(obj: &Bound<'_, PyAny>) -> PyResult<Value> {
                 return Ok(Value::FixedList(floats));
             }
         }
+    }
+
+    // Python datetime/date/time/timedelta map onto the fixed 8-byte time family.
+    if let Some(value) = py_time_value(obj)? {
+        return Ok(value);
     }
 
     if let Ok(s) = obj.extract::<String>() {
@@ -419,8 +475,32 @@ fn value_to_py(py: Python<'_>, val: &Value) -> PyResult<PyObject> {
         Value::Blob(b) => Ok(PyBytes::new_bound(py, b).into()),
         Value::FixedList(b) => Ok(PyBytes::new_bound(py, b).into()),
         Value::Json(j) => Ok(j.to_string().into_py(py)),
-        Value::Timestamp(t) => Ok(t.into_py(py)),
-        Value::Date(d) => Ok(d.into_py(py)),
+        // D5: the timestamp/date family is presented as Python datetime/date/
+        // time/timedelta on every conversion path, never as raw integers.
+        Value::Timestamp(t) => {
+            use chrono::{DateTime, Utc};
+            Ok(match DateTime::<Utc>::from_timestamp_micros(*t) {
+                Some(dt) => dt.naive_utc().into_py(py),
+                None => py.None(),
+            })
+        }
+        Value::Date(d) => {
+            use chrono::{Duration, NaiveDate};
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            Ok((epoch + Duration::days(*d as i64)).into_py(py))
+        }
+        Value::Time(t) => {
+            use chrono::NaiveTime;
+            let seconds = (*t).div_euclid(1_000_000) as u32;
+            let micros = (*t).rem_euclid(1_000_000) as u32;
+            Ok(
+                match NaiveTime::from_num_seconds_from_midnight_opt(seconds, micros * 1_000) {
+                    Some(time) => time.into_py(py),
+                    None => py.None(),
+                },
+            )
+        }
+        Value::Interval(t) => Ok(chrono::Duration::microseconds(*t).into_py(py)),
         Value::Array(arr) => {
             let list = PyList::empty_bound(py);
             for v in arr {
@@ -740,7 +820,10 @@ impl ApexStorageImpl {
                 | ColumnType::UInt32
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
-                | ColumnType::Date => {
+                | ColumnType::TimestampTz
+                | ColumnType::Date
+                | ColumnType::Time
+                | ColumnType::Interval => {
                     let Ok(v) = value.extract::<i64>() else {
                         return Ok(None);
                     };
@@ -894,6 +977,15 @@ impl ApexStorageImpl {
             schema.add_column(name, *column_type);
         }
         for (index, (_, column_type)) in columns.iter().enumerate() {
+            if *column_type == crate::storage::ColumnType::TimestampTz {
+                schema.set_logical_type(
+                    index,
+                    Some(crate::storage::LogicalType::TimestampTz {
+                        offset_minutes: 0,
+                    }),
+                );
+                continue;
+            }
             if *column_type != crate::storage::ColumnType::Decimal128 {
                 continue;
             }
@@ -979,7 +1071,18 @@ impl ApexStorageImpl {
                 "turboquant3_vector" | "tq3_vector" => ColumnType::TurboQuant3Vector,
                 "turboquant4_vector" | "tq4_vector" => ColumnType::TurboQuant4Vector,
                 "timestamp" | "datetime" => ColumnType::Timestamp,
+                "timestamptz" | "timestamp_tz" | "timestamp with time zone" => {
+                    if Self::logical_types_disabled() {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}' is timestamptz: parameterised column types are disabled by APEX_LOGICAL_TYPES=0",
+                            col_name
+                        )));
+                    }
+                    ColumnType::TimestampTz
+                }
                 "date" => ColumnType::Date,
+                "time" => ColumnType::Time,
+                "interval" | "duration" => ColumnType::Interval,
                 "json" | "jsonb" => ColumnType::Json,
                 _ => return Err(PyValueError::new_err(format!(
                     "Unknown column type '{}' for column '{}'. Supported: int8, int16, int32, int64, \
@@ -2038,6 +2141,116 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
             }
             Ok(list.into())
         }
+        ArrowDT::Timestamp(unit, timezone) => {
+            use arrow::datatypes::TimeUnit;
+            use chrono::{DateTime, Utc};
+            let list = PyList::empty_bound(py);
+            macro_rules! append_timestamps {
+                ($array:ty) => {{
+                    let a = arr.as_any().downcast_ref::<$array>().unwrap();
+                    for i in 0..n {
+                        if a.is_null(i) {
+                            list.append(py.None())?;
+                            continue;
+                        }
+                        let micros = match unit {
+                            TimeUnit::Second => a.value(i).saturating_mul(1_000_000),
+                            TimeUnit::Millisecond => a.value(i).saturating_mul(1_000),
+                            TimeUnit::Microsecond => a.value(i),
+                            TimeUnit::Nanosecond => a.value(i) / 1_000,
+                        };
+                        match DateTime::<Utc>::from_timestamp_micros(micros) {
+                            Some(moment) => {
+                                if timezone.is_some() {
+                                    // D5: a TimestampTz column is an aware datetime.
+                                    list.append(moment)?;
+                                } else {
+                                    list.append(moment.naive_utc())?;
+                                }
+                            }
+                            None => list.append(py.None())?,
+                        }
+                    }
+                }};
+            }
+            match unit {
+                TimeUnit::Second => append_timestamps!(TimestampSecondArray),
+                TimeUnit::Millisecond => append_timestamps!(TimestampMillisecondArray),
+                TimeUnit::Microsecond => append_timestamps!(TimestampMicrosecondArray),
+                TimeUnit::Nanosecond => append_timestamps!(TimestampNanosecondArray),
+            }
+            Ok(list.into())
+        }
+        ArrowDT::Date32 => {
+            use chrono::{Duration, NaiveDate};
+            let a = arr.as_any().downcast_ref::<Date32Array>().unwrap();
+            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
+            let list = PyList::empty_bound(py);
+            for i in 0..n {
+                if a.is_null(i) {
+                    list.append(py.None())?;
+                } else {
+                    list.append(epoch + Duration::days(a.value(i) as i64))?;
+                }
+            }
+            Ok(list.into())
+        }
+        ArrowDT::Time64(unit) => {
+            use arrow::datatypes::TimeUnit;
+            use chrono::NaiveTime;
+            let list = PyList::empty_bound(py);
+            macro_rules! append_times {
+                ($array:ty, $per_second:expr) => {{
+                    let a = arr.as_any().downcast_ref::<$array>().unwrap();
+                    for i in 0..n {
+                        if a.is_null(i) {
+                            list.append(py.None())?;
+                            continue;
+                        }
+                        let total = a.value(i) as i64;
+                        let per_second: i64 = $per_second;
+                        let seconds = (total / per_second) as u32;
+                        let nanos = ((total % per_second) * (1_000_000_000 / per_second)) as u32;
+                        match NaiveTime::from_num_seconds_from_midnight_opt(seconds, nanos) {
+                            Some(time) => list.append(time)?,
+                            None => list.append(py.None())?,
+                        }
+                    }
+                }};
+            }
+            match unit {
+                TimeUnit::Second => append_times!(Time32SecondArray, 1),
+                TimeUnit::Millisecond => append_times!(Time32MillisecondArray, 1_000),
+                TimeUnit::Microsecond => append_times!(Time64MicrosecondArray, 1_000_000),
+                TimeUnit::Nanosecond => append_times!(Time64NanosecondArray, 1_000_000_000),
+            }
+            Ok(list.into())
+        }
+        ArrowDT::Duration(unit) => {
+            use arrow::datatypes::TimeUnit;
+            use chrono::Duration;
+            let list = PyList::empty_bound(py);
+            macro_rules! append_durations {
+                ($array:ty, $scale:expr) => {{
+                    let a = arr.as_any().downcast_ref::<$array>().unwrap();
+                    for i in 0..n {
+                        if a.is_null(i) {
+                            list.append(py.None())?;
+                        } else {
+                            let micros = a.value(i) * $scale;
+                            list.append(Duration::microseconds(micros))?;
+                        }
+                    }
+                }};
+            }
+            match unit {
+                TimeUnit::Second => append_durations!(DurationSecondArray, 1_000_000),
+                TimeUnit::Millisecond => append_durations!(DurationMillisecondArray, 1_000),
+                TimeUnit::Microsecond => append_durations!(DurationMicrosecondArray, 1),
+                TimeUnit::Nanosecond => append_durations!(DurationNanosecondArray, 0),
+            }
+            Ok(list.into())
+        }
         ArrowDT::Decimal128(_, _) => {
             // DECIMAL values are surfaced as their 16-byte little-endian payload
             // (D4); Decimal128 arrays only exist for query-layer numeric math.
@@ -2102,6 +2315,73 @@ fn arrow_value_at(array: &arrow::array::ArrayRef, idx: usize) -> Value {
         ArrowDataType::UInt64 => {
             let arr = array.as_any().downcast_ref::<UInt64Array>().unwrap();
             Value::UInt64(arr.value(idx))
+        }
+        ArrowDataType::Timestamp(_, _) => {
+            use arrow::datatypes::TimeUnit;
+            let micros = match array.data_type() {
+                ArrowDataType::Timestamp(unit, _) => match unit {
+                    TimeUnit::Second => array
+                        .as_any()
+                        .downcast_ref::<TimestampSecondArray>()
+                        .map(|a| a.value(idx).saturating_mul(1_000_000)),
+                    TimeUnit::Millisecond => array
+                        .as_any()
+                        .downcast_ref::<TimestampMillisecondArray>()
+                        .map(|a| a.value(idx).saturating_mul(1_000)),
+                    TimeUnit::Microsecond => array
+                        .as_any()
+                        .downcast_ref::<TimestampMicrosecondArray>()
+                        .map(|a| a.value(idx)),
+                    TimeUnit::Nanosecond => array
+                        .as_any()
+                        .downcast_ref::<TimestampNanosecondArray>()
+                        .map(|a| a.value(idx) / 1_000),
+                },
+                _ => None,
+            };
+            micros.map(Value::Timestamp).unwrap_or(Value::Null)
+        }
+        ArrowDataType::Date32 => array
+            .as_any()
+            .downcast_ref::<Date32Array>()
+            .map(|a| Value::Date(a.value(idx)))
+            .unwrap_or(Value::Null),
+        ArrowDataType::Time64(unit) => {
+            use arrow::datatypes::TimeUnit;
+            let micros = match unit {
+                TimeUnit::Microsecond => array
+                    .as_any()
+                    .downcast_ref::<Time64MicrosecondArray>()
+                    .map(|a| a.value(idx)),
+                TimeUnit::Nanosecond => array
+                    .as_any()
+                    .downcast_ref::<Time64NanosecondArray>()
+                    .map(|a| a.value(idx) / 1_000),
+                _ => None,
+            };
+            micros.map(Value::Time).unwrap_or(Value::Null)
+        }
+        ArrowDataType::Duration(unit) => {
+            use arrow::datatypes::TimeUnit;
+            let micros = match unit {
+                TimeUnit::Second => array
+                    .as_any()
+                    .downcast_ref::<DurationSecondArray>()
+                    .map(|a| a.value(idx).saturating_mul(1_000_000)),
+                TimeUnit::Millisecond => array
+                    .as_any()
+                    .downcast_ref::<DurationMillisecondArray>()
+                    .map(|a| a.value(idx).saturating_mul(1_000)),
+                TimeUnit::Microsecond => array
+                    .as_any()
+                    .downcast_ref::<DurationMicrosecondArray>()
+                    .map(|a| a.value(idx)),
+                TimeUnit::Nanosecond => array
+                    .as_any()
+                    .downcast_ref::<DurationNanosecondArray>()
+                    .map(|a| a.value(idx) / 1_000),
+            };
+            micros.map(Value::Interval).unwrap_or(Value::Null)
         }
         ArrowDataType::Binary => {
             let arr = array.as_any().downcast_ref::<BinaryArray>().unwrap();

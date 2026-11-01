@@ -228,7 +228,7 @@ Create a new table, optionally with a pre-defined schema.
 - `table_name`: Name of the table to create.
 - `schema`: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.
 
-**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp`, `date`, `json`, `uuid`, `decimal128`, `decimal(p,s)` (for example `decimal(38,2)`).
+**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp`, `timestamptz`, `date`, `time`, `interval`, `json`, `uuid`, `decimal128`, `decimal(p,s)` (for example `decimal(38,2)`).
 
 `uuid` and `decimal128` values are fixed 16-byte payloads. They are written and
 projected as `bytes` (no implicit list/string conversion); `decimal(p,s)` also
@@ -250,6 +250,28 @@ back still yields its 16-byte payload (D4) unless a typed projection is
 requested. Set `APEX_SQL_DECIMAL=0` to restore the legacy text representation
 with text comparison semantics. `GROUP BY` accepts a DECIMAL key; joins and
 DECIMAL expressions outside the forms above are out of scope for V5.
+
+### Time family (D5)
+
+`timestamp` / `datetime`, `timestamptz`, `date`, `time` and `interval` share a
+fixed 8-byte payload (UTC microseconds, UTC microseconds with a fixed display
+offset, days since the epoch, microseconds since midnight and signed
+microseconds respectively). They are presented as Python `datetime`, `date`,
+`time` and `timedelta` on **every** read path (full scan, projection, `LIMIT`,
+point read, aggregated `MIN`/`MAX`); `timestamptz` is an aware `datetime` (the
+current format carries a fixed UTC offset, default UTC). SQL type names are
+`TIMESTAMP`/`DATETIME`, `TIMESTAMPTZ`/`TIMESTAMP WITH TIME ZONE`, `DATE`,
+`TIME` and `INTERVAL`; literals are `'YYYY-MM-DD[ HH:MM[:SS[.ffffff]]]'`,
+`'HH:MM[:SS[.ffffff]]'` and `'<n> <unit>'` (`seconds`/`minutes`/`hours`/`days`/
+`weeks`) and an unparseable literal is an explicit error. An unparseable
+timestamp/date no longer silently becomes the epoch.
+
+Writes accept Python `datetime`/`date`/`time`/`timedelta` objects (columnar and
+single-row `store()`) once the column is declared with a time-family type, plus
+string literals in SQL `INSERT`. `MIN`/`MAX` keep the column's type; `SUM`/`AVG`
+over a time-family column raise an explicit error instead of adding payload
+integers. `APEX_LOGICAL_TYPES=0` refuses `timestamptz` like the other
+parameterised types.
 
 An unrecognized type string raises `ValueError` listing the supported names.
 

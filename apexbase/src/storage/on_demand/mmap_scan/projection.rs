@@ -16,7 +16,10 @@ fn parallel_index_extract_supports(col_type: ColumnType, encoding: u8) -> bool {
         | ColumnType::UInt32
         | ColumnType::UInt64
         | ColumnType::Timestamp
-        | ColumnType::Date => matches!(
+        | ColumnType::Date
+        | ColumnType::TimestampTz
+        | ColumnType::Time
+        | ColumnType::Interval => matches!(
             encoding,
             COL_ENCODING_PLAIN | COL_ENCODING_RLE | COL_ENCODING_BITPACK
         ),
@@ -1170,12 +1173,20 @@ impl OnDemandStorage {
                         );
                         (ArrowDataType::Date32, Arc::new(arr) as ArrayRef)
                     }
-                    _ => {
-                        let arr = PrimitiveArray::<Int64Type>::new(
-                            ScalarBuffer::from(values.clone()),
-                            null_buf,
-                        );
-                        (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                    other => {
+                        if other.is_time_family() {
+                            crate::storage::on_demand::time_family_arrow_typed(
+                                other,
+                                values.clone(),
+                                null_buf,
+                            )
+                        } else {
+                            let arr = PrimitiveArray::<Int64Type>::new(
+                                ScalarBuffer::from(values.clone()),
+                                null_buf,
+                            );
+                            (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                        }
                     }
                 },
                 ColumnData::Float64(values) => {
@@ -2392,7 +2403,10 @@ impl OnDemandStorage {
             | ColumnType::UInt32
             | ColumnType::UInt64
             | ColumnType::Timestamp
-            | ColumnType::Date => {
+            | ColumnType::Date
+            | ColumnType::TimestampTz
+            | ColumnType::Time
+            | ColumnType::Interval => {
                 // Format: [count:u64][values:i64*]
                 // Zero-copy optimization: read directly into i64 buffer
                 let byte_offset = HEADER_SIZE + (start_row * 8) as u64;
@@ -3146,7 +3160,10 @@ impl OnDemandStorage {
             | ColumnType::UInt32
             | ColumnType::UInt64
             | ColumnType::Timestamp
-            | ColumnType::Date => Self::read_numeric_scattered_optimized::<i64>(
+            | ColumnType::Date
+            | ColumnType::TimestampTz
+            | ColumnType::Time
+            | ColumnType::Interval => Self::read_numeric_scattered_optimized::<i64>(
                 mmap_cache,
                 file,
                 index,
@@ -3332,7 +3349,10 @@ impl OnDemandStorage {
                     | ColumnType::UInt32
                     | ColumnType::UInt64
                     | ColumnType::Timestamp
-                    | ColumnType::Date => ColBuf::I64(vec![None; n_out]),
+                    | ColumnType::Date
+                    | ColumnType::TimestampTz
+                    | ColumnType::Time
+                    | ColumnType::Interval => ColBuf::I64(vec![None; n_out]),
                     ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_out]),
                     ColumnType::String | ColumnType::StringDict | ColumnType::Json => {
                         ColBuf::Str(StringBuilder::with_capacity(n_out, n_out * 10))
@@ -3400,6 +3420,9 @@ impl OnDemandStorage {
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
                         | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval
                         | ColumnType::Float64
                         | ColumnType::Float32
                         | ColumnType::String | ColumnType::Json
@@ -3580,7 +3603,10 @@ impl OnDemandStorage {
                         | ColumnType::UInt32
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
-                        | ColumnType::Date => {
+                        | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval => {
                             // Primitive buffer + validity: 9 B/row instead of the
                             // 16 B Option layout, and the final array is a buffer
                             // move rather than an element-wise rebuild.
@@ -4044,7 +4070,10 @@ impl OnDemandStorage {
                         | ColumnType::UInt32
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
-                        | ColumnType::Date,
+                        | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval,
                         ColBuf::I64(vals),
                     ) if data_bytes.len() >= 8 => {
                         for &(out_idx, local_idx) in local_pairs {
@@ -4177,7 +4206,10 @@ impl OnDemandStorage {
                         | ColumnType::UInt32
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
-                        | ColumnType::Date,
+                        | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval,
                         ColBuf::I64(vals),
                     ) => {
                         for &(out_idx, local_idx) in local_pairs {
@@ -4704,7 +4736,10 @@ impl OnDemandStorage {
                     | ColumnType::UInt32
                     | ColumnType::UInt64
                     | ColumnType::Timestamp
-                    | ColumnType::Date => ColBuf::I64(vec![None; n_rows]),
+                    | ColumnType::Date
+                    | ColumnType::TimestampTz
+                    | ColumnType::Time
+                    | ColumnType::Interval => ColBuf::I64(vec![None; n_rows]),
                     ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_rows]),
                     ColumnType::String | ColumnType::StringDict | ColumnType::Json => ColBuf::Str(vec![None; n_rows]),
                     ColumnType::Bool => ColBuf::Bool(vec![None; n_rows]),
@@ -4808,7 +4843,10 @@ impl OnDemandStorage {
                         | ColumnType::UInt32
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
-                        | ColumnType::Date,
+                        | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval,
                         ColBuf::I64(vals),
                     ) if data_bytes.len() >= 8 => {
                         for &(out_idx, local_idx) in &valid_pairs {
@@ -4913,7 +4951,10 @@ impl OnDemandStorage {
                         | ColumnType::UInt32
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
-                        | ColumnType::Date,
+                        | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval,
                         ColBuf::I64(vals),
                     ) => {
                         for &(out_idx, local_idx) in &valid_pairs {
@@ -5193,7 +5234,10 @@ impl OnDemandStorage {
                 | ColumnType::UInt32
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
-                | ColumnType::Date => ColBuf::I64(vec![None; n_ids]),
+                | ColumnType::Date
+                | ColumnType::TimestampTz
+                | ColumnType::Time
+                | ColumnType::Interval => ColBuf::I64(vec![None; n_ids]),
                 ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_ids]),
                 ColumnType::String | ColumnType::StringDict | ColumnType::Json => ColBuf::Str(vec![None; n_ids]),
                 ColumnType::Bool => ColBuf::Bool(vec![None; n_ids]),
@@ -5342,7 +5386,10 @@ impl OnDemandStorage {
                         | ColumnType::UInt32
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
-                        | ColumnType::Date,
+                        | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval,
                         ColBuf::I64(vals),
                     ) if data_bytes.len() >= 8 => {
                         for &(out_pos, local_idx) in &valid_hits {
@@ -5462,7 +5509,10 @@ impl OnDemandStorage {
                         | ColumnType::UInt32
                         | ColumnType::UInt64
                         | ColumnType::Timestamp
-                        | ColumnType::Date,
+                        | ColumnType::Date
+                        | ColumnType::TimestampTz
+                        | ColumnType::Time
+                        | ColumnType::Interval,
                         ColBuf::I64(vals),
                     ) => {
                         for &(out_pos, local_idx) in &valid_hits {

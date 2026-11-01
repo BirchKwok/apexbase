@@ -22,6 +22,7 @@ Encodings are reached by value shape, not by a knob:
 import random
 
 import pytest
+import datetime as dt_module
 
 from apexbase.client import ApexClient
 
@@ -395,12 +396,16 @@ def test_integer_widths_and_timestamps_match_every_lane(tmp_path):
             sum_column="i64",
         )
 
-        # `ts` keeps a dual representation like vector columns do: Arrow-shaped
-        # lanes decode to `datetime`, while point/limit lanes carry the raw
-        # stored microseconds. Only the value is guaranteed, so compare it after
-        # normalising whichever form the lane returned.
+        # D5 unifies the presentation: every lane (scan, LIMIT, point) returns
+        # `datetime` for a TIMESTAMP column. Compare the instants; a naive
+        # datetime is interpreted as UTC (the storage representation).
+        _epoch = dt_module.datetime(1970, 1, 1)
+
         def _micros(value):
-            return int(value.timestamp() * 1_000_000) if hasattr(value, "timestamp") else int(value)
+            if hasattr(value, "timestamp"):
+                naive = value.replace(tzinfo=None) if value.tzinfo is not None else value
+                return int((naive - _epoch).total_seconds() * 1_000_000)
+            return int(value)
 
         for row in client.execute("SELECT _id, ts FROM t LIMIT 50").to_dict():
             row_id = int(row["_id"])

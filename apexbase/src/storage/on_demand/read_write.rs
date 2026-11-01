@@ -3869,6 +3869,19 @@ impl OnDemandStorage {
                     _ => return Ok(None), // unknown encoding — caller falls to mmap path
                 }
             };
+            // D5: the fixed 8-byte payload of the time family is decoded as
+            // `Int64` above; relabel it so LIMIT/point readers return
+            // datetime/date/time/timedelta instead of raw integers.
+            let (arrow_dt, arr) = if col_type.is_time_family() {
+                match arr.as_any().downcast_ref::<Int64Array>() {
+                    Some(values) => {
+                        crate::storage::on_demand::time_family_arrow_from_i64(*col_type, values)
+                    }
+                    None => (arrow_dt, arr),
+                }
+            } else {
+                (arrow_dt, arr)
+            };
             fields.push(Field::new(col_name.as_str(), arrow_dt, has_nulls));
             arrays.push(arr);
         }
@@ -4637,7 +4650,7 @@ impl OnDemandStorage {
         // next save() (update_v4_footer_schema) and read paths synthesize
         // all-NULL values for rows already on disk — no full load, no padding.
         if is_v4 && !base_loaded {
-            let col_type = ColumnType::from_data_type(dtype);
+            let col_type = ColumnType::from_data_type(dtype)?;
             let mut schema = self.schema.write();
             schema.add_column(name, col_type);
             let mut header = self.header.write();
@@ -4650,7 +4663,7 @@ impl OnDemandStorage {
             self.load_all_columns_into_memory()?;
         }
 
-        let col_type = ColumnType::from_data_type(dtype);
+        let col_type = ColumnType::from_data_type(dtype)?;
 
         let mut schema = self.schema.write();
         let mut columns = self.columns.write();

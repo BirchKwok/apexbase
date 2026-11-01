@@ -3,6 +3,79 @@
 use super::*;
 use crate::storage::ColumnData;
 
+/// Convert a Python time-family object into the 8-byte payload of `declared`.
+fn py_time_payload(
+    item: &Bound<'_, PyAny>,
+    declared: crate::data::DataType,
+) -> Result<i64, String> {
+    use chrono::{DateTime, Duration as ChronoDuration, FixedOffset, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
+
+    match declared {
+        crate::data::DataType::Timestamp | crate::data::DataType::TimestampTz => {
+            if let Ok(moment) = item.extract::<DateTime<FixedOffset>>() {
+                return Ok(moment.with_timezone(&chrono::Utc).timestamp_micros());
+            }
+            if let Ok(moment) = item.extract::<NaiveDateTime>() {
+                return Ok(moment.and_utc().timestamp_micros());
+            }
+            if let Ok(raw) = item.extract::<i64>() {
+                return Ok(raw);
+            }
+            let text = item.extract::<String>().map_err(|_| {
+                "expected datetime or timestamp text".to_string()
+            })?;
+            crate::data::time_literals::parse_timestamp_micros(&text)
+        }
+        crate::data::DataType::Date => {
+            if let Ok(date) = item.extract::<NaiveDate>() {
+                let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("epoch");
+                return Ok((date - epoch).num_days());
+            }
+            if let Ok(raw) = item.extract::<i64>() {
+                return Ok(raw);
+            }
+            let text = item
+                .extract::<String>()
+                .map_err(|_| "expected date or date text".to_string())?;
+            crate::data::time_literals::parse_date_days(&text).map(|days| days as i64)
+        }
+        crate::data::DataType::Time => {
+            if let Ok(time) = item.extract::<NaiveTime>() {
+                return Ok(time.num_seconds_from_midnight() as i64 * 1_000_000
+                    + time.nanosecond() as i64 / 1_000);
+            }
+            if let Ok(raw) = item.extract::<i64>() {
+                return Ok(raw);
+            }
+            let text = item
+                .extract::<String>()
+                .map_err(|_| "expected time or time text".to_string())?;
+            crate::data::time_literals::parse_time_micros(&text)
+        }
+        crate::data::DataType::Interval => {
+            if let Ok(duration) = item.extract::<ChronoDuration>() {
+                return Ok(duration.num_microseconds().unwrap_or(i64::MAX));
+            }
+            if let Ok(raw) = item.extract::<i64>() {
+                return Ok(raw);
+            }
+            let text = item
+                .extract::<String>()
+                .map_err(|_| "expected timedelta or interval text".to_string())?;
+            crate::data::time_literals::parse_interval_micros(&text)
+        }
+        _ => Err(format!("column type {:?} is not a time type", declared)),
+    }
+}
+
+/// A Python time-family object (`datetime`, `date`, `time`, `timedelta`).
+fn is_py_time_object(item: &Bound<'_, PyAny>) -> bool {
+    item.get_type()
+        .name()
+        .map(|name| matches!(name.to_string().as_str(), "datetime" | "date" | "time" | "timedelta"))
+        .unwrap_or(false)
+}
+
 #[pymethods]
 impl ApexStorageImpl {
     fn has_secondary_indexes(&self, py: Python<'_>) -> PyResult<bool> {
@@ -186,11 +259,27 @@ impl ApexStorageImpl {
         let mut fixedlist_columns_map: HashMap<String, Vec<Vec<u8>>> = HashMap::new();
         let mut bool_columns: HashMap<String, Vec<bool>> = HashMap::new();
         let mut null_positions: HashMap<String, Vec<bool>> = HashMap::new();
+        // Declared time-family columns encode Python datetime/date/time/timedelta
+        // objects into the 8-byte payload before the value is bucketed.
+        let declared_types = self.declared_column_datatypes(py);
 
         for (key, value) in row.iter() {
             let col_name: String = key.extract()?;
             if col_name == "_id" {
                 continue;
+            }
+
+            if !value.is_none() {
+                if let Some(declared) = declared_types.get(&col_name).copied() {
+                    if declared.is_time_family() {
+                        let raw = py_time_payload(&value, declared).map_err(|error| {
+                            PyValueError::new_err(format!("column '{}': {}", col_name, error))
+                        })?;
+                        int_columns.insert(col_name.clone(), vec![raw]);
+                        null_positions.insert(col_name.clone(), vec![false]);
+                        continue;
+                    }
+                }
             }
 
             if value.is_none() {
@@ -394,7 +483,10 @@ impl ApexStorageImpl {
                 | ColumnType::UInt32
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
-                | ColumnType::Date => {
+                | ColumnType::TimestampTz
+                | ColumnType::Date
+                | ColumnType::Time
+                | ColumnType::Interval => {
                     let v = if value.is_none() {
                         0
                     } else if let Ok(v) = value.extract::<i64>() {
@@ -737,6 +829,8 @@ impl ApexStorageImpl {
         Ok(Some(ids.into_iter().map(|id| id as i64).collect()))
     }
 
+
+
     fn store_columnar(&self, py: Python<'_>, columns: &Bound<'_, PyDict>) -> PyResult<Vec<i64>> {
         if columns.is_empty() {
             return Ok(Vec::new());
@@ -776,6 +870,41 @@ impl ApexStorageImpl {
             return Ok(Vec::new());
         }
 
+        // Declared column types guide the time-family conversion: a
+        // datetime/date/time/timedelta object written into a column declared as
+        // timestamp/timestamptz/date/time/interval becomes the 8-byte payload
+        // instead of being dropped.
+        let declared_types: HashMap<String, crate::data::DataType> = {
+            let mut declared = HashMap::new();
+            if let Ok((table_path, table_name)) = self.get_current_table_info() {
+                let materialized = table_path.exists();
+                let schema_columns: Option<Vec<(String, crate::storage::on_demand::ColumnType)>> =
+                    if materialized {
+                        py.allow_threads(|| crate::Database::read_backend(&table_path))
+                            .ok()
+                            .map(|backend| backend.storage.schema_snapshot().columns)
+                    } else {
+                        let base_dir = self.current_base_dir();
+                        crate::storage::table_catalog::schema_bytes(&base_dir, &table_name)
+                            .ok()
+                            .flatten()
+                            .and_then(|bytes| {
+                                crate::storage::OnDemandSchema::from_bytes(&bytes).ok()
+                            })
+                            .map(|schema| schema.columns)
+                    };
+                if let Some(columns) = schema_columns {
+                    for (name, column_type) in columns {
+                        declared.insert(
+                            name,
+                            crate::storage::backend::column_type_to_datatype(column_type),
+                        );
+                    }
+                }
+            }
+            declared
+        };
+
         // Build ColumnData directly from the Python buffers. Strings and bytes
         // are borrowed (&str / &[u8]) and copied once into the column data
         // buffer — no per-element String/Vec allocation, no typed intermediate
@@ -795,6 +924,30 @@ impl ApexStorageImpl {
 
             let col_len = list.len();
             if col_len == 0 {
+                continue;
+            }
+
+            if let Some(declared) = declared_types
+                .get(&col_name)
+                .copied()
+                .filter(|data_type| data_type.is_time_family())
+            {
+                let mut values = Vec::with_capacity(col_len);
+                let mut nulls = Vec::with_capacity(col_len);
+                for item in list.iter() {
+                    if item.is_none() {
+                        nulls.push(true);
+                        values.push(0);
+                        continue;
+                    }
+                    let value = py_time_payload(&item, declared).map_err(|error| {
+                        PyValueError::new_err(format!("column '{}': {}", col_name, error))
+                    })?;
+                    values.push(value);
+                    nulls.push(false);
+                }
+                columns_map.insert(col_name.clone(), ColumnData::Int64(values));
+                null_positions.insert(col_name.clone(), nulls);
                 continue;
             }
 
@@ -837,6 +990,13 @@ impl ApexStorageImpl {
                         col_type = Some("float");
                     } else if item.extract::<&str>().is_ok() {
                         col_type = Some("string");
+                    } else if is_py_time_object(&item) {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}' contains datetime/date/time/timedelta values; declare the \
+                             column type with create_table(\"{}\": \"timestamp\" | \"timestamptz\" | \
+                             \"date\" | \"time\" | \"interval\") before storing them",
+                            col_name, col_name
+                        )));
                     }
                     break;
                 }
@@ -2615,6 +2775,41 @@ impl ApexStorageImpl {
 }
 
 /// Rust-only helpers shared by the numeric `_id` update fast paths.
+impl ApexStorageImpl {
+    /// Declared `DataType` per column of the current table (catalog/file schema).
+    fn declared_column_datatypes(
+        &self,
+        py: Python<'_>,
+    ) -> HashMap<String, crate::data::DataType> {
+        let mut declared = HashMap::new();
+        let Ok((table_path, table_name)) = self.get_current_table_info() else {
+            return declared;
+        };
+        let schema_columns: Option<Vec<(String, crate::storage::on_demand::ColumnType)>> =
+            if table_path.exists() {
+                py.allow_threads(|| crate::Database::read_backend(&table_path))
+                    .ok()
+                    .map(|backend| backend.storage.schema_snapshot().columns)
+            } else {
+                let base_dir = self.current_base_dir();
+                crate::storage::table_catalog::schema_bytes(&base_dir, &table_name)
+                    .ok()
+                    .flatten()
+                    .and_then(|bytes| crate::storage::OnDemandSchema::from_bytes(&bytes).ok())
+                    .map(|schema| schema.columns)
+            };
+        if let Some(columns) = schema_columns {
+            for (name, column_type) in columns {
+                declared.insert(
+                    name,
+                    crate::storage::backend::column_type_to_datatype(column_type),
+                );
+            }
+        }
+        declared
+    }
+}
+
 impl ApexStorageImpl {
     /// Resolve the backend, numeric column type, and fast-path guards for a
     /// numeric `_id` update target. Pending DeltaStore rows are allowed; the

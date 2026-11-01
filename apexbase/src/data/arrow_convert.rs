@@ -275,6 +275,10 @@ fn value_to_arrow_type(value: &Value) -> ArrowDataType {
         Value::Blob(_) => ArrowDataType::LargeBinary,
         Value::Timestamp(_) => ArrowDataType::Int64,
         Value::Date(_) => ArrowDataType::Int64,
+        // The IPC export path keeps the raw 8-byte payload (as it already does
+        // for timestamp/date); the Arrow C Data path carries the typed values.
+        Value::Time(_) => ArrowDataType::Int64,
+        Value::Interval(_) => ArrowDataType::Int64,
         Value::Array(_) => ArrowDataType::Utf8, // Serialize arrays as JSON strings
     }
 }

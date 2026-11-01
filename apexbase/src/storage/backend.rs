@@ -486,10 +486,20 @@ pub fn invalidate_global_dict_cache(path: &Path) {
 // Type Conversions
 // ============================================================================
 
-/// Convert DataType to OnDemand ColumnType
-pub fn datatype_to_column_type(dt: &DataType) -> ColumnType {
-    match dt {
-        DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => ColumnType::Int64,
+/// Convert DataType to OnDemand ColumnType.
+///
+/// Unsupported types are an explicit error: silently storing them as text is
+/// exactly the V5 S2 ⑥ downgrade that must not happen.
+pub fn datatype_to_column_type(dt: &DataType) -> io::Result<ColumnType> {
+    Ok(match dt {
+        DataType::Int64
+        | DataType::Int32
+        | DataType::Int16
+        | DataType::Int8
+        | DataType::UInt64
+        | DataType::UInt32
+        | DataType::UInt16
+        | DataType::UInt8 => ColumnType::Int64,
         DataType::Float64 | DataType::Float32 => ColumnType::Float64,
         DataType::String => ColumnType::String,
         DataType::Bool => ColumnType::Bool,
@@ -499,7 +509,10 @@ pub fn datatype_to_column_type(dt: &DataType) -> ColumnType {
         DataType::Decimal | DataType::Decimal128 => ColumnType::Decimal128,
         DataType::Uuid => ColumnType::Uuid,
         DataType::Timestamp => ColumnType::Timestamp,
+        DataType::TimestampTz => ColumnType::TimestampTz,
         DataType::Date => ColumnType::Date,
+        DataType::Time => ColumnType::Time,
+        DataType::Interval => ColumnType::Interval,
         DataType::Float32Vector => ColumnType::FixedList,
         DataType::Float16Vector => ColumnType::Float16List,
         DataType::BFloat16Vector => ColumnType::BFloat16List,
@@ -509,8 +522,13 @@ pub fn datatype_to_column_type(dt: &DataType) -> ColumnType {
         DataType::TurboQuant2Vector => ColumnType::TurboQuant2Vector,
         DataType::TurboQuant3Vector => ColumnType::TurboQuant3Vector,
         DataType::TurboQuant4Vector => ColumnType::TurboQuant4Vector,
-        _ => ColumnType::String, // Fallback for complex types
-    }
+        DataType::Null | DataType::Array => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Unsupported column type for storage: {:?}", dt),
+            ))
+        }
+    })
 }
 
 /// Convert OnDemand ColumnType to DataType
@@ -543,8 +561,11 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::TurboQuant3Vector => DataType::TurboQuant3Vector,
         ColumnType::TurboQuant4Vector => DataType::TurboQuant4Vector,
         ColumnType::Timestamp => DataType::Timestamp,
+        ColumnType::TimestampTz => DataType::TimestampTz,
         ColumnType::Date => DataType::Date,
-        ColumnType::Null => DataType::String,
+        ColumnType::Time => DataType::Time,
+        ColumnType::Interval => DataType::Interval,
+        ColumnType::Null => DataType::Null,
     }
 }
 
@@ -3080,6 +3101,76 @@ impl TableStorageBackend {
 
     /// Read columns to Arrow with dictionary encoding for low-cardinality string columns.
     /// Use this for GROUP BY queries where DictionaryArray accelerates aggregation.
+
+    /// D5: present the timestamp/date/time/interval family as typed Arrow arrays.
+    ///
+    /// Storage keeps the fixed 8-byte payload for the whole family, so the
+    /// generic builders decode it as `Int64`. Without this relabelling a
+    /// `LIMIT`/point-read result would expose raw integers while a full scan
+    /// (which goes through the schema-aware mmap projection lane) shows
+    /// datetime/date. `dtype` is the declared storage type of the column.
+    fn present_time_arrow(
+        dtype: Option<&DataType>,
+        arrow_dt: arrow::datatypes::DataType,
+        array: arrow::array::ArrayRef,
+    ) -> (arrow::datatypes::DataType, arrow::array::ArrayRef) {
+        use arrow::array::{Array, ArrayRef};
+        use arrow::datatypes::DataType as ArrowDataType;
+        use arrow::array::{
+            Date32Array, DurationMicrosecondArray, Int64Array, Time64MicrosecondArray,
+            TimestampMicrosecondArray,
+        };
+        use arrow::datatypes::TimeUnit;
+
+        let Some(dtype) = dtype else {
+            return (arrow_dt, array);
+        };
+        if !dtype.is_time_family() || !matches!(arrow_dt, ArrowDataType::Int64) {
+            return (arrow_dt, array);
+        }
+        let Some(values) = array.as_any().downcast_ref::<Int64Array>() else {
+            return (arrow_dt, array);
+        };
+        let raw: Vec<Option<i64>> = (0..values.len())
+            .map(|index| {
+                if values.is_null(index) {
+                    None
+                } else {
+                    Some(values.value(index))
+                }
+            })
+            .collect();
+        match dtype {
+            DataType::Timestamp => (
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+                Arc::new(TimestampMicrosecondArray::from(raw)),
+            ),
+            DataType::TimestampTz => {
+                let array = TimestampMicrosecondArray::from(raw).with_timezone("+00:00");
+                (
+                    ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                    Arc::new(array),
+                )
+            }
+            DataType::Date => {
+                let days: Vec<Option<i32>> = raw
+                    .into_iter()
+                    .map(|value: Option<i64>| value.map(|value| value as i32))
+                    .collect();
+                (ArrowDataType::Date32, Arc::new(Date32Array::from(days)))
+            }
+            DataType::Time => (
+                ArrowDataType::Time64(TimeUnit::Microsecond),
+                Arc::new(Time64MicrosecondArray::from(raw)),
+            ),
+            DataType::Interval => (
+                ArrowDataType::Duration(TimeUnit::Microsecond),
+                Arc::new(DurationMicrosecondArray::from(raw)),
+            ),
+            _ => (arrow_dt, array),
+        }
+    }
+
     pub fn read_columns_to_arrow_dict(
         &self,
         column_names: Option<&[&str]>,
@@ -3983,6 +4074,12 @@ impl TableStorageBackend {
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(&data, dim, codec),
                 };
 
+                let time_dtype = schema
+                    .iter()
+                    .find(|(name, _)| name == col_name)
+                    .map(|(_, dt)| dt.clone());
+                let (arrow_dt, array) =
+                    Self::present_time_arrow(time_dtype.as_ref(), arrow_dt, array);
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
             }
@@ -4221,6 +4318,12 @@ impl TableStorageBackend {
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
 
+                let time_dtype = schema
+                    .iter()
+                    .find(|(name, _)| name == col_name)
+                    .map(|(_, dt)| dt.clone());
+                let (arrow_dt, array) =
+                    Self::present_time_arrow(time_dtype.as_ref(), arrow_dt, array);
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
             }
@@ -4605,6 +4708,12 @@ impl TableStorageBackend {
                 ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(&data, dim, codec),
             };
 
+            let time_dtype = schema
+                .iter()
+                .find(|(name, _)| name == col_name)
+                .map(|(_, dt)| dt.clone());
+            let (arrow_dt, array) =
+                Self::present_time_arrow(time_dtype.as_ref(), arrow_dt, array);
             fields.push(Field::new(col_name, arrow_dt, true));
             arrays.push(array);
         }
@@ -4701,6 +4810,7 @@ impl TableStorageBackend {
     /// Shared by the lean RCIX lane and the targeted decoding fallback so both
     /// report the same shape and the same value conversions.
     fn point_values_to_arrow_batch(
+        &self,
         row_vals: &[(String, crate::data::Value)],
     ) -> io::Result<arrow::record_batch::RecordBatch> {
         use crate::data::Value;
@@ -4708,11 +4818,24 @@ impl TableStorageBackend {
         use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
         use std::sync::Arc;
 
+        let schema = self.schema.read();
         let mut fields: Vec<Field> = Vec::with_capacity(row_vals.len());
         let mut arrays: Vec<ArrayRef> = Vec::with_capacity(row_vals.len());
         for (col_name, val) in row_vals {
             let (dt, arr): (ArrowDataType, ArrayRef) = match val {
                 Value::Int64(v) => (ArrowDataType::Int64, Arc::new(Int64Array::from(vec![*v]))),
+                Value::Timestamp(v) => (
+                    ArrowDataType::Int64,
+                    Arc::new(Int64Array::from(vec![*v])) as ArrayRef,
+                ),
+                Value::Date(v) => (
+                    ArrowDataType::Int64,
+                    Arc::new(Int64Array::from(vec![*v as i64])) as ArrayRef,
+                ),
+                Value::Time(v) | Value::Interval(v) => (
+                    ArrowDataType::Int64,
+                    Arc::new(Int64Array::from(vec![*v])) as ArrayRef,
+                ),
                 Value::Float64(v) => (
                     ArrowDataType::Float64,
                     Arc::new(Float64Array::from(vec![*v])),
@@ -4739,6 +4862,11 @@ impl TableStorageBackend {
                 ),
             };
             let nullable = matches!(val, Value::Null);
+            let schema_dt = schema
+                .iter()
+                .find(|(name, _)| name == col_name)
+                .map(|(_, dt)| dt.clone());
+            let (dt, arr) = Self::present_time_arrow(schema_dt.as_ref(), dt, arr);
             fields.push(Field::new(col_name, dt, nullable));
             arrays.push(arr);
         }
@@ -4762,7 +4890,7 @@ impl TableStorageBackend {
         if self.storage.is_v4_format() {
             if !self.storage.has_v4_in_memory_data() {
                 if let Some(row_vals) = self.storage.retrieve_rcix(id)? {
-                    return Ok(Some(Self::point_values_to_arrow_batch(&row_vals)?));
+                    return Ok(Some(self.point_values_to_arrow_batch(&row_vals)?));
                 }
                 // The lean lane declined this read: either the row is really absent
                 // (a final answer) or the row group is compressed / carries an
@@ -4783,7 +4911,7 @@ impl TableStorageBackend {
             // buffered row against 0.005 ms for a base row on a 200k-row table
             // with five buffered rows).
             return match self.storage.read_row_by_id_values(id)? {
-                Some(row_vals) => Ok(Some(Self::point_values_to_arrow_batch(&row_vals)?)),
+                Some(row_vals) => Ok(Some(self.point_values_to_arrow_batch(&row_vals)?)),
                 None => Ok(None),
             };
         }
@@ -4872,6 +5000,7 @@ impl TableStorageBackend {
                 // Column not in row_data - return typed null value
                 Self::create_typed_null_array(dt)
             };
+            let (arrow_dt, array) = Self::present_time_arrow(Some(dt), arrow_dt, array);
             fields.push(Field::new(col_name, arrow_dt, true));
             arrays.push(array);
         }
@@ -4986,6 +5115,12 @@ impl TableStorageBackend {
                         Self::create_typed_null_array(&dt)
                     }
                 };
+                let schema_dt = schema
+                    .iter()
+                    .find(|(name, _)| name == *col_name)
+                    .map(|(_, dt)| dt.clone());
+                let (arrow_dt, array) =
+                    Self::present_time_arrow(schema_dt.as_ref(), arrow_dt, array);
                 fields.push(Field::new(*col_name, arrow_dt, nullable));
                 arrays.push(array);
             }
@@ -5089,6 +5224,7 @@ impl TableStorageBackend {
                 Self::create_typed_null_array(dt)
             };
 
+            let (arrow_dt, array) = Self::present_time_arrow(Some(dt), arrow_dt, array);
             fields.push(Field::new(col_name, arrow_dt, true));
             arrays.push(array);
         }
@@ -5595,6 +5731,12 @@ impl TableStorageBackend {
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
 
+                let time_dtype = schema
+                    .iter()
+                    .find(|(name, _)| name == col_name)
+                    .map(|(_, dt)| dt.clone());
+                let (arrow_dt, array) =
+                    Self::present_time_arrow(time_dtype.as_ref(), arrow_dt, array);
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
             }
@@ -5797,6 +5939,12 @@ impl TableStorageBackend {
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
+                let time_dtype = schema
+                    .iter()
+                    .find(|(name, _)| name == col_name)
+                    .map(|(_, dt)| dt.clone());
+                let (arrow_dt, array) =
+                    Self::present_time_arrow(time_dtype.as_ref(), arrow_dt, array);
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
             }
@@ -5959,6 +6107,12 @@ impl TableStorageBackend {
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
+                let time_dtype = schema
+                    .iter()
+                    .find(|(name, _)| name == col_name)
+                    .map(|(_, dt)| dt.clone());
+                let (arrow_dt, array) =
+                    Self::present_time_arrow(time_dtype.as_ref(), arrow_dt, array);
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
             }
@@ -6416,6 +6570,12 @@ impl TableStorageBackend {
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
                 };
+                let time_dtype = schema
+                    .iter()
+                    .find(|(name, _)| name == col_name)
+                    .map(|(_, dt)| dt.clone());
+                let (arrow_dt, array) =
+                    Self::present_time_arrow(time_dtype.as_ref(), arrow_dt, array);
                 fields.push(Field::new(col_name, arrow_dt, true));
                 arrays.push(array);
             }

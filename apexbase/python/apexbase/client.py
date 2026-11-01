@@ -91,6 +91,39 @@ def _ensure_polars():
     return pl
 
 import struct
+import datetime as _dt_module
+
+_EPOCH_DATETIME = _dt_module.datetime(1970, 1, 1)
+_EPOCH_DATE = _dt_module.date(1970, 1, 1)
+_datetime_timedelta = _dt_module.timedelta
+_datetime_time = _dt_module.time
+_datetime_timezone = _dt_module.timezone
+_RE_ID_POINT_QUERY = re.compile(r"_id\s*=\s*[0-9?]", re.IGNORECASE)
+
+
+def _us_to_datetime(value, aware):
+    """Epoch microseconds -> datetime (naive, or UTC-aware for timestamptz)."""
+    seconds, micros = divmod(int(value), 1_000_000)
+    moment = _EPOCH_DATETIME + _datetime_timedelta(seconds=seconds, microseconds=micros)
+    if aware:
+        return moment.replace(tzinfo=_datetime_timezone.utc)
+    return moment
+
+
+def _days_to_date(value):
+    return _EPOCH_DATE + _datetime_timedelta(days=int(value))
+
+
+def _us_to_time(value):
+    seconds, micros = divmod(int(value), 1_000_000)
+    hours, remainder = divmod(seconds, 3600)
+    minutes, secs = divmod(remainder, 60)
+    return _datetime_time(hours % 24, minutes, secs, micros)
+
+
+def _us_to_timedelta(value):
+    return _datetime_timedelta(microseconds=int(value))
+
 
 # Null context manager for lock-free SELECT execution paths
 _NULL_CONTEXT = contextlib.nullcontext()
@@ -1170,6 +1203,10 @@ class ApexClient:
         # if it turned out to be empty); avoids a catalog read on every store of
         # a schemaless table.
         self._schema_fetch_attempted = set()
+        # Tables that declare a time-family column: their point/short-read hot
+        # paths read raw 8-byte payloads, so D5 presentation requires the Arrow
+        # executor path instead.
+        self._time_family_columns_cache = {}
         self._buffered_writes_enabled = False
         self._buffered_write_rows = []
         self._buffered_write_table = None
@@ -1423,6 +1460,10 @@ class ApexClient:
         cache = getattr(self, '_numeric_range_rows_cache', None)
         if cache is not None:
             cache.clear()
+        # A file-replacing write may add/replace time-family columns.
+        cache = getattr(self, '_time_family_columns_cache', None)
+        if cache is not None:
+            cache.clear()
         cache = getattr(self, '_query_result_cache', None)
         if cache is not None:
             cache.clear()
@@ -1523,6 +1564,98 @@ class ApexClient:
             'QUANTILE(',
         ))
 
+    _TIME_FAMILY_PY_CONVERTERS = {
+        "timestamp": lambda value: _us_to_datetime(value, aware=False),
+        "datetime": lambda value: _us_to_datetime(value, aware=False),
+        "timestamptz": lambda value: _us_to_datetime(value, aware=True),
+        "timestamp_tz": lambda value: _us_to_datetime(value, aware=True),
+        "timestamp with time zone": lambda value: _us_to_datetime(value, aware=True),
+        "date": _days_to_date,
+        "time": _us_to_time,
+        "interval": _us_to_timedelta,
+        "duration": _us_to_timedelta,
+    }
+
+    def _present_time_row(self, row):
+        """D5: present a native point/short-read row's raw payloads as Python objects."""
+        if not isinstance(row, dict):
+            return row
+        table = self._current_table
+        if not table:
+            return row
+        declared = self._table_schemas.get(table)
+        if declared is None:
+            self._fetch_table_schema(table)
+            declared = self._table_schemas.get(table) or {}
+        if not declared:
+            return row
+        converted = None
+        for name, value in row.items():
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            kind = str(declared.get(name, "")).split("(", 1)[0].strip().lower()
+            converter = self._TIME_FAMILY_PY_CONVERTERS.get(kind)
+            if converter is None:
+                continue
+            if converted is None:
+                converted = dict(row)
+            converted[name] = converter(value)
+        return row if converted is None else converted
+
+    def _present_time_columns_dict(self, columns_dict):
+        """D5: convert native column lists for time-family declared columns."""
+        if not columns_dict:
+            return columns_dict
+        table = self._current_table
+        if not table:
+            return columns_dict
+        declared = self._table_schemas.get(table)
+        if declared is None:
+            self._fetch_table_schema(table)
+            declared = self._table_schemas.get(table) or {}
+        if not declared:
+            return columns_dict
+        for name, values in list(columns_dict.items()):
+            kind = str(declared.get(name, "")).split("(", 1)[0].strip().lower()
+            converter = self._TIME_FAMILY_PY_CONVERTERS.get(kind)
+            if converter is None:
+                continue
+            columns_dict[name] = [None if value is None else converter(value) for value in values]
+        return columns_dict
+
+    _TIME_FAMILY_DECLARED_TYPES = frozenset(
+        ("timestamp", "datetime", "timestamptz", "timestamp_tz",
+         "timestamp with time zone", "date", "time", "interval", "duration")
+    )
+
+    def _table_time_family_columns(self):
+        """Declared time-family columns of the current table (cached per table).
+
+        The native point/short-read bindings return the raw 8-byte payloads for
+        these columns; the SQL executor path presents them as datetime/date/
+        time/timedelta (D5). Hot paths are therefore skipped for such tables.
+        """
+        table = self._current_table
+        if not table:
+            return frozenset()
+        cached = self._time_family_columns_cache.get(table)
+        if cached is not None:
+            return cached
+        kinds = frozenset()
+        try:
+            declared = dict(self._storage.table_types(table))
+        except Exception:
+            declared = {}
+        if declared:
+            kinds = frozenset(
+                name
+                for name, value in declared.items()
+                if str(value).split("(", 1)[0].strip().lower()
+                in self._TIME_FAMILY_DECLARED_TYPES
+            )
+        self._time_family_columns_cache[table] = kinds
+        return kinds
+
     def _bound_point_lookup(self, sql, params, show_internal_id):
         """Fast path for ``SELECT <projection> FROM <table> WHERE _id = ?``.
 
@@ -1564,6 +1697,7 @@ class ApexClient:
         if row is None:
             return None
         show_flag = self._resolve_show_internal_id(sql, show_internal_id)
+        row = self._present_time_row(row)
         rv = ResultView(data=[row])
         rv._show_internal_id = show_flag
         return rv
@@ -1735,6 +1869,7 @@ class ApexClient:
         Returns:
             A :class:`ResultView` wrapping the columnar data.
         """
+        columns_dict = self._present_time_columns_dict(columns_dict)
         rv = ResultView(lazy_pydict=columns_dict)
         rv._show_internal_id = show_internal_id
         rv._declared_types = dict(self._table_schemas.get(self._current_table) or {}) or None
@@ -3209,7 +3344,8 @@ class ApexClient:
             # the row is read through the same native binding as the literal
             # fast path.
             if (not getattr(self, '_in_txn', False)
-                    and not getattr(self, '_fast_txn_active', False)):
+                    and not getattr(self, '_fast_txn_active', False)
+                    and not self._table_time_family_columns()):
                 bound_point = self._bound_point_lookup(
                     sql, params, show_internal_id
                 )
@@ -3227,6 +3363,24 @@ class ApexClient:
                 return self._rollback_fast_txn(show_internal_id)
 
         sql_stripped = sql.strip()
+        # D5: time-family tables must answer through the typed Arrow result.
+        # Every Python hot path below (point/short/numeric/string reads) returns
+        # the raw 8-byte payloads for these columns. Computed once per statement.
+        time_family_columns = (
+            self._table_time_family_columns()
+            if sql_stripped[:6].upper() == 'SELECT'
+            else frozenset()
+        )
+        if (
+            time_family_columns
+            and not getattr(self, '_in_txn', False)
+            and not getattr(self, '_fast_txn_active', False)
+            and ';' not in sql_stripped.rstrip(';')
+            and not _RE_ID_POINT_QUERY.search(sql_stripped)
+        ):
+            return self._execute_select_via_arrow(
+                sql, self._resolve_show_internal_id(sql, show_internal_id)
+            )
         cached_result, result_cache_key, result_cache_token = (
             self._get_cached_query_result(sql, show_internal_id)
         )
@@ -3239,12 +3393,14 @@ class ApexClient:
         # Arrow type fidelity and table-function/qualified-table semantics.
         if (not getattr(self, '_in_txn', False)
                 and not getattr(self, '_fast_txn_active', False)
+                and not time_family_columns
                 and sql_stripped[:6].upper() == 'SELECT'
                 and ';' not in sql_stripped.rstrip(';')):
             result = self._storage.execute_pk(sql)
             if isinstance(result, dict):
                 row = result.get('row')
                 if row is not None:
+                    row = self._present_time_row(row)
                     rv = ResultView(data=[row])
                     rv._show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
                     return rv
@@ -3260,6 +3416,8 @@ class ApexClient:
                 return rv
 
         cached_simple = self._simple_sql_cache.get(sql)
+        if cached_simple and time_family_columns:
+            cached_simple = None
         if cached_simple:
             if (not getattr(self, '_in_txn', False)
                     and not getattr(self, '_fast_txn_active', False)
@@ -3277,6 +3435,7 @@ class ApexClient:
                             if row is not None:
                                 if not show_flag and '_id' in row:
                                     row = {k: v for k, v in row.items() if k != '_id'}
+                                row = self._present_time_row(row)
                                 rv = ResultView(data=[row])
                                 rv._show_internal_id = show_flag
                                 return rv
@@ -3289,6 +3448,7 @@ class ApexClient:
                                     cached_simple[2], cached_simple[3]
                                 )
                             if row is not None:
+                                row = self._present_time_row(row)
                                 rv = ResultView(data=[row])
                                 rv._show_internal_id = show_flag
                                 return rv
@@ -3332,7 +3492,8 @@ class ApexClient:
                 return hot_result
 
         if (not getattr(self, '_in_txn', False)
-                and not getattr(self, '_fast_txn_active', False)):
+                and not getattr(self, '_fast_txn_active', False)
+                and not time_family_columns):
             view_result = self._execute_simple_group_view_select(
                 sql,
                 self._resolve_show_internal_id(sql, show_internal_id),
@@ -3864,6 +4025,31 @@ class ApexClient:
         except Exception:
             return _HOT_CACHE_MISS
     
+    def _execute_select_via_arrow(self, sql, show_internal_id):
+        """Execute a SELECT through the Arrow executor path.
+
+        Used for tables that declare time-family columns: D5 presentation lives
+        in the typed Arrow result, so the raw-payload Python hot paths must be
+        bypassed.
+        """
+        try:
+            schema_ptr, array_ptr = self._storage._execute_arrow_ffi(sql)
+            if schema_ptr != 0 and array_ptr != 0:
+                pa_mod = _ensure_pyarrow()
+                batch = pa_mod.RecordBatch._import_from_c(array_ptr, schema_ptr)
+                table = pa_mod.Table.from_batches([batch])
+            else:
+                table = None
+        except Exception:
+            # Read-only statement: replaying through the IPC export is safe.
+            ipc_bytes = self._storage._execute_arrow_ipc(sql)
+            pa_mod = _ensure_pyarrow()
+            reader = pa_mod.ipc.open_stream(pa_mod.BufferReader(ipc_bytes))
+            table = reader.read_all()
+        rv = ResultView(arrow_table=table, data=None)
+        rv._show_internal_id = show_internal_id
+        return rv
+
     def _execute_impl(self, sql: str, show_internal_id: bool = None) -> 'ResultView':
         """
         Core SQL execution implementation with routing, caching, and storage calls.
@@ -4123,6 +4309,7 @@ class ApexClient:
                         if row is not None:
                             if not show_internal_id and '_id' in row:
                                 row = {k: v for k, v in row.items() if k != '_id'}
+                            row = self._present_time_row(row)
                             rv = ResultView(data=[row])
                             rv._show_internal_id = show_internal_id
                             return rv
@@ -4142,6 +4329,7 @@ class ApexClient:
                         if row is None:
                             row = self._recover_projected_point_row(point_id, columns)
                         if row is not None:
+                            row = self._present_time_row(row)
                             rv = ResultView(data=[row])
                             rv._show_internal_id = self._resolve_show_internal_id(sql, show_internal_id)
                             return rv
@@ -4306,6 +4494,7 @@ class ApexClient:
                         if row is not None:
                             if not show_internal_id and '_id' in row:
                                 row = {k: v for k, v in row.items() if k != '_id'}
+                            row = self._present_time_row(row)
                             rv = ResultView(data=[row])
                             rv._show_internal_id = show_internal_id
                             return rv
@@ -4343,6 +4532,7 @@ class ApexClient:
                                         point_id, _simple_projection
                                     )
                                     if row is not None:
+                                        row = self._present_time_row(row)
                                         rv = ResultView(data=[row])
                                         rv._show_internal_id = show_internal_id
                                         return rv
@@ -5298,7 +5488,7 @@ class ApexClient:
         """
         self._check_connection()
         self._ensure_table_selected()
-        return self._storage.retrieve(id_)
+        return self._present_time_row(self._storage.retrieve(id_))
 
     def read_blob(self, column: str, id_: int) -> Optional[bytes]:
         """
@@ -5441,7 +5631,9 @@ class ApexClient:
             result = self._storage.retrieve_many(ids)
             columns_dict = result.get('columns_dict') if isinstance(result, dict) else None
             if columns_dict:
-                return ResultView(lazy_pydict=columns_dict)
+                return ResultView(
+                    lazy_pydict=self._present_time_columns_dict(columns_dict)
+                )
             return _empty_result_view()
 
     def retrieve_all(self) -> 'ResultView':

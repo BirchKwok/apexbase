@@ -2553,6 +2553,7 @@ impl ApexExecutor {
 
 // Split impl blocks for ApexExecutor methods
 include!("decimal.rs");
+include!("time_family.rs");
 include!("signature_engine.rs");
 include!("select.rs");
 include!("index_access.rs");

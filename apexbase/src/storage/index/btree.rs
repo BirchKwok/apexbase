@@ -56,6 +56,8 @@ impl IndexKey {
             Value::Blob(b) => IndexKey::Bytes(b.clone()),
             Value::Timestamp(t) => IndexKey::Int(*t),
             Value::Date(d) => IndexKey::Int(*d as i64),
+            Value::Time(t) => IndexKey::Int(*t),
+            Value::Interval(t) => IndexKey::Int(*t),
             Value::Json(j) => IndexKey::Str(j.to_string()),
             Value::Array(_) => IndexKey::Null,
             Value::FixedList(_) => IndexKey::Null,

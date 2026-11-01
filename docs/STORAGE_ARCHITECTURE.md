@@ -31,12 +31,17 @@ Compatibility is one-way by design:
   to be handed to an older build.
 - **V5 carries an optional parameterised (logical) type section.** A schema may
   append a `LogicalType` section after the constraint/derivation sections, one
-  entry per column (`Uuid`, `Decimal { precision, scale }`, ...). V5 is the
+  entry per column (`Uuid`, `Decimal { precision, scale }`,
+  `TimestampTz { offset_minutes }`, ...). V5 is the
   newest format (the preview does not use a higher version number), so tables
   with such columns still declare version `5`; tables without logical types keep
   writing `5`/`4` exactly as before. UUID/Decimal values are fixed 16-byte
   payloads and project as `bytes`; `APEX_LOGICAL_TYPES=0` refuses creating such
-  columns. Because the section is an addition to the preview format rather than
+  columns. The time family adds three type tags (time of day, fixed-offset
+  timestamp and duration) whose payload is the same fixed 8-byte integer as
+  timestamp/date, and every read lane presents the family as typed Arrow
+  `timestamp`/`date32`/`time64`/`duration` columns (D5), never as raw integers.
+  Because the section is an addition to the preview format rather than
   a new version, do not open files containing parameterised types with an older
   V5 preview build — upgrade the reading build first.
 

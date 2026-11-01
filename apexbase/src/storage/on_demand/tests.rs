@@ -7407,11 +7407,59 @@ fn decimal_data_type_maps_to_the_fixed_width_column_type() {
     // fixed 16-byte Decimal128 column; precision/scale travel as LogicalType
     // when the DDL path learns to carry them.
     assert_eq!(
-        ColumnType::from_data_type(crate::data::DataType::Decimal),
+        ColumnType::from_data_type(crate::data::DataType::Decimal).unwrap(),
         ColumnType::Decimal128
     );
     assert_eq!(
-        crate::storage::backend::datatype_to_column_type(&crate::data::DataType::Decimal),
+        crate::storage::backend::datatype_to_column_type(&crate::data::DataType::Decimal).unwrap(),
         ColumnType::Decimal128
     );
+}
+
+#[test]
+fn time_family_storage_types_map_explicitly() {
+    use crate::data::DataType;
+
+    assert_eq!(
+        ColumnType::from_data_type(DataType::Time).unwrap(),
+        ColumnType::Time
+    );
+    assert_eq!(
+        ColumnType::from_data_type(DataType::Interval).unwrap(),
+        ColumnType::Interval
+    );
+    assert_eq!(
+        ColumnType::from_data_type(DataType::TimestampTz).unwrap(),
+        ColumnType::TimestampTz
+    );
+    // Unsupported types must not silently become text columns (V5 S2 ⑥).
+    assert!(ColumnType::from_data_type(DataType::Array).is_err());
+    assert!(ColumnType::from_data_type(DataType::Null).is_err());
+
+    assert_eq!(
+        crate::storage::backend::column_type_to_datatype(ColumnType::Time),
+        DataType::Time
+    );
+    assert_eq!(
+        crate::storage::backend::column_type_to_datatype(ColumnType::Interval),
+        DataType::Interval
+    );
+    assert_eq!(
+        crate::storage::backend::column_type_to_datatype(ColumnType::TimestampTz),
+        DataType::TimestampTz
+    );
+
+    // The 8-byte payload family is fixed-width and decoded into `Int64` data.
+    for column_type in [
+        ColumnType::Time,
+        ColumnType::Interval,
+        ColumnType::TimestampTz,
+    ] {
+        assert_eq!(column_type.fixed_size(), 8, "{:?}", column_type);
+        assert!(column_type.is_time_family());
+        assert!(matches!(
+            ColumnData::new(column_type),
+            ColumnData::Int64(_)
+        ));
+    }
 }

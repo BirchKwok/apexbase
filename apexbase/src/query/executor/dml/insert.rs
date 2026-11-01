@@ -261,12 +261,12 @@ impl ApexExecutor {
                 .get_schema()
                 .iter()
                 .map(|(name, dt)| {
-                    (
+                    Ok((
                         name.clone(),
-                        crate::storage::backend::datatype_to_column_type(dt),
-                    )
+                        crate::storage::backend::datatype_to_column_type(dt)?,
+                    ))
                 })
-                .collect();
+                .collect::<io::Result<_>>()?;
         let ctx = DefaultEvalContext::new();
 
         Ok(values
@@ -325,12 +325,12 @@ impl ApexExecutor {
             schema
                 .iter()
                 .map(|(name, dt)| {
-                    (
+                    Ok((
                         name.clone(),
-                        crate::storage::backend::datatype_to_column_type(dt),
-                    )
+                        crate::storage::backend::datatype_to_column_type(dt)?,
+                    ))
                 })
-                .collect();
+                .collect::<io::Result<_>>()?;
         let ctx = DefaultEvalContext::new();
         let mut columns = Vec::with_capacity(schema.len());
         let mut row = Vec::with_capacity(schema.len());
@@ -436,12 +436,12 @@ impl ApexExecutor {
             schema
                 .iter()
                 .map(|(name, dt)| {
-                    (
+                    Ok((
                         name.clone(),
-                        crate::storage::backend::datatype_to_column_type(dt),
-                    )
+                        crate::storage::backend::datatype_to_column_type(dt)?,
+                    ))
                 })
-                .collect()
+                .collect::<io::Result<_>>()?
         };
 
         // Declared scale per Decimal128 column, used to encode numeric literals
@@ -513,10 +513,30 @@ impl ApexExecutor {
                         Value::String(v) => {
                             match col_schema_type {
                                 Some(crate::storage::on_demand::ColumnType::Timestamp) => {
-                                    Value::Timestamp(Self::parse_timestamp_string(v))
+                                    Value::Timestamp(
+                                        crate::data::time_literals::parse_timestamp_micros(v)
+                                            .map_err(err_input)?,
+                                    )
                                 }
-                                Some(crate::storage::on_demand::ColumnType::Date) => {
-                                    Value::Date(Self::parse_date_string(v) as i32)
+                                Some(crate::storage::on_demand::ColumnType::TimestampTz) => {
+                                    Value::Timestamp(
+                                        crate::data::time_literals::parse_timestamptz_micros(v)
+                                            .map_err(err_input)?,
+                                    )
+                                }
+                                Some(crate::storage::on_demand::ColumnType::Date) => Value::Date(
+                                    crate::data::time_literals::parse_date_days(v)
+                                        .map_err(err_input)?,
+                                ),
+                                Some(crate::storage::on_demand::ColumnType::Time) => Value::Time(
+                                    crate::data::time_literals::parse_time_micros(v)
+                                        .map_err(err_input)?,
+                                ),
+                                Some(crate::storage::on_demand::ColumnType::Interval) => {
+                                    Value::Interval(
+                                        crate::data::time_literals::parse_interval_micros(v)
+                                            .map_err(err_input)?,
+                                    )
                                 }
                                 Some(crate::storage::on_demand::ColumnType::Decimal128) => {
                                     let scale =

@@ -5,6 +5,7 @@ pub mod arrow_convert;
 mod row;
 mod types;
 mod value;
+pub(crate) mod time_literals;
 
 pub use aggregate::AggregateFunc;
 pub use arrow_convert::{

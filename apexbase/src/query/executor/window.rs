@@ -1683,6 +1683,23 @@ impl ApexExecutor {
         {
             // Scale-aware numeric comparison for DECIMAL sort keys.
             arr.value(a).cmp(&arr.value(b))
+        } else if let Some(arr) = array
+            .as_any()
+            .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
+        {
+            arr.value(a).cmp(&arr.value(b))
+        } else if let Some(arr) = array.as_any().downcast_ref::<arrow::array::Date32Array>() {
+            arr.value(a).cmp(&arr.value(b))
+        } else if let Some(arr) = array
+            .as_any()
+            .downcast_ref::<arrow::array::Time64MicrosecondArray>()
+        {
+            arr.value(a).cmp(&arr.value(b))
+        } else if let Some(arr) = array
+            .as_any()
+            .downcast_ref::<arrow::array::DurationMicrosecondArray>()
+        {
+            arr.value(a).cmp(&arr.value(b))
         } else if let Some(arr) = array.as_any().downcast_ref::<BooleanArray>() {
             arr.value(a).cmp(&arr.value(b))
         } else if let Some(arr) = array.as_any().downcast_ref::<StringArray>() {

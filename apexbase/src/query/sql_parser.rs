@@ -5802,9 +5802,15 @@ impl SqlParser {
                 } else if !matches!(self.current(), Token::As) {
                     self.expect(Token::RParen)?;
                 }
+                let data_type = DataType::from_sql_type(&ty).ok_or_else(|| {
+                    ApexError::QueryParseError(format!(
+                        "Unknown data type in CAST: {}",
+                        ty
+                    ))
+                })?;
                 Ok(SqlExpr::Cast {
                     expr: Box::new(expr),
-                    data_type: DataType::from_sql_type(&ty),
+                    data_type,
                 })
             }
             Token::Case => {
@@ -6538,8 +6544,52 @@ impl SqlParser {
                         self.last_decimal_params = Some((precision, scale));
                         Ok(DataType::String) // text fallback until the SQL DECIMAL batch (§129.3)
                     }
-                    "TIMESTAMP" | "DATETIME" => Ok(DataType::Timestamp),
+                    "TIMESTAMP" | "DATETIME" => {
+                        // `TIMESTAMP WITH TIME ZONE` is the spelled-out alias;
+                        // the physical payload stays 8-byte UTC microseconds and
+                        // LogicalType::TimestampTz carries the display offset.
+                        if matches!(self.current(), Token::With) {
+                            self.advance();
+                            let time = match self.current().clone() {
+                                Token::Identifier(word)
+                                    if word.eq_ignore_ascii_case("TIME") =>
+                                {
+                                    self.advance();
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if !time {
+                                let (start, _) = self.current_span();
+                                return Err(self.syntax_error(
+                                    start,
+                                    "Expected TIME after TIMESTAMP WITH".to_string(),
+                                ));
+                            }
+                            let zone = match self.current().clone() {
+                                Token::Identifier(word)
+                                    if word.eq_ignore_ascii_case("ZONE") =>
+                                {
+                                    self.advance();
+                                    true
+                                }
+                                _ => false,
+                            };
+                            if !zone {
+                                let (start, _) = self.current_span();
+                                return Err(self.syntax_error(
+                                    start,
+                                    "Expected ZONE after TIMESTAMP WITH TIME".to_string(),
+                                ));
+                            }
+                            return Ok(DataType::TimestampTz);
+                        }
+                        Ok(DataType::Timestamp)
+                    }
+                    "TIMESTAMPTZ" | "TIMESTAMP_TZ" => Ok(DataType::TimestampTz),
                     "DATE" => Ok(DataType::Date),
+                    "TIME" => Ok(DataType::Time),
+                    "INTERVAL" => Ok(DataType::Interval),
                     "ARRAY" => Ok(DataType::Array),
                     "FLOAT16_VECTOR" | "FLOAT16VECTOR" | "F16_VECTOR" => {
                         Ok(DataType::Float16Vector)

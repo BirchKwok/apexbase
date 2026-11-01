@@ -20,7 +20,7 @@ flight = ["dep:arrow-flight", "dep:tonic", "dep:tokio", "dep:clap", "dep:futures
 
 [dependencies]
 # Python bindings with numpy support (optional — disabled for server binary)
-pyo3 = { version = "0.22", features = ["multiple-pymethods"], optional = true }
+pyo3 = { version = "0.22", features = ["multiple-pymethods", "chrono"], optional = true }
 numpy = { version = "0.22", optional = true }
 
 # Memory-mapped I/O

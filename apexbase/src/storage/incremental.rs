@@ -215,6 +215,8 @@ impl WalRecord {
             }
             Value::Timestamp(value) => fixed!(17, value),
             Value::Date(value) => fixed!(18, value),
+            Value::Time(value) => fixed!(20, value),
+            Value::Interval(value) => fixed!(21, value),
             Value::Array(values) => {
                 buf.push(19);
                 buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
@@ -278,6 +280,8 @@ impl WalRecord {
             ),
             17 => fixed!(&mut pos, i64, Timestamp, 8),
             18 => fixed!(&mut pos, i32, Date, 4),
+            20 => fixed!(&mut pos, i64, Time, 8),
+            21 => fixed!(&mut pos, i64, Interval, 8),
             19 => {
                 let count =
                     u32::from_le_bytes(take(bytes, &mut pos, 4)?.try_into().unwrap()) as usize;

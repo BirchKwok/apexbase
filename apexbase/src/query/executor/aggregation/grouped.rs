@@ -4827,6 +4827,58 @@ impl ApexExecutor {
         }
     }
 
+        /// Per-group MIN/MAX over a typed time-family array.
+    fn group_time_min_max(
+        array: &arrow::array::ArrayRef,
+        group_indices: &[Vec<usize>],
+        output_name: &str,
+        is_min: bool,
+    ) -> io::Result<Option<(Field, ArrayRef)>> {
+        use arrow::datatypes::DataType as ArrowDataType;
+
+        let raw: Vec<Option<i64>> = match array.data_type() {
+            ArrowDataType::Timestamp(_, _) => {
+                let values = crate::query::executor::time_family_raw_i64(array);
+                match values {
+                    Some(values) => values,
+                    None => return Ok(None),
+                }
+            }
+            ArrowDataType::Date32 | ArrowDataType::Time64(_) | ArrowDataType::Duration(_) => {
+                match crate::query::executor::time_family_raw_i64(array) {
+                    Some(values) => values,
+                    None => return Ok(None),
+                }
+            }
+            _ => return Ok(None),
+        };
+        let mut per_group: Vec<Option<i64>> = Vec::with_capacity(group_indices.len());
+        for group in group_indices {
+            let mut best: Option<i64> = None;
+            for &index in group {
+                if let Some(Some(value)) = raw.get(index) {
+                    best = Some(match best {
+                        None => *value,
+                        Some(current) => {
+                            if is_min {
+                                current.min(*value)
+                            } else {
+                                current.max(*value)
+                            }
+                        }
+                    });
+                }
+            }
+            per_group.push(best);
+        }
+        Ok(crate::query::executor::time_family_group_min_max(
+            array,
+            per_group,
+            output_name,
+            is_min,
+        ))
+    }
+
     /// Per-group DECIMAL value aggregates over decoded i128 payloads.
     fn decimal_group_aggregate(
         func: &crate::query::AggregateFunc,
@@ -5245,6 +5297,14 @@ impl ApexExecutor {
                 let array = batch
                     .column_by_name(col_name)
                     .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
+                if let Some(output) = Self::group_time_min_max(
+                    array,
+                    group_indices,
+                    &output_name,
+                    true,
+                )? {
+                    return Ok(output);
+                }
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     let mins: Vec<Option<i64>> = group_indices
@@ -5315,6 +5375,14 @@ impl ApexExecutor {
                 let array = batch
                     .column_by_name(col_name)
                     .ok_or_else(|| err_not_found(format!("Column: {}", col_name)))?;
+                if let Some(output) = Self::group_time_min_max(
+                    array,
+                    group_indices,
+                    &output_name,
+                    false,
+                )? {
+                    return Ok(output);
+                }
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     let maxs: Vec<Option<i64>> = group_indices

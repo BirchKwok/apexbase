@@ -1269,7 +1269,7 @@ impl StorageEngine {
     ) -> io::Result<()> {
         use crate::storage::on_demand::ColumnType;
 
-        let target_type = ColumnType::from_data_type(target_dtype);
+        let target_type = ColumnType::from_data_type(target_dtype)?;
         if !matches!(
             target_type,
             ColumnType::Float16List
@@ -1645,7 +1645,10 @@ impl StorageEngine {
                                         | ColumnType::UInt32
                                         | ColumnType::UInt64
                                         | ColumnType::Timestamp
-                                        | ColumnType::Date => {
+                                        | ColumnType::Date
+                                        | ColumnType::TimestampTz
+                                        | ColumnType::Time
+                                        | ColumnType::Interval => {
                                             let vals =
                                                 if let Some(vals) = int_columns.remove(col_name) {
                                                     moved_int_columns.push(schema_idx);
@@ -2069,7 +2072,10 @@ impl StorageEngine {
                                         | ColumnType::UInt32
                                         | ColumnType::UInt64
                                         | ColumnType::Timestamp
-                                        | ColumnType::Date => {
+                                        | ColumnType::Date
+                                        | ColumnType::TimestampTz
+                                        | ColumnType::Time
+                                        | ColumnType::Interval => {
                                             let vals = match col {
                                                 Some(ColumnData::Int64(v)) => v,
                                                 _ => {

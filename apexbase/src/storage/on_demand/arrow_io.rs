@@ -5,6 +5,73 @@ pub(super) fn requires_large_arrow_offsets(value_bytes: usize) -> bool {
     value_bytes > i32::MAX as usize
 }
 
+
+/// D5: present the fixed 8-byte payload of a timestamp/date/time/interval column
+/// as the matching Arrow array.
+///
+/// The mmap projection and V4 batch lanes decode every fixed 8-byte column as
+/// `i64`; this relabels the time family so Arrow (and therefore Python) sees
+/// `timestamp`/`date32`/`time64`/`duration` instead of raw integers.
+#[inline]
+pub(crate) fn time_family_arrow_typed(
+    col_type: ColumnType,
+    values: Vec<i64>,
+    nulls: Option<arrow::buffer::NullBuffer>,
+) -> (arrow::datatypes::DataType, arrow::array::ArrayRef) {
+    use arrow::array::{ArrayRef, PrimitiveArray};
+    use arrow::buffer::ScalarBuffer;
+    use arrow::datatypes::{
+        DataType as ArrowDataType, Date32Type, DurationMicrosecondType,
+        Time64MicrosecondType, TimestampMicrosecondType, TimeUnit,
+    };
+    use std::sync::Arc;
+
+    match col_type {
+        ColumnType::Timestamp => (
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            Arc::new(PrimitiveArray::<TimestampMicrosecondType>::new(
+                ScalarBuffer::from(values),
+                nulls,
+            )) as ArrayRef,
+        ),
+        ColumnType::TimestampTz => {
+            let array = PrimitiveArray::<TimestampMicrosecondType>::new(
+                ScalarBuffer::from(values),
+                nulls,
+            )
+            .with_timezone("+00:00");
+            (
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                Arc::new(array) as ArrayRef,
+            )
+        }
+        ColumnType::Date => {
+            let days: Vec<i32> = values.iter().map(|day| *day as i32).collect();
+            (
+                ArrowDataType::Date32,
+                Arc::new(PrimitiveArray::<Date32Type>::new(
+                    ScalarBuffer::from(days),
+                    nulls,
+                )) as ArrayRef,
+            )
+        }
+        ColumnType::Time => (
+            ArrowDataType::Time64(TimeUnit::Microsecond),
+            Arc::new(PrimitiveArray::<Time64MicrosecondType>::new(
+                ScalarBuffer::from(values),
+                nulls,
+            )) as ArrayRef,
+        ),
+        _ => (
+            ArrowDataType::Duration(TimeUnit::Microsecond),
+            Arc::new(PrimitiveArray::<DurationMicrosecondType>::new(
+                ScalarBuffer::from(values),
+                nulls,
+            )) as ArrayRef,
+        ),
+    }
+}
+
 impl OnDemandStorage {
     /// Build Arrow RecordBatch directly from in-memory V4 columns.
     /// OPTIMIZATION: bypasses read_columns→HashMap→get_null_mask→Vec<bool> pipeline.
@@ -233,11 +300,15 @@ impl OnDemandStorage {
                             );
                             (ArrowDataType::Date32, Arc::new(arr) as ArrayRef)
                         }
-                        _ => {
-                            let arr = PrimitiveArray::<Int64Type>::new(
-                                ScalarBuffer::from(data_vec), null_buf,
-                            );
-                            (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                        other => {
+                            if other.is_time_family() {
+                                time_family_arrow_typed(other, data_vec, null_buf)
+                            } else {
+                                let arr = PrimitiveArray::<Int64Type>::new(
+                                    ScalarBuffer::from(data_vec), null_buf,
+                                );
+                                (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                            }
                         }
                     }
                 }
@@ -905,12 +976,16 @@ impl OnDemandStorage {
                             );
                             (ArrowDataType::Date32, Arc::new(arr) as ArrayRef)
                         }
-                        _ => {
-                            let arr = PrimitiveArray::<Int64Type>::new(
-                                ScalarBuffer::from(data_vec),
-                                null_buf,
-                            );
-                            (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                        other => {
+                            if other.is_time_family() {
+                                time_family_arrow_typed(other, data_vec, null_buf)
+                            } else {
+                                let arr = PrimitiveArray::<Int64Type>::new(
+                                    ScalarBuffer::from(data_vec),
+                                    null_buf,
+                                );
+                                (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                            }
                         }
                     }
                 }
@@ -1313,9 +1388,13 @@ impl OnDemandStorage {
                             );
                             (ArrowDataType::Date32, Arc::new(arr) as ArrayRef)
                         }
-                        _ => {
-                            let arr = PrimitiveArray::<Int64Type>::new(ScalarBuffer::from(data_vec), null_buf);
-                            (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                        other => {
+                            if other.is_time_family() {
+                                time_family_arrow_typed(other, data_vec, null_buf)
+                            } else {
+                                let arr = PrimitiveArray::<Int64Type>::new(ScalarBuffer::from(data_vec), null_buf);
+                                (ArrowDataType::Int64, Arc::new(arr) as ArrayRef)
+                            }
                         }
                     }
                 }
@@ -3944,4 +4023,70 @@ fn footer_physical_rows(footer: &V4Footer) -> usize {
         .iter()
         .map(|group| group.row_count as usize)
         .sum()
+}
+
+/// D5: relabel an already-built `Int64` array as the Arrow array matching a
+/// time-family storage column. Used by point/short-read lanes that decode the
+/// fixed 8-byte payload directly.
+pub(crate) fn time_family_arrow_from_i64(
+    col_type: ColumnType,
+    values: &arrow::array::Int64Array,
+) -> (arrow::datatypes::DataType, arrow::array::ArrayRef) {
+    use arrow::array::{ArrayRef, PrimitiveArray};
+    use arrow::buffer::ScalarBuffer;
+    use arrow::datatypes::{
+        DataType as ArrowDataType, Date32Type, DurationMicrosecondType,
+        Time64MicrosecondType, TimestampMicrosecondType, TimeUnit,
+    };
+    use std::sync::Arc;
+
+    use arrow::array::Array;
+    let raw: Vec<i64> = (0..values.len())
+        .map(|index| values.value(index))
+        .collect();
+    let nulls = values.nulls().cloned();
+    match col_type {
+        ColumnType::Timestamp => (
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            Arc::new(PrimitiveArray::<TimestampMicrosecondType>::new(
+                ScalarBuffer::from(raw),
+                nulls,
+            )) as ArrayRef,
+        ),
+        ColumnType::TimestampTz => {
+            let array = PrimitiveArray::<TimestampMicrosecondType>::new(
+                ScalarBuffer::from(raw),
+                nulls,
+            )
+            .with_timezone("+00:00");
+            (
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                Arc::new(array) as ArrayRef,
+            )
+        }
+        ColumnType::Date => {
+            let days: Vec<i32> = raw.iter().map(|day| *day as i32).collect();
+            (
+                ArrowDataType::Date32,
+                Arc::new(PrimitiveArray::<Date32Type>::new(
+                    ScalarBuffer::from(days),
+                    nulls,
+                )) as ArrayRef,
+            )
+        }
+        ColumnType::Time => (
+            ArrowDataType::Time64(TimeUnit::Microsecond),
+            Arc::new(PrimitiveArray::<Time64MicrosecondType>::new(
+                ScalarBuffer::from(raw),
+                nulls,
+            )) as ArrayRef,
+        ),
+        _ => (
+            ArrowDataType::Duration(TimeUnit::Microsecond),
+            Arc::new(PrimitiveArray::<DurationMicrosecondType>::new(
+                ScalarBuffer::from(raw),
+                nulls,
+            )) as ArrayRef,
+        ),
+    }
 }

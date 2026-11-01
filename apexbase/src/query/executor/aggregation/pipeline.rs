@@ -1979,6 +1979,12 @@ impl ApexExecutor {
                         format!("{}(*)", fn_name)
                     }
                 });
+                let column_dtype = column.as_ref().and_then(|name| {
+                    let clean = name.trim_matches('"');
+                    let bare = clean.rsplit('.').next().unwrap_or(clean);
+                    backend.get_column_type(bare)
+                });
+                let time_family = column_dtype.map(|dtype| dtype.is_time_family()).unwrap_or(false);
 
                 match func {
                     AggregateFunc::Count => {
@@ -2005,6 +2011,12 @@ impl ApexExecutor {
                     }
                     AggregateFunc::Sum => {
                         let col_name = column.as_ref().unwrap().as_str();
+                        if time_family {
+                            return Err(err_input(format!(
+                                "SUM requires a numeric column; '{}' is a time/timestamp-family column",
+                                col_name
+                            )));
+                        }
                         let s = match stats_cache.get(col_name) {
                             Some(s) => s,
                             None => return Ok(None),
@@ -2020,6 +2032,12 @@ impl ApexExecutor {
                     }
                     AggregateFunc::Avg => {
                         let col_name = column.as_ref().unwrap().as_str();
+                        if time_family {
+                            return Err(err_input(format!(
+                                "AVG requires a numeric column; '{}' is a time/timestamp-family column",
+                                col_name
+                            )));
+                        }
                         let s = match stats_cache.get(col_name) {
                             Some(s) => s,
                             None => return Ok(None),
@@ -2034,6 +2052,19 @@ impl ApexExecutor {
                             Some(s) => s,
                             None => return Ok(None),
                         };
+                        if time_family {
+                            let value = if s.0 == 0 { None } else { Some(s.2 as i64) };
+                            let (field, array) =
+                                crate::query::executor::time_family_value_output(
+                                    column_dtype.unwrap(),
+                                    value,
+                                    &output_name,
+                                )
+                                .ok_or_else(|| err_data("unsupported time-family MIN output"))?;
+                            fields.push(field);
+                            arrays.push(array);
+                            continue;
+                        }
                         // NAN marks a column whose min/max the deletion-vector
                         // correction could not recover (a deleted row held the
                         // extreme value): scan it instead of reporting a wrong one.
@@ -2060,6 +2091,19 @@ impl ApexExecutor {
                             Some(s) => s,
                             None => return Ok(None),
                         };
+                        if time_family {
+                            let value = if s.0 == 0 { None } else { Some(s.3 as i64) };
+                            let (field, array) =
+                                crate::query::executor::time_family_value_output(
+                                    column_dtype.unwrap(),
+                                    value,
+                                    &output_name,
+                                )
+                                .ok_or_else(|| err_data("unsupported time-family MAX output"))?;
+                            fields.push(field);
+                            arrays.push(array);
+                            continue;
+                        }
                         if s.3.is_nan() {
                             return Ok(None);
                         }

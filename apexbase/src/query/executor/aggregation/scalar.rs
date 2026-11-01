@@ -21,6 +21,31 @@ impl ApexExecutor {
 
     /// Decoded DECIMAL payloads plus the column scale for a value aggregate.
     /// `None` when the aggregate's column is not a DECIMAL column.
+    /// SUM/AVG over a time-family column must be refused: the 8-byte payload is
+    /// not a numeric quantity (V5 S2 ②).
+    fn reject_time_aggregate(
+        array: &arrow::array::ArrayRef,
+        column: &str,
+        function: &str,
+    ) -> io::Result<()> {
+        use arrow::datatypes::DataType as ArrowDataType;
+        if matches!(
+            array.data_type(),
+            ArrowDataType::Timestamp(_, _)
+                | ArrowDataType::Date32
+                | ArrowDataType::Date64
+                | ArrowDataType::Time32(_)
+                | ArrowDataType::Time64(_)
+                | ArrowDataType::Duration(_)
+        ) {
+            return Err(err_input(format!(
+                "{} requires a numeric column; '{}' is a time/timestamp-family column",
+                function, column
+            )));
+        }
+        Ok(())
+    }
+
     fn decimal_aggregate_values(
         batch: &RecordBatch,
         column: &Option<String>,
@@ -169,6 +194,7 @@ impl ApexExecutor {
                 let bare_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
                 let array = Self::aggregate_column(batch, col_name)
                     .ok_or_else(|| err_not_found(format!("Column: {}", bare_name)))?;
+                Self::reject_time_aggregate(array, bare_name, "SUM")?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // SIMD-optimized sum for non-null arrays
@@ -229,6 +255,7 @@ impl ApexExecutor {
                 let bare_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
                 let array = Self::aggregate_column(batch, col_name)
                     .ok_or_else(|| err_not_found(format!("Column: {}", bare_name)))?;
+                Self::reject_time_aggregate(array, bare_name, "AVG")?;
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     // SIMD-optimized AVG for non-null arrays
@@ -301,6 +328,13 @@ impl ApexExecutor {
                 let bare_name = clean_name.rsplit('.').next().unwrap_or(clean_name);
                 let array = Self::aggregate_column(batch, col_name)
                     .ok_or_else(|| err_not_found(format!("Column: {}", bare_name)))?;
+                if let Some(output) = crate::query::executor::time_family_min_max(
+                    array,
+                    &output_name,
+                    is_min,
+                ) {
+                    return Ok(output);
+                }
 
                 if let Some(int_array) = array.as_any().downcast_ref::<Int64Array>() {
                     let val = if is_min {

@@ -37,6 +37,14 @@ pub enum DataType {
     TurboQuant4Vector = 28,
     Uuid = 29,
     Decimal128 = 30,
+    /// Time of day without a date or time zone (microseconds since midnight).
+    Time = 31,
+    /// Duration/interval (signed microseconds). Presented as `timedelta`.
+    Interval = 32,
+    /// Timestamp with a fixed UTC offset; the physical payload is the same
+    /// 8-byte UTC microseconds as `Timestamp` and `LogicalType::TimestampTz`
+    /// carries the display offset.
+    TimestampTz = 33,
 }
 
 impl DataType {
@@ -48,7 +56,13 @@ impl DataType {
             DataType::Int8 | DataType::UInt8 => Some(1),
             DataType::Int16 | DataType::UInt16 => Some(2),
             DataType::Int32 | DataType::UInt32 | DataType::Float32 => Some(4),
-            DataType::Int64 | DataType::UInt64 | DataType::Float64 | DataType::Timestamp => Some(8),
+            DataType::Int64
+            | DataType::UInt64
+            | DataType::Float64
+            | DataType::Timestamp
+            | DataType::TimestampTz
+            | DataType::Time
+            | DataType::Interval => Some(8),
             DataType::Date => Some(4),
             DataType::Decimal | DataType::Uuid | DataType::Decimal128 => Some(16), // i128/16-byte payloads
             DataType::String
@@ -99,10 +113,25 @@ impl DataType {
         matches!(self, DataType::Decimal)
     }
 
-    /// Convert from SQL type string (for compatibility with DuckDB types)
-    pub fn from_sql_type(sql_type: &str) -> Self {
+    /// True for the timestamp/date/time/interval family.
+    pub(crate) fn is_time_family(&self) -> bool {
+        matches!(
+            self,
+            DataType::Timestamp
+                | DataType::TimestampTz
+                | DataType::Date
+                | DataType::Time
+                | DataType::Interval
+        )
+    }
+
+    /// Convert from SQL type string (for compatibility with DuckDB types).
+    ///
+    /// Unknown names return `None`; callers turn that into an explicit error
+    /// instead of silently degrading the column to text (V5 S2 ⑥).
+    pub fn from_sql_type(sql_type: &str) -> Option<Self> {
         let sql_type = sql_type.to_uppercase();
-        match sql_type.as_str() {
+        let data_type = match sql_type.as_str() {
             "BOOLEAN" | "BOOL" => DataType::Bool,
             "TINYINT" | "INT1" => DataType::Int8,
             "SMALLINT" | "INT2" => DataType::Int16,
@@ -120,7 +149,10 @@ impl DataType {
             "JSON" => DataType::Json,
             "DECIMAL" | "NUMERIC" => DataType::Decimal,
             "TIMESTAMP" | "DATETIME" => DataType::Timestamp,
+            "TIMESTAMPTZ" | "TIMESTAMP WITH TIME ZONE" => DataType::TimestampTz,
             "DATE" => DataType::Date,
+            "TIME" => DataType::Time,
+            "INTERVAL" => DataType::Interval,
             "FLOAT32_VECTOR" | "F32_VECTOR" => DataType::Float32Vector,
             "FLOAT16_VECTOR" | "FLOAT16VECTOR" | "F16_VECTOR" => DataType::Float16Vector,
             "BFLOAT16_VECTOR" | "BF16_VECTOR" => DataType::BFloat16Vector,
@@ -130,8 +162,9 @@ impl DataType {
             "TURBOQUANT2_VECTOR" | "TQ2_VECTOR" => DataType::TurboQuant2Vector,
             "TURBOQUANT3_VECTOR" | "TQ3_VECTOR" => DataType::TurboQuant3Vector,
             "TURBOQUANT4_VECTOR" | "TQ4_VECTOR" => DataType::TurboQuant4Vector,
-            _ => DataType::String, // Default to String for unknown types
-        }
+            _ => return None,
+        };
+        Some(data_type)
     }
 
     /// Convert to SQL type string
@@ -154,7 +187,10 @@ impl DataType {
             DataType::Blob => "BLOB",
             DataType::Json => "JSON",
             DataType::Timestamp => "TIMESTAMP",
+            DataType::TimestampTz => "TIMESTAMPTZ",
             DataType::Date => "DATE",
+            DataType::Time => "TIME",
+            DataType::Interval => "INTERVAL",
             DataType::Array => "ARRAY",
             DataType::Decimal => "DECIMAL",
             DataType::Uuid => "UUID",
@@ -190,10 +226,14 @@ mod tests {
 
     #[test]
     fn test_from_sql_type() {
-        assert_eq!(DataType::from_sql_type("BIGINT"), DataType::Int64);
-        assert_eq!(DataType::from_sql_type("VARCHAR"), DataType::String);
-        assert_eq!(DataType::from_sql_type("DOUBLE"), DataType::Float64);
-        assert_eq!(DataType::from_sql_type("BOOLEAN"), DataType::Bool);
+        assert_eq!(DataType::from_sql_type("BIGINT"), Some(DataType::Int64));
+        assert_eq!(DataType::from_sql_type("VARCHAR"), Some(DataType::String));
+        assert_eq!(DataType::from_sql_type("DOUBLE"), Some(DataType::Float64));
+        assert_eq!(DataType::from_sql_type("BOOLEAN"), Some(DataType::Bool));
+        assert_eq!(DataType::from_sql_type("TIMESTAMPTZ"), Some(DataType::TimestampTz));
+        assert_eq!(DataType::from_sql_type("TIME"), Some(DataType::Time));
+        assert_eq!(DataType::from_sql_type("INTERVAL"), Some(DataType::Interval));
+        assert_eq!(DataType::from_sql_type("NO_SUCH_TYPE"), None);
     }
 
     #[test]

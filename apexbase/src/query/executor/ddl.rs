@@ -240,7 +240,7 @@ impl ApexExecutor {
                 ));
             }
             let mut column_type =
-                crate::storage::ColumnType::from_data_type(col_def.data_type.clone());
+                crate::storage::ColumnType::from_data_type(col_def.data_type.clone())?;
             let decimal_params = if Self::sql_decimal_enabled() {
                 col_def.decimal_params
             } else {
@@ -254,6 +254,13 @@ impl ApexExecutor {
                 schema.set_logical_type(
                     idx,
                     Some(crate::storage::LogicalType::Decimal { precision, scale }),
+                );
+            } else if column_type == crate::storage::ColumnType::TimestampTz {
+                schema.set_logical_type(
+                    idx,
+                    Some(crate::storage::LogicalType::TimestampTz {
+                        offset_minutes: 0,
+                    }),
                 );
             }
             let default_val = col_def.constraints.iter().find_map(|c| match c {
@@ -331,7 +338,7 @@ impl ApexExecutor {
                 ));
             }
             let mut column_type =
-                crate::storage::ColumnType::from_data_type(col_def.data_type.clone());
+                crate::storage::ColumnType::from_data_type(col_def.data_type.clone())?;
             let decimal_params = if Self::sql_decimal_enabled() {
                 col_def.decimal_params
             } else {
@@ -345,6 +352,13 @@ impl ApexExecutor {
                 schema.set_logical_type(
                     idx,
                     Some(crate::storage::LogicalType::Decimal { precision, scale }),
+                );
+            } else if column_type == crate::storage::ColumnType::TimestampTz {
+                schema.set_logical_type(
+                    idx,
+                    Some(crate::storage::LogicalType::TimestampTz {
+                        offset_minutes: 0,
+                    }),
                 );
             }
             let default_value = col_def.constraints.iter().find_map(|constraint| match constraint {
@@ -498,7 +512,10 @@ impl ApexExecutor {
                             format!("Column '{}' already exists", name),
                         ));
                     }
-                    schema.add_column(name, crate::storage::ColumnType::from_data_type(*data_type));
+                    schema.add_column(
+                        name,
+                        crate::storage::ColumnType::from_data_type(*data_type)?,
+                    );
                     Ok(schema.to_bytes())
                 })?;
             }

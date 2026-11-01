@@ -833,6 +833,9 @@ impl StreamingColumnStats {
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
                 | ColumnType::Date
+                | ColumnType::TimestampTz
+                | ColumnType::Time
+                | ColumnType::Interval
                 | ColumnType::Bool
         );
         Self {
@@ -4099,7 +4102,10 @@ impl OnDemandStorage {
                 | ColumnType::UInt32
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
-                | ColumnType::Date => {
+                | ColumnType::Date
+                | ColumnType::TimestampTz
+                | ColumnType::Time
+                | ColumnType::Interval => {
                     int_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
                 ColumnType::Float64 | ColumnType::Float32 => {
@@ -4126,7 +4132,10 @@ impl OnDemandStorage {
                     | ColumnType::UInt32
                     | ColumnType::UInt64
                     | ColumnType::Timestamp
-                    | ColumnType::Date => {
+                    | ColumnType::Date
+                    | ColumnType::TimestampTz
+                    | ColumnType::Time
+                    | ColumnType::Interval => {
                         let v = data
                             .get(col_name)
                             .and_then(|v| match v {
@@ -4506,7 +4515,10 @@ impl OnDemandStorage {
                 | ColumnType::UInt32
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
-                | ColumnType::Date => {
+                | ColumnType::Date
+                | ColumnType::TimestampTz
+                | ColumnType::Time
+                | ColumnType::Interval => {
                     int_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
                 ColumnType::Float64 | ColumnType::Float32 => {
@@ -4553,7 +4565,10 @@ impl OnDemandStorage {
                     | ColumnType::UInt32
                     | ColumnType::UInt64
                     | ColumnType::Timestamp
-                    | ColumnType::Date => {
+                    | ColumnType::Date
+                    | ColumnType::TimestampTz
+                    | ColumnType::Time
+                    | ColumnType::Interval => {
                         let v = val
                             .and_then(|v| {
                                 if let ColumnValueRef::Int64(n) = v.as_delta_column_value_ref() {
@@ -4983,7 +4998,10 @@ impl OnDemandStorage {
                             | ColumnType::UInt32
                             | ColumnType::UInt64
                             | ColumnType::Timestamp
-                            | ColumnType::Date,
+                            | ColumnType::Date
+                            | ColumnType::TimestampTz
+                            | ColumnType::Time
+                            | ColumnType::Interval,
                         ) => {
                             let Some(&value) = values.get(row_idx_abs) else {
                                 return Ok(false);
@@ -5135,7 +5153,10 @@ impl OnDemandStorage {
                 | ColumnType::UInt32
                 | ColumnType::UInt64
                 | ColumnType::Timestamp
-                | ColumnType::Date => {
+                | ColumnType::Date
+                | ColumnType::TimestampTz
+                | ColumnType::Time
+                | ColumnType::Interval => {
                     let ColumnData::Int64(values) = sliced else {
                         return Ok(false);
                     };
@@ -6276,7 +6297,10 @@ impl OnDemandStorage {
             | ColumnType::UInt32
             | ColumnType::UInt64
             | ColumnType::Timestamp
-            | ColumnType::Date => ColumnData::Int64(vec![0i64; count]),
+            | ColumnType::Date
+            | ColumnType::TimestampTz
+            | ColumnType::Time
+            | ColumnType::Interval => ColumnData::Int64(vec![0i64; count]),
             ColumnType::Float64 | ColumnType::Float32 => ColumnData::Float64(vec![0.0f64; count]),
             ColumnType::String | ColumnType::StringDict | ColumnType::Json => ColumnData::String {
                 offsets: vec![0u64; count + 1],

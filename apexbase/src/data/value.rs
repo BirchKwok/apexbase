@@ -29,6 +29,10 @@ pub enum Value {
     Timestamp(i64),
     Date(i32),
     Array(Vec<Value>),
+    /// Time of day (microseconds since midnight); presented as `datetime.time`.
+    Time(i64),
+    /// Duration (signed microseconds); presented as `datetime.timedelta`.
+    Interval(i64),
 }
 
 impl Value {
@@ -55,6 +59,8 @@ impl Value {
             Value::Timestamp(_) => DataType::Timestamp,
             Value::Date(_) => DataType::Date,
             Value::Array(_) => DataType::Array,
+            Value::Time(_) => DataType::Time,
+            Value::Interval(_) => DataType::Interval,
         }
     }
 
@@ -82,6 +88,8 @@ impl Value {
             }
             Value::Timestamp(v) => Some(*v),
             Value::Date(v) => Some(*v as i64),
+            Value::Time(v) => Some(*v),
+            Value::Interval(v) => Some(*v),
             _ => None,
         }
     }
@@ -147,6 +155,8 @@ impl Value {
             Value::Json(j) => j.to_string(),
             Value::Timestamp(t) => t.to_string(),
             Value::Date(d) => d.to_string(),
+            Value::Time(t) => t.to_string(),
+            Value::Interval(t) => t.to_string(),
             Value::Array(arr) => {
                 let items: Vec<String> = arr.iter().map(|v| v.to_string_value()).collect();
                 format!("[{}]", items.join(", "))
@@ -208,6 +218,8 @@ impl Value {
             Value::Json(j) => j.clone(),
             Value::Timestamp(t) => serde_json::json!(*t),
             Value::Date(d) => serde_json::json!(*d),
+            Value::Time(t) => serde_json::json!(*t),
+            Value::Interval(t) => serde_json::json!(*t),
             Value::Array(arr) => {
                 serde_json::Value::Array(arr.iter().map(|v| v.to_json_value()).collect())
             }
@@ -223,6 +235,10 @@ impl PartialOrd for Value {
             (_, Value::Null) => Some(Ordering::Greater),
             (Value::Bool(a), Value::Bool(b)) => a.partial_cmp(b),
             (Value::Int64(a), Value::Int64(b)) => a.partial_cmp(b),
+            (Value::Timestamp(a), Value::Timestamp(b)) => a.partial_cmp(b),
+            (Value::Date(a), Value::Date(b)) => a.partial_cmp(b),
+            (Value::Time(a), Value::Time(b)) => a.partial_cmp(b),
+            (Value::Interval(a), Value::Interval(b)) => a.partial_cmp(b),
             (Value::Float64(a), Value::Float64(b)) => a.partial_cmp(b),
             (Value::String(a), Value::String(b)) => a.partial_cmp(b),
             // Try numeric comparison

@@ -124,6 +124,23 @@ impl ApexExecutor {
                     text
                 ))
             })?),
+            Some(crate::data::DataType::Timestamp) => Value::Timestamp(
+                crate::data::time_literals::parse_timestamp_micros(text)
+                    .map_err(err_input)?,
+            ),
+            Some(crate::data::DataType::TimestampTz) => Value::Timestamp(
+                crate::data::time_literals::parse_timestamptz_micros(text)
+                    .map_err(err_input)?,
+            ),
+            Some(crate::data::DataType::Date) => Value::Date(
+                crate::data::time_literals::parse_date_days(text).map_err(err_input)?,
+            ),
+            Some(crate::data::DataType::Time) => Value::Time(
+                crate::data::time_literals::parse_time_micros(text).map_err(err_input)?,
+            ),
+            Some(crate::data::DataType::Interval) => Value::Interval(
+                crate::data::time_literals::parse_interval_micros(text).map_err(err_input)?,
+            ),
             _ => return Ok(()),
         };
         *value = coerced;

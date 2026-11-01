@@ -47,6 +47,13 @@ pub enum ColumnType {
     /// Fixed 16-byte decimal: an i128 two's-complement little-endian value whose
     /// precision/scale live in `LogicalType::Decimal`.
     Decimal128 = TYPE_DECIMAL128,
+    /// Time of day without date/zone: signed microseconds since midnight (8B).
+    Time = TYPE_TIME,
+    /// Timestamp with a fixed UTC offset: UTC microseconds (8B); the display
+    /// offset travels in `LogicalType::TimestampTz`.
+    TimestampTz = TYPE_TIMESTAMPTZ,
+    /// Duration/interval: signed microseconds (8B).
+    Interval = TYPE_INTERVAL,
 }
 
 impl ColumnType {
@@ -76,7 +83,10 @@ impl ColumnType {
                 | ColumnType::Blob
                 | ColumnType::Json
                 | ColumnType::Timestamp
+                | ColumnType::TimestampTz
                 | ColumnType::Date
+                | ColumnType::Time
+                | ColumnType::Interval
         )
     }
 
@@ -112,6 +122,9 @@ impl ColumnType {
             TYPE_JSON => Some(ColumnType::Json),
             TYPE_UUID => Some(ColumnType::Uuid),
             TYPE_DECIMAL128 => Some(ColumnType::Decimal128),
+            TYPE_TIME => Some(ColumnType::Time),
+            TYPE_TIMESTAMPTZ => Some(ColumnType::TimestampTz),
+            TYPE_INTERVAL => Some(ColumnType::Interval),
             _ => None,
         }
     }
@@ -120,12 +133,17 @@ impl ColumnType {
     ///
     /// Kept in one place so schema evolution through the storage engine and
     /// through the lazy table-catalog schema path cannot drift.
-    pub fn from_data_type(dtype: crate::data::DataType) -> Self {
+    pub fn from_data_type(dtype: crate::data::DataType) -> io::Result<Self> {
         use crate::data::DataType;
-        match dtype {
-            DataType::Int64 | DataType::Int32 | DataType::Int16 | DataType::Int8 => {
-                ColumnType::Int64
-            }
+        Ok(match dtype {
+            DataType::Int64
+            | DataType::Int32
+            | DataType::Int16
+            | DataType::Int8
+            | DataType::UInt64
+            | DataType::UInt32
+            | DataType::UInt16
+            | DataType::UInt8 => ColumnType::Int64,
             DataType::Float64 | DataType::Float32 => ColumnType::Float64,
             DataType::String => ColumnType::String,
             DataType::Bool => ColumnType::Bool,
@@ -138,7 +156,10 @@ impl ColumnType {
             DataType::Decimal | DataType::Decimal128 => ColumnType::Decimal128,
             DataType::Uuid => ColumnType::Uuid,
             DataType::Timestamp => ColumnType::Timestamp,
+            DataType::TimestampTz => ColumnType::TimestampTz,
             DataType::Date => ColumnType::Date,
+            DataType::Time => ColumnType::Time,
+            DataType::Interval => ColumnType::Interval,
             DataType::Float16Vector => ColumnType::Float16List,
             DataType::Float32Vector => ColumnType::FixedList,
             DataType::BFloat16Vector => ColumnType::BFloat16List,
@@ -148,8 +169,13 @@ impl ColumnType {
             DataType::TurboQuant2Vector => ColumnType::TurboQuant2Vector,
             DataType::TurboQuant3Vector => ColumnType::TurboQuant3Vector,
             DataType::TurboQuant4Vector => ColumnType::TurboQuant4Vector,
-            _ => ColumnType::String,
-        }
+            DataType::Null | DataType::Array => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Unsupported column type for storage: {:?}", dtype),
+                ))
+            }
+        })
     }
 
     /// Fixed size in bytes (0 for variable-length types)
@@ -160,7 +186,14 @@ impl ColumnType {
             ColumnType::Int8 | ColumnType::UInt8 => 1,
             ColumnType::Int16 | ColumnType::UInt16 => 2,
             ColumnType::Int32 | ColumnType::UInt32 | ColumnType::Float32 => 4,
-            ColumnType::Int64 | ColumnType::UInt64 | ColumnType::Float64 | ColumnType::Timestamp | ColumnType::Date => 8,
+            ColumnType::Int64
+            | ColumnType::UInt64
+            | ColumnType::Float64
+            | ColumnType::Timestamp
+            | ColumnType::TimestampTz
+            | ColumnType::Date
+            | ColumnType::Time
+            | ColumnType::Interval => 8,
             ColumnType::String
             | ColumnType::Binary
             | ColumnType::Uuid | ColumnType::Decimal128
@@ -196,6 +229,19 @@ impl ColumnType {
                 | ColumnType::TurboQuant4Vector
                 | ColumnType::Blob
                 | ColumnType::Json
+        )
+    }
+
+    /// True for the timestamp/date/time/interval family (8-byte payload).
+    #[inline]
+    pub fn is_time_family(self) -> bool {
+        matches!(
+            self,
+            ColumnType::Timestamp
+                | ColumnType::TimestampTz
+                | ColumnType::Date
+                | ColumnType::Time
+                | ColumnType::Interval
         )
     }
 
@@ -297,6 +343,7 @@ impl AsColumnValueRef for crate::data::Value {
             Value::Bool(value) => ColumnValueRef::Bool(*value),
             Value::Int64(value) | Value::Timestamp(value) => ColumnValueRef::Int64(*value),
             Value::Int32(value) | Value::Date(value) => ColumnValueRef::Int64(*value as i64),
+            Value::Time(value) | Value::Interval(value) => ColumnValueRef::Int64(*value),
             Value::Float64(value) => ColumnValueRef::Float64(*value),
             Value::Float32(value) => ColumnValueRef::Float64(*value as f64),
             Value::String(value) => {
@@ -565,7 +612,8 @@ impl ColumnData {
             ColumnType::Bool => ColumnData::Bool { data: Vec::new(), len: 0 },
             ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 | ColumnType::Int64 |
             ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
-            ColumnType::Timestamp | ColumnType::Date => {
+            ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date |
+            ColumnType::Time | ColumnType::Interval => {
                 ColumnData::Int64(Vec::new())
             }
             ColumnType::Float32 | ColumnType::Float64 => ColumnData::Float64(Vec::new()),
@@ -1079,7 +1127,8 @@ impl ColumnData {
             }
             ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
             ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
-            ColumnType::Timestamp | ColumnType::Date => {
+            ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date |
+            ColumnType::Time | ColumnType::Interval => {
                 let count = read_u64!() as usize;
                 let byte_len = count * 8;
                 if pos + byte_len > bytes.len() {
@@ -1283,7 +1332,8 @@ impl ColumnData {
             }
             ColumnType::Int64 | ColumnType::Int8 | ColumnType::Int16 | ColumnType::Int32 |
             ColumnType::UInt8 | ColumnType::UInt16 | ColumnType::UInt32 | ColumnType::UInt64 |
-            ColumnType::Timestamp | ColumnType::Date => {
+            ColumnType::Timestamp | ColumnType::TimestampTz | ColumnType::Date |
+            ColumnType::Time | ColumnType::Interval => {
                 let count = read_u64!() as usize;
                 pos += count * 8;
             }

@@ -448,15 +448,96 @@ impl ApexExecutor {
         } else {
             crate::query::executor::DecimalHintGuard::none()
         };
+        // MIN/MAX over a time-family column must stay typed no matter which
+        // aggregation lane answered; collect the expected outputs up front.
+        let mut time_aggregate_outputs: Vec<(String, crate::data::DataType)> = Vec::new();
+        for column in &stmt.columns {
+            if let SelectColumn::Aggregate {
+                func,
+                column: Some(name),
+                alias,
+                ..
+            } = column
+            {
+                let function = match func {
+                    crate::query::AggregateFunc::Min => "MIN",
+                    crate::query::AggregateFunc::Max => "MAX",
+                    _ => continue,
+                };
+                let clean = name.trim_matches('"');
+                let bare = clean.rsplit('.').next().unwrap_or(clean);
+                let dtype = get_cached_backend(storage_path)
+                    .ok()
+                    .and_then(|backend| backend.get_column_type(bare));
+                if let Some(dtype) = dtype.filter(|dtype| dtype.is_time_family()) {
+                    let output_name = alias
+                        .clone()
+                        .unwrap_or_else(|| format!("{}({})", function, name));
+                    time_aggregate_outputs.push((output_name, dtype));
+                }
+            }
+        }
         let result = Self::execute_select_with_base_dir_inner(
             stmt,
             storage_path,
             base_dir,
             default_table_path,
         )?;
+        let result = Self::present_time_aggregate_outputs(result, &time_aggregate_outputs)?;
         // Internal numeric math uses Arrow Decimal128; the public surface keeps
         // the fixed 16-byte payload (D4).
         Ok(crate::query::executor::decimal_result_to_payload(result))
+    }
+
+    /// D5: relabel MIN/MAX outputs over time-family columns as typed Arrow
+    /// arrays, whichever aggregation lane produced them.
+    fn present_time_aggregate_outputs(
+        result: ApexResult,
+        outputs: &[(String, crate::data::DataType)],
+    ) -> io::Result<ApexResult> {
+        if outputs.is_empty() {
+            return Ok(result);
+        }
+        let ApexResult::Data(batch) = result else {
+            return Ok(result);
+        };
+        let mut fields: Vec<Field> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| (**field).clone())
+            .collect();
+        let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+        let mut changed = false;
+        for (name, dtype) in outputs {
+            let Ok(index) = batch.schema().index_of(name) else {
+                continue;
+            };
+            let column = batch.column(index);
+            let Some(values) = column.as_any().downcast_ref::<Int64Array>() else {
+                continue;
+            };
+            let raw: Vec<Option<i64>> = (0..values.len())
+                .map(|row| {
+                    if values.is_null(row) {
+                        None
+                    } else {
+                        Some(values.value(row))
+                    }
+                })
+                .collect();
+            let (arrow_dt, array) =
+                crate::query::executor::time_family_arrow_from_values(*dtype, raw);
+            fields[index] = Field::new(name, arrow_dt, true);
+            columns[index] = array;
+            changed = true;
+        }
+        if !changed {
+            return Ok(ApexResult::Data(batch));
+        }
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+            .map_err(|error| err_data(error.to_string()))?;
+        Ok(ApexResult::Data(batch))
     }
 
     fn execute_select_with_base_dir_inner(
@@ -4904,6 +4985,24 @@ let can_pushdown_limit = stmt.where_clause.is_none()
         // would read directly.
         if backend.has_pending_deltas() {
             return Ok(None);
+        }
+        // A time-family value aggregate must reach the typed executor path:
+        // this fused lane folds raw payloads as f64 and would report integers.
+        for column in &stmt.columns {
+            if let crate::query::SelectColumn::Aggregate {
+                column: Some(name), ..
+            } = column
+            {
+                let clean = name.trim_matches('"');
+                let bare = clean.rsplit('.').next().unwrap_or(clean);
+                if backend
+                    .get_column_type(bare)
+                    .map(|data_type| data_type.is_time_family())
+                    .unwrap_or(false)
+                {
+                    return Ok(None);
+                }
+            }
         }
 
         let where_clause = match &stmt.where_clause {

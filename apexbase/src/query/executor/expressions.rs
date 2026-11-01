@@ -2542,6 +2542,24 @@ impl ApexExecutor {
                     None,
                 ))
             }
+            Value::Time(t) => {
+                use arrow::array::PrimitiveArray;
+                use arrow::buffer::ScalarBuffer;
+                use arrow::datatypes::Time64MicrosecondType;
+                Arc::new(PrimitiveArray::<Time64MicrosecondType>::new(
+                    ScalarBuffer::from(vec![*t; num_rows]),
+                    None,
+                ))
+            }
+            Value::Interval(t) => {
+                use arrow::array::PrimitiveArray;
+                use arrow::buffer::ScalarBuffer;
+                use arrow::datatypes::DurationMicrosecondType;
+                Arc::new(PrimitiveArray::<DurationMicrosecondType>::new(
+                    ScalarBuffer::from(vec![*t; num_rows]),
+                    None,
+                ))
+            }
             Value::Array(_) => {
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
