@@ -3478,7 +3478,7 @@ projected as <code>bytes</code> (no implicit list/string conversion); <code>deci
 accepts <code>decimal.Decimal</code>, <code>int</code> and <code>str</code> on write and scales them to the
 declared scale (<code>Decimal("1.23")</code> in a <code>decimal(38,2)</code> column is stored as the
 integer <code>123</code>). Values with more fractional digits than the scale raise
-<code>ValueError</code>. Tables containing these types declare on-disk format version 6;
+<code>ValueError</code>. Tables containing these types declare on-disk format version 5 (the newest preview format, with an optional logical-type schema section);
 set <code>APEX_LOGICAL_TYPES=0</code> to refuse creating such columns (it is an explicit
 error, never a silent downgrade).</p>
 <p>SQL <code>DECIMAL(p,s)</code> / <code>NUMERIC(p,s)</code> columns are still projected as text by

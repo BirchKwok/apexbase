@@ -1492,10 +1492,10 @@
 </li>
         
           <li class="md-nav__item">
-  <a href="#storage-format-version-6" class="md-nav__link">
+  <a href="#storage-format-v5-logical-type-section" class="md-nav__link">
     <span class="md-ellipsis">
       
-        Storage Format (version 6)
+        Storage Format (V5 logical-type section)
       
     </span>
   </a>
@@ -3016,11 +3016,13 @@
 <p><em>2026-11-01</em></p>
 <p><a href="https://github.com/BirchKwok/ApexBase/compare/v1.38.0...v1.39.0">Compare with v1.38.0</a></p>
 <blockquote>
-<p><strong>V5 architecture preview (third release).</strong> v1.39.0 adds on-disk format
-version 6, an <em>optional</em> logical-type section for <code>UUID</code> and <code>DECIMAL(p,s)</code>
-columns. Tables without logical types keep writing version 5/4 exactly as
-before, so existing files and older builds are unaffected; a build that
-predates the section refuses a version-6 file at open instead of misreading it.</p>
+<p><strong>V5 architecture preview (third release).</strong> v1.39.0 keeps the preview at
+on-disk format version 5 and adds an <em>optional</em> logical-type schema section for
+<code>UUID</code> and <code>DECIMAL(p,s)</code> columns. V5 is still the newest format — the preview
+intentionally does not introduce a higher version number. Tables without
+logical types keep writing version 5/4 exactly as before. Because the section
+is an addition to the preview format, do not open files that contain
+parameterised types with an older V5 preview build; upgrade the reader first.</p>
 </blockquote>
 <h3 id="highlights">Highlights<a class="headerlink" href="#highlights" title="Permanent link">&para;</a></h3>
 <ul>
@@ -3035,16 +3037,16 @@ predates the section refuses a version-6 file at open instead of misreading it.<
   layout is still undecided, because those columns are read as a contiguous run
   (batch TopK lost ~28% otherwise).</li>
 </ul>
-<h3 id="storage-format-version-6">Storage Format (version 6)<a class="headerlink" href="#storage-format-version-6" title="Permanent link">&para;</a></h3>
+<h3 id="storage-format-v5-logical-type-section">Storage Format (V5 logical-type section)<a class="headerlink" href="#storage-format-v5-logical-type-section" title="Permanent link">&para;</a></h3>
 <ul>
 <li>New append-only logical-type section in the schema (<code>0x4C</code>): one entry per
   column, currently <code>Uuid</code>, <code>Decimal { precision, scale }</code> (and the timestamp
-  family to come). A table declares version 6 only when a logical type is
-  present, or when it contains a <code>Uuid</code>/<code>Decimal128</code> column whose semantics live
-  in the type tag; everything else keeps writing version 5/4.</li>
-<li>Reading a version-6 file works from the catalog bytes or the file footer;
-  lazily materialized tables restore their logical types through a cold path, so
-  a reopened process sees the same parameterised types.</li>
+  family to come). It lives inside format version 5 (the newest preview format);
+  tables with such columns keep declaring version 5, and everything else keeps
+  writing version 5/4.</li>
+<li>Reading a file with the section works from the catalog bytes or the file
+  footer; lazily materialized tables restore their logical types through a cold
+  path, so a reopened process sees the same parameterised types.</li>
 <li><code>APEX_LOGICAL_TYPES=0</code> refuses to create these columns (explicit error, never a
   silent downgrade).</li>
 </ul>
@@ -3115,8 +3117,8 @@ predates the section refuses a version-6 file at open instead of misreading it.<
 <h3 id="upgrade-notes">Upgrade Notes<a class="headerlink" href="#upgrade-notes" title="Permanent link">&para;</a></h3>
 <ul>
 <li>Files written by v1.39.0 without logical types are byte-compatible with
-  v1.38.0. Files containing <code>uuid</code>/<code>decimal(p,s)</code> columns declare version 6 and
-  must not be opened by older builds.</li>
+  v1.38.0. Files containing <code>uuid</code>/<code>decimal(p,s)</code> columns carry the extra V5
+  schema section and should not be opened by older preview builds.</li>
 <li><code>uuid</code>/decimal APIs are additive; the text fallback for SQL <code>DECIMAL</code> stays the
   default.</li>
 </ul>
