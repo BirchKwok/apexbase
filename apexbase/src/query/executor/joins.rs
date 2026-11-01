@@ -1810,6 +1810,33 @@ impl ApexExecutor {
         probe: &ArrayRef,
         build: &ArrayRef,
     ) -> Option<(usize, usize)> {
+        // The overwhelmingly common expression-ON key is an integer; a typed
+        // map avoids the per-row Vec key allocation and hashing.
+        if let (Some(probe_keys), Some(build_keys)) = (
+            probe.as_any().downcast_ref::<arrow::array::Int64Array>(),
+            build.as_any().downcast_ref::<arrow::array::Int64Array>(),
+        ) {
+            let mut counts: ahash::AHashMap<i64, usize> =
+                ahash::AHashMap::with_capacity(build_keys.len());
+            for row in 0..build_keys.len() {
+                if build_keys.is_null(row) {
+                    continue;
+                }
+                *counts.entry(build_keys.value(row)).or_insert(0) += 1;
+            }
+            let mut matched = 0usize;
+            let mut total = 0usize;
+            for row in 0..probe_keys.len() {
+                if probe_keys.is_null(row) {
+                    continue;
+                }
+                if let Some(count) = counts.get(&probe_keys.value(row)) {
+                    matched += 1;
+                    total += *count;
+                }
+            }
+            return Some((matched, total));
+        }
         // ahash (not the std SipHash map): the probe side is one lookup per left
         // row, which dominated the shape before.
         let mut counts: ahash::AHashMap<Vec<u8>, usize> =

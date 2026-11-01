@@ -1604,7 +1604,7 @@ class ApexClient:
         if not isinstance(row, dict):
             return row
         table = self._current_table
-        if not table:
+        if not table or not self._table_typed_read_columns():
             return row
         declared = self._table_schemas.get(table)
         if declared is None:
@@ -1638,7 +1638,7 @@ class ApexClient:
         if not columns_dict:
             return columns_dict
         table = self._current_table
-        if not table:
+        if not table or not self._table_typed_read_columns():
             return columns_dict
         declared = self._table_schemas.get(table)
         if declared is None:
@@ -1678,10 +1678,15 @@ class ApexClient:
         cached = self._declared_types_cache.get(table)
         if cached is not None:
             return cached
-        try:
-            declared = dict(self._storage.table_types(table))
-        except Exception:
-            declared = {}
+        declared = self._table_schemas.get(table)
+        if declared is None:
+            self._fetch_table_schema(table)
+            declared = self._table_schemas.get(table)
+        if declared is None:
+            try:
+                declared = dict(self._storage.table_types(table))
+            except Exception:
+                declared = {}
         self._declared_types_cache[table] = declared
         return declared
 
