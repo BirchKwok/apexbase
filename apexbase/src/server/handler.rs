@@ -43,6 +43,10 @@ use super::types::{schema_to_field_info, schema_to_field_info_binary};
 /// Client metadata key for tracking current database per connection
 const METADATA_KEY_DB: &str = "apex_current_db";
 
+/// Client metadata key for the open transaction id (V5 S6: per-connection
+/// transaction state so simple-query batches share one transaction).
+const METADATA_KEY_TXN: &str = "apex_txn_id";
+
 /// Default number of statements that may execute at once.
 ///
 /// Every query used to run *on* a tokio worker: execution concurrency was capped
@@ -93,6 +97,14 @@ impl QueryFailure {
     fn capacity(message: impl Into<String>) -> Self {
         Self {
             code: "53300",
+            message: message.into(),
+        }
+    }
+
+    /// A parse failure (SQLSTATE 42601).
+    fn syntax(message: impl Into<String>) -> Self {
+        Self {
+            code: "42601",
             message: message.into(),
         }
     }
@@ -295,6 +307,207 @@ impl ApexBaseHandler {
             .unwrap_or_else(|| "default".to_string())
     }
 
+    /// Read the open transaction id from client metadata (V5 S6).
+    fn current_txn_from_metadata<C: ClientInfo>(client: &mut C) -> Option<u64> {
+        client
+            .metadata()
+            .get(METADATA_KEY_TXN)
+            .and_then(|value| value.parse::<u64>().ok())
+    }
+
+    /// Publish (or clear) the per-connection transaction id.
+    fn set_txn_metadata<C: ClientInfo>(client: &mut C, txn: Option<u64>) {
+        match txn {
+            Some(id) => {
+                client
+                    .metadata_mut()
+                    .insert(METADATA_KEY_TXN.to_string(), id.to_string());
+            }
+            None => {
+                client.metadata_mut().remove(METADATA_KEY_TXN);
+            }
+        }
+    }
+
+    /// Whether the statement is a transaction control command.
+    fn is_txn_control(sql: &str) -> bool {
+        let s = Self::strip_sql_comments(sql);
+        if s.is_empty() {
+            return false;
+        }
+        let upper = s.get(..9).unwrap_or(s).to_ascii_uppercase();
+        upper.starts_with("BEGIN")
+            || upper.starts_with("COMMIT")
+            || upper.starts_with("ROLLBACK")
+            || upper.starts_with("SAVEPOINT")
+            || upper.starts_with("RELEASE")
+    }
+
+    /// Central routing decision shared with the embedded entry point: a
+    /// statement is a write when the query-signature classifier says so.
+    fn route_is_write(sql: &str) -> bool {
+        use crate::query::query_signature::{self, QuerySignature};
+        matches!(
+            query_signature::classify(sql),
+            QuerySignature::DmlWrite | QuerySignature::Ddl { .. }
+        )
+    }
+
+    /// Build a command tag from the kind recorded before execution.
+    fn tag_for(kind: &'static str, with_rows: bool, rows: usize) -> Tag {
+        match (kind, with_rows) {
+            ("", _) => Tag::new("OK"),
+            ("INSERT", true) => Tag::new("INSERT").with_oid(0).with_rows(rows),
+            (name, true) => Tag::new(name).with_rows(rows),
+            (name, false) => Tag::new(name),
+        }
+    }
+
+    /// Execute a statement batch inside one transaction.
+    ///
+    /// A batch that carries no explicit transaction control is wrapped in an
+    /// implicit transaction (PostgreSQL simple-query semantics): if any
+    /// statement fails, every earlier statement in the batch is rolled back.
+    /// An error inside an explicit transaction rolls that transaction back and
+    /// returns the connection to auto-commit, which keeps the abort semantics
+    /// explicit and the connection usable.
+    fn execute_stateful_sync(
+        base_dir: &Path,
+        database_dir: &Path,
+        statements: Vec<crate::query::SqlStatement>,
+        initial_txn: Option<u64>,
+    ) -> Result<(Vec<(RecordBatch, Tag, bool)>, Option<u64>), QueryFailure> {
+        use crate::query::SqlStatement;
+
+        let default_table_path = database_dir.join("apexbase.apex");
+        let session = crate::Session::new(database_dir, &default_table_path)
+            .with_root_dir(base_dir);
+        let has_control = statements.iter().any(|stmt| {
+            matches!(
+                stmt,
+                SqlStatement::BeginTransaction { .. }
+                    | SqlStatement::Commit
+                    | SqlStatement::Rollback
+                    | SqlStatement::Savepoint { .. }
+                    | SqlStatement::RollbackToSavepoint { .. }
+                    | SqlStatement::ReleaseSavepoint { .. }
+            )
+        });
+        let implicit = initial_txn.is_none() && !has_control && statements.len() > 1;
+        let mut txn = initial_txn;
+        if implicit {
+            let (_, new_txn) = session
+                .execute_multi_with_txn(
+                    vec![SqlStatement::BeginTransaction { read_only: false }],
+                    None,
+                )
+                .map_err(|error| QueryFailure::new(error.to_string()))?;
+            txn = new_txn;
+        }
+
+        let mut results: Vec<(RecordBatch, Tag, bool)> = Vec::with_capacity(statements.len());
+        for stmt in statements {
+            if txn.is_some() && matches!(stmt, SqlStatement::BeginTransaction { .. }) && !implicit {
+                let _ = session.execute_multi_with_txn(vec![SqlStatement::Rollback], txn);
+                return Err(QueryFailure::new(
+                    "BEGIN inside an active transaction is not supported",
+                ));
+            }
+            // The tag is decided before the statement moves into the executor.
+            let mut is_write = true;
+            let (tag_kind, with_rows): (&'static str, bool) = match &stmt {
+                SqlStatement::Insert { .. }
+                | SqlStatement::InsertSelect { .. }
+                | SqlStatement::InsertOnConflict { .. }
+                | SqlStatement::InsertOverwrite { .. }
+                | SqlStatement::HiveMultiInsert { .. } => ("INSERT", true),
+                SqlStatement::Delete { .. } => ("DELETE", true),
+                SqlStatement::Update { .. } => ("UPDATE", true),
+                SqlStatement::CreateTable { .. } => ("CREATE TABLE", false),
+                SqlStatement::DropTable { .. } => ("DROP TABLE", false),
+                SqlStatement::AlterTable { .. } => ("ALTER TABLE", false),
+                SqlStatement::TruncateTable { .. } => ("TRUNCATE TABLE", false),
+                SqlStatement::CreateIndex { .. } => ("CREATE INDEX", false),
+                SqlStatement::DropIndex { .. } => ("DROP INDEX", false),
+                SqlStatement::CopyImport { .. } => ("COPY", false),
+                SqlStatement::BeginTransaction { .. } => ("BEGIN", false),
+                SqlStatement::Commit => ("COMMIT", false),
+                SqlStatement::Rollback => ("ROLLBACK", false),
+                SqlStatement::Savepoint { .. } => ("SAVEPOINT", false),
+                SqlStatement::RollbackToSavepoint { .. } => ("ROLLBACK", false),
+                SqlStatement::ReleaseSavepoint { .. } => ("RELEASE", false),
+                _ => {
+                    is_write = false;
+                    ("", false)
+                }
+            };
+            match session.execute_multi_with_txn(vec![stmt], txn) {
+                Ok((result, new_txn)) => {
+                    txn = new_txn;
+                    let batch = result
+                        .to_record_batch()
+                        .map_err(|error| QueryFailure::new(error.to_string()))?;
+                    let tag = Self::tag_for(tag_kind, with_rows, batch.num_rows());
+                    results.push((batch, tag, is_write));
+                }
+                Err(error) => {
+                    if implicit || txn.is_some() {
+                        let _ = session.execute_multi_with_txn(vec![SqlStatement::Rollback], txn);
+                    }
+                    return Err(QueryFailure::new(error.to_string()));
+                }
+            }
+        }
+
+        if implicit {
+            match session.execute_multi_with_txn(vec![SqlStatement::Commit], txn) {
+                Ok((_, new_txn)) => txn = new_txn,
+                Err(error) => {
+                    let _ = session.execute_multi_with_txn(vec![SqlStatement::Rollback], txn);
+                    return Err(QueryFailure::new(error.to_string()));
+                }
+            }
+        }
+        Ok((results, txn))
+    }
+
+    /// Run a simple-query batch through the per-connection transaction state.
+    async fn run_stateful_batch(
+        &self,
+        sql: &str,
+        current_db: &str,
+        txn: Option<u64>,
+    ) -> Result<(Vec<(RecordBatch, Tag, bool)>, Option<u64>), QueryFailure> {
+        let base_dir = self.base_dir.clone();
+        let database_dir = self.effective_base_dir(current_db);
+        let sql = sql.to_string();
+        let permit = match tokio::time::timeout(
+            self.query_wait,
+            Arc::clone(&self.query_slots).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => {
+                return Err(QueryFailure::new(format!("query admission closed: {error}")))
+            }
+            Err(_) => {
+                return Err(QueryFailure::capacity(format!(
+                    "too many concurrent statements: all {} query slots are busy",
+                    self.query_concurrency()
+                )))
+            }
+        };
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let statements = crate::query::sql_parser::SqlParser::parse_multi(&sql)
+                .map_err(|error| QueryFailure::syntax(error.to_string()))?;
+            Self::execute_stateful_sync(&base_dir, &database_dir, statements, txn)
+        })
+        .await
+        .map_err(|error| QueryFailure::new(format!("query task failed: {error}")))?
+    }
+
     /// Stream encoded `DataRow`s for a batch.
     ///
     /// The whole `Vec<DataRow>` used to be built before the first row was sent,
@@ -367,34 +580,24 @@ impl ApexBaseHandler {
         }
     }
 
-    /// Check if SQL is a write/command operation (not a SELECT query)
-    fn is_write_op(sql: &str) -> bool {
-        let s = Self::strip_sql_comments(sql);
-        if s.is_empty() {
+    /// Whether the statement answers with a command tag instead of a result set.
+    ///
+    /// Routing is centralized on the same `query_signature::classify` the
+    /// embedded entry point uses (V5 S6 ③), so both transports agree on which
+    /// statements are writes/commands: DML, DDL, transaction control and session
+    /// commands answer with `CommandComplete`; everything else streams rows.
+    fn route_is_command(sql: &str) -> bool {
+        use crate::query::query_signature::{self, QuerySignature};
+        if Self::strip_sql_comments(sql).is_empty() {
             return false;
         }
-        // First-byte guard + eq_ignore_ascii_case — zero allocation
-        match s.as_bytes()[0] | 0x20 {
-            b'i' => s.len() >= 6 && s[..6].eq_ignore_ascii_case("INSERT"),
-            b'u' => s.len() >= 6 && s[..6].eq_ignore_ascii_case("UPDATE"),
-            b'd' => {
-                (s.len() >= 6 && s[..6].eq_ignore_ascii_case("DELETE"))
-                    || (s.len() >= 4 && s[..4].eq_ignore_ascii_case("DROP"))
-            }
-            b'c' => {
-                (s.len() >= 6 && s[..6].eq_ignore_ascii_case("CREATE"))
-                    || (s.len() >= 6 && s[..6].eq_ignore_ascii_case("COMMIT"))
-            }
-            b'a' => s.len() >= 5 && s[..5].eq_ignore_ascii_case("ALTER"),
-            b't' => s.len() >= 8 && s[..8].eq_ignore_ascii_case("TRUNCATE"),
-            b'b' => s.len() >= 5 && s[..5].eq_ignore_ascii_case("BEGIN"),
-            b'r' => {
-                (s.len() >= 8 && s[..8].eq_ignore_ascii_case("ROLLBACK"))
-                    || (s.len() >= 7 && s[..7].eq_ignore_ascii_case("RELEASE"))
-            }
-            b's' => s.len() >= 9 && s[..9].eq_ignore_ascii_case("SAVEPOINT"),
-            _ => false,
-        }
+        matches!(
+            query_signature::classify(sql),
+            QuerySignature::DmlWrite
+                | QuerySignature::Ddl { .. }
+                | QuerySignature::Transaction
+                | QuerySignature::SessionCommand
+        )
     }
 
     /// Get the proper PG command tag for a SQL statement
@@ -473,6 +676,64 @@ impl SimpleQueryHandler for ApexBaseHandler {
             .filter(|s| !s.is_empty())
             .collect();
 
+        let txn = Self::current_txn_from_metadata(client);
+        let needs_stateful =
+            txn.is_some() || statements.len() > 1 || statements.iter().any(|sql| Self::is_txn_control(sql));
+        if needs_stateful {
+            if statements
+                .iter()
+                .any(|sql| Self::try_parse_use_cmd(sql).is_some())
+            {
+                Self::set_txn_metadata(client, None);
+                return Err(PgWireError::UserError(Box::new(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42000".to_string(),
+                        "USE cannot run inside a multi-statement or transaction batch"
+                            .to_string(),
+                    ),
+                )));
+            }
+            let current_db = Self::current_db_from_metadata(client);
+            match self.run_stateful_batch(query, &current_db, txn).await {
+                Ok((results, new_txn)) => {
+                    Self::set_txn_metadata(client, new_txn);
+                    let mut responses = Vec::new();
+                    for (batch, tag, is_write) in results {
+                        if is_write {
+                            responses.push(Response::Execution(tag));
+                        } else {
+                            let schema = batch.schema();
+                            let field_infos: Arc<Vec<FieldInfo>> =
+                                Arc::new(schema_to_field_info(&schema));
+                            let rows =
+                                Self::encode_batch_rows(batch, Arc::clone(&field_infos))?;
+                            let data_row_stream = stream::iter(rows);
+                            responses.push(Response::Query(QueryResponse::new(
+                                field_infos,
+                                data_row_stream,
+                            )));
+                        }
+                    }
+                    return Ok(if responses.is_empty() {
+                        vec![Response::EmptyQuery]
+                    } else {
+                        responses
+                    });
+                }
+                Err(failure) => {
+                    Self::set_txn_metadata(client, None);
+                    return Err(PgWireError::UserError(Box::new(
+                        pgwire::error::ErrorInfo::new(
+                            "ERROR".to_string(),
+                            failure.code.to_string(),
+                            failure.message,
+                        ),
+                    )));
+                }
+            }
+        }
+
         let mut responses = Vec::new();
 
         for sql in statements {
@@ -488,7 +749,7 @@ impl SimpleQueryHandler for ApexBaseHandler {
             let current_db = Self::current_db_from_metadata(client);
             match self.run_query(sql, &current_db).await {
                 Ok(batch) => {
-                    if Self::is_write_op(sql) {
+                    if Self::route_is_command(sql) {
                         let tag = Self::command_tag(sql, batch.num_rows());
                         responses.push(Response::Execution(tag));
                     } else {
@@ -563,7 +824,7 @@ impl ExtendedQueryHandler for ApexBaseHandler {
             param_types.push(Type::UNKNOWN);
         }
 
-        if Self::is_write_op(sql) {
+        if Self::route_is_command(sql) {
             return Ok(DescribeStatementResponse::new(param_types, vec![]));
         }
 
@@ -609,7 +870,7 @@ impl ExtendedQueryHandler for ApexBaseHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let sql = &target.statement.statement;
-        if sql.trim().is_empty() || Self::is_write_op(sql) {
+        if sql.trim().is_empty() || Self::route_is_command(sql) {
             return Ok(DescribePortalResponse::new(vec![]));
         }
         // Use actual bound parameters for accurate schema discovery
@@ -670,9 +931,53 @@ impl ExtendedQueryHandler for ApexBaseHandler {
         let current_db = Self::current_db_from_metadata(_client);
         // Check if client requested binary result format
         let want_binary = matches!(portal.result_column_format, Format::UnifiedBinary);
+        let txn = Self::current_txn_from_metadata(_client);
+        if txn.is_some() || Self::is_txn_control(sql) {
+            let (results, new_txn) = self
+                .run_stateful_batch(sql, &current_db, txn)
+                .await
+                .map_err(|failure| {
+                    PgWireError::UserError(Box::new(pgwire::error::ErrorInfo::new(
+                        "ERROR".to_string(),
+                        failure.code.to_string(),
+                        failure.message,
+                    )))
+                })?;
+            Self::set_txn_metadata(_client, new_txn);
+            let mut results = results;
+            if results.len() != 1 {
+                return Err(PgWireError::UserError(Box::new(
+                    pgwire::error::ErrorInfo::new(
+                        "ERROR".to_string(),
+                        "42601".to_string(),
+                        "the extended query protocol executes exactly one statement"
+                            .to_string(),
+                    ),
+                )));
+            }
+            let (batch, tag, is_write) = results.remove(0);
+            if is_write {
+                return Ok(Response::Execution(tag));
+            }
+            let schema = batch.schema();
+            let field_infos: Arc<Vec<FieldInfo>> = Arc::new(if want_binary {
+                schema_to_field_info_binary(&schema)
+            } else {
+                schema_to_field_info(&schema)
+            });
+            if !want_binary {
+                self.cache_schema(raw_sql, field_infos.clone());
+            }
+            let rows = Self::encode_batch_rows(batch, Arc::clone(&field_infos))?;
+            let data_row_stream = stream::iter(rows);
+            return Ok(Response::Query(QueryResponse::new(
+                field_infos,
+                data_row_stream,
+            )));
+        }
         match self.run_query(sql, &current_db).await {
             Ok(batch) => {
-                if Self::is_write_op(sql) {
+                if Self::route_is_command(sql) {
                     let tag = Self::command_tag(sql, batch.num_rows());
                     Ok(Response::Execution(tag))
                 } else {

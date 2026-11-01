@@ -269,6 +269,36 @@ round-trip reads: predicates that compare a list column, `ORDER BY`, `GROUP BY`,
 `DISTINCT ON` and aggregates over a list column raise explicit errors instead
 of producing a value. `APEX_LOGICAL_TYPES=0` refuses creating list columns.
 
+### Statement routing & transactions (V5 S6: D9/D11)
+
+Every transport answers through the same routing decisions: statements are
+classified with the Rust `query_signature` classifier (DML/DDL/transaction/
+session commands answer with a command tag; everything else streams rows), and
+transaction batches run through `execute_multi_with_txn`, the same primitive the
+embedded entry point uses.
+
+- **Embedded** (`ApexClient.execute`): a statement string with several
+  statements is one transaction; `BEGIN; ...; ROLLBACK;` in one call discards
+  everything, and a client-side `BEGIN` covers later multi-statement batches.
+  `execute_batch()` keeps ordered read-after-write visibility.
+- **PG wire simple query**: every statement batch that is not a single
+  auto-commit statement runs in one transaction. A multi-statement message
+  without explicit control is an **implicit transaction**: if any statement
+  fails, every earlier statement in the message is rolled back (PostgreSQL
+  simple-query semantics). `BEGIN`/`COMMIT`/`ROLLBACK` are per-connection state,
+  so they work across messages (and through the extended/prepared protocol).
+- **Error and abort semantics** (explicit, documented): an error inside a
+  transaction rolls that transaction back and returns the connection to
+  auto-commit; `BEGIN` while a transaction is already open is an explicit error;
+  `USE`/`\c` inside a multi-statement batch or a transaction is rejected with an
+  explicit error (issue it as its own simple query).
+- **COPY routing** (D11): `COPY <new_table> FROM '<file>'` without a selected
+  table answers through the scalar entry — it creates and publishes the table
+  and does **not** import pyarrow for the first call (the previous Arrow route
+  paid a 43–51 ms first-import cliff). `COPY <table> TO '<file>'` still requires a
+  selected/known table. The COPY target becomes the selected table, so following
+  unqualified statements work.
+
 ### SQL semantics (V5 S5: D6/D7/D8)
 
 Three semantics changes land in V5 and are documented here as migration notes

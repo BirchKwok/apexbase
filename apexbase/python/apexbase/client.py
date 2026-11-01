@@ -829,10 +829,10 @@ def _is_scalar_write_sql(
     if len(statements) > 1 and in_txn:
         return False
     for statement in statements:
-        # `COPY <table> FROM <file>` can create the table it loads, and the scalar
-        # entry refuses to run without a selected table (the Arrow route falls back
-        # to the base directory). With a table already selected it is just a count.
-        if statement.startswith('COPY') and ' FROM ' in statement and not has_table:
+        # `COPY <table> FROM <file>` can create the table it loads (V5 S6 D11):
+        # the scalar entry publishes that table, so it is safe to answer here and
+        # avoid the first-import pyarrow cliff. `COPY ... TO` still needs a table.
+        if statement.startswith('COPY') and ' TO ' in statement and not has_table:
             return False
         if not statement.startswith(_SCALAR_WRITE_HEADS):
             return False
@@ -3817,6 +3817,19 @@ class ApexClient:
         ):
             return None
         result = self._storage.execute(sql)
+        # D11: the scalar COPY entry creates the target table. Publish it the same
+        # way the Arrow route does so following unqualified statements work.
+        if sql_upper.startswith('COPY ') and not self._current_table:
+            match = re.match(
+                r'COPY\s+([A-Za-z_][A-Za-z0-9_]*)\s+FROM\b', sql, re.IGNORECASE
+            )
+            if match is not None:
+                copied_table = match.group(1)
+                try:
+                    self._storage.use_table(copied_table)
+                except Exception:
+                    pass
+                self._current_table = copied_table.lower()
         # The Arrow route syncs the selected table from storage after every
         # statement -- `CREATE TABLE` and `COPY <table> FROM` publish the table they
         # touch. Doing the same here is what keeps following unqualified statements
