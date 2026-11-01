@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 150" role="img" aria-labelledby="title desc">
+  <title id="title">ApexBase wordmark</title>
+  <desc id="desc">A bold ApexBase wordmark with an outline and shadow.</desc>
+  <text
+    x="16"
+    y="100"
+    font-family="Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+    font-size="82"
+    font-weight="900"
+    letter-spacing="0"
+    fill="#20242c"
+    stroke="#ffffff"
+    stroke-width="8"
+    paint-order="stroke fill"
+    filter="url(#shadow)">ApexBase</text>
+  <defs>
+    <filter id="shadow" x="-10%" y="-40%" width="120%" height="180%">
+      <feDropShadow dx="5" dy="6" stdDeviation="1.2" flood-color="#00897b" flood-opacity="0.45"/>
+      <feDropShadow dx="9" dy="10" stdDeviation="0.8" flood-color="#111827" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+</svg>
