@@ -8,11 +8,13 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 
 [Compare with v1.38.0](https://github.com/BirchKwok/ApexBase/compare/v1.38.0...v1.39.0)
 
-> **V5 architecture preview (third release).** v1.39.0 adds on-disk format
-> version 6, an *optional* logical-type section for `UUID` and `DECIMAL(p,s)`
-> columns. Tables without logical types keep writing version 5/4 exactly as
-> before, so existing files and older builds are unaffected; a build that
-> predates the section refuses a version-6 file at open instead of misreading it.
+> **V5 architecture preview (third release).** v1.39.0 keeps the preview at
+> on-disk format version 5 and adds an *optional* logical-type schema section for
+> `UUID` and `DECIMAL(p,s)` columns. V5 is still the newest format — the preview
+> intentionally does not introduce a higher version number. Tables without
+> logical types keep writing version 5/4 exactly as before. Because the section
+> is an addition to the preview format, do not open files that contain
+> parameterised types with an older V5 preview build; upgrade the reader first.
 
 ### Highlights
 
@@ -27,16 +29,16 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
   layout is still undecided, because those columns are read as a contiguous run
   (batch TopK lost ~28% otherwise).
 
-### Storage Format (version 6)
+### Storage Format (V5 logical-type section)
 
 - New append-only logical-type section in the schema (`0x4C`): one entry per
   column, currently `Uuid`, `Decimal { precision, scale }` (and the timestamp
-  family to come). A table declares version 6 only when a logical type is
-  present, or when it contains a `Uuid`/`Decimal128` column whose semantics live
-  in the type tag; everything else keeps writing version 5/4.
-- Reading a version-6 file works from the catalog bytes or the file footer;
-  lazily materialized tables restore their logical types through a cold path, so
-  a reopened process sees the same parameterised types.
+  family to come). It lives inside format version 5 (the newest preview format);
+  tables with such columns keep declaring version 5, and everything else keeps
+  writing version 5/4.
+- Reading a file with the section works from the catalog bytes or the file
+  footer; lazily materialized tables restore their logical types through a cold
+  path, so a reopened process sees the same parameterised types.
 - `APEX_LOGICAL_TYPES=0` refuses to create these columns (explicit error, never a
   silent downgrade).
 
@@ -107,8 +109,8 @@ This page summarizes the changes introduced in each ApexBase release, grouped by
 ### Upgrade Notes
 
 - Files written by v1.39.0 without logical types are byte-compatible with
-  v1.38.0. Files containing `uuid`/`decimal(p,s)` columns declare version 6 and
-  must not be opened by older builds.
+  v1.38.0. Files containing `uuid`/`decimal(p,s)` columns carry the extra V5
+  schema section and should not be opened by older preview builds.
 - `uuid`/decimal APIs are additive; the text fallback for SQL `DECIMAL` stays the
   default.
 ## [v1.38.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.38.0)

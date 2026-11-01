@@ -17,9 +17,9 @@ def test_sql_decimal_opt_in_round_trips_scaled_values(tmp_path, monkeypatch):
     rows = client.execute("SELECT id, d FROM t ORDER BY id").to_dict()
     assert [_unscaled(row["d"]) for row in rows] == [123, -4560, 700]
     assert client._storage.table_types("t")["d"] == "decimal(10,2)"
-    # DECIMAL columns now declare the v6 format (logical-type section present).
+    # DECIMAL columns now declare the V5 format (logical-type section present).
     version = int.from_bytes(open(str(tmp_path / "t.apex"), "rb").read(16)[8:12], "little")
-    assert version == 6
+    assert version == 5
     client.close()
 
 

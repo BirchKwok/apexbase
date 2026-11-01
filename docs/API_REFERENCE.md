@@ -235,7 +235,7 @@ projected as `bytes` (no implicit list/string conversion); `decimal(p,s)` also
 accepts `decimal.Decimal`, `int` and `str` on write and scales them to the
 declared scale (`Decimal("1.23")` in a `decimal(38,2)` column is stored as the
 integer `123`). Values with more fractional digits than the scale raise
-`ValueError`. Tables containing these types declare on-disk format version 6;
+`ValueError`. Tables containing these types declare on-disk format version 5 (the newest preview format, with an optional logical-type schema section);
 set `APEX_LOGICAL_TYPES=0` to refuse creating such columns (it is an explicit
 error, never a silent downgrade).
 

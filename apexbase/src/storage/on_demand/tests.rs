@@ -7344,10 +7344,10 @@ fn logical_types_declare_format_version_six() {
         schema.add_column("id", ColumnType::Uuid);
         schema.set_logical_type(0, Some(LogicalType::Uuid));
     }
-    assert_eq!(storage.required_format_version(), FORMAT_VERSION_V6);
-    // The UUID column type itself requires v6 even without the logical type.
+    assert_eq!(storage.required_format_version(), FORMAT_VERSION_V5);
+    // The UUID column type itself requires V5 even without the logical type.
     storage.schema.write().set_logical_type(0, None);
-    assert_eq!(storage.required_format_version(), FORMAT_VERSION_V6);
+    assert_eq!(storage.required_format_version(), FORMAT_VERSION_V5);
 
     // A plain legacy schema keeps the old version.
     let legacy_path = dir.path().join("legacy_version.apex");
@@ -7357,7 +7357,7 @@ fn logical_types_declare_format_version_six() {
 }
 
 #[test]
-fn decimal128_column_round_trips_and_declares_v6() {
+fn decimal128_column_round_trips_and_declares_v5() {
     // TYPE_DECIMAL128 reuses the Binary payload (16-byte i128 two's complement
     // rows) until the SQL/Arrow surface lands.
     let data: Vec<u8> = (0u8..48).collect();
@@ -7389,7 +7389,7 @@ fn decimal128_column_round_trips_and_declares_v6() {
             }),
         );
     }
-    assert_eq!(storage.required_format_version(), FORMAT_VERSION_V6);
+    assert_eq!(storage.required_format_version(), FORMAT_VERSION_V5);
     let parsed = OnDemandSchema::from_bytes(&storage.schema.read().to_bytes()).unwrap();
     assert_eq!(parsed.columns[0].1, ColumnType::Decimal128);
     assert_eq!(

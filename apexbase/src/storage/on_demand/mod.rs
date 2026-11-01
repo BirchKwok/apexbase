@@ -430,10 +430,9 @@ const MAGIC: &[u8; 8] = b"APEXV3\0\0";
 /// supported below), while V4 builds are not expected to read V5 files. V5 only
 /// bumps the version when a file actually uses a V5-only encoding, so files that
 /// stay within V4 rules remain readable by older builds.
-const FORMAT_VERSION_MAX: u32 = FORMAT_VERSION_V6;
+const FORMAT_VERSION_MAX: u32 = FORMAT_VERSION_V5;
 const FORMAT_VERSION_V4: u32 = 4;
 const FORMAT_VERSION_V5: u32 = 5;
-const FORMAT_VERSION_V6: u32 = 6;
 
 /// True for file versions this build reads: V4 and V5 share the row-group
 /// layout, so every V4-specific code path also applies to V5.

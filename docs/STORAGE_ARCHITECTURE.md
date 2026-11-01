@@ -29,15 +29,16 @@ Compatibility is one-way by design:
   encodings and would misread values instead of failing, so do not point a
   pre-V5 build at a version-5 file. Use `APEX_WIDTH_FIDELITY=0` when a file has
   to be handed to an older build.
-- **Version 6 adds parameterised (logical) column types.** A schema may carry an
-  optional `LogicalType` section after the constraint/derivation sections, one
-  entry per column (`Uuid`, `Decimal { precision, scale }`, ...). Tables whose
-  schema contains one — or a `Uuid`/`Decimal128` column, whose semantics live in
-  the type tag — declare version `6`; a table without logical types keeps
-  writing `5`/`4`, so existing files and older builds are unaffected. A build
-  that predates the section refuses a version-6 file at open instead of meeting
-  an unknown schema tail. UUID/Decimal values are fixed 16-byte payloads and
-  project as `bytes`; `APEX_LOGICAL_TYPES=0` refuses creating such columns.
+- **V5 carries an optional parameterised (logical) type section.** A schema may
+  append a `LogicalType` section after the constraint/derivation sections, one
+  entry per column (`Uuid`, `Decimal { precision, scale }`, ...). V5 is the
+  newest format (the preview does not use a higher version number), so tables
+  with such columns still declare version `5`; tables without logical types keep
+  writing `5`/`4` exactly as before. UUID/Decimal values are fixed 16-byte
+  payloads and project as `bytes`; `APEX_LOGICAL_TYPES=0` refuses creating such
+  columns. Because the section is an addition to the preview format rather than
+  a new version, do not open files containing parameterised types with an older
+  V5 preview build — upgrade the reading build first.
 
 This document defines the architecture and engineering guidelines for future
 development.

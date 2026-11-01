@@ -1,9 +1,10 @@
-"""UUID columns: declared type, 16-byte payload, v6 file version.
+"""UUID columns: declared type, 16-byte payload, V5 file version.
 
 The on-disk payload reuses the binary layout and ``ColumnType::Uuid`` carries the
-semantics, so a file with a UUID column declares format version 6 (an older
-build must refuse it rather than misread the schema). Python values are 16 raw
-bytes and project as ``bytes`` (D4 decision: no list/string conversion).
+semantics, so a file with a UUID column declares the preview format version 5
+(the newest format; logical types are an optional V5 schema section, not a new
+version). Python values are 16 raw bytes and project as ``bytes`` (D4 decision:
+no list/string conversion).
 """
 
 import os
@@ -38,7 +39,7 @@ def test_uuid_column_round_trips_and_declares_format_version_six(tmp_path):
 
     rows = client.execute("SELECT id, u FROM t ORDER BY id").to_dict()
     assert [row["u"] for row in rows] == values
-    assert _file_version(os.path.join(path, "t.apex")) == 6
+    assert _file_version(os.path.join(path, "t.apex")) == 5
     client.close()
 
     reopened = ApexClient(path, drop_if_exists=False, enable_cache=False)
@@ -90,7 +91,7 @@ def test_uuid_row_insert_validates_the_sixteen_byte_contract(tmp_path):
     client.close()
 
 
-def test_decimal128_column_round_trips_bytes_and_declares_v6(tmp_path):
+def test_decimal128_column_round_trips_bytes_and_declares_v5(tmp_path):
     path = str(tmp_path)
     client = ApexClient(path, drop_if_exists=True, enable_cache=False)
     client.create_table("t", {"id": "int64", "d": "decimal128"})
@@ -101,7 +102,7 @@ def test_decimal128_column_round_trips_bytes_and_declares_v6(tmp_path):
     client.flush()
     rows = client.execute("SELECT id, d FROM t ORDER BY id").to_dict()
     assert [row["d"] for row in rows] == values
-    assert _file_version(os.path.join(path, "t.apex")) == 6
+    assert _file_version(os.path.join(path, "t.apex")) == 5
     client.close()
 
 
@@ -117,7 +118,7 @@ def test_decimal_with_precision_and_scale_round_trips(tmp_path):
     client.flush()
     rows = client.execute("SELECT id, d FROM t ORDER BY id").to_dict()
     assert [row["d"] for row in rows] == values
-    assert _file_version(os.path.join(path, "t.apex")) == 6
+    assert _file_version(os.path.join(path, "t.apex")) == 5
     client.close()
 
     reopened = ApexClient(path, drop_if_exists=False, enable_cache=False)
@@ -175,7 +176,7 @@ def test_add_column_supports_uuid_and_decimal128(tmp_path):
     assert rows[0]["u"] is None and rows[0]["d"] is None
     assert rows[1]["u"] == b"\x00" * 16
     assert rows[1]["d"] == payload
-    assert _file_version(os.path.join(str(tmp_path), "t.apex")) == 6
+    assert _file_version(os.path.join(str(tmp_path), "t.apex")) == 5
     # ALTER-created fixed-width columns keep the 16-byte contract.
     with pytest.raises((RuntimeError, OSError), match="fixed-width 16-byte"):
         client.store([{"id": 3, "u": b"short"}])

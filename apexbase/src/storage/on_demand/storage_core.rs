@@ -2360,9 +2360,9 @@ impl OnDemandStorage {
     }
 
     pub(crate) fn required_format_version(&self) -> u32 {
-        // A parameterised (logical) column type is carried in a schema section
-        // an older build does not know how to interpret for writes, so such a
-        // table declares format version 6 even when nothing else needs it.
+        // A parameterised (logical) column type is carried in an optional
+        // append-only schema section. V5 is still the newest format (the preview
+        // must not outrun it), so such a table simply declares version 5.
         let schema = self.schema.read();
         if schema.logical_types.iter().any(Option::is_some)
             || schema
@@ -2370,7 +2370,7 @@ impl OnDemandStorage {
                 .iter()
                 .any(|(_, column_type)| matches!(column_type, ColumnType::Uuid | ColumnType::Decimal128))
         {
-            return FORMAT_VERSION_V6;
+            return FORMAT_VERSION_V5;
         }
         let narrow_float = self.width_fidelity()
             && schema
