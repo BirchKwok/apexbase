@@ -269,6 +269,27 @@ round-trip reads: predicates that compare a list column, `ORDER BY`, `GROUP BY`,
 `DISTINCT ON` and aggregates over a list column raise explicit errors instead
 of producing a value. `APEX_LOGICAL_TYPES=0` refuses creating list columns.
 
+### SQL semantics (V5 S5: D6/D7/D8)
+
+Three semantics changes land in V5 and are documented here as migration notes
+(queries that relied on the old behaviour may return different rows/names):
+
+- **D6 `SELECT DISTINCT *`** now deduplicates by the *visible* columns only. The
+  internal `_id` is not part of the DISTINCT key, so rows that are identical in
+  every user-visible column collapse even though `_id` differs. Explicit
+  projections (`SELECT DISTINCT a` / `DISTINCT a, b`) are unchanged and keep
+  deduplicating on exactly the projected columns. `show_internal_id=True` keeps
+  one representative `_id` per visible combination.
+- **D7 duplicate projection aliases** are made unique deterministically instead
+  of silently overwriting: the first occurrence keeps its name, later
+  duplicates get `_1`, `_2`, … skipping names already used by the projection
+  (`SELECT a AS x, b AS x` → columns `x`, `x_1`). Use explicit distinct aliases
+  when the output names matter.
+- **D8 `ORDER BY <alias>`** resolves projection aliases (plain columns and
+  scalar expressions) before sorting, including the RIGHT JOIN path and other
+  join paths; previously alias ordering could be dropped. NULL ordering follows
+  the Arrow default: NULLs last for ascending, first for descending.
+
 ### Extension columns (V5 S4)
 
 `extension<codec>` stores codec-encoded objects. The storage layer keeps only

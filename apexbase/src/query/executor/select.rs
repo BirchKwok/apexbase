@@ -2560,14 +2560,20 @@ let can_pushdown_limit = stmt.where_clause.is_none()
                 // against its inputs (`UPPER(cat)` needs `cat`), and the
                 // projected batch only carries the outputs.
                 let (deduped, already_projected) = if can_dedup_raw {
-                    (Self::deduplicate_batch(&filtered)?, false)
+                    (
+                        Self::deduplicate_select_distinct(&filtered, &stmt.columns)?,
+                        false,
+                    )
                 } else {
                     let projected = Self::apply_projection_with_storage(
                         &filtered,
                         &stmt.columns,
                         Some(storage_path),
                     )?;
-                    (Self::deduplicate_batch(&projected)?, true)
+                    (
+                        Self::deduplicate_select_distinct(&projected, &stmt.columns)?,
+                        true,
+                    )
                 };
                 // ORDER BY must see plain values (dictionary key ids are not
                 // in value order); decoding after dedup touches few rows.

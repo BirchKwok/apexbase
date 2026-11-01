@@ -948,6 +948,39 @@ impl ApexExecutor {
             .map_err(|e| err_data( e.to_string()))
     }
 
+    /// `SELECT DISTINCT` deduplication respecting D6: a star projection dedupes
+    /// by the visible columns only, so the internal `_id` never makes otherwise
+    /// identical rows distinct. Explicit column lists keep their current
+    /// semantics (dedupe on exactly the projected columns).
+    pub(crate) fn deduplicate_select_distinct(
+        batch: &RecordBatch,
+        columns: &[crate::query::SelectColumn],
+    ) -> io::Result<RecordBatch> {
+        let star = columns.iter().any(|column| {
+            matches!(
+                column,
+                crate::query::SelectColumn::All
+                    | crate::query::SelectColumn::AllExclude(_)
+                    | crate::query::SelectColumn::AllReplace(_)
+                    | crate::query::SelectColumn::Columns(_)
+            )
+        });
+        if !star {
+            return Self::deduplicate_batch(batch);
+        }
+        let visible: Vec<String> = batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .filter(|name| name != "_id")
+            .collect();
+        if visible.is_empty() {
+            return Ok(batch.clone());
+        }
+        Self::deduplicate_batch_on(batch, &visible)
+    }
+
     /// DISTINCT ON: keep first row per unique combination of specified columns
     pub(crate) fn deduplicate_batch_on(batch: &RecordBatch, on_columns: &[String]) -> io::Result<RecordBatch> {
         if batch.num_rows() <= 1 || on_columns.is_empty() {

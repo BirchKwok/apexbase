@@ -851,9 +851,13 @@ impl ApexExecutor {
             return Self::execute_group_by(&filtered, &stmt);
         }
 
-        // Apply ORDER BY
+        // Apply ORDER BY. SELECT aliases are resolved to their source
+        // columns/expressions first (V5 S5 D8), so `ORDER BY <alias>` sorts the
+        // joined result instead of being silently skipped.
         let sorted = if !stmt.order_by.is_empty() {
-            Self::apply_order_by(&filtered, &stmt.order_by)?
+            let sort_batch =
+                Self::augment_batch_for_order_by(&filtered, &stmt.columns, &stmt.order_by)?;
+            Self::apply_order_by(&sort_batch, &stmt.order_by)?
         } else {
             filtered
         };
@@ -867,7 +871,7 @@ impl ApexExecutor {
 
         // Apply DISTINCT if specified
         let result = if stmt.distinct {
-            Self::deduplicate_batch(&projected)?
+            Self::deduplicate_select_distinct(&projected, &stmt.columns)?
         } else {
             projected
         };

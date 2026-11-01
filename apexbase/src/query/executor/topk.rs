@@ -168,20 +168,28 @@ impl ApexExecutor {
         use crate::query::SelectColumn;
         use arrow::datatypes::Field;
 
-        // Build alias→expr map from SELECT columns
+        // Build alias→expr map from SELECT columns, plus alias→source column for
+        // plain `column AS alias` projections (V5 S5 D8: ORDER BY <alias>).
         let mut alias_map: std::collections::HashMap<String, &crate::query::SqlExpr> =
             std::collections::HashMap::new();
+        let mut column_alias_map: std::collections::HashMap<String, String> =
+            std::collections::HashMap::new();
         for sc in select_cols {
-            if let SelectColumn::Expression {
-                expr,
-                alias: Some(alias),
-            } = sc
-            {
-                alias_map.insert(alias.to_lowercase(), expr);
+            match sc {
+                SelectColumn::Expression {
+                    expr,
+                    alias: Some(alias),
+                } => {
+                    alias_map.insert(alias.to_lowercase(), expr);
+                }
+                SelectColumn::ColumnAlias { column, alias } => {
+                    column_alias_map.insert(alias.to_lowercase(), column.clone());
+                }
+                _ => {}
             }
         }
 
-        if alias_map.is_empty() {
+        if alias_map.is_empty() && column_alias_map.is_empty() {
             return Ok(batch.clone());
         }
 
@@ -198,6 +206,17 @@ impl ApexExecutor {
                 if let Some(expr) = alias_map.get(&cn.to_lowercase()) {
                     let arr = Self::evaluate_expr_to_array(batch, expr)?;
                     extra.push((cn.to_string(), arr));
+                } else if let Some(source) = column_alias_map.get(&cn.to_lowercase()) {
+                    // `column AS alias` sorts exactly like the source column.
+                    let clean = source.trim_matches('"');
+                    let bare = clean.rsplit('.').next().unwrap_or(clean);
+                    let resolved = batch
+                        .column_by_name(clean)
+                        .or_else(|| batch.column_by_name(bare))
+                        .or_else(|| batch.column_by_name(source.as_str()));
+                    if let Some(column) = resolved {
+                        extra.push((cn.to_string(), column.clone()));
+                    }
                 }
             }
         }

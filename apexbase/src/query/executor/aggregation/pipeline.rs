@@ -1412,8 +1412,33 @@ impl ApexExecutor {
             }
         }
 
+        // D7: duplicate projection aliases are made unique deterministically:
+        // the first occurrence keeps its name, later duplicates get `_1`, `_2`…
+        // (skipping names already used by the projection).
+        Self::uniquify_projection_fields(&mut fields);
         let schema = Arc::new(Schema::new(fields));
         RecordBatch::try_new(schema, arrays).map_err(|e| err_data(e.to_string()))
+    }
+
+    /// Make projection output names unique (V5 S5 D7).
+    pub(in crate::query::executor) fn uniquify_projection_fields(fields: &mut [Field]) {
+        let mut used: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for field in fields.iter_mut() {
+            let base = field.name().clone();
+            if used.insert(base.clone()) {
+                continue;
+            }
+            let mut suffix = 1usize;
+            let unique = loop {
+                let candidate = format!("{}_{}", base, suffix);
+                if !used.contains(&candidate) {
+                    break candidate;
+                }
+                suffix += 1;
+            };
+            used.insert(unique.clone());
+            *field = Field::new(unique, field.data_type().clone(), field.is_nullable());
+        }
     }
 
     /// Convert a dictionary-encoded string column to a plain Utf8 array.
