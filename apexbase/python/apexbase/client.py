@@ -2197,10 +2197,14 @@ class ApexClient:
             Exception: Propagated from the storage layer if the table is missing.
         """
         self._check_connection()
-        self._declared_types_cache.pop(table_name, None)
-        self._time_family_columns_cache.pop(table_name, None)
-        self._list_columns_cache.pop(table_name, None)
-        self._extension_columns_cache.pop(table_name, None)
+        # Re-selecting the active table must not invalidate its declared-type
+        # caches: benchmark/transaction loops call use_table() before every
+        # operation, and a redundant pop forced a native schema fetch each time.
+        if self._current_table != table_name:
+            self._declared_types_cache.pop(table_name, None)
+            self._time_family_columns_cache.pop(table_name, None)
+            self._list_columns_cache.pop(table_name, None)
+            self._extension_columns_cache.pop(table_name, None)
         storage_lock = getattr(self, '_storage_lock', None)
         storage_context = storage_lock if storage_lock is not None else _NULL_CONTEXT
         with storage_context:
