@@ -123,8 +123,8 @@ and **1,000,000 vectors x 128 dimensions** on Apple arm64 with Python 3.12.
 
 | Area | Snapshot |
 | --- | --- |
-| **Public coverage** | 103 tabular metrics, 6 exact-vector metrics, and 8 ApexBase quantized-vector precision rows |
-| **Comparable results** | ApexBase wins 115 / 115 rows with a direct competitor in the retained complete snapshot |
+| **Public coverage** | 105 tabular metrics, 6 exact-vector metrics, and 8 ApexBase quantized-vector precision rows |
+| **Comparable results** | ApexBase wins 102 / 105 tabular metrics against the fastest competitor in the latest complete run (3 slower); exact-vector 6 / 6 |
 | **Exact vector search** | All 6 single/batch Float32 TopK rows beat the compared engines and match brute-force exact top-k row sets |
 | **Reproducibility** | Fixed data sizes, 2 warmups, 5 timed iterations, dependency metadata, and a retained JSON report |
 

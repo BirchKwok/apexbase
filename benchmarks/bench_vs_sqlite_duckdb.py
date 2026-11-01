@@ -2154,6 +2154,20 @@ class DuckDBBench:
             "EXCEPT SELECT city FROM bench WHERE age BETWEEN 25 AND 35 ORDER BY city"
         )
 
+    def bench_intersect_equal(self):
+        """INTERSECT with equality (set) semantics: no ORDER BY, only the set matters."""
+        return self._query_all(
+            "SELECT city FROM bench WHERE age BETWEEN 20 AND 30 "
+            "INTERSECT SELECT city FROM bench WHERE age BETWEEN 25 AND 35"
+        )
+
+    def bench_except_equal(self):
+        """EXCEPT with equality (set) semantics: no ORDER BY, only the set matters."""
+        return self._query_all(
+            "SELECT city FROM bench WHERE age BETWEEN 20 AND 30 "
+            "EXCEPT SELECT city FROM bench WHERE age BETWEEN 25 AND 35"
+        )
+
     def bench_in_subquery(self):
         return self._scalar(
             "SELECT COUNT(*) AS c FROM bench "
