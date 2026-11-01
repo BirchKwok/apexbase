@@ -72,18 +72,88 @@ pub(crate) fn time_family_arrow_typed(
     }
 }
 
+
+/// Re-type Arrow `Binary` columns that the schema declares as list columns into
+/// Arrow `ListArray`s. The storage layout keeps list rows as binary payloads, so
+/// every batch producer funnels through this one presentation step (V5 S3).
+pub(crate) fn present_list_columns(
+    batch: arrow::record_batch::RecordBatch,
+    list_columns: &[String],
+) -> io::Result<arrow::record_batch::RecordBatch> {
+    use arrow::array::{Array, ArrayRef, BinaryArray};
+    use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    if list_columns.is_empty() {
+        return Ok(batch);
+    }
+    let mut changed = false;
+    let mut fields: Vec<Field> = batch
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| (**field).clone())
+        .collect();
+    let mut columns: Vec<ArrayRef> = batch.columns().to_vec();
+    for name in list_columns {
+        let Ok(index) = batch.schema().index_of(name) else {
+            continue;
+        };
+        let Some(binary) = batch.column(index).as_any().downcast_ref::<BinaryArray>() else {
+            continue;
+        };
+        let mut offsets: Vec<u64> = Vec::with_capacity(binary.len() + 1);
+        for row in 0..=binary.len() {
+            offsets.push(binary.value_offsets()[row] as u64);
+        }
+        let (arrow_dt, array) = list_arrow_from_payloads(&offsets, binary.values())?;
+        fields[index] = Field::new(name, arrow_dt, true);
+        columns[index] = array;
+        changed = true;
+    }
+    if !changed {
+        return Ok(batch);
+    }
+    let _ = ArrowDataType::Binary;
+    let schema = Schema::new(fields);
+    RecordBatch::try_new(Arc::new(schema), columns)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))
+}
+
 impl OnDemandStorage {
     /// Build Arrow RecordBatch directly from in-memory V4 columns.
     /// OPTIMIZATION: bypasses read_columns→HashMap→get_null_mask→Vec<bool> pipeline.
     /// - Int64/Float64 without nulls: single memcpy (no per-element Option wrapping)
     /// - String: builds from &str references (no per-element String allocation)
     /// - Null bitmaps: read packed bytes directly (no Vec<bool> expansion)
+    /// Declared list columns of this table (empty when there are none).
+    fn declared_list_columns(&self) -> Vec<String> {
+        let schema = self.schema.read();
+        schema
+            .columns
+            .iter()
+            .filter(|(_, column_type)| *column_type == ColumnType::List)
+            .map(|(name, _)| name.clone())
+            .collect()
+    }
+
+    /// Re-type declared list columns in a finished batch (V5 S3).
+    fn present_list_columns(&self, batch: RecordBatch) -> io::Result<RecordBatch> {
+        let list_columns = self.declared_list_columns();
+        if list_columns.is_empty() {
+            return Ok(batch);
+        }
+        present_list_columns(batch, &list_columns)
+    }
+
     pub fn to_arrow_batch(
         &self,
         column_names: Option<&[&str]>,
         include_id: bool,
     ) -> io::Result<RecordBatch> {
-        self.to_arrow_batch_inner(column_names, include_id, false)
+        let batch = self.to_arrow_batch_inner(column_names, include_id, false)?;
+        self.present_list_columns(batch)
     }
 
     /// Build Arrow RecordBatch with optional dictionary encoding for string columns.
@@ -94,7 +164,8 @@ impl OnDemandStorage {
         column_names: Option<&[&str]>,
         include_id: bool,
     ) -> io::Result<RecordBatch> {
-        self.to_arrow_batch_inner(column_names, include_id, true)
+        let batch = self.to_arrow_batch_inner(column_names, include_id, true)?;
+        self.present_list_columns(batch)
     }
 
     fn to_arrow_batch_inner(
@@ -1211,6 +1282,16 @@ impl OnDemandStorage {
     /// Build Arrow RecordBatch with a row LIMIT from in-memory V4 columns.
     /// Much faster than read_columns() for small LIMIT queries (SELECT * LIMIT N).
     pub fn to_arrow_batch_with_limit(
+        &self,
+        column_names: Option<&[&str]>,
+        include_id: bool,
+        limit: usize,
+    ) -> io::Result<RecordBatch> {
+        let batch = self.to_arrow_batch_with_limit_inner(column_names, include_id, limit)?;
+        self.present_list_columns(batch)
+    }
+
+    fn to_arrow_batch_with_limit_inner(
         &self,
         column_names: Option<&[&str]>,
         include_id: bool,
@@ -4089,4 +4170,397 @@ pub(crate) fn time_family_arrow_from_i64(
             )) as ArrayRef,
         ),
     }
+}
+
+/// Encode one list row payload: `[element tag:u8][count:u32][values...]`.
+pub(crate) fn encode_list_row_from_values(
+    element: ColumnType,
+    values: &[crate::data::Value],
+) -> io::Result<Vec<u8>> {
+    use crate::data::Value;
+
+    let mut buf = Vec::new();
+    buf.push(element as u8);
+    buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    macro_rules! push_int {
+        () => {
+            for value in values {
+                let converted = value.as_i64().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "list element type mismatch")
+                })?;
+                buf.extend_from_slice(&converted.to_le_bytes());
+            }
+        };
+    }
+    match element {
+        ColumnType::Int64
+        | ColumnType::Int32
+        | ColumnType::Int16
+        | ColumnType::Int8
+        | ColumnType::UInt64
+        | ColumnType::UInt32
+        | ColumnType::UInt16
+        | ColumnType::UInt8
+        | ColumnType::Date
+        | ColumnType::Timestamp
+        | ColumnType::TimestampTz
+        | ColumnType::Time
+        | ColumnType::Interval => push_int!(),
+        ColumnType::Float64 | ColumnType::Float32 => {
+            for value in values {
+                let converted = value.as_f64().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "list element type mismatch")
+                })?;
+                buf.extend_from_slice(&converted.to_le_bytes());
+            }
+        }
+        ColumnType::Bool => {
+            for value in values {
+                let converted = value.as_bool().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "list element type mismatch")
+                })?;
+                buf.push(u8::from(converted));
+            }
+        }
+        ColumnType::String => {
+            for value in values {
+                let text = value.as_str().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "list element type mismatch")
+                })?;
+                buf.extend_from_slice(&(text.len() as u32).to_le_bytes());
+                buf.extend_from_slice(text.as_bytes());
+            }
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unsupported list element type: {:?}", other),
+            ))
+        }
+    }
+    Ok(buf)
+}
+
+/// Decode one list row payload into `(element type, values)`.
+pub(crate) fn decode_list_row_payload(
+    bytes: &[u8],
+) -> io::Result<(ColumnType, Vec<crate::data::Value>)> {
+    use crate::data::Value;
+
+    if bytes.len() < 5 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+    }
+    let element = ColumnType::from_u8(bytes[0])
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "unknown list element tag"))?;
+    let count = u32::from_le_bytes(bytes[1..5].try_into().unwrap()) as usize;
+    let mut values = Vec::with_capacity(count.min(bytes.len()));
+    let mut pos = 5;
+    match element {
+        ColumnType::Int64
+        | ColumnType::Int32
+        | ColumnType::Int16
+        | ColumnType::Int8
+        | ColumnType::UInt64
+        | ColumnType::UInt32
+        | ColumnType::UInt16
+        | ColumnType::UInt8 => {
+            if pos + count * 8 > bytes.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+            }
+            for _ in 0..count {
+                values.push(Value::Int64(i64::from_le_bytes(
+                    bytes[pos..pos + 8].try_into().unwrap(),
+                )));
+                pos += 8;
+            }
+        }
+        ColumnType::Date => {
+            if pos + count * 8 > bytes.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+            }
+            for _ in 0..count {
+                values.push(Value::Date(i32::from_le_bytes(
+                    bytes[pos..pos + 4].try_into().unwrap(),
+                )));
+                pos += 8;
+            }
+        }
+        ColumnType::Timestamp | ColumnType::TimestampTz => {
+            if pos + count * 8 > bytes.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+            }
+            for _ in 0..count {
+                values.push(Value::Timestamp(i64::from_le_bytes(
+                    bytes[pos..pos + 8].try_into().unwrap(),
+                )));
+                pos += 8;
+            }
+        }
+        ColumnType::Time => {
+            if pos + count * 8 > bytes.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+            }
+            for _ in 0..count {
+                values.push(Value::Time(i64::from_le_bytes(
+                    bytes[pos..pos + 8].try_into().unwrap(),
+                )));
+                pos += 8;
+            }
+        }
+        ColumnType::Interval => {
+            if pos + count * 8 > bytes.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+            }
+            for _ in 0..count {
+                values.push(Value::Interval(i64::from_le_bytes(
+                    bytes[pos..pos + 8].try_into().unwrap(),
+                )));
+                pos += 8;
+            }
+        }
+        ColumnType::Float64 | ColumnType::Float32 => {
+            if pos + count * 8 > bytes.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+            }
+            for _ in 0..count {
+                values.push(Value::Float64(f64::from_le_bytes(
+                    bytes[pos..pos + 8].try_into().unwrap(),
+                )));
+                pos += 8;
+            }
+        }
+        ColumnType::Bool => {
+            if pos + count > bytes.len() {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+            }
+            for _ in 0..count {
+                values.push(Value::Bool(bytes[pos] != 0));
+                pos += 1;
+            }
+        }
+        ColumnType::String => {
+            for _ in 0..count {
+                if pos + 4 > bytes.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+                }
+                let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+                pos += 4;
+                if pos + len > bytes.len() {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated list row"));
+                }
+                values.push(Value::String(
+                    String::from_utf8_lossy(&bytes[pos..pos + len]).to_string(),
+                ));
+                pos += len;
+            }
+        }
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported list element type in payload: {:?}", other),
+            ))
+        }
+    }
+    Ok((element, values))
+}
+
+/// Build an Arrow `ListArray` from a list column stored as `ColumnData::Binary`
+/// row payloads. Used at the result boundary so the physical row payload stays
+/// a plain binary column on disk.
+pub(crate) fn list_arrow_from_payloads(
+    offsets: &[u64],
+    data: &[u8],
+) -> io::Result<(arrow::datatypes::DataType, arrow::array::ArrayRef)> {
+    use arrow::array::{
+        ArrayRef, BooleanArray, Date32Array, DurationMicrosecondArray, Float32Array, Float64Array,
+        Int16Array, Int32Array, Int64Array, Int8Array, ListArray, StringArray,
+        Time64MicrosecondArray, TimestampMicrosecondArray, UInt16Array, UInt32Array, UInt64Array,
+        UInt8Array,
+    };
+    use arrow::buffer::{OffsetBuffer, ScalarBuffer};
+    use arrow::datatypes::{DataType as ArrowDataType, Field, TimeUnit};
+    use std::sync::Arc;
+
+    let rows = offsets.len().saturating_sub(1);
+    let mut element: Option<ColumnType> = None;
+    let mut row_offsets: Vec<i32> = Vec::with_capacity(rows + 1);
+    let mut int_values: Vec<i64> = Vec::new();
+    let mut float_values: Vec<f64> = Vec::new();
+    let mut bool_values: Vec<bool> = Vec::new();
+    let mut strings: Vec<Option<String>> = Vec::new();
+
+    for row in 0..rows {
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+        if start > end || end > data.len() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid list row offsets"));
+        }
+        let (row_element, values) = decode_list_row_payload(&data[start..end])?;
+        if let Some(existing) = element {
+            if existing != row_element {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "inconsistent list element types",
+                ));
+            }
+        } else {
+            element = Some(row_element);
+        }
+        for value in values {
+            match value {
+                crate::data::Value::Int64(v) => int_values.push(v),
+                crate::data::Value::Date(v) => int_values.push(v as i64),
+                crate::data::Value::Timestamp(v) => int_values.push(v),
+                crate::data::Value::Time(v) => int_values.push(v),
+                crate::data::Value::Interval(v) => int_values.push(v),
+                crate::data::Value::Float64(v) => float_values.push(v),
+                crate::data::Value::Bool(v) => bool_values.push(v),
+                crate::data::Value::String(v) => strings.push(Some(v)),
+                crate::data::Value::Null => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "list elements must not be NULL",
+                    ))
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unsupported list element value",
+                    ))
+                }
+            }
+        }
+        row_offsets.push(int_values.len().max(0) as i32);
+    }
+    // The child array must contain every element of every row in order; the
+    // per-type accumulators above are per-kind, so rebuild one typed child from
+    // the row payloads in a second pass.
+    let element = element.unwrap_or(ColumnType::Int64);
+    let total_elements = row_offsets.last().copied().unwrap_or(0) as usize;
+    let (child_dt, child): (ArrowDataType, ArrayRef) = match element {
+        ColumnType::Int64 => (
+            ArrowDataType::Int64,
+            Arc::new(Int64Array::from(
+                (0..total_elements).map(|index| Some(int_values[index])).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::Int32 => (
+            ArrowDataType::Int32,
+            Arc::new(Int32Array::from(
+                (0..total_elements).map(|index| Some(int_values[index] as i32)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::Int16 => (
+            ArrowDataType::Int16,
+            Arc::new(Int16Array::from(
+                (0..total_elements).map(|index| Some(int_values[index] as i16)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::Int8 => (
+            ArrowDataType::Int8,
+            Arc::new(Int8Array::from(
+                (0..total_elements).map(|index| Some(int_values[index] as i8)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::UInt64 => (
+            ArrowDataType::UInt64,
+            Arc::new(UInt64Array::from(
+                (0..total_elements).map(|index| Some(int_values[index] as u64)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::UInt32 => (
+            ArrowDataType::UInt32,
+            Arc::new(UInt32Array::from(
+                (0..total_elements).map(|index| Some(int_values[index] as u32)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::UInt16 => (
+            ArrowDataType::UInt16,
+            Arc::new(UInt16Array::from(
+                (0..total_elements).map(|index| Some(int_values[index] as u16)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::UInt8 => (
+            ArrowDataType::UInt8,
+            Arc::new(UInt8Array::from(
+                (0..total_elements).map(|index| Some(int_values[index] as u8)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::Float64 => (
+            ArrowDataType::Float64,
+            Arc::new(Float64Array::from(float_values.clone())) as ArrayRef,
+        ),
+        ColumnType::Float32 => (
+            ArrowDataType::Float32,
+            Arc::new(Float32Array::from(
+                float_values.iter().map(|value| Some(*value as f32)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::Bool => (
+            ArrowDataType::Boolean,
+            Arc::new(BooleanArray::from(bool_values.clone())) as ArrayRef,
+        ),
+        ColumnType::String => (
+            ArrowDataType::Utf8,
+            Arc::new(StringArray::from(strings.clone())) as ArrayRef,
+        ),
+        ColumnType::Date => (
+            ArrowDataType::Date32,
+            Arc::new(Date32Array::from(
+                (0..total_elements).map(|index| Some(int_values[index] as i32)).collect::<Vec<_>>(),
+            )) as ArrayRef,
+        ),
+        ColumnType::Timestamp => (
+            ArrowDataType::Timestamp(TimeUnit::Microsecond, None),
+            Arc::new(TimestampMicrosecondArray::from(int_values.clone())) as ArrayRef,
+        ),
+        ColumnType::TimestampTz => {
+            let array = TimestampMicrosecondArray::from(int_values.clone()).with_timezone("+00:00");
+            (
+                ArrowDataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                Arc::new(array) as ArrayRef,
+            )
+        }
+        ColumnType::Time => (
+            ArrowDataType::Time64(TimeUnit::Microsecond),
+            Arc::new(Time64MicrosecondArray::from(int_values.clone())) as ArrayRef,
+        ),
+        ColumnType::Interval => (
+            ArrowDataType::Duration(TimeUnit::Microsecond),
+            Arc::new(DurationMicrosecondArray::from(int_values.clone())) as ArrayRef,
+        ),
+        other => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("unsupported list element type: {:?}", other),
+            ))
+        }
+    };
+    // Row offsets were recorded as element indices already (see below); the
+    // per-kind accumulators above assumed per-row grouping, which the second
+    // pass preserved only when every row has the same element type ordering.
+    let _ = row_offsets;
+    // Recompute exact element-index offsets and the child values in row order.
+    let mut element_offsets: Vec<i32> = Vec::with_capacity(rows + 1);
+    element_offsets.push(0);
+    let mut index = 0i32;
+    for row in 0..rows {
+        let start = offsets[row] as usize;
+        let end = offsets[row + 1] as usize;
+        let (_, values) = decode_list_row_payload(&data[start..end])?;
+        index += values.len() as i32;
+        element_offsets.push(index);
+    }
+    let field = Arc::new(Field::new("item", child_dt.clone(), true));
+    let array = ListArray::try_new(
+        field,
+        OffsetBuffer::new(ScalarBuffer::from(element_offsets)),
+        child,
+        None,
+    )
+    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error.to_string()))?;
+    Ok((
+        ArrowDataType::List(Arc::new(Field::new("item", child_dt, true))),
+        Arc::new(array) as ArrayRef,
+    ))
 }

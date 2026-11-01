@@ -3,6 +3,11 @@
 use super::*;
 use crate::storage::ColumnData;
 
+/// Per-row element limit for list columns (V5 S3, explicit rejection).
+const LIST_ELEMENT_LIMIT: usize = 65_536;
+/// Per-row byte ceiling for a list column row payload (V5 S3).
+const LIST_ROW_BYTES_LIMIT: usize = 4 * 1024 * 1024;
+
 /// Convert a Python time-family object into the 8-byte payload of `declared`.
 fn py_time_payload(
     item: &Bound<'_, PyAny>,
@@ -463,6 +468,13 @@ impl ApexStorageImpl {
 
             use crate::storage::on_demand::ColumnType;
             match *col_type {
+                ColumnType::List => {
+                    return Err(PyValueError::new_err(format!(
+                        "column '{}' is a list column; use the columnar form \
+                         store({{'{}': [[...], [...]]}}) instead of a single row dict",
+                        col_name, col_name
+                    )));
+                }
                 ColumnType::Bool => {
                     let v = if value.is_none() {
                         false
@@ -874,36 +886,57 @@ impl ApexStorageImpl {
         // datetime/date/time/timedelta object written into a column declared as
         // timestamp/timestamptz/date/time/interval becomes the 8-byte payload
         // instead of being dropped.
-        let declared_types: HashMap<String, crate::data::DataType> = {
-            let mut declared = HashMap::new();
-            if let Ok((table_path, table_name)) = self.get_current_table_info() {
-                let materialized = table_path.exists();
-                let schema_columns: Option<Vec<(String, crate::storage::on_demand::ColumnType)>> =
-                    if materialized {
-                        py.allow_threads(|| crate::Database::read_backend(&table_path))
-                            .ok()
-                            .map(|backend| backend.storage.schema_snapshot().columns)
-                    } else {
-                        let base_dir = self.current_base_dir();
-                        crate::storage::table_catalog::schema_bytes(&base_dir, &table_name)
-                            .ok()
-                            .flatten()
-                            .and_then(|bytes| {
-                                crate::storage::OnDemandSchema::from_bytes(&bytes).ok()
-                            })
-                            .map(|schema| schema.columns)
-                    };
-                if let Some(columns) = schema_columns {
-                    for (name, column_type) in columns {
-                        declared.insert(
-                            name,
-                            crate::storage::backend::column_type_to_datatype(column_type),
-                        );
+        let mut declared_types: HashMap<String, crate::data::DataType> = HashMap::new();
+        // List columns are physically binary row payloads; the element type from
+        // the catalog's logical type is needed to encode each row.
+        let mut declared_list_elements: HashMap<String, crate::storage::on_demand::ColumnType> =
+            HashMap::new();
+        {
+            let Ok((table_path, table_name)) = self.get_current_table_info() else {
+                return Ok(Vec::new());
+            };
+            let base_dir = self.current_base_dir();
+            let catalog_schema = crate::storage::table_catalog::schema_bytes(&base_dir, &table_name)
+                .ok()
+                .flatten()
+                .and_then(|bytes| crate::storage::OnDemandSchema::from_bytes(&bytes).ok());
+            let mut schema: Option<crate::storage::OnDemandSchema> = None;
+            if table_path.exists() {
+                schema = py
+                    .allow_threads(|| crate::Database::read_backend(&table_path))
+                    .ok()
+                    .map(|backend| backend.storage.schema_snapshot());
+            }
+            // The materialized file can be created by a write path that only
+            // knows the column list, so parameterised types (list element type,
+            // decimal scale, timestamptz offset) may live only in the catalog.
+            if let (Some(schema), Some(catalog)) = (schema.as_mut(), catalog_schema.as_ref()) {
+                for (index, (column, _)) in schema.columns.clone().iter().enumerate() {
+                    if schema.logical_type(index).is_some() {
+                        continue;
+                    }
+                    if let Some(catalog_index) = catalog.get_index(column) {
+                        if let Some(logical) = catalog.logical_type(catalog_index) {
+                            schema.set_logical_type(index, Some(logical.clone()));
+                        }
                     }
                 }
             }
-            declared
-        };
+            let schema = schema.or(catalog_schema);
+            if let Some(schema) = schema {
+                for (index, (name, column_type)) in schema.columns.iter().enumerate() {
+                    declared_types.insert(
+                        name.clone(),
+                        crate::storage::backend::column_type_to_datatype(*column_type),
+                    );
+                    if let Some(crate::storage::LogicalType::List { element }) =
+                        schema.logical_type(index)
+                    {
+                        declared_list_elements.insert(name.clone(), *element);
+                    }
+                }
+            }
+        }
 
         // Build ColumnData directly from the Python buffers. Strings and bytes
         // are borrowed (&str / &[u8]) and copied once into the column data
@@ -947,6 +980,79 @@ impl ApexStorageImpl {
                     nulls.push(false);
                 }
                 columns_map.insert(col_name.clone(), ColumnData::Int64(values));
+                null_positions.insert(col_name.clone(), nulls);
+                continue;
+            }
+
+            if let Some(element) = declared_list_elements.get(&col_name).copied() {
+                let mut offsets = Vec::with_capacity(col_len + 1);
+                offsets.push(0u64);
+                let mut data: Vec<u8> = Vec::new();
+                let mut nulls = Vec::with_capacity(col_len);
+                for item in list.iter() {
+                    if item.is_none() {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}': NULL list rows are not supported (V5 S3)",
+                            col_name
+                        )));
+                    }
+                    let row = item.downcast::<PyList>().map_err(|_| {
+                        PyValueError::new_err(format!(
+                            "column '{}': every value must be a list",
+                            col_name
+                        ))
+                    })?;
+                    if row.is_empty() {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}': empty lists are not supported (V5 S3)",
+                            col_name
+                        )));
+                    }
+                    if row.len() > LIST_ELEMENT_LIMIT {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}': a list has {} elements, the limit is {}",
+                            col_name,
+                            row.len(),
+                            LIST_ELEMENT_LIMIT
+                        )));
+                    }
+                    let mut values: Vec<crate::data::Value> = Vec::with_capacity(row.len());
+                    for element_item in row.iter() {
+                        if element_item.is_none() {
+                            return Err(PyValueError::new_err(format!(
+                                "column '{}': list elements must not be NULL",
+                                col_name
+                            )));
+                        }
+                        if element_item.downcast::<PyList>().is_ok()
+                            || element_item.downcast::<PyDict>().is_ok()
+                        {
+                            return Err(PyValueError::new_err(format!(
+                                "column '{}': nested list/object elements are not supported",
+                                col_name
+                            )));
+                        }
+                        values.push(py_to_value(&element_item).map_err(|_| {
+                            PyValueError::new_err(format!(
+                                "column '{}': unsupported list element value",
+                                col_name
+                            ))
+                        })?);
+                    }
+                    let payload =
+                        crate::storage::on_demand::encode_list_row_from_values(element, &values)
+                            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+                    if data.len() + payload.len() > LIST_ROW_BYTES_LIMIT {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}': a list row payload exceeds the {} byte limit",
+                            col_name, LIST_ROW_BYTES_LIMIT
+                        )));
+                    }
+                    data.extend_from_slice(&payload);
+                    offsets.push(data.len() as u64);
+                    nulls.push(false);
+                }
+                columns_map.insert(col_name.clone(), ColumnData::Binary { offsets, data });
                 null_positions.insert(col_name.clone(), nulls);
                 continue;
             }
@@ -2785,19 +2891,21 @@ impl ApexStorageImpl {
         let Ok((table_path, table_name)) = self.get_current_table_info() else {
             return declared;
         };
-        let schema_columns: Option<Vec<(String, crate::storage::on_demand::ColumnType)>> =
-            if table_path.exists() {
-                py.allow_threads(|| crate::Database::read_backend(&table_path))
-                    .ok()
-                    .map(|backend| backend.storage.schema_snapshot().columns)
-            } else {
-                let base_dir = self.current_base_dir();
-                crate::storage::table_catalog::schema_bytes(&base_dir, &table_name)
-                    .ok()
-                    .flatten()
-                    .and_then(|bytes| crate::storage::OnDemandSchema::from_bytes(&bytes).ok())
-                    .map(|schema| schema.columns)
-            };
+        let mut schema_columns: Option<Vec<(String, crate::storage::on_demand::ColumnType)>> = None;
+        if table_path.exists() {
+            schema_columns = py
+                .allow_threads(|| crate::Database::read_backend(&table_path))
+                .ok()
+                .map(|backend| backend.storage.schema_snapshot().columns);
+        }
+        if schema_columns.is_none() {
+            let base_dir = self.current_base_dir();
+            schema_columns = crate::storage::table_catalog::schema_bytes(&base_dir, &table_name)
+                .ok()
+                .flatten()
+                .and_then(|bytes| crate::storage::OnDemandSchema::from_bytes(&bytes).ok())
+                .map(|schema| schema.columns);
+        }
         if let Some(columns) = schema_columns {
             for (name, column_type) in columns {
                 declared.insert(

@@ -1363,6 +1363,10 @@ impl ApexStorageImpl {
                 schema.logical_type(index)
             {
                 format!("decimal({precision},{scale})")
+            } else if let Some(crate::storage::LogicalType::List { element }) =
+                schema.logical_type(index)
+            {
+                format!("list<{}>", list_element_name(*element))
             } else {
                 match column_type {
                     ColumnType::Uuid => "uuid".to_string(),
@@ -1396,6 +1400,7 @@ impl ApexStorageImpl {
                     ColumnType::TurboQuant2Vector => "turboquant2_vector".to_string(),
                     ColumnType::TurboQuant3Vector => "turboquant3_vector".to_string(),
                     ColumnType::TurboQuant4Vector => "turboquant4_vector".to_string(),
+                    ColumnType::List => "list".to_string(),
                     ColumnType::Null => "string".to_string(),
                 }
             };
@@ -1906,4 +1911,30 @@ impl ApexStorageImpl {
         self.try_pk_read(py, &sig, &table_name, &table_path, &base_dir, true)
     }
 
+}
+
+
+/// Declared name of a list element type (used by `table_types`).
+fn list_element_name(element: crate::storage::on_demand::ColumnType) -> &'static str {
+    use crate::storage::on_demand::ColumnType;
+    match element {
+        ColumnType::Int8 => "int8",
+        ColumnType::Int16 => "int16",
+        ColumnType::Int32 => "int32",
+        ColumnType::Int64 => "int64",
+        ColumnType::UInt8 => "uint8",
+        ColumnType::UInt16 => "uint16",
+        ColumnType::UInt32 => "uint32",
+        ColumnType::UInt64 => "uint64",
+        ColumnType::Float32 => "float32",
+        ColumnType::Float64 => "float64",
+        ColumnType::Bool => "bool",
+        ColumnType::String => "string",
+        ColumnType::Date => "date",
+        ColumnType::Timestamp => "timestamp",
+        ColumnType::TimestampTz => "timestamptz",
+        ColumnType::Time => "time",
+        ColumnType::Interval => "interval",
+        _ => "unsupported",
+    }
 }

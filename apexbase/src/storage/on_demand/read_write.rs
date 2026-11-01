@@ -767,6 +767,14 @@ pub(crate) fn compressed_directory_point_reads() -> usize {
 /// the targeted BITPACK/RLE readers, so serving a compressed group from the
 /// directory silently fell back to decoding whole columns. One decoder means a
 /// new encoding cannot reach only one lane.
+/// Decode one list row payload into `Value::Array` for the point lanes.
+fn list_row_value(bytes: &[u8]) -> crate::data::Value {
+    match crate::storage::on_demand::decode_list_row_payload(bytes) {
+        Ok((_, values)) => crate::data::Value::Array(values),
+        Err(_) => crate::data::Value::Null,
+    }
+}
+
 fn decode_point_column_value(
     col_bytes: &[u8],
     col_type: ColumnType,
@@ -914,7 +922,7 @@ fn decode_point_column_value(
                             })
                             .unwrap_or(Value::Null)
                     }
-                    (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128) => {
+                    (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List) => {
                         // [count:u64][(start:u32,end:u32) × count][data_len:u64][data]
                         if data_bytes.len() >= 8 {
                             let count =
@@ -937,6 +945,8 @@ fn decode_point_column_value(
                                         // resolver returns the payload bytes and
                                         // passes a plain value through unchanged.
                                         Value::Blob(read_blob(&bytes)?)
+                                    } else if col_type == ColumnType::List {
+                                        list_row_value(&bytes)
                                     } else {
                                         Value::Binary(bytes)
                                     }
@@ -2924,7 +2934,7 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut str_buf)?;
                     Value::String(std::str::from_utf8(&str_buf).unwrap_or("").to_string())
                 }
-                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128) => {
+                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List) => {
                     let mut count_buf = [0u8; 8];
                     self.read_cached_bytes(data_base, &mut count_buf)?;
                     let count = u64::from_le_bytes(count_buf) as usize;
@@ -2945,6 +2955,8 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut bin_buf)?;
                     if col_type == ColumnType::Blob {
                         Value::Blob(self.read_blob_value(&bin_buf)?)
+                    } else if col_type == ColumnType::List {
+                        list_row_value(&bin_buf)
                     } else {
                         Value::Binary(bin_buf)
                     }
@@ -3304,7 +3316,7 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut str_buf)?;
                     Value::String(std::str::from_utf8(&str_buf).unwrap_or("").to_string())
                 }
-                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128) => {
+                (COL_ENCODING_PLAIN, ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List) => {
                     let mut count_buf = [0u8; 8];
                     self.read_cached_bytes(data_base, &mut count_buf)?;
                     let count = u64::from_le_bytes(count_buf) as usize;
@@ -3325,6 +3337,8 @@ impl OnDemandStorage {
                     self.read_cached_bytes(data_base + (dd_start + s) as u64, &mut bin_buf)?;
                     if col_type == ColumnType::Blob {
                         Value::Blob(self.read_blob_value(&bin_buf)?)
+                    } else if col_type == ColumnType::List {
+                        list_row_value(&bin_buf)
                     } else {
                         Value::Binary(bin_buf)
                     }
@@ -7721,7 +7735,7 @@ impl OnDemandStorage {
                 .unwrap_or(16.0),
             None => match col_type {
                 ColumnType::Bool => 1.0,
-                ColumnType::Binary | ColumnType::String | ColumnType::StringDict | ColumnType::Json => 16.0,
+                ColumnType::Binary | ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::List => 16.0,
                 ColumnType::FixedList => 32.0,
                 ColumnType::Float16List => 16.0,
                 dtype if dtype.vector_codec().is_some() => 16.0,

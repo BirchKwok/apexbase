@@ -1207,6 +1207,7 @@ class ApexClient:
         # paths read raw 8-byte payloads, so D5 presentation requires the Arrow
         # executor path instead.
         self._time_family_columns_cache = {}
+        self._list_columns_cache = {}
         self._buffered_writes_enabled = False
         self._buffered_write_rows = []
         self._buffered_write_table = None
@@ -1464,6 +1465,9 @@ class ApexClient:
         cache = getattr(self, '_time_family_columns_cache', None)
         if cache is not None:
             cache.clear()
+        cache = getattr(self, '_list_columns_cache', None)
+        if cache is not None:
+            cache.clear()
         cache = getattr(self, '_query_result_cache', None)
         if cache is not None:
             cache.clear()
@@ -1655,6 +1659,38 @@ class ApexClient:
             )
         self._time_family_columns_cache[table] = kinds
         return kinds
+
+    def _table_list_columns(self):
+        """Declared list columns of the current table (cached per table).
+
+        List columns are physically binary row payloads; the native point and
+        short-read bindings return those payloads verbatim, while the SQL
+        executor path retypes them as Arrow ListArrays. Hot paths are therefore
+        skipped for such tables (V5 S3).
+        """
+        table = self._current_table
+        if not table:
+            return frozenset()
+        cached = self._list_columns_cache.get(table)
+        if cached is not None:
+            return cached
+        kinds = frozenset()
+        try:
+            declared = dict(self._storage.table_types(table))
+        except Exception:
+            declared = {}
+        if declared:
+            kinds = frozenset(
+                name
+                for name, value in declared.items()
+                if str(value).strip().lower().startswith('list<')
+            )
+        self._list_columns_cache[table] = kinds
+        return kinds
+
+    def _table_typed_read_columns(self):
+        """Columns that need the typed Arrow reader (time family + lists)."""
+        return self._table_time_family_columns() | self._table_list_columns()
 
     def _bound_point_lookup(self, sql, params, show_internal_id):
         """Fast path for ``SELECT <projection> FROM <table> WHERE _id = ?``.
@@ -3367,7 +3403,7 @@ class ApexClient:
         # Every Python hot path below (point/short/numeric/string reads) returns
         # the raw 8-byte payloads for these columns. Computed once per statement.
         time_family_columns = (
-            self._table_time_family_columns()
+            self._table_typed_read_columns()
             if sql_stripped[:6].upper() == 'SELECT'
             else frozenset()
         )

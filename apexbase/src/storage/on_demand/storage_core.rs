@@ -4527,7 +4527,7 @@ impl OnDemandStorage {
                 ColumnType::String | ColumnType::StringDict | ColumnType::Json => {
                     string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
-                ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => {
+                ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
                     binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
                 ColumnType::FixedList
@@ -4609,7 +4609,7 @@ impl OnDemandStorage {
                             .unwrap_or_default();
                         string_columns.get_mut(col_name).unwrap().push(v);
                     }
-                    ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => {
+                    ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
                         let v = val
                             .and_then(|v| match v.as_delta_column_value_ref() {
                                 ColumnValueRef::Binary(b) | ColumnValueRef::Blob(b) => {
@@ -5234,6 +5234,7 @@ impl OnDemandStorage {
                 ColumnType::Binary
                 | ColumnType::Blob
                 | ColumnType::Uuid | ColumnType::Decimal128
+                | ColumnType::List
                 | ColumnType::FixedList
                 | ColumnType::Float16List
                 | ColumnType::BFloat16List
@@ -6306,7 +6307,7 @@ impl OnDemandStorage {
                 offsets: vec![0u64; count + 1],
                 data: Vec::new(),
             },
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => ColumnData::Binary {
                 offsets: vec![0u64; count + 1],
                 data: Vec::new(),
             },
@@ -6850,7 +6851,7 @@ impl OnDemandStorage {
                         ArrowDataType::Float64,
                         Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
                     ),
-                    ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List => (
+                    ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List | ColumnType::List => (
                         ArrowDataType::Binary,
                         Arc::new(BinaryArray::from(Vec::<Option<&[u8]>>::new())),
                     ),
@@ -6928,7 +6929,7 @@ impl OnDemandStorage {
                     let refs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
                     (ArrowDataType::Utf8, Arc::new(StringArray::from(refs)))
                 }
-                ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List => {
+                ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List | ColumnType::List => {
                     let values: Vec<Option<Vec<u8>>> = positions
                         .iter()
                         .map(|(_, row_idx)| {

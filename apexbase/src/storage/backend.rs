@@ -522,7 +522,8 @@ pub fn datatype_to_column_type(dt: &DataType) -> io::Result<ColumnType> {
         DataType::TurboQuant2Vector => ColumnType::TurboQuant2Vector,
         DataType::TurboQuant3Vector => ColumnType::TurboQuant3Vector,
         DataType::TurboQuant4Vector => ColumnType::TurboQuant4Vector,
-        DataType::Null | DataType::Array => {
+        DataType::Array => ColumnType::List,
+        DataType::Null => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("Unsupported column type for storage: {:?}", dt),
@@ -565,6 +566,7 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::Date => DataType::Date,
         ColumnType::Time => DataType::Time,
         ColumnType::Interval => DataType::Interval,
+        ColumnType::List => DataType::Array,
         ColumnType::Null => DataType::Null,
     }
 }
@@ -2744,6 +2746,15 @@ impl TableStorageBackend {
         self.storage.has_pending_deltas()
     }
 
+    /// Whether the table declares any list column (V5 S3).
+    pub fn has_list_columns(&self) -> bool {
+        let schema = self.storage.schema_snapshot();
+        schema
+            .columns
+            .iter()
+            .any(|(_, column_type)| *column_type == crate::storage::on_demand::ColumnType::List)
+    }
+
     /// Check whether pending DeltaStore updates touch a specific column.
     pub fn pending_delta_updates_column(&self, column_name: &str) -> bool {
         self.storage.delta_updates_column(column_name)
@@ -3843,7 +3854,7 @@ impl TableStorageBackend {
 
             // Use remove() to take ownership and avoid clone
             if let Some(data) = col_data.remove(col_name) {
-                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(result) = Self::list_arrow_pair_for(schema.as_slice(), col_name, &data) { result? } else { match data {
                     ColumnData::Int64(values) => {
                         // Apply null mask if there are any nulls
                         if has_nulls {
@@ -4072,7 +4083,7 @@ impl TableStorageBackend {
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(&data, dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(&data, dim),
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(&data, dim, codec),
-                };
+                } };
 
                 let time_dtype = schema
                     .iter()
@@ -4146,6 +4157,35 @@ impl TableStorageBackend {
             }
         }
         self.read_columns_to_arrow(column_names, start_row, row_count)
+    }
+
+    /// Whether `col_name` is a declared list column in this schema.
+    fn is_list_column(schema: &[(String, crate::data::DataType)], col_name: &str) -> bool {
+        schema
+            .iter()
+            .find(|(name, _)| name == col_name)
+            .map(|(_, dtype)| *dtype == crate::data::DataType::Array)
+            .unwrap_or(false)
+    }
+
+    /// Build the Arrow array for a list column (binary row payloads).
+    fn list_arrow_pair_for(
+        schema: &[(String, crate::data::DataType)],
+        col_name: &str,
+        data: &ColumnData,
+    ) -> Option<io::Result<(arrow::datatypes::DataType, arrow::array::ArrayRef)>> {
+        if !Self::is_list_column(schema, col_name) {
+            return None;
+        }
+        Some(match data {
+            ColumnData::Binary { offsets, data } => {
+                crate::storage::on_demand::list_arrow_from_payloads(offsets, data)
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "list column must be stored as binary row payloads",
+            )),
+        })
     }
 
     /// Read all columns to Arrow (convenience method)
@@ -4233,7 +4273,7 @@ impl TableStorageBackend {
 
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
-                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(result) = Self::list_arrow_pair_for(schema.as_slice(), col_name, &data) { result? } else { match data {
                     ColumnData::Int64(values) => (
                         ArrowDataType::Int64,
                         Arc::new(Int64Array::from_iter_values(values.iter().copied())),
@@ -4316,7 +4356,7 @@ impl TableStorageBackend {
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
-                };
+                } };
 
                 let time_dtype = schema
                     .iter()
@@ -5646,7 +5686,7 @@ impl TableStorageBackend {
 
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
-                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(result) = Self::list_arrow_pair_for(schema.as_slice(), col_name, &data) { result? } else { match data {
                     ColumnData::Int64(values) => (
                         ArrowDataType::Int64,
                         Arc::new(Int64Array::from_iter_values(values.iter().copied())),
@@ -5729,7 +5769,7 @@ impl TableStorageBackend {
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
-                };
+                } };
 
                 let time_dtype = schema
                     .iter()
@@ -5841,7 +5881,7 @@ impl TableStorageBackend {
 
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
-                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(result) = Self::list_arrow_pair_for(schema.as_slice(), col_name, &data) { result? } else { match data {
                     ColumnData::Int64(values) => (
                         ArrowDataType::Int64,
                         Arc::new(Int64Array::from_iter_values(values.iter().copied())),
@@ -5938,7 +5978,7 @@ impl TableStorageBackend {
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
-                };
+                } };
                 let time_dtype = schema
                     .iter()
                     .find(|(name, _)| name == col_name)
@@ -6008,7 +6048,7 @@ impl TableStorageBackend {
 
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
-                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(result) = Self::list_arrow_pair_for(schema.as_slice(), col_name, &data) { result? } else { match data {
                     ColumnData::Int64(values) => (
                         ArrowDataType::Int64,
                         Arc::new(Int64Array::from_iter_values(values.iter().copied())),
@@ -6106,7 +6146,7 @@ impl TableStorageBackend {
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
-                };
+                } };
                 let time_dtype = schema
                     .iter()
                     .find(|(name, _)| name == col_name)
@@ -6473,7 +6513,7 @@ impl TableStorageBackend {
 
         for col_name in &col_order {
             if let Some(data) = col_data.get(col_name) {
-                let (arrow_dt, array): (ArrowDataType, ArrayRef) = match data {
+                let (arrow_dt, array): (ArrowDataType, ArrayRef) = if let Some(result) = Self::list_arrow_pair_for(schema.as_slice(), col_name, &data) { result? } else { match data {
                     ColumnData::Int64(values) => (
                         ArrowDataType::Int64,
                         Arc::new(Int64Array::from_iter_values(values.iter().copied())),
@@ -6569,7 +6609,7 @@ impl TableStorageBackend {
                     ColumnData::FixedList { data, dim } => fixedlist_to_arrow_pair(data, *dim),
                     ColumnData::Float16List { data, dim } => float16list_to_arrow_pair(data, *dim),
                     ColumnData::QuantizedList { data, dim, codec } => quantizedlist_to_arrow_pair(data, *dim, *codec),
-                };
+                } };
                 let time_dtype = schema
                     .iter()
                     .find(|(name, _)| name == col_name)

@@ -54,6 +54,11 @@ pub enum ColumnType {
     TimestampTz = TYPE_TIMESTAMPTZ,
     /// Duration/interval: signed microseconds (8B).
     Interval = TYPE_INTERVAL,
+    /// Variable-length list of scalar elements. The physical column reuses the
+    /// `Binary` layout: each row payload is
+    /// `[element tag:u8][count:u32][values...]`, and `LogicalType::List` records
+    /// the declared element type for schema presentation/typed projection.
+    List = TYPE_LIST,
 }
 
 impl ColumnType {
@@ -86,7 +91,7 @@ impl ColumnType {
                 | ColumnType::TimestampTz
                 | ColumnType::Date
                 | ColumnType::Time
-                | ColumnType::Interval
+                | ColumnType::Interval | ColumnType::List
         )
     }
 
@@ -125,6 +130,7 @@ impl ColumnType {
             TYPE_TIME => Some(ColumnType::Time),
             TYPE_TIMESTAMPTZ => Some(ColumnType::TimestampTz),
             TYPE_INTERVAL => Some(ColumnType::Interval),
+            TYPE_LIST => Some(ColumnType::List),
             _ => None,
         }
     }
@@ -169,7 +175,8 @@ impl ColumnType {
             DataType::TurboQuant2Vector => ColumnType::TurboQuant2Vector,
             DataType::TurboQuant3Vector => ColumnType::TurboQuant3Vector,
             DataType::TurboQuant4Vector => ColumnType::TurboQuant4Vector,
-            DataType::Null | DataType::Array => {
+            DataType::Array => ColumnType::List,
+            DataType::Null => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!("Unsupported column type for storage: {:?}", dtype),
@@ -208,7 +215,8 @@ impl ColumnType {
             | ColumnType::TurboQuant3Vector
             | ColumnType::TurboQuant4Vector
             | ColumnType::Blob
-            | ColumnType::Json => 0,
+            | ColumnType::Json
+            | ColumnType::List => 0,
         }
     }
 
@@ -229,6 +237,7 @@ impl ColumnType {
                 | ColumnType::TurboQuant4Vector
                 | ColumnType::Blob
                 | ColumnType::Json
+                | ColumnType::List
         )
     }
 
@@ -621,7 +630,7 @@ impl ColumnData {
                 offsets: vec![0u64],
                 data: Vec::new(),
             },
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => ColumnData::Binary {
                 offsets: vec![0u64],
                 data: Vec::new(),
             },
@@ -1182,7 +1191,7 @@ impl ColumnData {
                 pos += data_len;
                 Ok((ColumnData::String { offsets, data }, pos))
             }
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 if pos + offsets_len > bytes.len() {
@@ -1341,7 +1350,7 @@ impl ColumnData {
                 let count = read_u64!() as usize;
                 pos += count * 8;
             }
-            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 pos += offsets_len;

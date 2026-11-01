@@ -1157,6 +1157,9 @@ impl ApexStorageImpl {
         if backend.has_pending_deltas() || backend.has_delta() {
             return Ok(None);
         }
+        if backend.has_list_columns() {
+            return Ok(None);
+        }
 
         let mut sorted_ids: Vec<u64> = ids
             .into_iter()
@@ -1274,6 +1277,7 @@ impl ApexStorageImpl {
             // Fast path: direct mmap-to-Python columns — one footer lock + one mmap slice per RG.
             let batch_cols_opt = if !backend.has_pending_deltas()
                 && !backend.has_delta()
+                && !backend.has_list_columns()
                 && backend.storage.is_v4_format()
                 && !backend.storage.has_v4_in_memory_data()
             {

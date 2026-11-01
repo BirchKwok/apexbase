@@ -7432,8 +7432,11 @@ fn time_family_storage_types_map_explicitly() {
         ColumnType::from_data_type(DataType::TimestampTz).unwrap(),
         ColumnType::TimestampTz
     );
-    // Unsupported types must not silently become text columns (V5 S2 ⑥).
-    assert!(ColumnType::from_data_type(DataType::Array).is_err());
+    // `Array` is the V5 S3 list column; `Null` must not silently become text.
+    assert_eq!(
+        ColumnType::from_data_type(DataType::Array).unwrap(),
+        ColumnType::List
+    );
     assert!(ColumnType::from_data_type(DataType::Null).is_err());
 
     assert_eq!(
@@ -7462,4 +7465,85 @@ fn time_family_storage_types_map_explicitly() {
             ColumnData::Int64(_)
         ));
     }
+}
+
+#[test]
+fn list_columns_store_payloads_and_retype_to_arrow_lists() {
+    use crate::data::Value;
+
+    // The logical type section round-trips the declared element type.
+    let mut schema = OnDemandSchema::new();
+    schema.add_column("id", ColumnType::Int64);
+    schema.add_column("vals", ColumnType::List);
+    schema.set_logical_type(1, Some(LogicalType::List { element: ColumnType::Int64 }));
+    let bytes = schema.to_bytes();
+    let decoded = OnDemandSchema::from_bytes(&bytes).expect("schema round-trip");
+    assert_eq!(decoded.columns[1].1, ColumnType::List);
+    assert_eq!(
+        decoded.logical_type(1),
+        Some(&LogicalType::List { element: ColumnType::Int64 })
+    );
+    assert_eq!(
+        crate::storage::backend::column_type_to_datatype(ColumnType::List),
+        crate::data::DataType::Array
+    );
+
+    // Row payload codec.
+    let payload = encode_list_row_from_values(
+        ColumnType::Int64,
+        &[Value::Int64(1), Value::Int64(-2), Value::Int64(3)],
+    )
+    .expect("encode");
+    let (element, values) = decode_list_row_payload(&payload).expect("decode");
+    assert_eq!(element, ColumnType::Int64);
+    assert_eq!(
+        values,
+        vec![Value::Int64(1), Value::Int64(-2), Value::Int64(3)]
+    );
+
+    let strings = encode_list_row_from_values(
+        ColumnType::String,
+        &[Value::String("a".into()), Value::String("bc".into())],
+    )
+    .expect("encode strings");
+    let (element, values) = decode_list_row_payload(&strings).expect("decode strings");
+    assert_eq!(element, ColumnType::String);
+    assert_eq!(
+        values,
+        vec![Value::String("a".into()), Value::String("bc".into())]
+    );
+
+    // Arrow presentation of two rows.
+    let first = encode_list_row_from_values(
+        ColumnType::Int64,
+        &[Value::Int64(10), Value::Int64(20)],
+    )
+    .expect("encode row 1");
+    let second = encode_list_row_from_values(ColumnType::Int64, &[Value::Int64(30)])
+        .expect("encode row 2");
+    let mut data = first.clone();
+    data.extend_from_slice(&second);
+    let offsets = vec![0u64, first.len() as u64, data.len() as u64];
+    let (arrow_dt, array) =
+        list_arrow_from_payloads(&offsets, &data).expect("arrow list presentation");
+    assert!(matches!(
+        arrow_dt,
+        arrow::datatypes::DataType::List(_)
+    ));
+    use arrow::array::Array;
+    let list = array
+        .as_any()
+        .downcast_ref::<arrow::array::ListArray>()
+        .expect("ListArray");
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.value_length(0), 2);
+    assert_eq!(list.value_length(1), 1);
+
+    // Nested/oversized element types are rejected by the declared-type parser
+    // (Python side) and the payload codec keeps only scalar kinds.
+    assert!(encode_list_row_from_values(
+        ColumnType::FixedList,
+        &[Value::Int64(1)]
+    )
+    .is_err());
 }

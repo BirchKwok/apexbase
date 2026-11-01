@@ -707,6 +707,9 @@ pub enum LogicalType {
     Decimal { precision: u8, scale: i8 },
     /// Timestamp with an explicit fixed UTC offset in minutes.
     TimestampTz { offset_minutes: i16 },
+    /// Variable-length list whose scalar element type travels here (the physical
+    /// row payload repeats the tag so every row is self-describing).
+    List { element: crate::storage::on_demand::ColumnType },
 }
 
 impl LogicalType {
@@ -721,6 +724,10 @@ impl LogicalType {
             Self::TimestampTz { offset_minutes } => {
                 out.push(3);
                 out.extend_from_slice(&offset_minutes.to_le_bytes());
+            }
+            Self::List { element } => {
+                out.push(4);
+                out.push(*element as u8);
             }
         }
     }
@@ -750,6 +757,15 @@ impl LogicalType {
                     i16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap());
                 *pos += 2;
                 Ok(Self::TimestampTz { offset_minutes })
+            }
+            4 => {
+                let raw = *bytes
+                    .get(*pos)
+                    .ok_or_else(|| err_data("Truncated list logical type"))?;
+                *pos += 1;
+                let element = crate::storage::on_demand::ColumnType::from_u8(raw)
+                    .ok_or_else(|| err_data("Unknown list element type tag"))?;
+                Ok(Self::List { element })
             }
             _ => Err(err_data("Unknown logical type tag")),
         }

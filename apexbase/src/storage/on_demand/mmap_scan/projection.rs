@@ -2465,7 +2465,7 @@ impl OnDemandStorage {
                     len: row_count,
                 })
             }
-            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
                 // Variable-length type: need to read offsets first
                 self.read_variable_column_range_mmap(
                     mmap_cache, file, index, dtype, start_row, row_count,
@@ -2593,7 +2593,7 @@ impl OnDemandStorage {
 
         match dtype {
             ColumnType::String | ColumnType::Json => Ok(ColumnData::String { offsets, data }),
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => Ok(ColumnData::Binary { offsets, data }),
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => Ok(ColumnData::Binary { offsets, data }),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Not a variable type",
@@ -2928,7 +2928,7 @@ impl OnDemandStorage {
                 offsets: result_offsets,
                 data: result_data,
             }),
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => Ok(ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => Ok(ColumnData::Binary {
                 offsets: result_offsets,
                 data: result_data,
             }),
@@ -3181,7 +3181,7 @@ impl OnDemandStorage {
                 )
                 .map(ColumnData::Float64)
             }
-            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
                 // Optimized scattered read for variable-length types
                 self.read_variable_column_scattered_mmap(
                     mmap_cache,
@@ -3358,7 +3358,7 @@ impl OnDemandStorage {
                         ColBuf::Str(StringBuilder::with_capacity(n_out, n_out * 10))
                     }
                     ColumnType::Bool => ColBuf::Bool(vec![None; n_out]),
-                    ColumnType::Binary | ColumnType::Blob => {
+                    ColumnType::Binary | ColumnType::Blob | ColumnType::List => {
                         ColBuf::Bin(vec![None; n_out])
                     }
                     ColumnType::FixedList
@@ -4743,7 +4743,7 @@ impl OnDemandStorage {
                     ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_rows]),
                     ColumnType::String | ColumnType::StringDict | ColumnType::Json => ColBuf::Str(vec![None; n_rows]),
                     ColumnType::Bool => ColBuf::Bool(vec![None; n_rows]),
-                    ColumnType::Binary => ColBuf::Bin(vec![None; n_rows]),
+                    ColumnType::Binary | ColumnType::List => ColBuf::Bin(vec![None; n_rows]),
                     _ => ColBuf::Str(vec![None; n_rows]),
                 }
             })
@@ -5241,7 +5241,7 @@ impl OnDemandStorage {
                 ColumnType::Float64 | ColumnType::Float32 => ColBuf::F64(vec![None; n_ids]),
                 ColumnType::String | ColumnType::StringDict | ColumnType::Json => ColBuf::Str(vec![None; n_ids]),
                 ColumnType::Bool => ColBuf::Bool(vec![None; n_ids]),
-                ColumnType::Binary => ColBuf::Bin(vec![None; n_ids]),
+                ColumnType::Binary | ColumnType::List => ColBuf::Bin(vec![None; n_ids]),
                 _ => ColBuf::Str(vec![None; n_ids]), // rare types as string fallback
             })
             .collect();

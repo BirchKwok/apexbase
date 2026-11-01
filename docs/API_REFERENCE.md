@@ -228,7 +228,7 @@ Create a new table, optionally with a pre-defined schema.
 - `table_name`: Name of the table to create.
 - `schema`: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.
 
-**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp`, `timestamptz`, `date`, `time`, `interval`, `json`, `uuid`, `decimal128`, `decimal(p,s)` (for example `decimal(38,2)`).
+**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp`, `timestamptz`, `date`, `time`, `interval`, `json`, `uuid`, `decimal128`, `decimal(p,s)` (for example `decimal(38,2)`), `list<element>` (for example `list<int64>`, `list<string>`).
 
 `uuid` and `decimal128` values are fixed 16-byte payloads. They are written and
 projected as `bytes` (no implicit list/string conversion); `decimal(p,s)` also
@@ -250,6 +250,24 @@ back still yields its 16-byte payload (D4) unless a typed projection is
 requested. Set `APEX_SQL_DECIMAL=0` to restore the legacy text representation
 with text comparison semantics. `GROUP BY` accepts a DECIMAL key; joins and
 DECIMAL expressions outside the forms above are out of scope for V5.
+
+### List columns (V5 S3)
+
+`list<element>` declares a variable-length list of scalar elements. Supported
+element types: `int8`…`uint64`, `float32`, `float64`, `bool`, `string`, `date`,
+`timestamp`, `timestamptz`, `time`, `interval`; nested lists and vector/uuid/
+decimal elements are explicit errors. Values are written columnar
+(`store({"tags": [[1, 2], [3], ...]})`) and are rejected when a row is NULL,
+empty, contains a NULL element, mixes nested containers, or exceeds the
+per-row limits (65,536 elements / 4 MiB payload). A single-row dict `store()`
+of a list column is rejected with a pointer to the columnar form.
+
+Reads return Python lists on every lane (scan/projection/`LIMIT`/point/
+`retrieve`/`retrieve_many`) and Arrow `ListArray`s through `to_arrow()`/
+`to_polars()`. `table_types()` reports `list<element>`. S3 keeps lists to
+round-trip reads: predicates that compare a list column, `ORDER BY`, `GROUP BY`,
+`DISTINCT ON` and aggregates over a list column raise explicit errors instead
+of producing a value. `APEX_LOGICAL_TYPES=0` refuses creating list columns.
 
 ### Time family (D5)
 

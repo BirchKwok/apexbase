@@ -448,6 +448,12 @@ impl ApexExecutor {
         } else {
             crate::query::executor::DecimalHintGuard::none()
         };
+        // V5 S3: list columns only round-trip; ORDER BY / GROUP BY / DISTINCT ON
+        // over them are explicit errors, and projected list columns are re-typed
+        // as Arrow ListArrays at the boundary.
+        crate::query::executor::list_values::reject_list_query_shapes(&stmt, storage_path)?;
+        let list_outputs =
+            crate::query::executor::list_values::list_output_columns(&stmt, storage_path);
         // MIN/MAX over a time-family column must stay typed no matter which
         // aggregation lane answered; collect the expected outputs up front.
         let mut time_aggregate_outputs: Vec<(String, crate::data::DataType)> = Vec::new();
@@ -484,6 +490,8 @@ impl ApexExecutor {
             default_table_path,
         )?;
         let result = Self::present_time_aggregate_outputs(result, &time_aggregate_outputs)?;
+        let result =
+            crate::query::executor::list_values::present_list_outputs(result, &list_outputs)?;
         // Internal numeric math uses Arrow Decimal128; the public surface keeps
         // the fixed 16-byte payload (D4).
         Ok(crate::query::executor::decimal_result_to_payload(result))

@@ -805,6 +805,12 @@ impl ApexStorageImpl {
         for ((_, col_type), value) in schema.iter().zip(py_values.iter()) {
             use crate::storage::on_demand::ColumnType;
             match *col_type {
+                ColumnType::List => {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "list columns cannot be written through the single-row fast path; \
+                         use the columnar store(dict) form",
+                    ));
+                }
                 ColumnType::Bool => {
                     let Ok(v) = value.extract::<bool>() else {
                         return Ok(None);
@@ -986,6 +992,19 @@ impl ApexStorageImpl {
                 );
                 continue;
             }
+            if *column_type == crate::storage::ColumnType::List {
+                let declared = dict
+                    .get_item(&columns[index].0)?
+                    .and_then(|value| value.extract::<String>().ok())
+                    .unwrap_or_default();
+                if let Ok(element) = Self::parse_list_element(&declared) {
+                    schema.set_logical_type(
+                        index,
+                        Some(crate::storage::LogicalType::List { element }),
+                    );
+                }
+                continue;
+            }
             if *column_type != crate::storage::ColumnType::Decimal128 {
                 continue;
             }
@@ -1084,17 +1103,69 @@ impl ApexStorageImpl {
                 "time" => ColumnType::Time,
                 "interval" | "duration" => ColumnType::Interval,
                 "json" | "jsonb" => ColumnType::Json,
+                _ if type_str.to_lowercase().starts_with("list<") => {
+                    if Self::logical_types_disabled() {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}' is a list: parameterised column types are disabled by APEX_LOGICAL_TYPES=0",
+                            col_name
+                        )));
+                    }
+                    Self::parse_list_element(&type_str).map_err(|error| {
+                        PyValueError::new_err(format!("column '{}': {}", col_name, error))
+                    })?;
+                    ColumnType::List
+                }
                 _ => return Err(PyValueError::new_err(format!(
                     "Unknown column type '{}' for column '{}'. Supported: int8, int16, int32, int64, \
                      uint8, uint16, uint32, uint64, float32, float64, bool, string, binary, blob, \
                      float32_vector, float16_vector, bfloat16_vector, int8_vector, uint8_vector, \
-                     bit1_vector, turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, date, json, uuid, decimal128",
+                     bit1_vector, turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, timestamptz, date, time, interval, json, uuid, decimal128, list<element>",
                     type_str, col_name
                 ))),
             };
             cols.push((col_name, ct));
         }
         Ok(cols)
+    }
+
+    /// Parse a `list<element>` declared type into the scalar element column type.
+    fn parse_list_element(type_str: &str) -> Result<crate::storage::on_demand::ColumnType, String> {
+        use crate::storage::on_demand::ColumnType;
+        let lowered = type_str.trim().to_lowercase();
+        let inner = lowered
+            .strip_prefix("list<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .map(str::trim)
+            .ok_or_else(|| format!("malformed list type '{}'", type_str))?;
+        if inner.starts_with("list<") {
+            return Err("nested lists are not supported (element types must be scalar)".to_string());
+        }
+        let element = match inner {
+            "int8" | "i8" => ColumnType::Int8,
+            "int16" | "i16" => ColumnType::Int16,
+            "int32" | "i32" | "int" => ColumnType::Int32,
+            "int64" | "i64" | "integer" => ColumnType::Int64,
+            "uint8" | "u8" => ColumnType::UInt8,
+            "uint16" | "u16" => ColumnType::UInt16,
+            "uint32" | "u32" => ColumnType::UInt32,
+            "uint64" | "u64" => ColumnType::UInt64,
+            "float32" | "f32" | "float" => ColumnType::Float32,
+            "float64" | "f64" | "double" => ColumnType::Float64,
+            "bool" | "boolean" => ColumnType::Bool,
+            "str" | "string" | "text" | "varchar" => ColumnType::String,
+            "date" => ColumnType::Date,
+            "timestamp" | "datetime" => ColumnType::Timestamp,
+            "timestamptz" | "timestamp_tz" | "timestamp with time zone" => ColumnType::TimestampTz,
+            "time" => ColumnType::Time,
+            "interval" | "duration" => ColumnType::Interval,
+            other => {
+                return Err(format!(
+                    "unsupported list element type '{}'. Supported: int8..uint64, float32, float64,                      bool, string, date, timestamp, timestamptz, time, interval",
+                    other
+                ))
+            }
+        };
+        Ok(element)
     }
 
     /// Get the path for the current table
@@ -1931,6 +2002,35 @@ fn arrow_col_to_pylist(py: Python<'_>, arr: &arrow::array::ArrayRef) -> PyResult
 
     let n = arr.len();
     match arr.data_type() {
+        ArrowDT::List(_) | ArrowDT::LargeList(_) => {
+            let (child, offsets): (ArrayRef, Vec<usize>) = if let Some(list) =
+                arr.as_any().downcast_ref::<ListArray>()
+            {
+                let mut offsets = Vec::with_capacity(n + 1);
+                for row in 0..=n {
+                    offsets.push(list.value_offsets()[row] as usize);
+                }
+                (list.values().clone(), offsets)
+            } else {
+                let list = arr.as_any().downcast_ref::<LargeListArray>().unwrap();
+                let mut offsets = Vec::with_capacity(n + 1);
+                for row in 0..=n {
+                    offsets.push(list.value_offsets()[row] as usize);
+                }
+                (list.values().clone(), offsets)
+            };
+            let flat = arrow_col_to_pylist(py, &child)?;
+            let flat = flat.bind(py).downcast::<PyList>()?;
+            let out = PyList::empty_bound(py);
+            for row in 0..n {
+                let items = PyList::empty_bound(py);
+                for column in offsets[row]..offsets[row + 1] {
+                    items.append(flat.get_item(column)?)?;
+                }
+                out.append(items)?;
+            }
+            Ok(out.into())
+        }
         ArrowDT::Int64 => {
             let a = arr.as_any().downcast_ref::<Int64Array>().unwrap();
             let has_nulls = a.null_count() > 0;
@@ -2286,6 +2386,27 @@ fn arrow_value_at(array: &arrow::array::ArrayRef, idx: usize) -> Value {
     }
 
     match array.data_type() {
+        ArrowDataType::List(_) | ArrowDataType::LargeList(_) => {
+            let (start, end, child) = if let Some(list) = array.as_any().downcast_ref::<ListArray>() {
+                (
+                    list.value_offsets()[idx] as usize,
+                    list.value_offsets()[idx + 1] as usize,
+                    list.values().clone(),
+                )
+            } else {
+                let list = array.as_any().downcast_ref::<LargeListArray>().unwrap();
+                (
+                    list.value_offsets()[idx] as usize,
+                    list.value_offsets()[idx + 1] as usize,
+                    list.values().clone(),
+                )
+            };
+            let mut values = Vec::with_capacity(end - start);
+            for column in start..end {
+                values.push(arrow_value_at(&child, column));
+            }
+            Value::Array(values)
+        }
         ArrowDataType::Int64 => {
             let arr = array.as_any().downcast_ref::<Int64Array>().unwrap();
             Value::Int64(arr.value(idx))

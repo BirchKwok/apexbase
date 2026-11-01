@@ -32,7 +32,7 @@ Compatibility is one-way by design:
 - **V5 carries an optional parameterised (logical) type section.** A schema may
   append a `LogicalType` section after the constraint/derivation sections, one
   entry per column (`Uuid`, `Decimal { precision, scale }`,
-  `TimestampTz { offset_minutes }`, ...). V5 is the
+  `TimestampTz { offset_minutes }`, `List { element }`, ...). V5 is the
   newest format (the preview does not use a higher version number), so tables
   with such columns still declare version `5`; tables without logical types keep
   writing `5`/`4` exactly as before. UUID/Decimal values are fixed 16-byte
@@ -41,6 +41,12 @@ Compatibility is one-way by design:
   timestamp and duration) whose payload is the same fixed 8-byte integer as
   timestamp/date, and every read lane presents the family as typed Arrow
   `timestamp`/`date32`/`time64`/`duration` columns (D5), never as raw integers.
+  The list type is tag 33: the physical column reuses the `Binary` layout and
+  each row payload is `[element tag:u8][count:u32][values...]` (fixed 8-byte
+  integers/floats, 1-byte bools, length-prefixed UTF-8 for strings). The
+  declared element type also travels in `LogicalType::List`, and the batch
+  producers retype list columns to Arrow `ListArray`s at the result boundary;
+  row NULLs and empty/NULL/nested/oversized lists are rejected by the writer.
   Because the section is an addition to the preview format rather than
   a new version, do not open files containing parameterised types with an older
   V5 preview build — upgrade the reading build first.

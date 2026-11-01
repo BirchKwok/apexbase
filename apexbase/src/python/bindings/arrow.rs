@@ -25,6 +25,8 @@ pub(super) fn pylist_representable(dtype: &arrow::datatypes::DataType) -> bool {
             | ArrowDT::Time64(_)
             | ArrowDT::Duration(_)
             | ArrowDT::Dictionary(_, _)
+            | ArrowDT::List(_)
+            | ArrowDT::LargeList(_)
     )
 }
 
