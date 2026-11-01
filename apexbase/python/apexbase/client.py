@@ -1229,6 +1229,7 @@ class ApexClient:
         # Tables that declare a time-family column: their point/short-read hot
         # paths read raw 8-byte payloads, so D5 presentation requires the Arrow
         # executor path instead.
+        self._declared_types_cache = {}
         self._time_family_columns_cache = {}
         self._list_columns_cache = {}
         self._extension_columns_cache = {}
@@ -1485,16 +1486,6 @@ class ApexClient:
         cache = getattr(self, '_numeric_range_rows_cache', None)
         if cache is not None:
             cache.clear()
-        # A file-replacing write may add/replace time-family columns.
-        cache = getattr(self, '_time_family_columns_cache', None)
-        if cache is not None:
-            cache.clear()
-        cache = getattr(self, '_list_columns_cache', None)
-        if cache is not None:
-            cache.clear()
-        cache = getattr(self, '_extension_columns_cache', None)
-        if cache is not None:
-            cache.clear()
         cache = getattr(self, '_query_result_cache', None)
         if cache is not None:
             cache.clear()
@@ -1631,16 +1622,22 @@ class ApexClient:
             if converted is None:
                 converted = dict(row)
             converted[name] = converter(value)
-        # V5 S4: extension columns decode through the registered codec.
-        extensions = self._table_extension_columns()
-        if extensions:
-            for name, value in row.items():
-                if name not in extensions or not isinstance(value, (bytes, bytearray)):
-                    continue
-                codec, version = extensions[name]
-                if converted is None:
-                    converted = dict(row)
-                converted[name] = _decode_extension_value_checked(codec, version, value)
+        # V5 S4: extension columns decode through the registered codec. Skip the
+        # registry lookup entirely unless the cached declared schema has one.
+        if any(
+            str(value).strip().lower().startswith('extension<')
+            for value in declared.values()
+        ):
+            extensions = self._table_extension_columns()
+        else:
+            extensions = {}
+        for name, value in row.items():
+            if name not in extensions or not isinstance(value, (bytes, bytearray)):
+                continue
+            codec, version = extensions[name]
+            if converted is None:
+                converted = dict(row)
+            converted[name] = _decode_extension_value_checked(codec, version, value)
         return row if converted is None else converted
 
     def _present_time_columns_dict(self, columns_dict):
@@ -1662,6 +1659,11 @@ class ApexClient:
             if converter is None:
                 continue
             columns_dict[name] = [None if value is None else converter(value) for value in values]
+        if not any(
+            str(value).strip().lower().startswith('extension<')
+            for value in declared.values()
+        ):
+            return columns_dict
         extensions = self._table_extension_columns()
         for name, (codec, version) in extensions.items():
             values = columns_dict.get(name)
@@ -1678,6 +1680,21 @@ class ApexClient:
          "timestamp with time zone", "date", "time", "interval", "duration")
     )
 
+    def _table_declared_types(self):
+        """Declared type strings of the current table (one native fetch per table)."""
+        table = self._current_table
+        if not table:
+            return {}
+        cached = self._declared_types_cache.get(table)
+        if cached is not None:
+            return cached
+        try:
+            declared = dict(self._storage.table_types(table))
+        except Exception:
+            declared = {}
+        self._declared_types_cache[table] = declared
+        return declared
+
     def _table_time_family_columns(self):
         """Declared time-family columns of the current table (cached per table).
 
@@ -1691,11 +1708,8 @@ class ApexClient:
         cached = self._time_family_columns_cache.get(table)
         if cached is not None:
             return cached
+        declared = self._table_declared_types()
         kinds = frozenset()
-        try:
-            declared = dict(self._storage.table_types(table))
-        except Exception:
-            declared = {}
         if declared:
             kinds = frozenset(
                 name
@@ -1720,11 +1734,8 @@ class ApexClient:
         cached = self._list_columns_cache.get(table)
         if cached is not None:
             return cached
+        declared = self._table_declared_types()
         kinds = frozenset()
-        try:
-            declared = dict(self._storage.table_types(table))
-        except Exception:
-            declared = {}
         if declared:
             kinds = frozenset(
                 name
@@ -1748,10 +1759,9 @@ class ApexClient:
         if cached is not None:
             return cached
         kinds = {}
-        try:
-            declared = dict(self._storage.table_types(table))
-        except Exception:
-            declared = {}
+        declared = self._table_schemas.get(table)
+        if declared is None:
+            declared = self._table_declared_types()
         for name, value in declared.items():
             text = str(value).strip().lower()
             if not text.startswith('extension<'):
@@ -2101,6 +2111,10 @@ class ApexClient:
             self._storage.use_database_(database)
             self._current_database = database if database else 'default'
             self._current_table = None
+            self._declared_types_cache.clear()
+            self._time_family_columns_cache.clear()
+            self._list_columns_cache.clear()
+            self._extension_columns_cache.clear()
             self._invalidate_replace_cache()
         return self
 
@@ -2183,6 +2197,10 @@ class ApexClient:
             Exception: Propagated from the storage layer if the table is missing.
         """
         self._check_connection()
+        self._declared_types_cache.pop(table_name, None)
+        self._time_family_columns_cache.pop(table_name, None)
+        self._list_columns_cache.pop(table_name, None)
+        self._extension_columns_cache.pop(table_name, None)
         storage_lock = getattr(self, '_storage_lock', None)
         storage_context = storage_lock if storage_lock is not None else _NULL_CONTEXT
         with storage_context:
@@ -2281,6 +2299,10 @@ class ApexClient:
                 except OSError as e:
                     raise ValueError(str(e)) from e
                 self._invalidate_replace_cache()
+                self._declared_types_cache.pop(table_name, None)
+                self._time_family_columns_cache.pop(table_name, None)
+                self._list_columns_cache.pop(table_name, None)
+                self._extension_columns_cache.pop(table_name, None)
         self._current_table = table_name
         self._schema_fetch_attempted.discard(table_name)
         if schema is None:
@@ -2345,6 +2367,10 @@ class ApexClient:
         Returns:
             None
         """
+        self._declared_types_cache.pop(table_name, None)
+        self._time_family_columns_cache.pop(table_name, None)
+        self._list_columns_cache.pop(table_name, None)
+        self._extension_columns_cache.pop(table_name, None)
         self._check_connection()
 
         # Detach the engine while the table can still be selected.
@@ -6525,6 +6551,10 @@ class ApexClient:
             return
         self._table_schemas.pop(table, None)
         self._table_decimal_scales.pop(table, None)
+        self._declared_types_cache.pop(table, None)
+        self._time_family_columns_cache.pop(table, None)
+        self._list_columns_cache.pop(table, None)
+        self._extension_columns_cache.pop(table, None)
         self._schema_fetch_attempted.discard(table)
 
     def add_column(self, column_name: str, column_type: str):
