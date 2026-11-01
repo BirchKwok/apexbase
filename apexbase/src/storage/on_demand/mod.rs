@@ -2436,6 +2436,7 @@ const TYPE_TIME: u8 = 30; // Time of day (microseconds since midnight, no date/z
 const TYPE_TIMESTAMPTZ: u8 = 31; // UTC microseconds + LogicalType::TimestampTz display offset
 const TYPE_INTERVAL: u8 = 32; // Signed duration in microseconds
 const TYPE_LIST: u8 = 33; // Variable-length list of scalars (binary row payload + LogicalType::List)
+const TYPE_EXTENSION: u8 = 34; // Codec-encoded object payload (Binary layout + LogicalType::Extension)
 
 // ============================================================================
 // Data Types

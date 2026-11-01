@@ -547,7 +547,7 @@ pub fn column_type_to_datatype(ct: ColumnType) -> DataType {
         ColumnType::String | ColumnType::StringDict => DataType::String,
         ColumnType::Json => DataType::Json,
         ColumnType::Bool => DataType::Bool,
-        ColumnType::Binary | ColumnType::Uuid => DataType::Binary,
+        ColumnType::Binary | ColumnType::Uuid | ColumnType::Extension => DataType::Binary,
         // Report the parameterised decimal type so DML coercion can see it;
         // precision/scale travel through the storage schema's LogicalType.
         ColumnType::Decimal128 => DataType::Decimal,
@@ -2749,6 +2749,16 @@ impl TableStorageBackend {
     /// Whether the table declares any list column (V5 S3).
     pub fn has_list_columns(&self) -> bool {
         self.storage.has_list_columns()
+    }
+
+    /// Logical type of a column (V5 parameterised types).
+    pub fn column_logical_type(&self, name: &str) -> Option<crate::storage::LogicalType> {
+        self.storage.column_logical_type(name)
+    }
+
+    /// Declared storage column type (V5 parameterised types included).
+    pub fn column_storage_type(&self, name: &str) -> Option<crate::storage::on_demand::ColumnType> {
+        self.storage.column_storage_type(name)
     }
 
     /// Re-type declared list columns in a finished read batch (V5 S3).

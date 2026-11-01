@@ -75,8 +75,16 @@ pub(in crate::query::executor) fn reject_list_query_shapes(
             .map(|dtype| dtype == crate::data::DataType::Array)
             .unwrap_or(false)
     };
+    let is_extension = |name: &str| -> bool {
+        let clean = name.trim_matches('"');
+        let bare = clean.rsplit('.').next().unwrap_or(clean);
+        matches!(
+            backend.column_storage_type(bare),
+            Some(crate::storage::on_demand::ColumnType::Extension)
+        )
+    };
     for order in &stmt.order_by {
-        if is_list(&order.column) {
+        if is_list(&order.column) || is_extension(&order.column) {
             return Err(err_data(format!(
                 "ORDER BY over list column '{}' is not supported (V5 S3 keeps list columns to round-trip reads)",
                 order.column
@@ -84,7 +92,7 @@ pub(in crate::query::executor) fn reject_list_query_shapes(
         }
     }
     for group in &stmt.group_by {
-        if is_list(group) {
+        if is_list(group) || is_extension(group) {
             return Err(err_data(format!(
                 "GROUP BY over list column '{}' is not supported (V5 S3 keeps list columns to round-trip reads)",
                 group
@@ -96,7 +104,7 @@ pub(in crate::query::executor) fn reject_list_query_shapes(
             column: Some(name), ..
         } = column
         {
-            if is_list(name) {
+            if is_list(name) || is_extension(name) {
                 return Err(err_data(format!(
                     "aggregates over list column '{}' are not supported (V5 S3 keeps list columns to round-trip reads)",
                     name
@@ -105,7 +113,7 @@ pub(in crate::query::executor) fn reject_list_query_shapes(
         }
     }
     for name in &stmt.distinct_on.clone().unwrap_or_default() {
-        if is_list(name) {
+        if is_list(name) || is_extension(name) {
             return Err(err_data(format!(
                 "DISTINCT ON over list column '{}' is not supported (V5 S3)",
                 name

@@ -228,7 +228,7 @@ Create a new table, optionally with a pre-defined schema.
 - `table_name`: Name of the table to create.
 - `schema`: Optional dict mapping column names to type strings. Pre-defining schema avoids type inference on the first insert, providing a performance benefit for bulk loading.
 
-**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp`, `timestamptz`, `date`, `time`, `interval`, `json`, `uuid`, `decimal128`, `decimal(p,s)` (for example `decimal(38,2)`), `list<element>` (for example `list<int64>`, `list<string>`).
+**Supported types:** `int8`, `int16`, `int32`, `int64`, `uint8`, `uint16`, `uint32`, `uint64`, `float32`, `float64`, `bool`, `string`, `binary`, `blob`, `large_binary`, `float16_vector`, `float32_vector`, `bfloat16_vector`, `int8_vector`, `uint8_vector`, `bit1_vector`, `turboquant2_vector`, `turboquant3_vector`, `turboquant4_vector`, `timestamp`, `timestamptz`, `date`, `time`, `interval`, `json`, `uuid`, `decimal128`, `decimal(p,s)` (for example `decimal(38,2)`), `list<element>` (for example `list<int64>`, `list<string>`), `extension<codec>` / `extension<codec@version>` (for example `extension<json>`).
 
 `uuid` and `decimal128` values are fixed 16-byte payloads. They are written and
 projected as `bytes` (no implicit list/string conversion); `decimal(p,s)` also
@@ -268,6 +268,48 @@ Reads return Python lists on every lane (scan/projection/`LIMIT`/point/
 round-trip reads: predicates that compare a list column, `ORDER BY`, `GROUP BY`,
 `DISTINCT ON` and aggregates over a list column raise explicit errors instead
 of producing a value. `APEX_LOGICAL_TYPES=0` refuses creating list columns.
+
+### Extension columns (V5 S4)
+
+`extension<codec>` stores codec-encoded objects. The storage layer keeps only
+the encoded bytes in a binary column and records the codec name/version in the
+logical-type schema section (format version stays 5). Encoding and decoding
+happen in Python through a registry:
+
+```python
+from apexbase import register_extension_codec
+
+register_extension_codec("json", lambda v: json.dumps(v).encode(), lambda b: json.loads(b))
+client.create_table("t", {"id": "int64", "payload": "extension<json>"})
+client.store({"id": [1], "payload": [{"a": 1}]})
+client.execute("SELECT * FROM t").to_dict()   # -> [{"id": 1, "payload": {"a": 1}}]
+```
+
+- Built-in codecs: `bytes` (bytes-like values) and `json` (JSON values).
+  `pickle` is **not** registered by default: decoding a pickle payload can
+  execute arbitrary code, so enabling it is an explicit
+  `register_extension_codec("pickle", pickle.dumps, pickle.loads)` decision
+  that the application owns.
+- `register_extension_codec(name, encode, decode, version=1)` records the codec
+  version in the column's logical type; reading a column whose recorded version
+  differs from the registered codec raises `ExtensionCodecError`.
+- Unregistered codecs, codec encode/decode failures (corrupt payloads) and
+  version mismatches are explicit errors — there is no silent fallback to raw
+  bytes or text.
+- `to_dict()` / iteration decode values through the registry; `to_arrow()`
+  keeps the encoded `binary` column and attaches extension metadata
+  (`ARROW:extension:name`, `apexbase.extension.codec`,
+  `apexbase.extension.version`); `to_pandas()` / `to_polars()` keep the binary
+  payloads. Point lanes (`retrieve` / `retrieve_many`) and filter/projection
+  lanes decode as well.
+- Lists/JSON arrays can be stored per row through the columnar form
+  (`store({"payload": [[1, 2], [3]]})`); a single-row dict whose value is
+  itself a list is interpreted as the columnar form, so wrap it
+  (`store([{"payload": [1, 2]}])`).
+- Query shapes beyond round-trip (aggregates / `ORDER BY` / `GROUP BY` /
+  predicates on the encoded column) raise explicit errors. Extension columns
+  are created through the Python declared schema; `APEX_LOGICAL_TYPES=0`
+  refuses them.
 
 ### Time family (D5)
 

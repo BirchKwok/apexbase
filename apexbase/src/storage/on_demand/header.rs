@@ -710,6 +710,10 @@ pub enum LogicalType {
     /// Variable-length list whose scalar element type travels here (the physical
     /// row payload repeats the tag so every row is self-describing).
     List { element: crate::storage::on_demand::ColumnType },
+    /// Codec-encoded object payload: the registry name and the codec version
+    /// that produced the stored bytes. `pickle` is only usable after the user
+    /// registers it explicitly (security responsibility is theirs).
+    Extension { codec: String, version: u8 },
 }
 
 impl LogicalType {
@@ -728,6 +732,13 @@ impl LogicalType {
             Self::List { element } => {
                 out.push(4);
                 out.push(*element as u8);
+            }
+            Self::Extension { codec, version } => {
+                out.push(5);
+                let name = codec.as_bytes();
+                out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+                out.extend_from_slice(name);
+                out.push(*version);
             }
         }
     }
@@ -766,6 +777,22 @@ impl LogicalType {
                 let element = crate::storage::on_demand::ColumnType::from_u8(raw)
                     .ok_or_else(|| err_data("Unknown list element type tag"))?;
                 Ok(Self::List { element })
+            }
+            5 => {
+                if *pos + 2 > bytes.len() {
+                    return Err(err_data("Truncated extension logical type"));
+                }
+                let len =
+                    u16::from_le_bytes(bytes[*pos..*pos + 2].try_into().unwrap()) as usize;
+                *pos += 2;
+                if *pos + len + 1 > bytes.len() {
+                    return Err(err_data("Truncated extension logical type"));
+                }
+                let codec = String::from_utf8_lossy(&bytes[*pos..*pos + len]).to_string();
+                *pos += len;
+                let version = bytes[*pos];
+                *pos += 1;
+                Ok(Self::Extension { codec, version })
             }
             _ => Err(err_data("Unknown logical type tag")),
         }

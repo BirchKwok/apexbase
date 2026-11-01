@@ -538,6 +538,23 @@ impl ApexStorageImpl {
                     string_columns.insert(col_name.clone(), vec![v]);
                     null_positions.insert(col_name, vec![value.is_none()]);
                 }
+                ColumnType::Extension => {
+                    let bytes = if value.is_none() {
+                        Vec::new()
+                    } else if let Ok(b) = value.downcast::<pyo3::types::PyBytes>() {
+                        b.as_bytes().to_vec()
+                    } else if let Ok(b) = value.extract::<Vec<u8>>() {
+                        b
+                    } else {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}' is an extension column: encode the object with the \
+                             registered codec before storing it",
+                            col_name
+                        )));
+                    };
+                    binary_columns_map.insert(col_name.clone(), vec![bytes]);
+                    null_positions.insert(col_name, vec![value.is_none()]);
+                }
                 ColumnType::Binary | ColumnType::Uuid | ColumnType::Decimal128 => {
                     let v = if value.is_none() {
                         Vec::new()

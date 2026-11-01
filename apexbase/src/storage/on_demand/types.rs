@@ -59,6 +59,10 @@ pub enum ColumnType {
     /// `[element tag:u8][count:u32][values...]`, and `LogicalType::List` records
     /// the declared element type for schema presentation/typed projection.
     List = TYPE_LIST,
+    /// Codec-encoded object: physical layout is `Binary` (one encoded payload
+    /// per row); `LogicalType::Extension` records the codec name and version.
+    /// V5 stores only bytes — the codec registry lives in the Python layer.
+    Extension = TYPE_EXTENSION,
 }
 
 impl ColumnType {
@@ -91,7 +95,7 @@ impl ColumnType {
                 | ColumnType::TimestampTz
                 | ColumnType::Date
                 | ColumnType::Time
-                | ColumnType::Interval | ColumnType::List
+                | ColumnType::Interval | ColumnType::List | ColumnType::Extension
         )
     }
 
@@ -131,6 +135,7 @@ impl ColumnType {
             TYPE_TIMESTAMPTZ => Some(ColumnType::TimestampTz),
             TYPE_INTERVAL => Some(ColumnType::Interval),
             TYPE_LIST => Some(ColumnType::List),
+            TYPE_EXTENSION => Some(ColumnType::Extension),
             _ => None,
         }
     }
@@ -216,7 +221,8 @@ impl ColumnType {
             | ColumnType::TurboQuant4Vector
             | ColumnType::Blob
             | ColumnType::Json
-            | ColumnType::List => 0,
+            | ColumnType::List
+            | ColumnType::Extension | ColumnType::Extension => 0,
         }
     }
 
@@ -237,7 +243,7 @@ impl ColumnType {
                 | ColumnType::TurboQuant4Vector
                 | ColumnType::Blob
                 | ColumnType::Json
-                | ColumnType::List
+                | ColumnType::List | ColumnType::Extension
         )
     }
 
@@ -630,7 +636,7 @@ impl ColumnData {
                 offsets: vec![0u64],
                 data: Vec::new(),
             },
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List | ColumnType::Extension => ColumnData::Binary {
                 offsets: vec![0u64],
                 data: Vec::new(),
             },
@@ -1191,7 +1197,7 @@ impl ColumnData {
                 pos += data_len;
                 Ok((ColumnData::String { offsets, data }, pos))
             }
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List | ColumnType::Extension => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 if pos + offsets_len > bytes.len() {
@@ -1350,7 +1356,7 @@ impl ColumnData {
                 let count = read_u64!() as usize;
                 pos += count * 8;
             }
-            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
+            ColumnType::String | ColumnType::Json | ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List | ColumnType::Extension => {
                 let count = read_u64!() as usize;
                 let offsets_len = (count + 1) * 4;
                 pos += offsets_len;

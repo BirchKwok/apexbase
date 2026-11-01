@@ -18,6 +18,17 @@ import numpy as np
 # Import Rust core
 from apexbase._core import ApexStorage, __version__
 
+from .extensions import (
+    ExtensionCodecError,
+    decode_extension_value,
+    encode_extension_value,
+    get_extension_codec,
+    list_extension_codecs,
+    parse_extension_declared,
+    register_extension_codec,
+    unregister_extension_codec,
+)
+
 # FTS is now directly implemented in Rust layer, no need for Python nanofts package
 # But keep compatibility flag
 FTS_AVAILABLE = True  # Always available since integrated into Rust core
@@ -381,6 +392,11 @@ class ResultView:
         self._arrow_table = arrow_table
         self._data = data  # Lazy loading, convert from Arrow
         self._lazy_pydict = lazy_pydict  # Deferred: convert to Arrow on demand
+        # V5 S4: extension columns are decoded through the codec registry when
+        # rows are materialized; the Arrow table keeps the encoded binary plus
+        # extension metadata.
+        self._extension_columns = None
+        self._extension_decoded = False
         if arrow_table is not None:
             self._num_rows = arrow_table.num_rows
         elif lazy_pydict is not None:
@@ -407,6 +423,21 @@ class ResultView:
             self._lazy_pydict = None
     
     def _ensure_data(self):
+        """Ensure row data is available, decoding extension payloads (V5 S4)."""
+        rows = self._ensure_data_raw()
+        extensions = getattr(self, "_extension_columns", None)
+        if extensions and rows and not getattr(self, "_extension_decoded", False):
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                for name, (codec, version) in extensions.items():
+                    value = row.get(name)
+                    if isinstance(value, (bytes, bytearray)):
+                        row[name] = decode_extension_value(codec, bytes(value), version)
+            self._extension_decoded = True
+        return rows
+
+    def _ensure_data_raw(self):
         """Ensure _data is available (lazy load from Arrow conversion, optionally hide _id)"""
         if self._data is None:
             # Try lazy pydict first (avoids Arrow round-trip for to_dict)
@@ -609,9 +640,34 @@ class ResultView:
                 table = table.drop(['_id'])
         if declared_types is None:
             declared_types = getattr(self, "_declared_types", None)
+        extensions = getattr(self, "_extension_columns", None)
+        if extensions:
+            table = self._apply_extension_metadata(pa_mod, table, extensions)
         if declared_types:
             return _apply_declared_arrow_types(pa_mod, table, declared_types)
         return table
+
+    def _apply_extension_metadata(self, pa_mod, table, extensions):
+        """Attach Arrow extension metadata to encoded extension binary columns."""
+        schema = table.schema
+        fields = []
+        changed = False
+        for field in schema:
+            entry = extensions.get(field.name)
+            if entry is None or not pa_mod.types.is_binary(field.type):
+                fields.append(field)
+                continue
+            codec, version = entry
+            metadata = dict(field.metadata or {})
+            metadata[b"ARROW:extension:name"] = f"apexbase.{codec}".encode()
+            metadata[b"apexbase.extension.codec"] = str(codec).encode()
+            metadata[b"apexbase.extension.version"] = str(version).encode()
+            metadata[b"ARROW:extension:metadata"] = str(version).encode()
+            fields.append(pa_mod.field(field.name, field.type, metadata=metadata))
+            changed = True
+        if not changed:
+            return table
+        return table.cast(pa_mod.schema(fields))
 
     def to_record_batches(self, max_chunksize: int = None):
         """Split the materialized Arrow result into record batches.

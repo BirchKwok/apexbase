@@ -2362,6 +2362,20 @@ impl OnDemandStorage {
         self.schema.read().clone()
     }
 
+    /// Declared storage column type of a column.
+    pub(crate) fn column_storage_type(&self, name: &str) -> Option<ColumnType> {
+        let schema = self.schema.read();
+        let index = schema.get_index(name)?;
+        schema.columns.get(index).map(|(_, column_type)| *column_type)
+    }
+
+    /// Logical type of a column, if the schema records one (V5 logical types).
+    pub(crate) fn column_logical_type(&self, name: &str) -> Option<crate::storage::LogicalType> {
+        let schema = self.schema.read();
+        let index = schema.get_index(name)?;
+        schema.logical_type(index).cloned()
+    }
+
     /// Whether the table declares any list column (V5 S3) — no schema clone.
     pub(crate) fn has_list_columns(&self) -> bool {
         self.schema
@@ -4536,7 +4550,7 @@ impl OnDemandStorage {
                 ColumnType::String | ColumnType::StringDict | ColumnType::Json => {
                     string_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
-                ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
+                ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List | ColumnType::Extension => {
                     binary_columns.insert(col_name.clone(), Vec::with_capacity(rows.len()));
                 }
                 ColumnType::FixedList
@@ -4618,7 +4632,7 @@ impl OnDemandStorage {
                             .unwrap_or_default();
                         string_columns.get_mut(col_name).unwrap().push(v);
                     }
-                    ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => {
+                    ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List | ColumnType::Extension => {
                         let v = val
                             .and_then(|v| match v.as_delta_column_value_ref() {
                                 ColumnValueRef::Binary(b) | ColumnValueRef::Blob(b) => {
@@ -5252,7 +5266,7 @@ impl OnDemandStorage {
                 | ColumnType::Bit1Vector
                 | ColumnType::TurboQuant2Vector
                 | ColumnType::TurboQuant3Vector
-                | ColumnType::TurboQuant4Vector => {
+                | ColumnType::TurboQuant4Vector | ColumnType::Extension => {
                     return Ok(false);
                 }
             }
@@ -6316,7 +6330,7 @@ impl OnDemandStorage {
                 offsets: vec![0u64; count + 1],
                 data: Vec::new(),
             },
-            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List => ColumnData::Binary {
+            ColumnType::Binary | ColumnType::Blob | ColumnType::Uuid | ColumnType::Decimal128 | ColumnType::List | ColumnType::Extension => ColumnData::Binary {
                 offsets: vec![0u64; count + 1],
                 data: Vec::new(),
             },
@@ -6860,7 +6874,7 @@ impl OnDemandStorage {
                         ArrowDataType::Float64,
                         Arc::new(Float64Array::from(Vec::<Option<f64>>::new())),
                     ),
-                    ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List | ColumnType::List => (
+                    ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List | ColumnType::List | ColumnType::Extension => (
                         ArrowDataType::Binary,
                         Arc::new(BinaryArray::from(Vec::<Option<&[u8]>>::new())),
                     ),
@@ -6938,7 +6952,7 @@ impl OnDemandStorage {
                     let refs: Vec<Option<&str>> = values.iter().map(|v| v.as_deref()).collect();
                     (ArrowDataType::Utf8, Arc::new(StringArray::from(refs)))
                 }
-                ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List | ColumnType::List => {
+                ColumnType::Binary | ColumnType::FixedList | ColumnType::Float16List | ColumnType::List | ColumnType::Extension => {
                     let values: Vec<Option<Vec<u8>>> = positions
                         .iter()
                         .map(|(_, row_idx)| {

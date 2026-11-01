@@ -7547,3 +7547,40 @@ fn list_columns_store_payloads_and_retype_to_arrow_lists() {
     )
     .is_err());
 }
+
+#[test]
+fn extension_logical_type_roundtrips_and_maps_to_binary() {
+    // The logical type section carries the codec name and version.
+    let mut schema = OnDemandSchema::new();
+    schema.add_column("id", ColumnType::Int64);
+    schema.add_column("payload", ColumnType::Extension);
+    schema.set_logical_type(
+        1,
+        Some(LogicalType::Extension {
+            codec: "json".to_string(),
+            version: 1,
+        }),
+    );
+    let bytes = schema.to_bytes();
+    let decoded = OnDemandSchema::from_bytes(&bytes).expect("schema round-trip");
+    assert_eq!(decoded.columns[1].1, ColumnType::Extension);
+    assert_eq!(
+        decoded.logical_type(1),
+        Some(&LogicalType::Extension {
+            codec: "json".to_string(),
+            version: 1,
+        })
+    );
+
+    // Physical layout reuses the binary column representation.
+    assert_eq!(
+        crate::storage::backend::column_type_to_datatype(ColumnType::Extension),
+        crate::data::DataType::Binary
+    );
+    assert!(matches!(
+        ColumnData::new(ColumnType::Extension),
+        ColumnData::Binary { .. }
+    ));
+    assert_eq!(ColumnType::Extension.fixed_size(), 0);
+    assert_eq!(ColumnType::from_u8(34), Some(ColumnType::Extension));
+}

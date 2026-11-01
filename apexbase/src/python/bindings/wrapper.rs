@@ -851,6 +851,12 @@ impl ApexStorageImpl {
                     };
                     ordered_values.push(SchemaStableValue::Str(v));
                 }
+                ColumnType::Extension => {
+                    let Ok(v) = value.downcast::<PyBytes>() else {
+                        return Ok(None);
+                    };
+                    ordered_values.push(SchemaStableValue::Binary(v.as_bytes()));
+                }
                 ColumnType::Binary | ColumnType::Uuid | ColumnType::Decimal128 => {
                     let Ok(v) = value.downcast::<PyBytes>() else {
                         return Ok(None);
@@ -992,6 +998,19 @@ impl ApexStorageImpl {
                 );
                 continue;
             }
+            if *column_type == crate::storage::ColumnType::Extension {
+                let declared = dict
+                    .get_item(&columns[index].0)?
+                    .and_then(|value| value.extract::<String>().ok())
+                    .unwrap_or_default();
+                if let Ok((codec, version)) = Self::parse_extension_spec(&declared) {
+                    schema.set_logical_type(
+                        index,
+                        Some(crate::storage::LogicalType::Extension { codec, version }),
+                    );
+                }
+                continue;
+            }
             if *column_type == crate::storage::ColumnType::List {
                 let declared = dict
                     .get_item(&columns[index].0)?
@@ -1103,6 +1122,18 @@ impl ApexStorageImpl {
                 "time" => ColumnType::Time,
                 "interval" | "duration" => ColumnType::Interval,
                 "json" | "jsonb" => ColumnType::Json,
+                _ if type_str.to_lowercase().starts_with("extension<") => {
+                    if Self::logical_types_disabled() {
+                        return Err(PyValueError::new_err(format!(
+                            "column '{}' is an extension column: parameterised column types are disabled by APEX_LOGICAL_TYPES=0",
+                            col_name
+                        )));
+                    }
+                    Self::parse_extension_spec(&type_str).map_err(|error| {
+                        PyValueError::new_err(format!("column '{}': {}", col_name, error))
+                    })?;
+                    ColumnType::Extension
+                }
                 _ if type_str.to_lowercase().starts_with("list<") => {
                     if Self::logical_types_disabled() {
                         return Err(PyValueError::new_err(format!(
@@ -1119,13 +1150,44 @@ impl ApexStorageImpl {
                     "Unknown column type '{}' for column '{}'. Supported: int8, int16, int32, int64, \
                      uint8, uint16, uint32, uint64, float32, float64, bool, string, binary, blob, \
                      float32_vector, float16_vector, bfloat16_vector, int8_vector, uint8_vector, \
-                     bit1_vector, turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, timestamptz, date, time, interval, json, uuid, decimal128, list<element>",
+                     bit1_vector, turboquant2_vector, turboquant3_vector, turboquant4_vector, timestamp, timestamptz, date, time, interval, json, uuid, decimal128, list<element>, extension<codec[@version]>",
                     type_str, col_name
                 ))),
             };
             cols.push((col_name, ct));
         }
         Ok(cols)
+    }
+
+    /// Parse an `extension<codec[@version]>` declared type.
+    fn parse_extension_spec(type_str: &str) -> Result<(String, u8), String> {
+        let lowered = type_str.trim().to_lowercase();
+        let inner = lowered
+            .strip_prefix("extension<")
+            .and_then(|rest| rest.strip_suffix('>'))
+            .map(str::trim)
+            .ok_or_else(|| format!("malformed extension type '{}'", type_str))?;
+        let (name, version) = match inner.split_once('@') {
+            Some((name, version)) => (
+                name.trim(),
+                version
+                    .trim()
+                    .parse::<u8>()
+                    .map_err(|_| format!("invalid extension codec version in '{}'", type_str))?,
+            ),
+            None => (inner, 1u8),
+        };
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+        {
+            return Err(format!("invalid extension codec name '{}'", name));
+        }
+        if version == 0 {
+            return Err("extension codec version must be >= 1".to_string());
+        }
+        Ok((name.to_string(), version))
     }
 
     /// Parse a `list<element>` declared type into the scalar element column type.

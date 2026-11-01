@@ -32,7 +32,7 @@ Compatibility is one-way by design:
 - **V5 carries an optional parameterised (logical) type section.** A schema may
   append a `LogicalType` section after the constraint/derivation sections, one
   entry per column (`Uuid`, `Decimal { precision, scale }`,
-  `TimestampTz { offset_minutes }`, `List { element }`, ...). V5 is the
+  `TimestampTz { offset_minutes }`, `List { element }`, `Extension { codec, version }`, ...). V5 is the
   newest format (the preview does not use a higher version number), so tables
   with such columns still declare version `5`; tables without logical types keep
   writing `5`/`4` exactly as before. UUID/Decimal values are fixed 16-byte

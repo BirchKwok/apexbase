@@ -25,6 +25,13 @@ import numpy as np
 
 from apexbase._core import ApexStorage
 from . import ResultView, _empty_result_view, _registry, DurabilityLevel, _ensure_lance
+from .extensions import (
+    ExtensionCodecError,
+    decode_extension_value,
+    encode_extension_value,
+    get_extension_codec,
+    parse_extension_declared,
+)
 
 pa = None
 pd = None
@@ -32,6 +39,22 @@ pl = None
 ARROW_AVAILABLE = importlib.util.find_spec("pyarrow") is not None
 PANDAS_AVAILABLE = importlib.util.find_spec("pandas") is not None
 POLARS_AVAILABLE = importlib.util.find_spec("polars") is not None
+
+
+def _encode_extension_value_checked(codec, version, value):
+    """Encode one extension value, rejecting an unregistered/stale codec."""
+    registered_version, _, _ = get_extension_codec(codec)
+    if version != registered_version:
+        raise ExtensionCodecError(
+            f"extension codec '{codec}' version mismatch: column stores v{version}, "
+            f"registered codec is v{registered_version}"
+        )
+    return encode_extension_value(codec, value)
+
+
+def _decode_extension_value_checked(codec, version, payload):
+    """Decode one stored extension payload through the registry."""
+    return decode_extension_value(codec, payload, version)
 
 
 def _ensure_pyarrow():
@@ -1208,6 +1231,7 @@ class ApexClient:
         # executor path instead.
         self._time_family_columns_cache = {}
         self._list_columns_cache = {}
+        self._extension_columns_cache = {}
         self._buffered_writes_enabled = False
         self._buffered_write_rows = []
         self._buffered_write_table = None
@@ -1468,6 +1492,9 @@ class ApexClient:
         cache = getattr(self, '_list_columns_cache', None)
         if cache is not None:
             cache.clear()
+        cache = getattr(self, '_extension_columns_cache', None)
+        if cache is not None:
+            cache.clear()
         cache = getattr(self, '_query_result_cache', None)
         if cache is not None:
             cache.clear()
@@ -1604,6 +1631,16 @@ class ApexClient:
             if converted is None:
                 converted = dict(row)
             converted[name] = converter(value)
+        # V5 S4: extension columns decode through the registered codec.
+        extensions = self._table_extension_columns()
+        if extensions:
+            for name, value in row.items():
+                if name not in extensions or not isinstance(value, (bytes, bytearray)):
+                    continue
+                codec, version = extensions[name]
+                if converted is None:
+                    converted = dict(row)
+                converted[name] = _decode_extension_value_checked(codec, version, value)
         return row if converted is None else converted
 
     def _present_time_columns_dict(self, columns_dict):
@@ -1625,6 +1662,15 @@ class ApexClient:
             if converter is None:
                 continue
             columns_dict[name] = [None if value is None else converter(value) for value in values]
+        extensions = self._table_extension_columns()
+        for name, (codec, version) in extensions.items():
+            values = columns_dict.get(name)
+            if values is None:
+                continue
+            columns_dict[name] = [
+                None if value is None else _decode_extension_value_checked(codec, version, value)
+                for value in values
+            ]
         return columns_dict
 
     _TIME_FAMILY_DECLARED_TYPES = frozenset(
@@ -1688,9 +1734,117 @@ class ApexClient:
         self._list_columns_cache[table] = kinds
         return kinds
 
+    def _table_extension_columns(self):
+        """Declared extension columns of the current table (cached per table).
+
+        Returns ``{column: (codec, version)}`` parsed from the ``extension<...>``
+        declared type. Encoding/decoding happens in Python through the codec
+        registry; the storage layer only keeps the encoded bytes.
+        """
+        table = self._current_table
+        if not table:
+            return {}
+        cached = self._extension_columns_cache.get(table)
+        if cached is not None:
+            return cached
+        kinds = {}
+        try:
+            declared = dict(self._storage.table_types(table))
+        except Exception:
+            declared = {}
+        for name, value in declared.items():
+            text = str(value).strip().lower()
+            if not text.startswith('extension<'):
+                continue
+            try:
+                kinds[name] = parse_extension_declared(text)
+            except Exception:
+                continue
+        self._extension_columns_cache[table] = kinds
+        return kinds
+
+    def _extension_output_columns(self, sql: str) -> dict:
+        """Extension columns visible in a SELECT, including projection aliases.
+
+        The storage schema names the source column; a query may alias it, so the
+        result view needs the alias -> codec mapping to decode the projected
+        payloads and to attach Arrow extension metadata.
+        """
+        base = self._table_extension_columns()
+        if not base:
+            return {}
+        lowered = sql.lower()
+        found = {}
+        for name, (codec, version) in base.items():
+            pattern = re.compile(
+                rf'(?:[a-z_][a-z0-9_]*\.)?"?{re.escape(name)}"?\s+as\s+("[^"]+"|[a-z_][a-z0-9_]*)',
+                re.IGNORECASE,
+            )
+            for match in pattern.finditer(sql):
+                alias = match.group(1).strip('"')
+                found[alias] = (codec, version)
+            if re.search(
+                rf'\b(?:select|,)\s*(?:[a-z_][a-z0-9_]*\.)?"?{re.escape(name)}"?\b',
+                lowered,
+            ) or re.search(rf'\bselect\s+\*', lowered):
+                found.setdefault(name, (codec, version))
+        return found
+
+    def _encode_extension_data(self, data):
+        """Encode extension values to codec payload bytes before storage.
+
+        Handles the columnar dict form, a single row dict and a list of row
+        dicts. Values already stored as bytes are re-encoded through the codec
+        (the codec owns the object -> bytes mapping).
+        """
+        extensions = self._table_extension_columns()
+        if not extensions:
+            return data
+        version_by_column = {name: version for name, (_, version) in extensions.items()}
+
+        def encode_value(name, value):
+            codec = extensions[name][0]
+            version = version_by_column[name]
+            return _encode_extension_value_checked(codec, version, value)
+
+        if isinstance(data, dict):
+            columnar = self._is_columnar_dict(data)
+            encoded = None
+            for name in extensions:
+                if name not in data:
+                    continue
+                if columnar:
+                    values = [None if v is None else encode_value(name, v) for v in data[name]]
+                else:
+                    values = None if data[name] is None else encode_value(name, data[name])
+                if encoded is None:
+                    encoded = dict(data)
+                encoded[name] = values
+            return data if encoded is None else encoded
+
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            encoded_rows = None
+            for index, row in enumerate(data):
+                if not any(name in row for name in extensions):
+                    continue
+                new_row = dict(row)
+                for name in extensions:
+                    if name in row and row[name] is not None:
+                        new_row[name] = encode_value(name, row[name])
+                if encoded_rows is None:
+                    encoded_rows = list(data)
+                encoded_rows[index] = new_row
+            return data if encoded_rows is None else encoded_rows
+
+        return data
+
     def _table_typed_read_columns(self):
-        """Columns that need the typed Arrow reader (time family + lists)."""
-        return self._table_time_family_columns() | self._table_list_columns()
+        """Columns that need the typed Arrow reader (time family + lists + extension)."""
+        return (
+            self._table_time_family_columns()
+            | self._table_list_columns()
+            | frozenset(self._table_extension_columns())
+        )
 
     def _bound_point_lookup(self, sql, params, show_internal_id):
         """Fast path for ``SELECT <projection> FROM <table> WHERE _id = ?``.
@@ -2061,6 +2215,33 @@ class ApexClient:
         self._check_connection()
         return self._current_table
 
+    def _normalize_extension_schema(self, schema):
+        """Validate extension declarations and pin the registered codec version.
+
+        A column declared ``extension<codec>`` or ``extension<codec@N>`` is
+        rewritten to the version currently registered for that codec so the
+        persisted logical type and the encoder always agree. Unregistered
+        codecs fail here, before any data is written.
+        """
+        if not schema:
+            return schema
+        normalized = None
+        for name, declared in schema.items():
+            text = str(declared).strip().lower()
+            if not text.startswith('extension<'):
+                continue
+            codec, version = parse_extension_declared(text)
+            registered_version, _, _ = get_extension_codec(codec)
+            if version != registered_version:
+                raise ExtensionCodecError(
+                    f"column '{name}': extension codec '{codec}' version mismatch "
+                    f"(declared v{version}, registered v{registered_version})"
+                )
+            if normalized is None:
+                normalized = dict(schema)
+            normalized[name] = f"extension<{codec}@{registered_version}>"
+        return schema if normalized is None else normalized
+
     def create_table(self, table_name: str, schema: dict = None):
         """
         Create a new table and select it as the current table.
@@ -2094,6 +2275,7 @@ class ApexClient:
             with self._lock:
                 self._flush_pending_memtable_rows_for_read()
                 self.flush_buffered_writes()
+                schema = self._normalize_extension_schema(schema)
                 try:
                     self._storage.create_table(table_name, schema)
                 except OSError as e:
@@ -2680,6 +2862,9 @@ class ApexClient:
         """
         self._check_connection()
         self._ensure_table_selected()
+        # V5 S4: encode extension values through the registered codecs before
+        # any fast path sees them (the storage layer keeps bytes only).
+        data = self._encode_extension_data(data)
         # Acquire storage lock for thread-safe concurrent access (shared across all clients)
         storage_lock = getattr(self, '_storage_lock', None)
         if storage_lock is not None:
@@ -4084,6 +4269,10 @@ class ApexClient:
             table = reader.read_all()
         rv = ResultView(arrow_table=table, data=None)
         rv._show_internal_id = show_internal_id
+        extensions = self._extension_output_columns(sql)
+        if extensions:
+            rv._extension_columns = dict(extensions)
+        rv._declared_types = dict(self._table_schemas.get(self._current_table) or {}) or None
         return rv
 
     def _execute_impl(self, sql: str, show_internal_id: bool = None) -> 'ResultView':

@@ -1367,6 +1367,14 @@ impl ApexStorageImpl {
                 schema.logical_type(index)
             {
                 format!("list<{}>", list_element_name(*element))
+            } else if let Some(crate::storage::LogicalType::Extension { codec, version }) =
+                schema.logical_type(index)
+            {
+                if *version <= 1 {
+                    format!("extension<{codec}>")
+                } else {
+                    format!("extension<{codec}@{version}>")
+                }
             } else {
                 match column_type {
                     ColumnType::Uuid => "uuid".to_string(),
@@ -1401,6 +1409,7 @@ impl ApexStorageImpl {
                     ColumnType::TurboQuant3Vector => "turboquant3_vector".to_string(),
                     ColumnType::TurboQuant4Vector => "turboquant4_vector".to_string(),
                     ColumnType::List => "list".to_string(),
+                    ColumnType::Extension => "extension".to_string(),
                     ColumnType::Null => "string".to_string(),
                 }
             };

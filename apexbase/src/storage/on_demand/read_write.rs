@@ -1247,6 +1247,7 @@ impl OnDemandStorage {
                     | (ColumnType::Float64, SchemaStableValue::Float64(_))
                     | (ColumnType::String, SchemaStableValue::Str(_))
                     | (ColumnType::Binary, SchemaStableValue::Binary(_))
+                    | (ColumnType::Extension, SchemaStableValue::Binary(_))
             );
             if !valid {
                 return Err(err_input("schema-stable insert value type mismatch"));
@@ -1287,7 +1288,7 @@ impl OnDemandStorage {
                         columns[idx].push_f64(*v)
                     }
                     (ColumnType::String, SchemaStableValue::Str(v)) => columns[idx].push_string(v),
-                    (ColumnType::Binary, SchemaStableValue::Binary(v)) => {
+                    (ColumnType::Binary | ColumnType::Extension, SchemaStableValue::Binary(v)) => {
                         columns[idx].push_bytes(v)
                     }
                     _ => unreachable!("validated schema-stable insert value"),
@@ -7735,7 +7736,7 @@ impl OnDemandStorage {
                 .unwrap_or(16.0),
             None => match col_type {
                 ColumnType::Bool => 1.0,
-                ColumnType::Binary | ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::List => 16.0,
+                ColumnType::Binary | ColumnType::String | ColumnType::StringDict | ColumnType::Json | ColumnType::List | ColumnType::Extension => 16.0,
                 ColumnType::FixedList => 32.0,
                 ColumnType::Float16List => 16.0,
                 dtype if dtype.vector_codec().is_some() => 16.0,
