@@ -9,63 +9,10 @@ use arrow::array::{Array, ArrayRef, BinaryArray};
 use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use std::io;
-use std::path::Path;
 use std::sync::Arc;
 
 fn err_data(msg: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.into())
-}
-
-/// Output names that carry a list column, paired with their source column names.
-pub(in crate::query::executor) fn list_output_columns(
-    stmt: &SelectStatement,
-    storage_path: &Path,
-) -> Vec<(String, String)> {
-    let Ok(backend) = crate::query::executor::get_cached_backend(storage_path) else {
-        return Vec::new();
-    };
-    let is_list = |name: &str| -> bool {
-        let clean = name.trim_matches('"');
-        let bare = clean.rsplit('.').next().unwrap_or(clean);
-        backend
-            .get_column_type(bare)
-            .map(|dtype| dtype == crate::data::DataType::Array)
-            .unwrap_or(false)
-    };
-    let all_list: Vec<String> = backend
-        .storage
-        .schema_snapshot()
-        .columns
-        .iter()
-        .filter(|(_, column_type)| *column_type == crate::storage::on_demand::ColumnType::List)
-        .map(|(name, _)| name.clone())
-        .collect();
-    let mut outputs = Vec::new();
-    for column in &stmt.columns {
-        match column {
-            SelectColumn::Column(name) => {
-                if is_list(name) {
-                    let clean = name.trim_matches('"').to_string();
-                    let bare = clean.rsplit('.').next().unwrap_or(&clean).to_string();
-                    outputs.push((clean, bare));
-                }
-            }
-            SelectColumn::ColumnAlias { column, alias } => {
-                if is_list(column) {
-                    let clean = column.trim_matches('"').to_string();
-                    let bare = clean.rsplit('.').next().unwrap_or(&clean).to_string();
-                    outputs.push((alias.clone(), bare));
-                }
-            }
-            SelectColumn::All | SelectColumn::Columns(_) => {
-                for name in &all_list {
-                    outputs.push((name.clone(), name.clone()));
-                }
-            }
-            _ => {}
-        }
-    }
-    outputs
 }
 
 /// Re-type list output columns as Arrow `ListArray`s (V5 S3 ③).
@@ -118,11 +65,8 @@ pub(in crate::query::executor) fn present_list_outputs(
 /// Reject ORDER BY / GROUP BY / DISTINCT ON over list columns (V5 S3 ⑤).
 pub(in crate::query::executor) fn reject_list_query_shapes(
     stmt: &SelectStatement,
-    storage_path: &Path,
+    backend: &crate::storage::TableStorageBackend,
 ) -> io::Result<()> {
-    let Ok(backend) = crate::query::executor::get_cached_backend(storage_path) else {
-        return Ok(());
-    };
     let is_list = |name: &str| -> bool {
         let clean = name.trim_matches('"');
         let bare = clean.rsplit('.').next().unwrap_or(clean);

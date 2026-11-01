@@ -220,6 +220,13 @@ impl ApexExecutor {
             }
         };
 
+        // Pre-parse reads bypass the SELECT executor's boundary pass, so re-type
+        // projected list columns here (V5 S3).
+        let batch = match batch {
+            Some(batch) => Some(backend.present_list_columns_in_batch(batch)?),
+            None => None,
+        };
+
         // Pre-parse reads bypass the SELECT executor, so record their route
         // here (architecture review R5: EXPLAIN ANALYZE physical path trace).
         if batch.is_some() {

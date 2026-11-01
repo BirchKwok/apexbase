@@ -28,6 +28,7 @@ def test_declared_list_roundtrip_and_arrow_projection(tmp_path):
                 "floats": "list<float64>",
                 "strings": "list<string>",
                 "bools": "list<bool>",
+                "label": "string",
             },
         )
         rows = {
@@ -36,6 +37,7 @@ def test_declared_list_roundtrip_and_arrow_projection(tmp_path):
             "floats": [[1.5], [-2.25, 3.0], [0.0]],
             "strings": [["a", "b"], ["c"], ["d", "e"]],
             "bools": [[True, False], [True], [False]],
+            "label": ["a", "b", "c"],
         }
         client.store(rows)
         client.flush()
@@ -69,6 +71,17 @@ def test_declared_list_roundtrip_and_arrow_projection(tmp_path):
         assert [row["ints"] for row in many] == [[9], [4, 5]]
         point_sql = client.execute("SELECT * FROM t WHERE _id = 2").to_dict()
         assert point_sql[0]["ints"] == [9]
+
+        # Pre-parse lanes also present typed lists (string filter / LIKE /
+        # id set / bounded offset).
+        filtered = client.execute("SELECT ints FROM t WHERE label = 'b'").to_dict()
+        assert [row["ints"] for row in filtered] == [[9]]
+        like = client.execute("SELECT ints FROM t WHERE label LIKE 'a%'").to_dict()
+        assert [row["ints"] for row in like] == [[1, 2, 3]]
+        id_set = client.execute("SELECT ints FROM t WHERE _id IN (1, 3)").to_dict()
+        assert [row["ints"] for row in id_set] == [[1, 2, 3], [4, 5]]
+        offset = client.execute("SELECT ints FROM t LIMIT 2 OFFSET 1").to_dict()
+        assert [row["ints"] for row in offset] == [[9], [4, 5]]
     finally:
         client.close()
 

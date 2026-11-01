@@ -448,12 +448,55 @@ impl ApexExecutor {
         } else {
             crate::query::executor::DecimalHintGuard::none()
         };
+        // Output name -> source column name, captured before `stmt` moves into
+        // the inner executor. Used to re-type projected list columns at the
+        // boundary when a lane built them as raw binary payloads.
+        let mut list_name_map: Vec<(String, String)> = Vec::new();
+        let mut selects_all_columns = false;
+        for column in &stmt.columns {
+            match column {
+                SelectColumn::Column(name) => {
+                    let clean = name.trim_matches('"');
+                    let bare = clean.rsplit('.').next().unwrap_or(clean);
+                    list_name_map.push((clean.to_string(), bare.to_string()));
+                }
+                SelectColumn::ColumnAlias { column, alias } => {
+                    let clean = column.trim_matches('"');
+                    let bare = clean.rsplit('.').next().unwrap_or(clean);
+                    list_name_map.push((alias.clone(), bare.to_string()));
+                }
+                SelectColumn::All | SelectColumn::AllExclude(_) | SelectColumn::Columns(_) => {
+                    selects_all_columns = true;
+                }
+                _ => {}
+            }
+        }
+
         // V5 S3: list columns only round-trip; ORDER BY / GROUP BY / DISTINCT ON
-        // over them are explicit errors, and projected list columns are re-typed
-        // as Arrow ListArrays at the boundary.
-        crate::query::executor::list_values::reject_list_query_shapes(&stmt, storage_path)?;
-        let list_outputs =
-            crate::query::executor::list_values::list_output_columns(&stmt, storage_path);
+        // over them are explicit errors. Only shapes that can touch those
+        // operators pay the schema lookup, so plain numeric/string projections
+        // keep their hot path byte-for-byte.
+        let needs_list_shape_check = !stmt.order_by.is_empty()
+            || !stmt.group_by.is_empty()
+            || stmt.distinct_on.is_some()
+            || stmt.columns.iter().any(|column| {
+                matches!(
+                    column,
+                    SelectColumn::Aggregate {
+                        column: Some(_),
+                        ..
+                    }
+                )
+            });
+        if needs_list_shape_check {
+            if let Ok(backend) = get_cached_backend(storage_path) {
+                let stmt_for_check = stmt.clone();
+                crate::query::executor::list_values::reject_list_query_shapes(
+                    &stmt_for_check,
+                    &backend,
+                )?;
+            }
+        }
         // MIN/MAX over a time-family column must stay typed no matter which
         // aggregation lane answered; collect the expected outputs up front.
         let mut time_aggregate_outputs: Vec<(String, crate::data::DataType)> = Vec::new();
@@ -490,8 +533,15 @@ impl ApexExecutor {
             default_table_path,
         )?;
         let result = Self::present_time_aggregate_outputs(result, &time_aggregate_outputs)?;
-        let result =
-            crate::query::executor::list_values::present_list_outputs(result, &list_outputs)?;
+        // Re-type projected list columns (lanes that build raw binary payloads).
+        // Only batches carrying a binary column can contain one, so ordinary
+        // numeric/string results never touch the schema lookup.
+        let result = Self::present_list_columns_at_boundary(
+            result,
+            storage_path,
+            &list_name_map,
+            selects_all_columns,
+        )?;
         // Internal numeric math uses Arrow Decimal128; the public surface keeps
         // the fixed 16-byte payload (D4).
         Ok(crate::query::executor::decimal_result_to_payload(result))
@@ -546,6 +596,48 @@ impl ApexExecutor {
         let batch = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
             .map_err(|error| err_data(error.to_string()))?;
         Ok(ApexResult::Data(batch))
+    }
+
+    /// Re-type list output columns at the SELECT boundary (V5 S3).
+    fn present_list_columns_at_boundary(
+        result: ApexResult,
+        storage_path: &std::path::Path,
+        name_map: &[(String, String)],
+        selects_all_columns: bool,
+    ) -> io::Result<ApexResult> {
+        let ApexResult::Data(batch) = &result else {
+            return Ok(result);
+        };
+        let has_binary = batch.columns().iter().any(|column| {
+            matches!(
+                column.data_type(),
+                ArrowDataType::Binary | ArrowDataType::LargeBinary
+            )
+        });
+        if !has_binary {
+            return Ok(result);
+        }
+        let Ok(backend) = get_cached_backend(storage_path) else {
+            return Ok(result);
+        };
+        if !backend.has_list_columns() {
+            return Ok(result);
+        }
+        let mut outputs: Vec<(String, String)> = Vec::new();
+        if selects_all_columns {
+            let schema = backend.storage.schema_snapshot();
+            for (name, _) in &schema.columns {
+                if backend.get_column_type(name) == Some(crate::data::DataType::Array) {
+                    outputs.push((name.clone(), name.clone()));
+                }
+            }
+        }
+        for (output, source) in name_map {
+            if backend.get_column_type(source) == Some(crate::data::DataType::Array) {
+                outputs.push((output.clone(), source.clone()));
+            }
+        }
+        crate::query::executor::list_values::present_list_outputs(result, &outputs)
     }
 
     fn execute_select_with_base_dir_inner(

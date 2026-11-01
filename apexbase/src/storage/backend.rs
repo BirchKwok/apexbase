@@ -2748,11 +2748,35 @@ impl TableStorageBackend {
 
     /// Whether the table declares any list column (V5 S3).
     pub fn has_list_columns(&self) -> bool {
-        let schema = self.storage.schema_snapshot();
-        schema
-            .columns
-            .iter()
-            .any(|(_, column_type)| *column_type == crate::storage::on_demand::ColumnType::List)
+        self.storage.has_list_columns()
+    }
+
+    /// Re-type declared list columns in a finished read batch (V5 S3).
+    pub(crate) fn present_list_columns_in_batch(
+        &self,
+        batch: arrow::record_batch::RecordBatch,
+    ) -> io::Result<arrow::record_batch::RecordBatch> {
+        let has_binary = batch.columns().iter().any(|column| {
+            matches!(
+                column.data_type(),
+                arrow::datatypes::DataType::Binary | arrow::datatypes::DataType::LargeBinary
+            )
+        });
+        if !has_binary {
+            return Ok(batch);
+        }
+        let names: Vec<String> = {
+            let schema = self.schema.read();
+            schema
+                .iter()
+                .filter(|(_, dtype)| *dtype == crate::data::DataType::Array)
+                .map(|(name, _)| name.clone())
+                .collect()
+        };
+        if names.is_empty() {
+            return Ok(batch);
+        }
+        crate::storage::on_demand::present_list_columns(batch, &names)
     }
 
     /// Check whether pending DeltaStore updates touch a specific column.

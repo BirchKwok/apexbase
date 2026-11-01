@@ -2362,6 +2362,15 @@ impl OnDemandStorage {
         self.schema.read().clone()
     }
 
+    /// Whether the table declares any list column (V5 S3) — no schema clone.
+    pub(crate) fn has_list_columns(&self) -> bool {
+        self.schema
+            .read()
+            .columns
+            .iter()
+            .any(|(_, column_type)| *column_type == ColumnType::List)
+    }
+
     pub(crate) fn required_format_version(&self) -> u32 {
         // A parameterised (logical) column type is carried in an optional
         // append-only schema section. V5 is still the newest format (the preview
