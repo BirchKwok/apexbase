@@ -344,22 +344,6 @@ impl ApexExecutor {
         // scaled i128 values so the ordering is numeric.
         let decimal_sorted = crate::query::executor::decimal_sort_batch(batch, order_by)?;
         let batch: &RecordBatch = decimal_sorted.as_ref().unwrap_or(batch);
-        // ORDER BY materialises a sort key per row plus the permutation indices. Charge that
-        // footprint to the query budget: GROUP BY state was already budgeted, while ORDER BY
-        // (and JOIN/DISTINCT) could grow without any limit at all (out-of-core item OOC-3).
-        // Admission control now, spilling later (OOC-4).
-        let order_state_bytes = {
-            let mut bytes = batch.num_rows().saturating_mul(std::mem::size_of::<usize>() * 2);
-            for order in order_by {
-                let name = Self::resolve_order_col_name(batch, &order.column);
-                if let Some(column) = batch.column_by_name(&name) {
-                    bytes = bytes.saturating_add(column.get_array_memory_size());
-                }
-            }
-            bytes
-        };
-        let _order_state_charge =
-            crate::query::executor::memory::QueryMemoryCharge::new(order_state_bytes)?;
         use arrow::compute::SortColumn;
 
         // Pre-evaluate expression ORDER BY columns (e.g. ORDER BY array_distance(...))
@@ -429,6 +413,27 @@ impl ApexExecutor {
             return Ok(batch.clone());
         }
 
+        // ORDER BY materialises a sort key per row plus the permutation
+        // indices. Charge that footprint to the query budget; if it does not
+        // fit, spill sorted runs to disk and merge them (S11 / W3-3) instead of
+        // failing or growing without bound.
+        let order_state_bytes = {
+            let mut bytes = batch.num_rows().saturating_mul(std::mem::size_of::<usize>() * 2);
+            for column in &sort_columns {
+                bytes = bytes.saturating_add(column.values.get_array_memory_size());
+            }
+            bytes
+        };
+        let _order_state_charge = match crate::query::executor::memory::QueryMemoryCharge::new(
+            order_state_bytes,
+        ) {
+            Ok(charge) => charge,
+            Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                return Self::spilled_order_by(batch, order_by, error);
+            }
+            Err(error) => return Err(error),
+        };
+
         let num_rows = batch.num_rows();
 
         // For large datasets (>50K rows), use parallel sort with Rayon
@@ -460,6 +465,50 @@ impl ApexExecutor {
         };
 
         RecordBatch::try_new(batch.schema(), columns).map_err(|e| err_data(e.to_string()))
+    }
+
+    /// External (spill) ORDER BY fallback used when the sort state does not fit
+    /// the query budget.
+    fn spilled_order_by(
+        batch: &RecordBatch,
+        order_by: &[crate::query::OrderByClause],
+        budget_error: std::io::Error,
+    ) -> io::Result<RecordBatch> {
+        let keys: Vec<crate::spill::SpillSortKey> = order_by
+            .iter()
+            .filter_map(|clause| {
+                let name = Self::resolve_order_col_name(batch, &clause.column);
+                batch.column_by_name(&name).map(|_| crate::spill::SpillSortKey {
+                    column: name.to_string(),
+                    descending: clause.descending,
+                    nulls_first: clause.nulls_first.unwrap_or(clause.descending),
+                })
+            })
+            .collect();
+        if keys.is_empty() {
+            return Ok(batch.clone());
+        }
+        let budget = crate::query::executor::memory::configured_query_memory_limit();
+        let chunk_bytes = if budget == 0 {
+            64 * 1024 * 1024
+        } else {
+            (budget / 4).max(256 * 1024)
+        };
+        let area = match crate::spill::SpillArea::new() {
+            Ok(area) => area,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!("{budget_error}; spill area unavailable: {error}"),
+                ))
+            }
+        };
+        crate::spill::external_sort_batch(&area, batch, &keys, chunk_bytes).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("{budget_error}; spilled ORDER BY failed: {error}"),
+            )
+        })
     }
 
     /// Parallel sort for single-column ORDER BY using Rayon

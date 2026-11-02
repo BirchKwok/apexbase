@@ -324,8 +324,14 @@ def _run_threads(worker, count=4):
         thread.join()
 
 
-def test_over_budget_order_by_reports_clear_error(tmp_path, monkeypatch):
-    """ORDER BY state is budgeted too: a huge sort must fail loudly, not grow unbounded."""
+def test_over_budget_order_by_spills_and_cleans_up(tmp_path, monkeypatch):
+    """ORDER BY over budget spills sorted runs to APEX_SPILL_DIR (S11) instead of failing.
+
+    The result must be identical to the in-memory sort and the per-query spill
+    area must be removed when the statement finishes.
+    """
+    spill_dir = tmp_path / "spill"
+    monkeypatch.setenv("APEX_SPILL_DIR", str(spill_dir))
     client = ApexClient(str(tmp_path / "order"), drop_if_exists=True)
     client.create_table("t", schema={"k": "int64", "s": "string"})
     client.use_table("t")
@@ -334,9 +340,13 @@ def test_over_budget_order_by_reports_clear_error(tmp_path, monkeypatch):
     client.flush()
     try:
         monkeypatch.setenv(LIMIT_ENV, "1")
-        with pytest.raises(Exception) as error:
-            client.execute("SELECT * FROM t ORDER BY k DESC").to_dict()
-        assert "query memory budget exceeded" in str(error.value)
+        spilled = client.execute("SELECT * FROM t ORDER BY k DESC").to_dict()
+        assert len(spilled) == rows
+        assert spilled[0]["k"] == rows - 1
+        assert spilled[-1]["k"] == 0
+        # The spill area is created per query and removed on completion.
+        assert spill_dir.exists()
+        assert not any(spill_dir.iterdir())
 
         # A bounded sort (LIMIT) stays on the top-k lane and must still work.
         limited = client.execute("SELECT * FROM t ORDER BY k DESC LIMIT 10").to_dict()

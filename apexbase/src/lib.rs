@@ -20,6 +20,7 @@ pub mod fts;
 pub mod python;
 pub mod query;
 pub mod scaling;
+pub mod spill;
 #[cfg(feature = "server")]
 pub mod server;
 pub mod storage;
