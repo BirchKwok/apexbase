@@ -67,19 +67,26 @@ pub(in crate::query::executor) fn reject_list_query_shapes(
     stmt: &SelectStatement,
     backend: &crate::storage::TableStorageBackend,
 ) -> io::Result<()> {
-    let is_list = |name: &str| -> bool {
+    // One schema snapshot for the whole guard: checking each aggregate/ORDER BY
+    // column through the backend re-took the schema lock (and showed up on tiny
+    // aggregate statements).
+    let schema = backend.storage.schema_snapshot();
+    let column_type = |name: &str| -> Option<crate::storage::on_demand::ColumnType> {
         let clean = name.trim_matches('"');
         let bare = clean.rsplit('.').next().unwrap_or(clean);
-        backend
-            .get_column_type(bare)
-            .map(|dtype| dtype == crate::data::DataType::Array)
-            .unwrap_or(false)
+        schema
+            .get_index(bare)
+            .and_then(|index| schema.columns.get(index).map(|(_, column_type)| *column_type))
+    };
+    let is_list = |name: &str| -> bool {
+        matches!(
+            column_type(name),
+            Some(crate::storage::on_demand::ColumnType::List)
+        )
     };
     let is_extension = |name: &str| -> bool {
-        let clean = name.trim_matches('"');
-        let bare = clean.rsplit('.').next().unwrap_or(clean);
         matches!(
-            backend.column_storage_type(bare),
+            column_type(name),
             Some(crate::storage::on_demand::ColumnType::Extension)
         )
     };

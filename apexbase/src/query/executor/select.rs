@@ -498,31 +498,49 @@ impl ApexExecutor {
             }
         }
         // MIN/MAX over a time-family column must stay typed no matter which
-        // aggregation lane answered; collect the expected outputs up front.
+        // aggregation lane answered; collect the expected outputs up front. The
+        // backend is fetched at most once per statement (a per-aggregate lookup
+        // showed up on tiny aggregate queries), and not at all when the statement
+        // has no MIN/MAX aggregate.
+        let needs_minmax = stmt.columns.iter().any(|column| {
+            matches!(
+                column,
+                SelectColumn::Aggregate {
+                    func: crate::query::AggregateFunc::Min | crate::query::AggregateFunc::Max,
+                    column: Some(_),
+                    ..
+                }
+            )
+        });
+        let time_backend = if needs_minmax {
+            get_cached_backend(storage_path).ok()
+        } else {
+            None
+        };
         let mut time_aggregate_outputs: Vec<(String, crate::data::DataType)> = Vec::new();
-        for column in &stmt.columns {
-            if let SelectColumn::Aggregate {
-                func,
-                column: Some(name),
-                alias,
-                ..
-            } = column
-            {
-                let function = match func {
-                    crate::query::AggregateFunc::Min => "MIN",
-                    crate::query::AggregateFunc::Max => "MAX",
-                    _ => continue,
-                };
-                let clean = name.trim_matches('"');
-                let bare = clean.rsplit('.').next().unwrap_or(clean);
-                let dtype = get_cached_backend(storage_path)
-                    .ok()
-                    .and_then(|backend| backend.get_column_type(bare));
-                if let Some(dtype) = dtype.filter(|dtype| dtype.is_time_family()) {
-                    let output_name = alias
-                        .clone()
-                        .unwrap_or_else(|| format!("{}({})", function, name));
-                    time_aggregate_outputs.push((output_name, dtype));
+        if let Some(backend) = time_backend.as_deref() {
+            for column in &stmt.columns {
+                if let SelectColumn::Aggregate {
+                    func,
+                    column: Some(name),
+                    alias,
+                    ..
+                } = column
+                {
+                    let function = match func {
+                        crate::query::AggregateFunc::Min => "MIN",
+                        crate::query::AggregateFunc::Max => "MAX",
+                        _ => continue,
+                    };
+                    let clean = name.trim_matches('"');
+                    let bare = clean.rsplit('.').next().unwrap_or(clean);
+                    let dtype = backend.get_column_type(bare);
+                    if let Some(dtype) = dtype.filter(|dtype| dtype.is_time_family()) {
+                        let output_name = alias
+                            .clone()
+                            .unwrap_or_else(|| format!("{}({})", function, name));
+                        time_aggregate_outputs.push((output_name, dtype));
+                    }
                 }
             }
         }
