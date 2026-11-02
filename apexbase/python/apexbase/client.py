@@ -1044,6 +1044,50 @@ def _coerce_decimal_columns(data, decimals):
     return data
 
 
+class _ArrowBatchStreamIterator:
+    """Iterator over ``pyarrow.RecordBatch`` results for ``ApexClient.execute_stream``.
+
+    The Rust side runs the query on a background thread and hands over one
+    Arrow IPC-encoded batch at a time, so only one row-group batch is resident
+    at the consumer. Shapes outside the streaming gate (ORDER BY / GROUP BY /
+    JOIN) may be materialized internally (bounded by the spill operators) and
+    arrive as a single batch.
+    """
+
+    def __init__(self, handle):
+        self._handle = handle
+        self._closed = False
+        self._pyarrow = _ensure_pyarrow()
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._closed:
+            raise StopIteration
+        payload = self._handle.next_batch()
+        if payload is None:
+            self._closed = True
+            raise StopIteration
+        reader = self._pyarrow.ipc.open_stream(
+            self._pyarrow.BufferReader(payload)
+        )
+        return reader.read_next_batch()
+
+    def close(self):
+        """Stop the stream early; the producer stops at its next batch boundary."""
+        if not self._closed:
+            self._closed = True
+            self._handle.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()
+        return False
+
+
 class ApexClient:
     """
     High-performance embedded database client for ApexBase.
@@ -3555,6 +3599,33 @@ class ApexClient:
             self._in_txn = old_in_txn
             self._fast_txn_active = old_fast_txn_active
         return None
+
+    def execute_stream(self, sql: str):
+        """Execute a read statement and stream its result batch by batch.
+
+        Opt-in companion to :meth:`execute`: it returns an iterator of
+        ``pyarrow.RecordBatch`` objects instead of a fully materialized
+        :class:`ResultView`. Large plain projections are produced one row group
+        at a time, so memory stays bounded by one batch. ORDER BY / GROUP BY /
+        JOIN shapes may be materialized internally (the spill operators keep
+        that bounded) and are yielded as a single batch.
+
+        The default :meth:`execute` behaviour and return type are unchanged.
+        Errors that happen before or during the stream surface as
+        ``RuntimeError`` from the iterator (a partially consumed stream simply
+        stops); call :meth:`close` to stop early.
+
+        Args:
+            sql: SQL SELECT statement. Write/DDL statements are not streamable.
+
+        Returns:
+            Iterator of :class:`pyarrow.RecordBatch`.
+
+        Requires pyarrow.
+        """
+        self._check_connection()
+        handle = self._storage._stream_batches(sql)
+        return _ArrowBatchStreamIterator(handle)
 
     def execute(
         self,

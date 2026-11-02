@@ -66,6 +66,7 @@ fn _core(m: &Bound<'_, PyModule>) -> PyResult<()> {
     }
 
     m.add_class::<python::ApexStorage>()?;
+    m.add_class::<python::ArrowBatchStream>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
     // Add scheduler functions

@@ -126,6 +126,14 @@ pub struct ApexBaseHandler {
     query_limit: usize,
 }
 
+/// One event from a streaming query producer thread to the lazily consumed
+/// PostgreSQL row stream (S12).
+enum PgStreamEvent {
+    Batch(RecordBatch),
+    Error(String),
+    End,
+}
+
 impl ApexBaseHandler {
     pub fn new(base_dir: PathBuf) -> Self {
         Self::with_query_limits(base_dir, default_query_concurrency(), default_query_wait())
@@ -215,6 +223,157 @@ impl ApexBaseHandler {
             .map_err(|e| e.to_string())?
             .to_record_batch()
             .map_err(|e| e.to_string())
+    }
+
+    /// Execute a read statement as a lazily consumed row stream (S12).
+    ///
+    /// The first batch must arrive before a response can be built (PostgreSQL
+    /// sends the row description first); the producer then keeps sending
+    /// row-group batches over a bounded channel, so the server holds one batch
+    /// plus one encoded row. `Ok(None)` means "not streamable here, use the
+    /// materialized path" (command/catalog/empty/error-before-first-batch).
+    async fn run_query_stream(
+        &self,
+        sql: &str,
+        current_db: &str,
+    ) -> Result<
+        Option<(
+            Arc<Vec<FieldInfo>>,
+            std::pin::Pin<
+                Box<dyn futures::Stream<Item = PgWireResult<pgwire::messages::data::DataRow>> + Send>,
+            >,
+        )>,
+        QueryFailure,
+    > {
+        let base_dir = self.base_dir.clone();
+        let database_dir = self.effective_base_dir(current_db);
+        let sql_owned = sql.to_string();
+        let permit = match tokio::time::timeout(
+            self.query_wait,
+            Arc::clone(&self.query_slots).acquire_owned(),
+        )
+        .await
+        {
+            Ok(Ok(permit)) => permit,
+            Ok(Err(error)) => {
+                return Err(QueryFailure::new(format!("query admission closed: {error}")))
+            }
+            Err(_) => {
+                return Err(QueryFailure::capacity(format!(
+                    "too many concurrent statements: all {} query slots are busy",
+                    self.query_concurrency()
+                )))
+            }
+        };
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<PgStreamEvent>(2);
+        let producer = {
+            let base_dir = base_dir.clone();
+            let database_dir = database_dir.clone();
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let default_table_path = database_dir.join("apexbase.apex");
+                let session = crate::Session::new(&database_dir, &default_table_path)
+                    .with_root_dir(&base_dir);
+                let batch_sender = sender.clone();
+                let mut emit = |batch: RecordBatch| -> bool {
+                    batch_sender
+                        .blocking_send(PgStreamEvent::Batch(batch))
+                        .is_ok()
+                };
+                match session.execute_streaming(&sql_owned, &mut emit) {
+                    Ok(Some(_rows)) => {
+                        let _ = sender.blocking_send(PgStreamEvent::End);
+                    }
+                    Ok(None) => match session.execute(&sql_owned) {
+                        Ok(result) => match result.to_record_batch() {
+                            Ok(batch) => {
+                                let _ = sender.blocking_send(PgStreamEvent::Batch(batch));
+                                let _ = sender.blocking_send(PgStreamEvent::End);
+                            }
+                            Err(error) => {
+                                let _ = sender
+                                    .blocking_send(PgStreamEvent::Error(error.to_string()));
+                            }
+                        },
+                        Err(error) => {
+                            let _ = sender.blocking_send(PgStreamEvent::Error(error.to_string()));
+                        }
+                    },
+                    Err(error) => {
+                        let _ = sender.blocking_send(PgStreamEvent::Error(error.to_string()));
+                    }
+                }
+            })
+        };
+        let first = loop {
+            match receiver.recv().await {
+                Some(PgStreamEvent::Batch(batch)) => break batch,
+                Some(PgStreamEvent::Error(error)) => {
+                    let _ = producer.await;
+                    return Err(QueryFailure::new(error));
+                }
+                Some(PgStreamEvent::End) | None => {
+                    let _ = producer.await;
+                    return Ok(None);
+                }
+            }
+        };
+        let field_infos: Arc<Vec<FieldInfo>> = Arc::new(schema_to_field_info(&first.schema()));
+        let rows = Self::encode_batch_rows(first, Arc::clone(&field_infos))
+            .map_err(|error| QueryFailure::new(error.to_string()))?;
+        struct RowState {
+            receiver: tokio::sync::mpsc::Receiver<PgStreamEvent>,
+            rows: Box<dyn Iterator<Item = PgWireResult<pgwire::messages::data::DataRow>> + Send>,
+            field_infos: Arc<Vec<FieldInfo>>,
+            done: bool,
+        }
+        let state = RowState {
+            receiver,
+            rows: Box::new(rows),
+            field_infos: Arc::clone(&field_infos),
+            done: false,
+        };
+        let stream = futures::stream::unfold(Some(state), |state| async move {
+            let mut state = state?;
+            loop {
+                if let Some(row) = state.rows.next() {
+                    return Some((row, Some(state)));
+                }
+                if state.done {
+                    return None;
+                }
+                match state.receiver.recv().await {
+                    Some(PgStreamEvent::Batch(batch)) => match Self::encode_batch_rows(
+                        batch,
+                        Arc::clone(&state.field_infos),
+                    ) {
+                        Ok(rows) => state.rows = Box::new(rows),
+                        Err(error) => {
+                            state.done = true;
+                            return Some((Err(error), Some(state)));
+                        }
+                    },
+                    Some(PgStreamEvent::Error(error)) => {
+                        state.done = true;
+                        return Some((
+                            Err(PgWireError::UserError(Box::new(
+                                pgwire::error::ErrorInfo::new(
+                                    "ERROR".to_string(),
+                                    "XX000".to_string(),
+                                    error,
+                                ),
+                            ))),
+                            Some(state),
+                        ));
+                    }
+                    Some(PgStreamEvent::End) | None => {
+                        state.done = true;
+                        return None;
+                    }
+                }
+            }
+        });
+        Ok(Some((field_infos, Box::pin(stream))))
     }
 
     /// Execute a SQL query in the context of the given database, waiting for a
@@ -747,6 +906,30 @@ impl SimpleQueryHandler for ApexBaseHandler {
                 continue;
             }
             let current_db = Self::current_db_from_metadata(client);
+            // Streamable read: send row-group batches lazily (S12). Catalog
+            // probes and commands keep their fast materialized path.
+            if !Self::route_is_command(sql)
+                && !Self::is_txn_control(sql)
+                && pg_catalog::try_handle_catalog_query(sql, &self.base_dir).is_none()
+            {
+                match self.run_query_stream(sql, &current_db).await {
+                    Ok(Some((field_infos, rows))) => {
+                        self.cache_schema(sql, Arc::clone(&field_infos));
+                        responses.push(Response::Query(QueryResponse::new(field_infos, rows)));
+                        continue;
+                    }
+                    Ok(None) => {}
+                    Err(failure) => {
+                        return Err(PgWireError::UserError(Box::new(
+                            pgwire::error::ErrorInfo::new(
+                                "ERROR".to_string(),
+                                failure.code.to_string(),
+                                failure.message,
+                            ),
+                        )));
+                    }
+                }
+            }
             match self.run_query(sql, &current_db).await {
                 Ok(batch) => {
                     if Self::route_is_command(sql) {

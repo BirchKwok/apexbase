@@ -95,6 +95,7 @@ PUBLIC_API_CASES = (
     "ApexClient.execute",
     "ApexClient.execute_batch",
     "ApexClient.execute_batch_parallel",
+    "ApexClient.execute_stream",
     "ApexClient.topk_distance",
     "ApexClient.batch_topk_distance",
     "ApexClient.hybrid_search",
@@ -451,6 +452,8 @@ class Fixture:
         api = self.api
         if api == "execute":
             return self.apexbase.execute("SELECT COUNT(*) FROM module_api")
+        if api == "execute_stream":
+            return None
         if api == "encode_vector":
             from apexbase.client import encode_vector
             return encode_vector(self.np.arange(4096, dtype=self.np.float32))
@@ -548,6 +551,16 @@ class Fixture:
         if name == "execute":
             c.use_table("main")
             return c.execute("SELECT category, SUM(value) FROM main GROUP BY category")
+        if name == "execute_stream":
+            c.use_table("main")
+            rows = 0
+            stream = c.execute_stream("SELECT value, category FROM main LIMIT 1000")
+            try:
+                for batch in stream:
+                    rows += batch.num_rows
+            finally:
+                stream.close()
+            return rows
         if name == "execute_batch":
             c.use_table("main")
             return c.execute_batch(["SELECT COUNT(*) FROM main", "SELECT MAX(value) FROM main"])

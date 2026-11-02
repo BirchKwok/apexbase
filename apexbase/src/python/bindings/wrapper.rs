@@ -27,6 +27,8 @@ mod arrow_bridge;
 mod blob;
 #[path = "read.rs"]
 mod read;
+#[path = "stream.rs"]
+pub(crate) mod stream;
 #[path = "sql.rs"]
 mod sql;
 #[path = "write.rs"]

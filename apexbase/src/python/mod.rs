@@ -9,6 +9,7 @@ mod flight_bridge;
 mod server_bridge;
 
 pub use bindings::ApexStorageImpl as ApexStorage;
+pub use bindings::ArrowBatchStream;
 #[cfg(feature = "flight")]
 pub use flight_bridge::start_flight_server;
 #[cfg(feature = "server")]
