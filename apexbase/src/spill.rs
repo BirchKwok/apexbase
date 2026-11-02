@@ -154,6 +154,29 @@ pub fn write_run(path: &Path, batches: &[RecordBatch]) -> io::Result<()> {
     Ok(())
 }
 
+/// Incrementally append batches to one IPC run file (one file per partition).
+pub struct RunWriter {
+    writer: arrow::ipc::writer::FileWriter<File>,
+    path: PathBuf,
+}
+
+impl RunWriter {
+    pub fn create(path: PathBuf, schema: &arrow::datatypes::Schema) -> io::Result<Self> {
+        let file = File::create(&path)?;
+        let writer = arrow::ipc::writer::FileWriter::try_new(file, schema).map_err(io_other)?;
+        Ok(Self { writer, path })
+    }
+
+    pub fn write(&mut self, batch: &RecordBatch) -> io::Result<()> {
+        self.writer.write(batch).map_err(io_other)
+    }
+
+    pub fn finish(mut self) -> io::Result<PathBuf> {
+        self.writer.finish().map_err(io_other)?;
+        Ok(self.path)
+    }
+}
+
 /// Read every batch from an Arrow IPC run file.
 pub fn read_run(path: &Path) -> io::Result<Vec<RecordBatch>> {
     let file = File::open(path)?;
@@ -168,6 +191,123 @@ pub fn read_run(path: &Path) -> io::Result<Vec<RecordBatch>> {
 /// Stable path names inside one area.
 fn run_path(area: &SpillArea, pass: usize, index: usize) -> PathBuf {
     area.file_path(format!("run-{pass}-{index}.arrow"))
+}
+
+/// Hash-partition `batch` into `partitions` run files by the given key columns.
+///
+/// The partition is chosen from the Arrow row-format bytes of the key columns,
+/// so every distinct key value deterministically lands in one partition
+/// (group-by / distinct partial results can be concatenated afterwards). Input
+/// batches are sliced into windows so peak memory is one window of indices plus
+/// one window-sized batch.
+pub fn hash_partition_batch(
+    area: &SpillArea,
+    batch: &RecordBatch,
+    key_columns: &[usize],
+    partitions: usize,
+    name_prefix: &str,
+) -> io::Result<Vec<PathBuf>> {
+    let partitions = partitions.max(1);
+    let schema = batch.schema();
+    let mut writers: Vec<Option<RunWriter>> = Vec::with_capacity(partitions);
+    let mut paths: Vec<PathBuf> = Vec::with_capacity(partitions);
+    for index in 0..partitions {
+        let path = area.file_path(format!("{name_prefix}-{index}.arrow"));
+        paths.push(path.clone());
+        writers.push(None);
+    }
+    if batch.num_rows() == 0 {
+        for (index, path) in paths.iter().enumerate() {
+            let writer = RunWriter::create(path.clone(), schema.as_ref())?;
+            writers[index] = Some(writer);
+        }
+        let mut finished = Vec::with_capacity(partitions);
+        for writer in writers.into_iter().flatten() {
+            finished.push(writer.finish()?);
+        }
+        return Ok(finished);
+    }
+
+    let fields: Vec<arrow::datatypes::Field> = key_columns
+        .iter()
+        .map(|&index| schema.field(index).clone())
+        .collect();
+    let converter = arrow::row::RowConverter::new(
+        fields
+            .iter()
+            .map(|field| arrow::row::SortField::new(field.data_type().clone()))
+            .collect(),
+    )
+    .map_err(io_other)?;
+    const WINDOW_ROWS: usize = 16 * 1024;
+    let mut start = 0usize;
+    while start < batch.num_rows() {
+        let end = (start + WINDOW_ROWS).min(batch.num_rows());
+        let window = batch.slice(start, end - start);
+        let key_arrays: Vec<arrow::array::ArrayRef> = key_columns
+            .iter()
+            .map(|&index| window.column(index).clone())
+            .collect();
+        let rows = converter.convert_columns(&key_arrays).map_err(io_other)?;
+        let mut buckets: Vec<Vec<u32>> = vec![Vec::new(); partitions];
+        use std::hash::Hasher;
+        let mut hasher = ahash::AHasher::default();
+        for row in 0..window.num_rows() {
+            let row_ref = rows.row(row);
+            hasher.write(row_ref.as_ref());
+            let hash = hasher.finish();
+            hasher = ahash::AHasher::default();
+            buckets[(hash as usize) % partitions].push(row as u32);
+        }
+        for (index, indices) in buckets.iter().enumerate() {
+            if indices.is_empty() {
+                continue;
+            }
+            let selector = arrow::array::UInt32Array::from(indices.clone());
+            let columns = window
+                .columns()
+                .iter()
+                .map(|column| take(column, &selector, None))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(io_other)?;
+            let partition_batch = RecordBatch::try_new(schema.clone(), columns).map_err(io_other)?;
+            if writers[index].is_none() {
+                writers[index] = Some(RunWriter::create(
+                    paths[index].clone(),
+                    schema.as_ref(),
+                )?);
+            }
+            writers[index]
+                .as_mut()
+                .expect("writer initialized above")
+                .write(&partition_batch)?;
+        }
+        start = end;
+    }
+    let mut finished = Vec::with_capacity(partitions);
+    for index in 0..partitions {
+        match writers[index].take() {
+            Some(writer) => finished.push(writer.finish()?),
+            None => {
+                let writer = RunWriter::create(paths[index].clone(), schema.as_ref())?;
+                finished.push(writer.finish()?);
+            }
+        }
+    }
+    Ok(finished)
+}
+
+/// Read and concatenate every batch from a run file.
+pub fn read_run_batch(path: &Path) -> io::Result<RecordBatch> {
+    let batches = read_run(path)?;
+    if batches.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty spill run file",
+        ));
+    }
+    let schema = batches[0].schema();
+    concat_batches(&schema, &batches).map_err(io_other)
 }
 
 /// Bounded-memory external sort of one in-memory batch.

@@ -842,6 +842,97 @@ impl ApexExecutor {
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
+    /// Partitioned spill fallback for GROUP BY when the in-memory kernel cannot
+    /// fit the query budget (S11 / W3-3).
+    ///
+    /// The input batch is hash-partitioned by the GROUP BY key columns, so each
+    /// partition can be aggregated independently (a group never spans two
+    /// partitions) with the normal kernel and the partition results simply
+    /// concatenated. `ORDER BY` / `LIMIT` / `OFFSET` are stripped from the
+    /// partition statement and applied once to the merged result.
+    pub(in crate::query::executor) fn spilled_group_by(
+        batch: &RecordBatch,
+        stmt: &SelectStatement,
+        budget_error: io::Error,
+    ) -> io::Result<ApexResult> {
+        let budget = crate::query::executor::memory::configured_query_memory_limit();
+        if budget == 0 || batch.num_rows() == 0 {
+            return Err(budget_error);
+        }
+        if stmt.order_by.iter().any(|clause| clause.expr.is_some()) {
+            // Expression ORDER BY keys are resolved per partition; replaying them
+            // globally is not safe, so keep the explicit budget error.
+            return Err(budget_error);
+        }
+        let mut key_indices = Vec::with_capacity(stmt.group_by.len());
+        for group in &stmt.group_by {
+            let clean = group.trim_matches('"');
+            let bare = clean.rsplit('.').next().unwrap_or(clean);
+            let Some(index) = batch.schema().index_of(clean).ok().or_else(|| {
+                batch.schema().index_of(bare).ok()
+            }) else {
+                return Err(budget_error);
+            };
+            key_indices.push(index);
+        }
+        if key_indices.is_empty() {
+            return Err(budget_error);
+        }
+        let total_bytes = batch.get_array_memory_size().max(1);
+        let target = (budget / 4).max(1024 * 1024);
+        let partitions = ((total_bytes.saturating_add(target - 1)) / target).clamp(8, 256);
+        let area = match crate::spill::SpillArea::new() {
+            Ok(area) => area,
+            Err(error) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!("{budget_error}; spill area unavailable: {error}"),
+                ))
+            }
+        };
+        let paths = crate::spill::hash_partition_batch(&area, batch, &key_indices, partitions, "gby")
+            .map_err(|error| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!("{budget_error}; spilled GROUP BY partition failed: {error}"),
+                )
+            })?;
+        let mut partition_stmt = stmt.clone();
+        partition_stmt.order_by.clear();
+        partition_stmt.limit = None;
+        partition_stmt.offset = None;
+        let mut chunks: Vec<RecordBatch> = Vec::with_capacity(paths.len());
+        {
+            // Partition kernels must not re-enter the (already exhausted) budget:
+            // each partition is sized to a fraction of it, so running them
+            // unbudgeted keeps the peak bounded without failing.
+            let _unbudgeted =
+                crate::query::executor::memory::install_query_memory_budget(None);
+            for path in paths {
+                let part = crate::spill::read_run_batch(&path)?;
+                if part.num_rows() == 0 {
+                    continue;
+                }
+                if let ApexResult::Data(result) = Self::execute_group_by(&part, &partition_stmt)? {
+                    if result.num_rows() > 0 {
+                        chunks.push(result);
+                    }
+                }
+            }
+        }
+        if chunks.is_empty() {
+            return Self::execute_group_by(&batch.slice(0, 0), &partition_stmt);
+        }
+        let schema = chunks[0].schema();
+        let mut merged = arrow::compute::concat_batches(&schema, &chunks)
+            .map_err(|error| err_data(error.to_string()))?;
+        if !stmt.order_by.is_empty() {
+            merged = Self::apply_order_by(&merged, &stmt.order_by)?;
+        }
+        merged = Self::apply_limit_offset(&merged, stmt.limit, stmt.offset)?;
+        Ok(ApexResult::Data(Self::decode_dict_columns(&merged)))
+    }
+
     pub(in crate::query::executor) fn execute_group_by_vectorized(
         batch: &RecordBatch,
         stmt: &SelectStatement,

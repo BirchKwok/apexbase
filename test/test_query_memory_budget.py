@@ -125,10 +125,17 @@ GENERIC_HIGH_CARDINALITY_SHAPES = (
 
 
 @pytest.mark.parametrize("label, sql, expected_rows", GENERIC_HIGH_CARDINALITY_SHAPES)
-def test_generic_high_cardinality_shapes_are_bounded(client, label, sql, expected_rows):
+def test_generic_high_cardinality_shapes_spill_within_budget(
+    client, label, sql, expected_rows, tmp_path, monkeypatch
+):
+    """Single-batch aggregation shapes spill to disk instead of failing (S11)."""
+    spill_dir = tmp_path / "spill"
+    monkeypatch.setenv("APEX_SPILL_DIR", str(spill_dir))
+
     def run():
-        with pytest.raises(RuntimeError, match="query memory budget exceeded"):
-            client.execute(sql)
+        rows = client.execute(sql).to_dict()
+        assert len(rows) == expected_rows, (label, len(rows))
+        assert not any(spill_dir.iterdir()), "spill area must be cleaned up"
 
     _with_limit(1, run)
 
@@ -257,16 +264,16 @@ def _run_rss_child(dirpath, limit_mb):
     return json.loads(completed.stdout.strip().splitlines()[-1])
 
 
-def test_bounded_run_has_lower_peak_rss_than_unlimited():
+def test_bounded_run_keeps_lower_peak_than_unlimited():
     with tempfile.TemporaryDirectory() as tmp:
         _seed_rss_fixture(tmp)
         bounded = _run_rss_child(tmp, 1)
         unlimited = _run_rss_child(tmp, 0)
 
-    assert bounded["outcome"] == "error"
+    # S11: the over-budget query spills instead of aborting, and its peak RSS
+    # stays clearly below the run that materializes every group state.
+    assert bounded["outcome"] == "ok"
     assert unlimited["outcome"] == "ok"
-    # The bounded run aborts after the budget is crossed, so its peak RSS must
-    # stay clearly below the run that materializes every group.
     assert bounded["peak_mb"] < unlimited["peak_mb"], (bounded, unlimited)
     assert unlimited["peak_mb"] - bounded["peak_mb"] > 10.0, (bounded, unlimited)
 
@@ -391,9 +398,9 @@ def test_numeric_group_by_cannot_bypass_the_budget(tmp_path, monkeypatch):
     client.flush()
     try:
         monkeypatch.setenv(LIMIT_ENV, "1")
-        with pytest.raises(Exception) as error:
-            client.execute("SELECT k, COUNT(*) AS n FROM t GROUP BY k").to_dict()
-        assert "query memory budget exceeded" in str(error.value)
+        spilled = client.execute("SELECT k, COUNT(*) AS n FROM t GROUP BY k").to_dict()
+        assert len(spilled) == rows
+        assert sum(int(row["n"]) for row in spilled) == rows
 
         # Without the budget constraint the very same query must be exact.
         monkeypatch.delenv(LIMIT_ENV, raising=False)

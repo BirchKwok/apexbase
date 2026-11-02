@@ -2532,13 +2532,40 @@ let can_pushdown_limit = stmt.where_clause.is_none()
         // plain projection path, emitting one row per input row instead of one
         // row per group.
         if !stmt.group_by.is_empty() {
-            return Self::execute_group_by(&filtered, &stmt);
+            return match Self::execute_group_by(&filtered, &stmt) {
+                Ok(result) => Ok(result),
+                Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                    Self::spilled_group_by(&filtered, &stmt, error)
+                }
+                Err(error) => Err(error),
+            };
         }
 
         // For DISTINCT: sort without top-k limit, project, deduplicate, then limit
         // For DISTINCT ON: sort, deduplicate by ON columns, project, then limit/offset
         // For non-DISTINCT: apply top-k sort + limit, then project
         let result = if stmt.distinct {
+            // SELECT DISTINCT dedupe state is budgeted too: when the batch is
+            // too large for the budget, dedupe hash-partitioned runs instead of
+            // growing an unbounded set (S11 / W3-3).
+            let distinct_state_bytes = filtered
+                .get_array_memory_size()
+                .saturating_add(filtered.num_rows().saturating_mul(16));
+            let distinct_charge = match crate::query::executor::memory::QueryMemoryCharge::new(
+                distinct_state_bytes,
+            ) {
+                Ok(charge) => charge,
+                Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                    return Ok(Self::spilled_distinct(
+                        &filtered,
+                        &stmt,
+                        storage_path,
+                        error,
+                    )?);
+                }
+                Err(error) => return Err(error),
+            };
+            let _distinct_charge = distinct_charge;
             if let Some(ref on_cols) = stmt.distinct_on {
                 // DISTINCT ON: deduplicate by ON columns, then project + limit/offset
                 let sorted = if !stmt.order_by.is_empty() {
@@ -2632,6 +2659,76 @@ let can_pushdown_limit = stmt.where_clause.is_none()
         };
 
         Ok(ApexResult::Data(result))
+    }
+
+    /// Hash-partitioned spill fallback for SELECT DISTINCT (S11 / W3-3).
+    ///
+    /// The projected batch is partitioned by every output column, so each
+    /// distinct value lands in exactly one partition; each partition is
+    /// deduplicated with the regular kernel and the survivors concatenated.
+    /// ORDER BY / LIMIT / OFFSET are applied once to the merged result.
+    fn spilled_distinct(
+        batch: &RecordBatch,
+        stmt: &SelectStatement,
+        storage_path: &Path,
+        budget_error: std::io::Error,
+    ) -> io::Result<ApexResult> {
+        let budget = crate::query::executor::memory::configured_query_memory_limit();
+        if budget == 0 || batch.num_rows() == 0 {
+            return Err(budget_error);
+        }
+        if stmt.order_by.iter().any(|clause| clause.expr.is_some()) {
+            return Err(budget_error);
+        }
+        let projected = Self::apply_projection_with_storage(batch, &stmt.columns, Some(storage_path))?;
+        let projected = Self::decode_dict_columns(&projected);
+        if projected.num_columns() == 0 || projected.num_rows() == 0 {
+            return Ok(ApexResult::Data(projected));
+        }
+        let columns: Vec<usize> = (0..projected.num_columns()).collect();
+        let total_bytes = projected.get_array_memory_size().max(1);
+        let target = (budget / 4).max(1024 * 1024);
+        let partitions = ((total_bytes.saturating_add(target - 1)) / target).clamp(8, 256);
+        let area = match crate::spill::SpillArea::new() {
+            Ok(area) => area,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!("{budget_error}; spill area unavailable: {error}"),
+                ))
+            }
+        };
+        let paths =
+            crate::spill::hash_partition_batch(&area, &projected, &columns, partitions, "distinct")
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::OutOfMemory,
+                        format!("{budget_error}; spilled DISTINCT partition failed: {error}"),
+                    )
+                })?;
+        let mut survivors: Vec<RecordBatch> = Vec::with_capacity(paths.len());
+        {
+            let _unbudgeted =
+                crate::query::executor::memory::install_query_memory_budget(None);
+            for path in paths {
+                let part = crate::spill::read_run_batch(&path)?;
+                if part.num_rows() == 0 {
+                    continue;
+                }
+                survivors.push(Self::deduplicate_batch(&part)?);
+            }
+        }
+        if survivors.is_empty() {
+            return Ok(ApexResult::Data(RecordBatch::new_empty(projected.schema())));
+        }
+        let mut merged = arrow::compute::concat_batches(&projected.schema(), &survivors)
+            .map_err(|error| err_data(error.to_string()))?;
+        if !stmt.order_by.is_empty() {
+            let k = stmt.limit.map(|limit| limit + stmt.offset.unwrap_or(0));
+            merged = Self::apply_order_by_topk(&merged, &stmt.order_by, k)?;
+        }
+        merged = Self::apply_limit_offset(&merged, stmt.limit, stmt.offset)?;
+        Ok(ApexResult::Data(Self::decode_dict_columns(&merged)))
     }
 
     /// Multiple scalar COUNT(DISTINCT col) expressions. String cardinalities
