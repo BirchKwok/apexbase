@@ -124,7 +124,7 @@ and **1,000,000 vectors x 128 dimensions** on Apple arm64 with Python 3.12.
 | Area | Snapshot |
 | --- | --- |
 | **Public coverage** | 105 tabular metrics, 6 exact-vector metrics, and 8 ApexBase quantized-vector precision rows |
-| **Comparable results** | ApexBase wins 102 / 105 tabular metrics against the fastest competitor in the latest complete run (3 slower); exact-vector 6 / 6 |
+| **Comparable results** | ApexBase wins 105 / 105 tabular metrics against the fastest competitor in the latest complete runs; exact-vector 6 / 6 |
 | **Exact vector search** | All 6 single/batch Float32 TopK rows beat the compared engines and match brute-force exact top-k row sets |
 | **Reproducibility** | Fixed data sizes, 2 warmups, 5 timed iterations, dependency metadata, and a retained JSON report |
 
@@ -139,27 +139,28 @@ streaming overlay reads, and a per-query aggregation memory budget on top of it.
 See [Scan & Physical Execution](https://birchkwok.github.io/apexbase/latest/SCAN_EXECUTION_ARCHITECTURE/)
 and [Resource Ownership](https://birchkwok.github.io/apexbase/latest/RESOURCE_OWNERSHIP/).
 
-v1.37.0–v1.39.0 are the **V5 architecture preview** releases. Files may declare
-format version `5` (including when the schema carries parameterised types such
-as `uuid` or `decimal(p,s)`), and carry V5-only column encodings, `_id` ranges are
-reserved against a shared
-on-disk high-water mark so several processes can write one table, and new read
-lanes cover direct point reads, executor index lookups, full-text row-selection
-pushdown, and distance TopK. v1.38.0 keeps the same format and fixes the
-`SELECT t.* … JOIN` projection failure, the SQL point-lookup latency gap and the
-read degradation a predicate `UPDATE` used to leave behind. v1.39.0 keeps format version 5 and extends it with the optional logical-type
-section (`uuid`, `decimal(p,s)`), the
-matching Python/Arrow projections and an opt-in SQL `DECIMAL` path. V5 builds read V4
-files; to keep a file readable by
-a pre-V5 build, set `APEX_WIDTH_FIDELITY=0` to write the V4 layout. Compressed
-tables now store one compressed frame per column by default (so a
-column-selective scan does not decode the whole row group); set
-`APEX_CHUNK_INDEX=0` to keep the flat compressed frame, which is also what a
-build that predates per-column frames expects. The format may still gain
-encodings before V5 is declared stable, so treat it as a preview
-and see the [release notes](https://birchkwok.github.io/apexbase/latest/release-notes/)
-and [Storage Architecture](https://birchkwok.github.io/apexbase/latest/STORAGE_ARCHITECTURE/)
-for the compatibility rules.
+v2.0.0 is the **V5 GA** release. Files use on-disk format version `5`, which is
+now the stable format for this release line. V5 builds read V4 files, and
+`APEX_WIDTH_FIDELITY=0` writes the V4 layout for files that must stay readable
+by pre-V5 builds. Format 5 adds an optional logical-type schema section
+(`uuid`, `decimal(p,s)`, `timestamp`/`timestamptz`/`date`/`time`/`interval`,
+`list<T>` and extension codecs), keeps one compressed frame per column for
+chunked tables (set `APEX_CHUNK_INDEX=0` for the flat frame expected by older
+builds), and reserves `_id` ranges against a shared on-disk high-water mark so
+several processes can write one table.
+
+V5 also closes the SQL semantics gaps (`DISTINCT *`, alias uniquification,
+RIGHT JOIN ordering) and unifies statement routing inside transactions and for
+`COPY ... FROM` without a selected table. Memory is bounded by design:
+`APEX_QUERY_MEMORY_MB` caps per-query operator memory, `APEX_PROCESS_BUDGET_MB`
+adds a process-level admission ceiling with a bounded queue, out-of-core spill
+keeps `ORDER BY`/`GROUP BY`/`DISTINCT`/`JOIN` within memory
+(`APEX_SPILL_DIR`), and `ApexClient.execute_stream()` streams results batch by
+batch. Extension codecs are explicit: `bytes`/`json` are built in, `pickle`
+must be registered deliberately. The complete V5→V4 compatibility rules and
+migration notes are in the
+[release notes](https://birchkwok.github.io/apexbase/latest/release-notes/) and
+[Storage Architecture](https://birchkwok.github.io/apexbase/latest/STORAGE_ARCHITECTURE/).
 
 ## Documentation
 

@@ -3,6 +3,80 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v2.0.0](https://github.com/BirchKwok/ApexBase/releases/tag/v2.0.0)
+*2026-11-03*
+
+[Compare with v1.39.0](https://github.com/BirchKwok/ApexBase/compare/v1.39.0...v2.0.0)
+
+> **V5 GA.** v2.0.0 declares the V5 storage and execution architecture stable:
+> on-disk format version 5 is fixed for this release line, the V5 type system
+> (time family, `List<T>`, extension codecs, `uuid`, `DECIMAL(p,s)`) is complete,
+> the SQL semantics/routing gaps are closed, and execution is memory-bounded
+> through admission control, per-query budgets, out-of-core spill and streaming
+> results.
+
+### Highlights
+
+- **Storage format 5 is stable.** V5 builds read V4 files; V4 files written by
+  this build (`APEX_WIDTH_FIDELITY=0`) stay readable by older builds. Format 5
+  files themselves must not be opened by pre-V5 builds, which do not know the
+  new encodings.
+- **Logical types** carry an optional schema section: `uuid`, `decimal(p,s)`,
+  `timestamp`/`timestamptz`/`date`/`time`/`interval`, `list<element>` and
+  `extension<codec[@version]>`. Typed Arrow/Polars projections are the default;
+  `client.describe_table()` reports the declared types (including parameterised
+  ones) and `to_arrow(declared_types=...)` / `to_polars(...)` keep decimals in
+  their 16-byte payload form (D4).
+- **Extension codecs** register explicitly (`register_extension_codec`);
+  `bytes`/`json` are built in and `pickle` must be registered deliberately —
+  the storage layer never unpickles data implicitly.
+- **Compressed tables** keep one frame per column by default (chunked layout),
+  so column-selective scans skip other columns; `APEX_CHUNK_INDEX=0` keeps the
+  flat frame for older readers. Multi-process writes reserve `_id` ranges from a
+  shared on-disk high-water mark.
+- **SQL semantics**: `DISTINCT *` deduplicates on the visible columns (D6),
+  duplicate SELECT aliases are uniquified deterministically (D7), RIGHT JOIN
+  output ordering is fixed (D8); statements route uniformly inside transactions
+  (ROLLBACK applies to buffered DML) and `COPY ... FROM` works without a
+  selected table (D9/D11).
+- **Bounded execution**: `APEX_QUERY_MEMORY_MB` bounds per-query operator state;
+  `APEX_PROCESS_BUDGET_MB` adds process-level admission with a bounded queue and
+  explicit `[APEX_ADMISSION_*]` rejections; `ORDER BY`/`GROUP BY`/`DISTINCT`/
+  `JOIN` spill to `APEX_SPILL_DIR` when they exceed the budget (results are
+  unchanged); `ApexClient.execute_stream()` and PG wire/Flight stream large
+  results batch by batch. FTS persistence reconciles its snapshot/WAL generation
+  with the table on open and rejects stale indexes explicitly instead of
+  answering from partial coverage.
+- **Performance**: the public scoreboard now has 105 tabular metrics; three
+  retained complete runs won 105/105 tabular and 6/6 exact-vector comparisons,
+  and the public baseline is the median of those runs. The 10M-row scale harness
+  records: COUNT 0.043 ms, low-cardinality GROUP BY 7.1 ms, high-cardinality
+  10M-group GROUP BY 2.6 s under a 1 GB budget (256 MB re-run validated spilling
+  with an exact result), and 10M IVF recall@10 = 0.97 at ~11 ms median with
+  nprobe=16.
+
+### Migration notes
+
+- Existing V4 files open unchanged; a table starts declaring version 5 on the
+  first V5-only write. To keep a file readable by older builds set
+  `APEX_WIDTH_FIDELITY=0` (V4 layout) and, for compressed tables,
+  `APEX_CHUNK_INDEX=0` (flat frames).
+- Files using the logical-type section (types above) require a v2.0.0-or-newer
+  reader; older V5 preview builds must be upgraded first.
+- Opt-outs: `APEX_LOGICAL_TYPES=0` refuses creating the new typed columns;
+  `APEX_SQL_DECIMAL=0` restores the legacy text representation; `APEX_SPILL=...`
+  is not required (spill is automatic when the budget is exceeded).
+- No SQL migration step is required for V4 files; no table rewrite is performed.
+
+### Known limits
+
+- `ORDER BY ... LIMIT` over 10M rows is slower than DuckDB in the scale harness
+  (83.8 ms vs 50.5 ms at 10M); it is recorded as a performance follow-up.
+- A 10M-row SQLite comparison is recorded on a 1M subset (SQLite import time);
+  DuckDB is compared at full 10M.
+- Large results are still materialized for `execute()` (O(output)); use
+  `execute_stream()` when that is too large.
+
 ## [v1.39.0](https://github.com/BirchKwok/ApexBase/releases/tag/v1.39.0)
 *2026-11-01*
 
@@ -326,6 +400,10 @@ a version-5 file.
 
 ### V5 Preview Status
 
+- **V5 is GA as of v2.0.0.** Format version 5 is the stable format for this
+  release line and the compatibility rules below remain in force. The bullets
+  that mention a "preview" describe the earlier v1.37–v1.39 releases and are
+  kept for historical context.
 - **What is stable.** The V5 write path (width fidelity, cross-process write
   exclusion and row-id reservation), the format-version declaration, and every
   new read lane are implemented, covered by tests on both the Rust and Python

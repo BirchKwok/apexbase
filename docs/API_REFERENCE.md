@@ -12,6 +12,11 @@ Complete API reference for ApexBase Python SDK.
 6. [Temporary Tables from Files](#temporary-tables-from-files) - register_temp_table / drop_temp_table
 7. [Set Operations](#set-operations) - UNION / INTERSECT / EXCEPT
 8. [Vector Search](#vector-search) - topk_distance / batch_topk_distance / SQL explode_rename
+9. [Process Memory Admission](#process-memory-admission-v5-s10) - APEX_PROCESS_BUDGET_MB / bounded queue
+10. [Out-of-Core Spill](#out-of-core-spill-v5-s11) - APEX_SPILL_DIR / ORDER BY / GROUP BY / DISTINCT / JOIN
+11. [Streaming Results](#streaming-results-v5-s12) - execute_stream / Arrow batch iterator
+12. [Vector Index (IVF)](#vector-index-ivf-v5-s13) - create_vector_index / vector_index_info / drop_vector_index
+13. [Hybrid Search](#hybrid-search) - hybrid_search / RRF / weighted fusion
 
 ---
 
@@ -235,7 +240,7 @@ projected as `bytes` (no implicit list/string conversion); `decimal(p,s)` also
 accepts `decimal.Decimal`, `int` and `str` on write and scales them to the
 declared scale (`Decimal("1.23")` in a `decimal(38,2)` column is stored as the
 integer `123`). Values with more fractional digits than the scale raise
-`ValueError`. Tables containing these types declare on-disk format version 5 (the newest preview format, with an optional logical-type schema section);
+`ValueError`. Tables containing these types declare on-disk format version 5 (the stable V5 format since v2.0.0, with an optional logical-type schema section);
 set `APEX_LOGICAL_TYPES=0` to refuse creating such columns (it is an explicit
 error, never a silent downgrade).
 
@@ -2510,3 +2515,89 @@ results = client.execute("""
 - DDL statements (CREATE, ALTER, DROP, INSERT) return empty results
 
 ---
+
+## Process Memory Admission (V5 S10)
+
+Every upper entry point (Python embedded, PG wire, Arrow Flight, Rust `Session`)
+admits each top-level statement through a process-wide memory reservation. It is
+disabled by default; the per-query budget stays the hard bound on one
+statement's operator state.
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `APEX_PROCESS_BUDGET_MB` | unset/`0` = disabled | Process-wide reservation budget (MiB) |
+| `APEX_QUERY_ADMISSION_MB` | 16 | Reservation for ordinary point/short/scan statements |
+| `APEX_QUERY_QUEUE_MAX` | 64 | Maximum statements waiting for a slot |
+| `APEX_QUERY_QUEUE_WAIT_MS` | 5000 | Per-statement wait limit (`0` fails fast) |
+
+Heavy statements (aggregation, ORDER BY, JOIN, DISTINCT, set operations, CTE,
+window) reserve `min(APEX_QUERY_MEMORY_MB, APEX_PROCESS_BUDGET_MB)`. Statements
+that do not fit wait in a bounded queue; a full queue or a timeout is rejected
+explicitly with `[APEX_ADMISSION_QUEUE_FULL]` or `[APEX_ADMISSION_TIMEOUT]` in
+the `RuntimeError` message (never an OOM or a silent drop). `execute()` results
+are unchanged.
+
+```python
+# Observability counters for the current process.
+client._storage._admission_stats()
+# (used_bytes, waiting, admitted, rejected, timed_out, budget_bytes)
+```
+
+## Out-of-Core Spill (V5 S11)
+
+`ORDER BY`, `GROUP BY`, `SELECT DISTINCT` and equi-`JOIN` fall back to disk when
+their tracked state would exceed the query budget instead of failing:
+
+| Environment variable | Default | Meaning |
+| --- | --- | --- |
+| `APEX_SPILL_DIR` | system temp `apex_spill/` | Root directory for run files |
+| `APEX_SPILL_TTL_SECS` | 3600 | Age after which crash leftovers are removed |
+
+Each query gets its own spill area, removed on success, error or cancellation.
+The result is identical to the in-memory path (ordering without `ORDER BY` is
+unspecified); a spill failure is reported explicitly and keeps the original
+budget message. The in-memory paths are unchanged (canary-verified).
+
+## Streaming Results (V5 S12)
+
+```python
+for batch in client.execute_stream("SELECT id, payload FROM events"):
+    process(batch)  # pyarrow.RecordBatch, one row group at a time
+```
+
+`execute_stream(sql)` returns an iterator of `pyarrow.RecordBatch` objects:
+plain projections (with or without WHERE) stream one row-group batch at a time,
+so only one batch is resident. Shapes outside the streaming gate (ORDER BY,
+GROUP BY, JOIN) are materialized internally — bounded by the spill operators —
+and delivered as a single batch. `close()` stops early; `execute()` and its
+return type are unchanged; errors surface as `RuntimeError` from the iterator.
+PG wire simple reads stream row-group batches the same way, and Arrow Flight
+uses the same streaming entry point.
+
+## Vector Index (IVF) (V5 S13)
+
+```python
+client.create_vector_index("vec", nlist=64, iterations=10, metric="l2")
+info = client.vector_index_info()   # dim/nlist/rows/metric/stale
+results = client.topk_distance("vec", query, k=10, nprobe=16)
+client.drop_vector_index()
+```
+
+`create_vector_index` builds a persisted IVF index over the current table; pass
+`nprobe` to `topk_distance` to query approximately (lower `nprobe` = faster,
+lower recall). `vector_index_info()["stale"]` reports whether the table changed
+since the build; rebuild before using `nprobe` in that case. At 10M rows and
+nprobe=16 the release harness records recall@10 = 0.97 at ~11 ms median.
+
+## Hybrid Search
+
+```python
+client.init_fts()  # FTS must be available for the text branch
+results = client.hybrid_search(query_vector, "search terms", k=10,
+                               vector_col="vec", fusion="rrf")
+```
+
+`hybrid_search` fuses a vector `topk_distance` branch with a BM25 text branch on
+`_id` and returns `_id` / `score` sorted by fused score. `fusion="rrf"` uses
+reciprocal rank fusion (`rrf_k`, default 60); `fusion="weighted"` combines
+normalized scores with `alpha` (0 = text only, 1 = vector only).

@@ -33,7 +33,8 @@ Compatibility is one-way by design:
   append a `LogicalType` section after the constraint/derivation sections, one
   entry per column (`Uuid`, `Decimal { precision, scale }`,
   `TimestampTz { offset_minutes }`, `List { element }`, `Extension { codec, version }`, ...). V5 is the
-  newest format (the preview does not use a higher version number), so tables
+  newest and, as of v2.0.0, stable format (it does not use a higher version
+  number), so tables
   with such columns still declare version `5`; tables without logical types keep
   writing `5`/`4` exactly as before. UUID/Decimal values are fixed 16-byte
   payloads and project as `bytes`; `APEX_LOGICAL_TYPES=0` refuses creating such
@@ -47,9 +48,10 @@ Compatibility is one-way by design:
   declared element type also travels in `LogicalType::List`, and the batch
   producers retype list columns to Arrow `ListArray`s at the result boundary;
   row NULLs and empty/NULL/nested/oversized lists are rejected by the writer.
-  Because the section is an addition to the preview format rather than
-  a new version, do not open files containing parameterised types with an older
-  V5 preview build — upgrade the reading build first.
+  The section is part of format version 5 rather than a new version, so files
+  containing parameterised types must be read by a build that understands it
+  (v2.0.0 or newer); older V5 preview builds must be upgraded before reading
+  such files.
 
 This document defines the architecture and engineering guidelines for future
 development.

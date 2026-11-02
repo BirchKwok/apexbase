@@ -278,3 +278,56 @@ def test_baseline_rebuild_uses_median_of_three_samples():
         module.aggregate_public_baseline(
             [samples[0], samples[1], report({"a": 1.0, "TopK": 1.0})]
         )
+
+
+def test_docs_and_version_are_consistent():
+    read = lambda path: (ROOT / path).read_text(encoding="utf-8")
+    readme = read("README.md")
+    release_notes = read("docs/release-notes.md")
+    storage = read("docs/STORAGE_ARCHITECTURE.md")
+    api = read("docs/API_REFERENCE.md")
+
+    # Current-state docs describe V5 as GA / stable, never as a pending preview.
+    assert "V5 GA" in readme
+    assert "105 tabular metrics" in readme
+    assert "execute_stream" in readme
+    for text, label in ((readme, "README"), (api, "API"), (storage, "STORAGE")):
+        assert "architecture preview" not in text.lower(), label
+        assert "newest preview format" not in text.lower(), label
+    assert "V5 GA" in release_notes
+    assert "[!v2.0.0]" not in release_notes
+    assert "## [v2.0.0]" in release_notes
+    assert "V5 is GA as of v2.0.0" in release_notes
+    assert "stable format" in storage.lower()
+
+    # The new documented surfaces exist in the API reference.
+    for section in (
+        "Process Memory Admission",
+        "Out-of-Core Spill",
+        "Streaming Results",
+        "Vector Index (IVF)",
+        "Hybrid Search",
+        "APEX_PROCESS_BUDGET_MB",
+        "APEX_SPILL_DIR",
+        "execute_stream",
+        "create_vector_index",
+        "hybrid_search",
+    ):
+        assert section in api, section
+
+    # Version strings agree across the crate, package and lock files.
+    for path in ("Cargo.toml", "pyproject.toml", "Cargo.lock"):
+        text = read(path)
+        assert 'version = "2.0.0"' in text, path
+        assert 'version = "1.39.0"' not in text, path
+    assert '__version__ = "2.0.0"' in read("apexbase/python/apexbase/__init__.py")
+
+    # No format-version constant above the stable V5 value exists.
+    import re
+
+    for path in (ROOT / "apexbase" / "src").rglob("*.rs"):
+        text = path.read_text(encoding="utf-8", errors="ignore")
+        for match in re.finditer(r"FORMAT_VERSION_(\w+)\s*:\s*u32\s*=\s*(\d+)", text):
+            name, value = match.group(1), int(match.group(2))
+            if name not in {"V4", "V5"}:
+                assert value <= 5, (path, name, value)
