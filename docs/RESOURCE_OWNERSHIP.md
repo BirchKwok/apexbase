@@ -30,7 +30,29 @@
 | `KEEP_DICT_PROJECTION`（thread-local） | 执行器 | 当前线程 | 布尔开关 | — | `with_keep_dict_projection` 结束 | 每查询 | 无 |
 | `PATH_TRACE`（thread-local） | 执行器 | 当前线程 | EXPLAIN ANALYZE 记录的实际物理路径标签（首个胜出路由 + 可选细节） | 单个短字符串 | `begin_path_trace` 重置 / `finish_path_trace` 取出置 None | 每 EXPLAIN ANALYZE | 无（线程本地；默认关闭，非 EXPLAIN ANALYZE 查询零成本） |
 | `QUERY_MEMORY_BUDGET`（thread-local，S1） | 执行器（`executor/memory.rs`） | 当前线程 | 顶层查询的聚合内存预算：`limit` + 共享 `AtomicUsize` 已用字节；并行 worker 通过捕获同一 `Arc` 共享计数 | 每顶层查询一个 `Arc`；`APEX_QUERY_MEMORY_MB` 可配置，`0`=不限，默认 1 GiB | `QueryMemoryBudgetGuard` RAII：查询结束（成功/取消/失败）恢复上一层上下文；失败的内核回退释放自己的预留 | 每查询 | 无（进程内计数，不跨进程） |
+| `PROCESS_ADMISSION`（进程级，`admission.rs`，S10） | `Session` 入口（embedded / PG wire / Flight 共用） | 进程 | 顶层语句的准入预留：已用字节、等待队列长度、admitted/rejected/timed_out 计数 | 已用字节 ≤ budget；等待者 ≤ `APEX_QUERY_QUEUE_MAX`（默认 64）；每个语句的等待 ≤ `APEX_QUERY_QUEUE_WAIT_MS`（默认 5000） | 语句结束（含失败/取消）RAII 释放；等待超时/队满显式拒绝 | 每语句 | 无（进程内计数） |
 | `PLAN_DIVERGENCE`（thread-local，Cell） | 执行器 | 当前线程 | EXPLAIN ANALYZE 记录的规划/执行分歧说明（首个胜出，静态字符串） | 单个 `&'static str` | `begin_path_trace` 重置 / `finish_plan_divergence` 取出置 None | 每 EXPLAIN ANALYZE | 无（线程本地；默认关闭且未记录时零状态、零分配） |
+
+### 1.1.1 进程级内存准入与排队（S10 / W3-2）
+
+- **`APEX_PROCESS_BUDGET_MB`**：进程级准入预算（MiB）。未设置/畸形/`0` = **默认关闭**
+  准入与排队（嵌入式点查询零成本），此时 `APEX_QUERY_MEMORY_MB` 仍按原语义生效。
+- **预留口径**：普通点读/短扫描/写语句按 `APEX_QUERY_ADMISSION_MB`（默认 16）预留；
+  聚合/ORDER BY/JOIN/DISTINCT/UNION/INTERSECT/EXCEPT/HAVING/CTE/窗口等重语句按
+  `min(APEX_QUERY_MEMORY_MB, APEX_PROCESS_BUDGET_MB)` 预留；`APEX_QUERY_ADMISSION_MB=0`
+  表示普通语句也预留整个进程预算。
+- **叠加规则**：进程预算是并发数的上限（同时驻留语句的预留和 ≤ 预算）；
+  `APEX_QUERY_MEMORY_MB` 仍是单语句算子状态的硬上限（不再叠加修改，两者独立生效；
+  设 `APEX_QUERY_MEMORY_MB <= APEX_PROCESS_BUDGET_MB` 可得严格求和上界）。
+- **排队/拒绝**：放不下时进入**有界队列**（`APEX_QUERY_QUEUE_MAX`），等待至多
+  `APEX_QUERY_QUEUE_WAIT_MS`；超时或队列满返回显式错误（Python 侧 `RuntimeError`，
+  文本含 `[APEX_ADMISSION_TIMEOUT]` / `[APEX_ADMISSION_QUEUE_FULL]`）。不存在无界
+  队列、OOM 或静默丢弃路径。
+- **观测**：`client._storage._admission_stats()` 返回
+  `(used_bytes, waiting, admitted, rejected, timed_out, budget_bytes)`；Rust 侧
+  `admission::process_stats()`。
+- **覆盖入口**：所有上层（Python embedded、PG wire、Arrow Flight、Rust embedded）统一
+  经由 `Session::execute*` 进入，同一准入门；事务内语句与多语句批次按重语句口径预留。
 
 ### 1.2 查询规划与分类（`apexbase/src/query/`）
 

@@ -8,6 +8,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL_ALLOCATOR: MiMalloc = MiMalloc;
 
+pub mod admission;
 pub mod compute;
 pub mod data;
 pub mod database;

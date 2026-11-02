@@ -4,6 +4,20 @@ use super::*;
 
 #[pymethods]
 impl ApexStorageImpl {
+    /// Process admission counters + configured budget (V5 S10 tests):
+    /// (used_bytes, waiting, admitted, rejected, timed_out, budget_bytes).
+    fn _admission_stats(&self) -> PyResult<(u64, u64, u64, u64, u64, u64)> {
+        let stats = crate::admission::process_stats();
+        Ok((
+            stats.used_bytes as u64,
+            stats.waiting as u64,
+            stats.admitted,
+            stats.rejected,
+            stats.timed_out,
+            crate::admission::configured_process_budget_bytes() as u64,
+        ))
+    }
+
     fn _table_epoch(&self) -> PyResult<u64> {
         let table_path = self.get_current_table_path()?;
         Ok(crate::storage::epoch::current(&table_path))

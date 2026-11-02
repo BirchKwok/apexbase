@@ -117,6 +117,9 @@ impl<'a> Session<'a> {
     #[inline]
     pub fn execute(&self, sql: &str) -> io::Result<ApexResult> {
         let _scope = self.enter();
+        // Process-level memory admission (S10): one bounded reservation per
+        // top-level statement; a no-op unless APEX_PROCESS_BUDGET_MB is set.
+        let _admission = crate::admission::admit_statement(sql)?;
         Database::execute(sql, self.base_dir, self.table_path)
     }
 
@@ -129,6 +132,7 @@ impl<'a> Session<'a> {
         emit: &mut dyn FnMut(RecordBatch) -> bool,
     ) -> io::Result<Option<u64>> {
         let _scope = self.enter();
+        let _admission = crate::admission::admit_statement(sql)?;
         Database::execute_streaming(sql, self.base_dir, self.table_path, emit)
     }
 
@@ -139,12 +143,14 @@ impl<'a> Session<'a> {
         signature: &QuerySignature,
     ) -> io::Result<ApexResult> {
         let _scope = self.enter();
+        let _admission = crate::admission::admit_statement(sql)?;
         Database::execute_classified(sql, signature, self.base_dir, self.table_path)
     }
 
     #[inline]
     pub fn execute_in_txn(&self, txn_id: u64, statement: SqlStatement) -> io::Result<ApexResult> {
         let _scope = self.enter();
+        let _admission = crate::admission::admit_heavy_statement()?;
         Database::execute_in_txn(txn_id, statement, self.base_dir, self.table_path)
     }
 
@@ -170,6 +176,8 @@ impl<'a> Session<'a> {
         initial_txn_id: Option<u64>,
     ) -> io::Result<(ApexResult, Option<u64>)> {
         let _scope = self.enter();
+        // A batch may mix any operator shape; reserve conservatively.
+        let _admission = crate::admission::admit_heavy_statement()?;
         Database::execute_multi_with_txn(statements, self.base_dir, self.table_path, initial_txn_id)
     }
 
