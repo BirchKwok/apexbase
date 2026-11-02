@@ -2746,6 +2746,11 @@ impl TableStorageBackend {
         self.storage.has_pending_deltas()
     }
 
+    /// Whether any column is a list or extension column (cheap guard probe).
+    pub(crate) fn has_list_or_extension_columns(&self) -> bool {
+        self.storage.has_list_or_extension_columns()
+    }
+
     /// Whether the table declares any list column (V5 S3).
     pub fn has_list_columns(&self) -> bool {
         self.storage.has_list_columns()

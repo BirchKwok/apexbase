@@ -67,6 +67,12 @@ pub(in crate::query::executor) fn reject_list_query_shapes(
     stmt: &SelectStatement,
     backend: &crate::storage::TableStorageBackend,
 ) -> io::Result<()> {
+    // Cheap pre-check: a table without list/extension columns never needs the
+    // guard, and this avoids cloning the schema on every aggregate/ORDER BY
+    // statement (the width-aggregate regression).
+    if !backend.has_list_or_extension_columns() {
+        return Ok(());
+    }
     // One schema snapshot for the whole guard: checking each aggregate/ORDER BY
     // column through the backend re-took the schema lock (and showed up on tiny
     // aggregate statements).

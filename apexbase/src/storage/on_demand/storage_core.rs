@@ -2376,6 +2376,16 @@ impl OnDemandStorage {
         schema.logical_type(index).cloned()
     }
 
+    /// Whether any column is a list or extension column (V5 S3/S4 guard).
+    pub(crate) fn has_list_or_extension_columns(&self) -> bool {
+        self.schema.read().columns.iter().any(|(_, column_type)| {
+            matches!(
+                column_type,
+                ColumnType::List | ColumnType::Extension
+            )
+        })
+    }
+
     /// Whether the table declares any list column (V5 S3) — no schema clone.
     pub(crate) fn has_list_columns(&self) -> bool {
         self.schema

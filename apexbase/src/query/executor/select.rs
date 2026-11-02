@@ -488,20 +488,8 @@ impl ApexExecutor {
                     }
                 )
             });
-        if needs_list_shape_check {
-            if let Ok(backend) = get_cached_backend(storage_path) {
-                let stmt_for_check = stmt.clone();
-                crate::query::executor::list_values::reject_list_query_shapes(
-                    &stmt_for_check,
-                    &backend,
-                )?;
-            }
-        }
         // MIN/MAX over a time-family column must stay typed no matter which
-        // aggregation lane answered; collect the expected outputs up front. The
-        // backend is fetched at most once per statement (a per-aggregate lookup
-        // showed up on tiny aggregate queries), and not at all when the statement
-        // has no MIN/MAX aggregate.
+        // aggregation lane answered; collect the expected outputs up front.
         let needs_minmax = stmt.columns.iter().any(|column| {
             matches!(
                 column,
@@ -512,11 +500,23 @@ impl ApexExecutor {
                 }
             )
         });
-        let time_backend = if needs_minmax {
+        // One backend fetch serves both the list/extension shape guard and the
+        // MIN/MAX time-family output collection.
+        let statement_backend = if needs_list_shape_check || needs_minmax {
             get_cached_backend(storage_path).ok()
         } else {
             None
         };
+        if needs_list_shape_check {
+            if let Some(backend) = statement_backend.as_deref() {
+                let stmt_for_check = stmt.clone();
+                crate::query::executor::list_values::reject_list_query_shapes(
+                    &stmt_for_check,
+                    backend,
+                )?;
+            }
+        }
+        let time_backend = statement_backend;
         let mut time_aggregate_outputs: Vec<(String, crate::data::DataType)> = Vec::new();
         if let Some(backend) = time_backend.as_deref() {
             for column in &stmt.columns {
