@@ -2628,9 +2628,14 @@ impl ApexStorageImpl {
             }
             let needs_rebuild = py.allow_threads(|| -> PyResult<bool> {
                 m.configure_table(&table_name, config);
-                m.get_engine(&table_name)
-                    .map(|engine| engine.needs_rebuild())
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+                let engine = m
+                    .get_engine(&table_name)
+                    .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+                // A reopened index that cannot account for the table (lost WAL
+                // tail, foreign writer, legacy snapshot) is quarantined here and
+                // the rebuild below restores completeness.
+                crate::Database::reconcile_fts_table_index(&base_dir, &table_name, &engine);
+                Ok(engine.needs_rebuild())
             })?;
             if needs_rebuild {
                 let backfill_running =

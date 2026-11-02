@@ -619,6 +619,16 @@ impl Database {
 
     #[cfg(feature = "python")]
     #[inline]
+    /// Reconcile a recovered FTS index with its table generation (upper
+    /// entry-point facade; keeps python/server code off query::executor).
+    pub(crate) fn reconcile_fts_table_index(
+        base_dir: &std::path::Path,
+        table_name: &str,
+        engine: &crate::fts::FtsEngine,
+    ) -> Option<String> {
+        crate::query::executor::reconcile_fts_table_index(base_dir, table_name, engine)
+    }
+
     pub(crate) fn fts_backfill(
         base_dir: &Path,
         table: &str,

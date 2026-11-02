@@ -32,6 +32,12 @@ const POSTING_CODEC_SINGLE_DOC: u32 = 1;
 const WAL_SNAPSHOT_THRESHOLD: usize = 100_000;
 const MAX_WAL_RECORD_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TERM_BYTES: usize = 1024 * 1024;
+/// WAL generation-2 file header: every record carries the table epoch it was
+/// applied at, so a crash can be reconciled against the table generation.
+const WAL_MAGIC: &[u8; 8] = b"APXFTSW2";
+/// Sidecar recording which table generation/row set a snapshot was built from.
+const SOURCE_META_MAGIC: &[u8; 8] = b"APXFTSM1";
+const SOURCE_META_BYTES: usize = 36;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct FtsConfig {

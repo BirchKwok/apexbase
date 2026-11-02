@@ -4,6 +4,17 @@ struct EngineCore {
     config: RwLock<FtsConfig>,
     state: RwLock<IndexState>,
     search_count: AtomicU64,
+    /// Table file this index was built from (file-backed engines only). Used to
+    /// reconcile the recovered index against the table generation/row count.
+    table_path: Option<PathBuf>,
+    /// Which table generation/row set the loaded snapshot was built from.
+    snapshot_meta: RwLock<Option<SourceMeta>>,
+    /// Highest table epoch recovered from the WAL (0 when no WAL was replayed).
+    wal_epoch: AtomicU64,
+    /// Set when reconciliation finds the index stale; MATCH must reject until a
+    /// rebuild has been requested.
+    stale_reason: RwLock<Option<String>>,
+    reconciled: std::sync::atomic::AtomicBool,
 }
 
 pub struct FtsEngine {
@@ -13,6 +24,16 @@ pub struct FtsEngine {
 
 impl FtsEngine {
     pub fn new<P: AsRef<Path>>(index_path: P, config: FtsConfig) -> FtsResult<Self> {
+        Self::new_with_table(index_path, config, None)
+    }
+
+    /// Like [`FtsEngine::new`] but records the table file the index belongs to so
+    /// the recovered index can be reconciled with the table's generation/rows.
+    pub fn new_with_table<P: AsRef<Path>>(
+        index_path: P,
+        config: FtsConfig,
+        table_path: Option<PathBuf>,
+    ) -> FtsResult<Self> {
         let index_path = index_path.as_ref().to_path_buf();
         if let Some(parent) = index_path.parent() {
             fs::create_dir_all(parent)?;
@@ -20,6 +41,7 @@ impl FtsEngine {
         let wal_path = PathBuf::from(format!("{}.wal", index_path.display()));
         let mut state = IndexState::default();
         state.needs_rebuild = !index_path.exists();
+        let mut snapshot_meta = None;
         if index_path.exists() {
             if let Err(error) = load_snapshot(&index_path, &mut state, &config) {
                 match error {
@@ -28,15 +50,19 @@ impl FtsEngine {
                             PathBuf::from(format!("{}.incompatible", index_path.display()));
                         let _ = fs::rename(&index_path, quarantine);
                         let _ = fs::remove_file(&wal_path);
+                        remove_source_meta(&index_path);
                         state = IndexState::default();
                         state.needs_rebuild = true;
                     }
                     other => return Err(other),
                 }
+            } else {
+                snapshot_meta = read_source_meta(&index_path).ok().flatten();
             }
         }
+        let mut wal_epoch = 0u64;
         if wal_path.exists() {
-            replay_wal(&wal_path, &mut state)?;
+            wal_epoch = replay_wal(&wal_path, &mut state)?;
         }
         Ok(Self {
             core: Arc::new(EngineCore {
@@ -45,6 +71,11 @@ impl FtsEngine {
                 config: RwLock::new(config),
                 state: RwLock::new(state),
                 search_count: AtomicU64::new(0),
+                table_path,
+                snapshot_meta: RwLock::new(snapshot_meta),
+                wal_epoch: AtomicU64::new(wal_epoch),
+                stale_reason: RwLock::new(None),
+                reconciled: std::sync::atomic::AtomicBool::new(false),
             }),
             flush_handle: Mutex::new(None),
         })
@@ -64,6 +95,11 @@ impl FtsEngine {
                 config: RwLock::new(config),
                 state: RwLock::new(state),
                 search_count: AtomicU64::new(0),
+                table_path: None,
+                snapshot_meta: RwLock::new(None),
+                wal_epoch: AtomicU64::new(0),
+                stale_reason: RwLock::new(None),
+                reconciled: std::sync::atomic::AtomicBool::new(false),
             }),
             flush_handle: Mutex::new(None),
         })
@@ -71,6 +107,98 @@ impl FtsEngine {
 
     pub fn needs_rebuild(&self) -> bool {
         self.core.state.read().needs_rebuild
+    }
+
+    /// Stale/index-incomplete reason recorded by reconciliation, if any.
+    pub fn stale_reason(&self) -> Option<String> {
+        self.core.stale_reason.read().clone()
+    }
+
+    pub fn is_stale(&self) -> bool {
+        self.stale_reason().is_some()
+    }
+
+    /// Reconcile the recovered index with the current table state (once).
+    ///
+    /// `expected_rows` is the table's active row count and `current_epoch` the
+    /// table generation. Returns a human-readable reason and quarantines the
+    /// index when it cannot account for the table (missing WAL tail, foreign
+    /// writer, legacy/unverifiable snapshot). No-op for engines without a table
+    /// path (in-memory/process-local indexes).
+    pub fn reconcile_source(
+        &self,
+        expected_rows: Option<u64>,
+        current_epoch: Option<u64>,
+    ) -> Option<String> {
+        let Some(_table_path) = self.core.table_path.as_ref() else {
+            return None;
+        };
+        if self
+            .core
+            .reconciled
+            .swap(true, Ordering::AcqRel)
+        {
+            return self.stale_reason();
+        }
+        let (rows, has_terms) = {
+            let state = self.core.state.read();
+            let rows = state.live_docs().len() as u64;
+            let has_terms = !state.base_postings.is_empty() || state.mmap_postings.is_some();
+            (rows, has_terms)
+        };
+        let meta = *self.core.snapshot_meta.read();
+        let snapshot_epoch = meta.map(|meta| meta.epoch).unwrap_or(0);
+        let wal_epoch = self.core.wal_epoch.load(Ordering::Acquire);
+        let recovered_epoch = snapshot_epoch.max(wal_epoch);
+        let mut reason = None;
+        if meta.is_none() && self.core.index_path.exists() {
+            reason = Some(
+                "index has no source generation metadata (created by an older build or copied from elsewhere)"
+                    .to_string(),
+            );
+        }
+        if reason.is_none() {
+            if let Some(expected_rows) = expected_rows {
+                // A table without any string fields legitimately indexes zero
+                // documents; only a non-empty index can prove coverage.
+                if (has_terms || rows > 0) && rows != expected_rows {
+                    reason = Some(format!(
+                        "table has {expected_rows} rows but the index covers {rows} (WAL tail lost or writes bypassed FTS)"
+                    ));
+                }
+            }
+        }
+        if reason.is_none() && wal_epoch == 0 {
+            // No WAL replay: the snapshot is the only recovered state, so a
+            // table generation change means the table moved on without FTS.
+            if let (Some(expected), Some(current)) = (meta, current_epoch) {
+                if current > expected.epoch {
+                    reason = Some(format!(
+                        "table generation advanced to {current} after the index snapshot (generation {})",
+                        expected.epoch
+                    ));
+                }
+            }
+        }
+        if let Some(reason) = reason {
+            let _ = fs::remove_file(&self.core.wal_path);
+            remove_source_meta(&self.core.index_path);
+            let quarantine = PathBuf::from(format!("{}.stale", self.core.index_path.display()));
+            if self.core.index_path.exists() {
+                let _ = fs::rename(&self.core.index_path, &quarantine);
+            }
+            *self.core.snapshot_meta.write() = None;
+            self.core.wal_epoch.store(0, Ordering::Release);
+            {
+                let mut state = self.core.state.write();
+                *state = IndexState::default();
+                state.needs_rebuild = true;
+            }
+            *self.core.stale_reason.write() = Some(reason.clone());
+            Some(reason)
+        } else {
+            None
+        }
     }
 
     pub fn add_document(&self, doc_id: u64, fields: HashMap<String, String>) -> FtsResult<()> {
@@ -549,7 +677,11 @@ impl FtsManager {
             Arc::new(FtsEngine::memory_only(config)?)
         } else {
             let index_path = self.base_path.join(format!("{table_name}.afts"));
-            Arc::new(FtsEngine::new(index_path, config)?)
+            let table_path = self
+                .base_path
+                .parent()
+                .map(|dir| dir.join(format!("{table_name}.apex")));
+            Arc::new(FtsEngine::new_with_table(index_path, config, table_path)?)
         };
         engines.insert(table_name.to_string(), Arc::clone(&engine));
         Ok(engine)
@@ -561,7 +693,17 @@ impl FtsManager {
         }
         self.table_configs.write().remove(table_name);
         if delete_files {
-            for suffix in ["afts", "afts.wal", "afts.tmp", "nfts", "nfts.wal"] {
+            for suffix in [
+                "afts",
+                "afts.wal",
+                "afts.tmp",
+                "afts.meta",
+                "afts.meta.tmp",
+                "afts.stale",
+                "afts.incompatible",
+                "nfts",
+                "nfts.wal",
+            ] {
                 let path = self.base_path.join(format!("{table_name}.{suffix}"));
                 if path.exists() {
                     fs::remove_file(path)?;

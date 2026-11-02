@@ -48,6 +48,58 @@ impl<W: Write> Write for CrcWriter<W> {
     }
 }
 
+/// Table generation/row-set a snapshot was built from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct SourceMeta {
+    pub rows: u64,
+    pub epoch: u64,
+    pub generation: u64,
+}
+
+fn source_meta_path(index_path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.meta", index_path.display()))
+}
+
+pub(super) fn read_source_meta(index_path: &Path) -> FtsResult<Option<SourceMeta>> {
+    let path = source_meta_path(index_path);
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if bytes.len() != SOURCE_META_BYTES || &bytes[..8] != SOURCE_META_MAGIC {
+        return Err(FtsError::CorruptIndex("invalid ApexFTS source metadata".into()));
+    }
+    let expected_crc = u32::from_le_bytes(bytes[32..36].try_into().unwrap());
+    if crc32fast::hash(&bytes[..32]) != expected_crc {
+        return Err(FtsError::CorruptIndex("source metadata checksum mismatch".into()));
+    }
+    Ok(Some(SourceMeta {
+        rows: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        epoch: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        generation: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
+    }))
+}
+
+fn write_source_meta(index_path: &Path, meta: SourceMeta) -> FtsResult<()> {
+    let path = source_meta_path(index_path);
+    let temp_path = PathBuf::from(format!("{}.tmp", path.display()));
+    let mut bytes = Vec::with_capacity(SOURCE_META_BYTES);
+    bytes.extend_from_slice(SOURCE_META_MAGIC);
+    bytes.extend_from_slice(&meta.rows.to_le_bytes());
+    bytes.extend_from_slice(&meta.epoch.to_le_bytes());
+    bytes.extend_from_slice(&meta.generation.to_le_bytes());
+    let crc = crc32fast::hash(&bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
+    fs::write(&temp_path, &bytes)?;
+    fs::rename(&temp_path, &path)?;
+    Ok(())
+}
+
+pub(super) fn remove_source_meta(index_path: &Path) {
+    let _ = fs::remove_file(source_meta_path(index_path));
+}
+
 fn load_snapshot_v2(path: &Path, state: &mut IndexState) -> FtsResult<()> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
@@ -175,11 +227,33 @@ fn load_snapshot_v2(path: &Path, state: &mut IndexState) -> FtsResult<()> {
     Ok(())
 }
 
-fn replay_wal(path: &Path, state: &mut IndexState) -> FtsResult<()> {
+fn replay_wal(path: &Path, state: &mut IndexState) -> FtsResult<u64> {
     let file = OpenOptions::new().read(true).write(true).open(path)?;
     let file_len = file.metadata()?.len();
     let mut reader = BufReader::new(file.try_clone()?);
-    let mut valid_len = 0u64;
+    let generation_two = file_len >= WAL_MAGIC.len() as u64
+        && {
+            let mut magic = [0u8; 8];
+            reader.read_exact(&mut magic)?;
+            let matches = &magic == WAL_MAGIC;
+            if !matches {
+                // Legacy WAL: reset to the start and replay the old layout.
+                use std::io::Seek;
+                file.try_clone()?.seek(SeekFrom::Start(0))?;
+            }
+            matches
+        };
+    if generation_two {
+        // header consumed
+    } else {
+        reader = BufReader::new(file.try_clone()?);
+    }
+    let mut valid_len = if generation_two {
+        WAL_MAGIC.len() as u64
+    } else {
+        0
+    };
+    let mut max_epoch = 0u64;
     loop {
         let len = match read_u32(&mut reader) {
             Ok(len) => len as usize,
@@ -194,6 +268,15 @@ fn replay_wal(path: &Path, state: &mut IndexState) -> FtsResult<()> {
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         };
+        let epoch = if generation_two {
+            match read_u64(&mut reader) {
+                Ok(epoch) => epoch,
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+        } else {
+            0
+        };
         let mut payload = vec![0; len];
         if let Err(e) = reader.read_exact(&mut payload) {
             if e.kind() == io::ErrorKind::UnexpectedEof {
@@ -201,7 +284,12 @@ fn replay_wal(path: &Path, state: &mut IndexState) -> FtsResult<()> {
             }
             return Err(e.into());
         }
-        if crc32fast::hash(&payload) != expected_crc {
+        let mut crc_input = Vec::with_capacity(8 + payload.len());
+        if generation_two {
+            crc_input.extend_from_slice(&epoch.to_le_bytes());
+        }
+        crc_input.extend_from_slice(&payload);
+        if crc32fast::hash(&crc_input) != expected_crc {
             break;
         }
         let op: WalOp = match bincode::deserialize(&payload) {
@@ -216,14 +304,15 @@ fn replay_wal(path: &Path, state: &mut IndexState) -> FtsResult<()> {
             } => state.apply_upsert(doc_id, AnalyzedDocument { terms, tokens }, false),
             WalOp::Delete { doc_id } => state.apply_delete(doc_id, false),
         }
-        valid_len += 8 + len as u64;
+        max_epoch = max_epoch.max(epoch);
+        valid_len += 8 + len as u64 + if generation_two { 8 } else { 0 };
     }
     drop(reader);
     if valid_len < file_len {
         file.set_len(valid_len)?;
         file.sync_data()?;
     }
-    Ok(())
+    Ok(max_epoch)
 }
 
 fn append_pending_wal(core: &EngineCore) -> FtsResult<usize> {
@@ -235,15 +324,32 @@ fn append_pending_wal(core: &EngineCore) -> FtsResult<usize> {
         .create(true)
         .append(true)
         .open(&core.wal_path)?;
+    if file.metadata()?.len() == 0 {
+        file.write_all(WAL_MAGIC)?;
+    }
+    // The epoch is captured once per flush (the table write that produced
+    // these pending ops already bumped it), so recovery can tell whether the
+    // table generation moved past everything the WAL accounts for.
+    let epoch = core
+        .table_path
+        .as_ref()
+        .map(|path| crate::storage::epoch::current(path))
+        .unwrap_or(0);
     let count = state.pending_wal.len();
     for op in &state.pending_wal {
         let payload = bincode::serialize(op)
             .map_err(|e| FtsError::CorruptIndex(format!("cannot encode WAL entry: {e}")))?;
+        let epoch_bytes = epoch.to_le_bytes();
+        let mut crc_input = Vec::with_capacity(8 + payload.len());
+        crc_input.extend_from_slice(&epoch_bytes);
+        crc_input.extend_from_slice(&payload);
         write_u32(&mut file, payload.len() as u32)?;
-        write_u32(&mut file, crc32fast::hash(&payload))?;
+        write_u32(&mut file, crc32fast::hash(&crc_input))?;
+        file.write_all(&epoch_bytes)?;
         file.write_all(&payload)?;
     }
     file.sync_data()?;
+    core.wal_epoch.fetch_max(epoch, std::sync::atomic::Ordering::AcqRel);
     state.pending_wal.clear();
     Ok(count)
 }
@@ -524,6 +630,26 @@ fn persist_snapshot(core: &EngineCore) -> FtsResult<usize> {
     if core.wal_path.exists() {
         fs::remove_file(&core.wal_path)?;
     }
+    let previous_generation = core
+        .snapshot_meta
+        .read()
+        .map(|meta| meta.generation)
+        .unwrap_or(0);
+    let source_meta = SourceMeta {
+        rows: core.state.read().live_docs().len() as u64,
+        epoch: core
+            .table_path
+            .as_ref()
+            .map(|path| crate::storage::epoch::current(path))
+            .unwrap_or(0),
+        generation: previous_generation.saturating_add(1),
+    };
+    write_source_meta(&core.index_path, source_meta)?;
+    *core.snapshot_meta.write() = Some(source_meta);
+    core.wal_epoch.store(0, std::sync::atomic::Ordering::Release);
+    // A fresh snapshot accounts for the table: clear a previous stale verdict so
+    // MATCH is accepted again after the rebuild.
+    *core.stale_reason.write() = None;
 
     if config.lazy_load {
         let file = File::open(&core.index_path)?;

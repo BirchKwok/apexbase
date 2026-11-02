@@ -1,5 +1,58 @@
 // FTS query helpers: MATCH()/FUZZY_MATCH() resolution to compressed bitmaps and score projection.
 
+/// Current table row count / generation for FTS reconciliation.
+fn fts_table_state(base_dir: &Path, table_name: &str) -> (Option<u64>, Option<u64>) {
+    let table_path = base_dir.join(format!("{table_name}.apex"));
+    if crate::storage::is_memory_path(base_dir) {
+        let rows = crate::storage::engine::engine()
+            .memory_backend(&table_path)
+            .map(|backend| backend.row_count() as u64);
+        return (rows, None);
+    }
+    let memory_rows = crate::storage::engine::engine()
+        .memory_backend(&table_path)
+        .map(|backend| backend.row_count() as u64);
+    let rows = match memory_rows {
+        Some(rows) => Some(rows),
+        None if table_path.exists() => {
+            crate::storage::TableStorageBackend::persisted_row_count_hint(&table_path).ok()
+        }
+        None => None,
+    };
+    let epoch = table_path
+        .exists()
+        .then(|| crate::storage::epoch::current(&table_path));
+    (rows, epoch)
+}
+
+/// Reconcile a loaded FTS index with its table once; returns the stale reason.
+pub(crate) fn reconcile_fts_table_index(
+    base_dir: &Path,
+    table_name: &str,
+    engine: &crate::fts::FtsEngine,
+) -> Option<String> {
+    let (rows, epoch) = fts_table_state(base_dir, table_name);
+    engine.reconcile_source(rows, epoch)
+}
+
+/// Reject queries against an index that cannot account for the table.
+fn ensure_fts_index_fresh(
+    base_dir: &Path,
+    table_name: &str,
+    engine: &crate::fts::FtsEngine,
+) -> io::Result<()> {
+    if let Some(reason) = reconcile_fts_table_index(base_dir, table_name, engine) {
+        return Err(err_data(format!(
+            "FTS index for table '{}' is stale and was quarantined: {}; rebuild it with init_fts() before querying",
+            table_name, reason
+        )));
+    }
+    // A pending rebuild with no covering docs is only rejected through the row
+    // reconciliation above: an FTS index created on an empty table legitimately
+    // ingests rows incrementally before the first snapshot exists.
+    Ok(())
+}
+
 impl ApexExecutor {
     // ========== FTS Helper: resolve MATCH()/FUZZY_MATCH() to a compressed bitmap ==========
 
@@ -189,6 +242,7 @@ impl ApexExecutor {
         let engine = manager
             .get_engine(table_name)
             .map_err(|error| err_data(error.to_string()))?;
+        ensure_fts_index_fresh(base_dir, table_name, &engine)?;
         let score_limit = Self::fts_score_limit(stmt);
         let mut score_maps = AHashMap::with_capacity(queries.len());
         for query in queries {
@@ -250,6 +304,7 @@ impl ApexExecutor {
                 let engine = mgr
                     .get_engine(table_name)
                     .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                ensure_fts_index_fresh(base_dir, table_name, &engine)?;
                 let result = if fuzzy {
                     engine
                         .fuzzy_search(&query, 1)

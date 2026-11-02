@@ -1751,6 +1751,11 @@ impl ApexExecutor {
             Err(_) => return,
         };
         crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+        // Do not feed a quarantined/stale index: it will be rebuilt from the
+        // table, and appending here would mix two generations.
+        if engine.is_stale() {
+            return;
+        }
 
         // Determine string columns to index
         let schema = storage.get_schema();
@@ -1858,6 +1863,9 @@ impl ApexExecutor {
             Err(_) => return,
         };
         crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
+        if engine.is_stale() {
+            return;
+        }
 
         let ids: Vec<u64> = deleted_entries.iter().map(|(id, _)| *id).collect();
         let _ = engine.remove_documents(&ids);
@@ -1907,6 +1915,9 @@ impl ApexExecutor {
         manager.configure_table(&table_name, fts_config);
         crate::query::executor::wait_fts_backfill(&base_dir, &table_name);
         if let Ok(engine) = manager.get_engine(&table_name) {
+            if engine.is_stale() {
+                return;
+            }
             if engine.add_documents(documents).is_ok() {
                 let _ = engine.flush();
             }
