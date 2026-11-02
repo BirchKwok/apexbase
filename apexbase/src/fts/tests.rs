@@ -310,7 +310,7 @@ mod tests {
                 .add_documents_arrow_texts(&[1, 2], &["alpha", "beta"])
                 .unwrap();
             engine.flush().unwrap();
-            assert!(engine.reconcile_source(Some(2), Some(0)).is_none());
+            assert!(engine.reconcile_source(|| (Some(2), Some(0))).is_none());
         }
         // Simulate a crash that lost writes: the table says 5 rows, the index
         // recovered only 2.
@@ -320,7 +320,7 @@ mod tests {
             Some(table_path.clone()),
         )
         .unwrap();
-        let reason = engine.reconcile_source(Some(5), Some(0));
+        let reason = engine.reconcile_source(|| (Some(5), Some(0)));
         assert!(reason.is_some(), "row-count mismatch must be reported");
         assert!(engine.is_stale());
         assert!(engine.needs_rebuild());
@@ -360,7 +360,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(engine.search_ids("beta").unwrap(), vec![2]);
-            assert!(engine.reconcile_source(Some(2), Some(0)).is_none());
+            assert!(engine.reconcile_source(|| (Some(2), Some(0))).is_none());
         }
         // Losing the WAL tail leaves the table with a row the index cannot see.
         fs::remove_file(&wal_path).unwrap();
@@ -371,7 +371,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(engine.search_ids("beta").unwrap(), Vec::<u64>::new());
-        let reason = engine.reconcile_source(Some(2), Some(0));
+        let reason = engine.reconcile_source(|| (Some(2), Some(0)));
         assert!(reason.is_some(), "lost WAL tail must be reported as stale");
     }
 
@@ -400,7 +400,7 @@ mod tests {
             Some(table_path.clone()),
         )
         .unwrap();
-        let reason = engine.reconcile_source(Some(1), Some(7));
+        let reason = engine.reconcile_source(|| (Some(1), Some(7)));
         assert!(reason.is_some(), "generation advance must be reported");
     }
 

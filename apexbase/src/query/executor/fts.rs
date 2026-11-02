@@ -31,8 +31,7 @@ pub(crate) fn reconcile_fts_table_index(
     table_name: &str,
     engine: &crate::fts::FtsEngine,
 ) -> Option<String> {
-    let (rows, epoch) = fts_table_state(base_dir, table_name);
-    engine.reconcile_source(rows, epoch)
+    engine.reconcile_source(|| fts_table_state(base_dir, table_name))
 }
 
 /// Reject queries against an index that cannot account for the table.

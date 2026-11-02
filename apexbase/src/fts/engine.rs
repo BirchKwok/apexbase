@@ -125,11 +125,10 @@ impl FtsEngine {
     /// index when it cannot account for the table (missing WAL tail, foreign
     /// writer, legacy/unverifiable snapshot). No-op for engines without a table
     /// path (in-memory/process-local indexes).
-    pub fn reconcile_source(
-        &self,
-        expected_rows: Option<u64>,
-        current_epoch: Option<u64>,
-    ) -> Option<String> {
+    pub fn reconcile_source<F>(&self, source: F) -> Option<String>
+    where
+        F: FnOnce() -> (Option<u64>, Option<u64>),
+    {
         let Some(_table_path) = self.core.table_path.as_ref() else {
             return None;
         };
@@ -140,6 +139,7 @@ impl FtsEngine {
         {
             return self.stale_reason();
         }
+        let (expected_rows, current_epoch) = source();
         let (rows, has_terms) = {
             let state = self.core.state.read();
             let rows = state.live_docs().len() as u64;
