@@ -170,6 +170,21 @@ impl TxnManager {
             .clone()
     }
 
+    /// Drop the per-table stores that hold no rows or versions.
+    ///
+    /// Read-only transaction helpers call `get_version_store` for every table
+    /// they touch, so a long multi-table loop would otherwise keep one empty
+    /// entry per table for the process lifetime.
+    fn prune_empty_version_stores(&self) {
+        let mut stores = self.version_stores.write();
+        stores.retain(|_, store| store.row_count() > 0 || store.total_versions() > 0);
+    }
+
+    /// Number of tracked per-table version stores (for monitoring/tests).
+    pub fn version_store_count(&self) -> usize {
+        self.version_stores.read().len()
+    }
+
     /// Get reference to the snapshot manager
     pub fn snapshot_manager(&self) -> &Arc<SnapshotManager> {
         &self.snapshot_manager
@@ -381,10 +396,18 @@ impl TxnManager {
         let oldest = self.snapshot_manager.oldest_active_timestamp();
         if oldest != u64::MAX {
             self.conflict_detector.advance_watermark(oldest);
+        } else {
+            // No snapshot is active, so every future snapshot is created after
+            // all recorded commits: nothing can conflict with them any more.
+            // Without this the committed-write log grew for the whole process
+            // lifetime whenever commits never overlapped another snapshot.
+            self.conflict_detector.advance_watermark(u64::MAX);
+            self.conflict_detector.clear_committed_writes();
         }
         for store in self.version_stores.read().values() {
             self.gc.maybe_run(store, &self.snapshot_manager);
         }
+        self.prune_empty_version_stores();
 
         Ok(writes)
     }
@@ -589,6 +612,57 @@ mod tests {
     }
 
     #[test]
+    fn no_active_snapshot_clears_conflict_log_and_empty_stores() {
+        let mgr = TxnManager::new_standalone();
+        let txn = mgr.begin();
+        mgr.with_context(txn, |ctx| ctx.buffer_insert("users", 0, make_row("alice")))
+            .unwrap();
+        mgr.commit(txn).unwrap();
+
+        // No other snapshot existed while committing: the log can be dropped.
+        assert_eq!(mgr.conflict_detector().committed_write_count(), 0);
+        // The insert left a real version behind, so its store stays.
+        assert_eq!(mgr.version_store_count(), 1);
+    }
+
+    #[test]
+    fn read_only_tables_do_not_accumulate_version_stores() {
+        let mgr = TxnManager::new_standalone();
+        for index in 0..64u64 {
+            let table = format!("read_only_{index}");
+            let txn = mgr.begin();
+            // A read-only transaction touches every table through the
+            // visibility helper, which creates an empty per-table store.
+            assert!(!mgr.is_visible(txn, &table, 0).unwrap());
+            mgr.commit(txn).unwrap();
+        }
+        assert!(
+            mgr.version_store_count() <= 1,
+            "empty stores must be pruned after each commit, got {}",
+            mgr.version_store_count()
+        );
+    }
+
+    #[test]
+    fn active_snapshot_keeps_recent_committed_writes_for_validation() {
+        let mgr = TxnManager::new_standalone();
+        let reader = mgr.begin(); // holds a snapshot
+        let writer = mgr.begin();
+        mgr.with_context(writer, |ctx| ctx.buffer_insert("users", 0, make_row("alice")))
+            .unwrap();
+        mgr.commit(writer).unwrap();
+        assert!(
+            mgr.conflict_detector().committed_write_count() >= 1,
+            "a commit while a snapshot is active must stay in the log"
+        );
+        mgr.rollback(reader).unwrap();
+        // The next commit trims the log because no snapshot is left.
+        let txn = mgr.begin();
+        mgr.commit(txn).unwrap();
+        assert_eq!(mgr.conflict_detector().committed_write_count(), 0);
+    }
+
+    #[test]
     fn test_begin_commit() {
         let mgr = TxnManager::new_standalone();
         let txn_id = mgr.begin();
@@ -701,7 +775,10 @@ mod tests {
         mgr.finalize_commit(prepared).unwrap();
         assert!(!mgr.is_active(txn_id));
         assert_eq!(mgr.total_committed(), 1);
-        assert_eq!(mgr.conflict_detector().committed_write_count(), 1);
+        // No snapshot was active across the commit, so the log is trimmed
+        // immediately (S8); future snapshots cannot see this write as a
+        // conflict.
+        assert_eq!(mgr.conflict_detector().committed_write_count(), 0);
         assert_eq!(
             mgr.get_version_store("users")
                 .read_latest(7)

@@ -2214,6 +2214,38 @@ impl OnDemandStorage {
 
     pub(crate) fn invalidate_page_cache(&self) {
         self.page_cache.write().clear();
+        self.invalidate_derived_read_caches();
+    }
+
+    /// Drop only the cached 4 KiB pages that overlap `[start, end)`.
+    ///
+    /// Appends and in-place deletion-vector writes leave every byte before the
+    /// old footer untouched, so the rest of the point-read cache stays warm.
+    pub(crate) fn invalidate_page_range(&self, start: u64, end: u64) {
+        if end <= start {
+            return;
+        }
+        let page_bytes = PAGE_CACHE_PAGE_BYTES as u64;
+        let first_page = start / page_bytes;
+        let last_page = (end - 1) / page_bytes;
+        let mut cache = self.page_cache.write();
+        cache.retain(|page, _| *page < first_page || *page > last_page);
+    }
+
+    /// Invalidate a set of byte ranges in the point-read page cache.
+    pub(crate) fn invalidate_page_ranges(&self, ranges: &[(u64, u64)]) {
+        let mut cache = self.page_cache.write();
+        cache.retain(|page, _| {
+            let page_start = *page * PAGE_CACHE_PAGE_BYTES as u64;
+            let page_end = page_start + PAGE_CACHE_PAGE_BYTES as u64;
+            !ranges
+                .iter()
+                .any(|(start, end)| page_start < *end && page_end > *start)
+        });
+    }
+
+    /// Derived read caches that are keyed by whole-file state.
+    pub(crate) fn invalidate_derived_read_caches(&self) {
         self.decompressed_rg_cache.write().clear();
         if self
             .numeric_scan_cache_populated

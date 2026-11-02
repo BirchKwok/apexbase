@@ -1310,6 +1310,18 @@ impl ApexStorageImpl {
         Ok(())
     }
 
+    /// Process-wide transaction bookkeeping sizes: (per-table version stores,
+    /// committed-write log entries, active snapshots). Used by the memory/cache
+    /// closure tests to prove long single-shot txn loops stay bounded.
+    fn txn_diagnostics(&self) -> PyResult<(usize, usize, usize)> {
+        let manager = crate::txn::txn_manager();
+        Ok((
+            manager.version_store_count(),
+            manager.conflict_detector().committed_write_count(),
+            manager.snapshot_manager().active_count(),
+        ))
+    }
+
     /// Whether the table declares any column that needs the typed Arrow reader
     /// (time family, list or extension). This is the cheap probe behind the
     /// Python fast-path bypass: it reads only the stored schema bytes (catalog

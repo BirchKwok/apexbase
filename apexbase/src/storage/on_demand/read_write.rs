@@ -6267,9 +6267,11 @@ impl OnDemandStorage {
         footer.schema = schema.clone();
         drop(schema);
 
-        // Release mmap before writing
+        // Release mmap before writing. Only the footer bytes changed: the
+        // point-read page cache keeps every page before it.
         self.mmap_cache.write().invalidate();
-        self.invalidate_page_cache();
+        self.invalidate_page_range(footer_offset, u64::MAX);
+        self.invalidate_derived_read_caches();
         *self.file.write() = None;
         *self.write_file.write() = None;
         crate::storage::epoch::bump(&self.path);
@@ -6372,9 +6374,30 @@ impl OnDemandStorage {
             }
         }
 
-        // Release mmap before writing
+        // Only the header, the deletion-vector bytes of every row group and the
+        // footer change, so the rest of the point-read page cache stays valid.
+        let mut affected: Vec<(u64, u64)> = vec![(0, 1), (footer_offset, u64::MAX)];
+        {
+            let file_guard = self.file.read();
+            let file = file_guard
+                .as_ref()
+                .ok_or_else(|| err_not_conn("File not open"))?;
+            for rg_meta in &footer.row_groups {
+                let rg_rows = rg_meta.row_count as usize;
+                if rg_rows == 0 {
+                    continue;
+                }
+                let mut rg_header = [0u8; 32];
+                pread_fallback(file, &mut rg_header, rg_meta.offset)?;
+                let id_section_len = rg_id_section_len(rg_rows, rg_header[30]);
+                let del_vec_offset = rg_meta.offset + 32 + id_section_len as u64;
+                let del_vec_len = (rg_rows + 7) / 8;
+                affected.push((del_vec_offset, del_vec_offset + del_vec_len as u64));
+            }
+        }
         self.mmap_cache.write().invalidate();
-        self.invalidate_page_cache();
+        self.invalidate_page_ranges(&affected);
+        self.invalidate_derived_read_caches();
         *self.file.write() = None;
         *self.write_file.write() = None;
         crate::storage::epoch::bump(&self.path);
@@ -6916,8 +6939,15 @@ impl OnDemandStorage {
         // The next open_with_durability / open_for_read_with_file call applies pending state.
         #[cfg(unix)]
         {
-            // Clear user-space row cache only (no mmap invalidation needed)
-            self.invalidate_page_cache();
+            // Only the header, the deletion-vector pages and the footer can be
+            // stale for point reads; keep the remaining cached pages.
+            let mut affected: Vec<(u64, u64)> = vec![(0, 1), (footer_offset, u64::MAX)];
+            for (rg_i, wr) in &rg_writes {
+                let del_vec_len = (footer_mut.row_groups[*rg_i].row_count as usize + 7) / 8;
+                affected.push((wr.del_vec_offset, wr.del_vec_offset + del_vec_len as u64));
+            }
+            self.invalidate_page_ranges(&affected);
+            self.invalidate_derived_read_caches();
 
             // Update footer deletion counts
             for (rg_i, wr) in &rg_writes {
@@ -6984,7 +7014,13 @@ impl OnDemandStorage {
             // On Windows, invalidate engine cache first to release mmap handles
             // that would otherwise block file writes (OS error 1224).
             self.mmap_cache.write().invalidate();
-            self.invalidate_page_cache();
+            let mut affected: Vec<(u64, u64)> = vec![(0, 1), (footer_offset, u64::MAX)];
+            for (rg_i, wr) in &rg_writes {
+                let del_vec_len = (footer_mut.row_groups[*rg_i].row_count as usize + 7) / 8;
+                affected.push((wr.del_vec_offset, wr.del_vec_offset + del_vec_len as u64));
+            }
+            self.invalidate_page_ranges(&affected);
+            self.invalidate_derived_read_caches();
             *self.file.write() = None;
             *self.write_file.write() = None;
             #[cfg(windows)]
@@ -7258,9 +7294,12 @@ impl OnDemandStorage {
         }
         let col_count = footer.schema.column_count();
 
-        // Release mmap before writing
+        // Release mmap before writing. An append overwrites the header and
+        // everything from the old footer onwards; every earlier data page stays
+        // byte-identical, so its cached pages remain valid.
         self.mmap_cache.write().invalidate();
-        self.invalidate_page_cache();
+        self.invalidate_page_ranges(&[(0, 1), (footer_offset, u64::MAX)]);
+        self.invalidate_derived_read_caches();
         *self.file.write() = None;
         *self.write_file.write() = None;
         crate::storage::epoch::bump(&self.path);

@@ -1051,6 +1051,87 @@ fn compact_after_delete_keeps_the_appended_delta_row() {
 }
 
 #[test]
+fn append_keeps_unaffected_page_cache_segments() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("append_page_cache.apex");
+    let storage = OnDemandStorage::create(&path).unwrap();
+    let mut int_cols = HashMap::new();
+    int_cols.insert("a".to_string(), (0..4000).collect::<Vec<i64>>());
+    let mut string_cols = HashMap::new();
+    string_cols.insert(
+        "s".to_string(),
+        (0..4000).map(|i| format!("value_{i:08}")).collect::<Vec<String>>(),
+    );
+    storage
+        .insert_typed(
+            int_cols,
+            HashMap::new(),
+            string_cols,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save_v4().unwrap();
+    let footer_offset = storage.header.read().footer_offset;
+
+    // Warm pages before the footer (3, 5) and the header page (0).
+    let page_bytes = 4096u64;
+    let mut buf = [0u8; 32];
+    for page in [0u64, 3, 5] {
+        storage
+            .read_cached_bytes(page * page_bytes, &mut buf)
+            .unwrap();
+    }
+    let cached_before = storage.page_cache_len();
+    assert!(cached_before >= 3);
+
+    // Append one Row Group: the footer is overwritten from `footer_offset` on.
+    let schema = storage.schema.read();
+    let col_count = schema.column_count();
+    let mut new_columns: Vec<ColumnData> = Vec::new();
+    for (name, col_type) in &schema.columns {
+        if name == "_id" {
+            new_columns.push(ColumnData::Int64(vec![4000, 4001, 4002]));
+        } else {
+            match col_type {
+                ColumnType::Int64 => new_columns.push(ColumnData::Int64(vec![1, 2, 3])),
+                ColumnType::String => {
+                    let mut data = Vec::new();
+                    let mut offsets = vec![0u64];
+                    for value in ["appended", "rows", "here"] {
+                        data.extend_from_slice(value.as_bytes());
+                        offsets.push(data.len() as u64);
+                    }
+                    new_columns.push(ColumnData::String { offsets, data })
+                }
+                _ => new_columns.push(ColumnData::new(*col_type)),
+            }
+        }
+    }
+    drop(schema);
+    let new_nulls: Vec<Vec<u8>> = vec![Vec::new(); col_count];
+    storage
+        .append_row_group(&[4000, 4001, 4002], &new_columns, &new_nulls)
+        .unwrap();
+
+    // Pages before the old footer survive; the header page was dropped so it
+    // re-reads the new row count.
+    assert!(
+        storage.page_cache_len() >= 2,
+        "pre-footer data pages must stay cached"
+    );
+    storage.read_cached_bytes(0, &mut buf).unwrap();
+    let file_bytes = std::fs::read(&path).unwrap();
+    assert_eq!(&buf[..], &file_bytes[..32]);
+    // A retained data page still serves the current file content.
+    storage
+        .read_cached_bytes(3 * page_bytes, &mut buf)
+        .unwrap();
+    let start = (3 * page_bytes) as usize;
+    assert_eq!(&buf[..], &file_bytes[start..start + 32]);
+}
+
+#[test]
 fn test_v4_append_row_group() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("test_v4_append.apex");
@@ -3440,6 +3521,63 @@ fn point_read_page_cache_hits_and_invalidation() {
     // Writes invalidate the cache (the file may have moved under it).
     storage.invalidate_page_cache();
     assert_eq!(storage.page_cache_len(), 0);
+}
+
+#[test]
+fn point_read_page_cache_segment_invalidation_keeps_other_pages() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("page_cache_segments.apex");
+    {
+        let storage = OnDemandStorage::create(&path).unwrap();
+        let mut int_cols = HashMap::new();
+        int_cols.insert("a".to_string(), (0..4000).collect::<Vec<i64>>());
+        let mut string_cols = HashMap::new();
+        string_cols.insert(
+            "s".to_string(),
+            (0..4000).map(|i| format!("value_{i:08}")).collect::<Vec<String>>(),
+        );
+        storage
+            .insert_typed(
+                int_cols,
+                HashMap::new(),
+                string_cols,
+                HashMap::new(),
+                HashMap::new(),
+            )
+            .unwrap();
+        storage.save().unwrap();
+    }
+
+    let file_bytes = std::fs::read(&path).unwrap();
+    assert!(file_bytes.len() > 7 * 4096, "fixture must span 7 pages");
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let page_bytes = 4096u64;
+    let mut buf = [0u8; 16];
+    for page in [0u64, 2, 4, 6] {
+        storage
+            .read_cached_bytes(page * page_bytes, &mut buf)
+            .unwrap();
+        let start = (page * page_bytes) as usize;
+        assert_eq!(&buf[..], &file_bytes[start..start + 16]);
+    }
+    assert_eq!(storage.page_cache_len(), 4);
+
+    // Only page 2 is inside the invalidated range.
+    storage.invalidate_page_range(2 * page_bytes, 3 * page_bytes);
+    assert_eq!(storage.page_cache_len(), 3);
+    // Remaining pages are still cached (served without a new insert).
+    storage.read_cached_bytes(0, &mut buf).unwrap();
+    storage.read_cached_bytes(4 * page_bytes, &mut buf).unwrap();
+    storage.read_cached_bytes(6 * page_bytes, &mut buf).unwrap();
+    assert_eq!(storage.page_cache_len(), 3);
+    // The invalidated page is re-read from disk and cached again.
+    storage.read_cached_bytes(2 * page_bytes, &mut buf).unwrap();
+    assert_eq!(&buf[..], &file_bytes[(2 * page_bytes) as usize..][..16]);
+    assert_eq!(storage.page_cache_len(), 4);
+
+    // A multi-range invalidation drops only the overlapping pages.
+    storage.invalidate_page_ranges(&[(0, page_bytes), (6 * page_bytes, 7 * page_bytes)]);
+    assert_eq!(storage.page_cache_len(), 2);
 }
 
 #[test]

@@ -244,6 +244,14 @@ impl ConflictDetector {
         committed.retain(|cw| cw.commit_ts >= new_watermark);
     }
 
+    /// Drop every committed write.
+    ///
+    /// Only safe when no snapshot is active: every future snapshot is created
+    /// after all recorded commits, so none of them can observe a conflict.
+    pub(crate) fn clear_committed_writes(&self) {
+        self.committed_writes.write().clear();
+    }
+
     /// Number of tracked committed writes (for monitoring)
     pub fn committed_write_count(&self) -> usize {
         self.committed_writes.read().len()
