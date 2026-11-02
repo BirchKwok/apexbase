@@ -6224,7 +6224,7 @@ fn query_memory_budget_guard_restores_previous_context() {
 }
 
 #[test]
-fn batch_pipeline_rejects_high_cardinality_state_over_budget() {
+fn batch_pipeline_spills_high_cardinality_state_over_budget() {
     let dir = tempdir().unwrap();
     let path = dir.path().join("memory_budget_serial.apex");
     create_batch_scan_fixture(&path);
@@ -6241,17 +6241,18 @@ fn batch_pipeline_rejects_high_cardinality_state_over_budget() {
     std::env::set_var("APEX_PARALLEL_SCAN", "0");
 
     // The fixture's distinct (city, code) groups need more than 512 bytes of
-    // tracked state.
+    // tracked state: the streaming kernel hands the query to the partitioned
+    // spill fallback (S11) instead of aborting.
     {
         let _guard = install_query_memory_budget(Some(Arc::new(QueryMemoryBudget::new(512))));
-        let error = ApexExecutor::execute(sql, &path)
-            .err()
-            .expect("high-cardinality state must exceed the tiny budget");
-        assert_eq!(error.kind(), io::ErrorKind::OutOfMemory, "{error}");
-        assert!(error.to_string().contains("query memory budget exceeded"));
+        let batch = ApexExecutor::execute(sql, &path)
+            .expect("over-budget aggregation must spill, not fail")
+            .to_record_batch()
+            .unwrap();
+        assert!(batch.num_rows() > 0);
     }
     // The failure path restores the context and releases the charge: the same
-    // query succeeds once the budget allows the state.
+    // query succeeds inside the charged kernel once the budget allows the state.
     assert!(crate::query::executor::memory::query_memory_budget().is_none());
     let budget = Arc::new(QueryMemoryBudget::new(1024 * 1024));
     {
@@ -6304,10 +6305,13 @@ fn parallel_partial_state_shares_the_query_memory_budget() {
         ApexExecutor::execute(sql, &path)
     };
     std::env::remove_var("APEX_PARALLEL_SCAN");
-    let error = result
-        .err()
-        .expect("two live partial folds must exceed the budget");
-    assert_eq!(error.kind(), io::ErrorKind::OutOfMemory);
+    // Two live partial folds exceed the budget, so the parallel fold aborts;
+    // the query then completes through the partitioned spill fallback (S11).
+    let batch = result
+        .expect("over-budget parallel fold must fall back to spilling")
+        .to_record_batch()
+        .unwrap();
+    assert!(batch.num_rows() > 0);
 }
 
 #[test]

@@ -72,7 +72,7 @@ impl QueryMemoryBudget {
         }
     }
 
-    #[cfg(test)]
+    /// Configured limit in bytes for this query budget.
     pub fn limit(&self) -> usize {
         self.limit
     }
@@ -223,6 +223,16 @@ impl Drop for QueryMemoryBudgetGuard {
 /// Process-configured limit in bytes; `0` means unlimited. Read when a
 /// top-level query installs its budget, so `APEX_QUERY_MEMORY_MB` can be
 /// toggled between queries (same contract as `APEX_BATCH_SCAN`).
+/// Limit used by spill fallbacks: the installed per-query budget when present
+/// (embedded callers and tests install one directly), otherwise the
+/// environment-configured limit.
+pub fn effective_query_memory_limit() -> usize {
+    match query_memory_budget() {
+        Some(budget) => budget.limit(),
+        None => configured_query_memory_limit(),
+    }
+}
+
 pub fn configured_query_memory_limit() -> usize {
     match std::env::var_os("APEX_QUERY_MEMORY_MB") {
         None => DEFAULT_QUERY_MEMORY_BYTES,

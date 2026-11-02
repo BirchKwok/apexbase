@@ -855,7 +855,7 @@ impl ApexExecutor {
         stmt: &SelectStatement,
         budget_error: io::Error,
     ) -> io::Result<ApexResult> {
-        let budget = crate::query::executor::memory::configured_query_memory_limit();
+        let budget = crate::query::executor::memory::effective_query_memory_limit();
         if budget == 0 || batch.num_rows() == 0 {
             return Err(budget_error);
         }

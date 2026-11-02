@@ -61,11 +61,13 @@ LOW_CARDINALITY_SQL = (
 )
 
 
-def test_over_budget_group_by_reports_clear_error(client):
-    # ~30k distinct (k, v) groups need several MiB of tracked state.
+def test_over_budget_group_by_spills(client):
+    # ~30k distinct (k, v) groups need several MiB of tracked state; the
+    # streaming kernel falls through to the partitioned spill path (S11).
     def run():
-        with pytest.raises(RuntimeError, match="query memory budget exceeded"):
-            client.execute(HIGH_CARDINALITY_SQL)
+        rows = client.execute(HIGH_CARDINALITY_SQL).to_dict()
+        assert len(rows) == ROWS
+        assert sum(int(row["n"]) for row in rows) == ROWS
 
     _with_limit(1, run)
 
@@ -84,11 +86,10 @@ def test_released_budget_does_not_leak_into_the_next_query(client):
         small = client.execute(LOW_CARDINALITY_SQL).to_dict()
         assert len(small) == 10
 
-        with pytest.raises(RuntimeError, match="query memory budget exceeded"):
-            client.execute(HIGH_CARDINALITY_SQL)
-
-        # The failed query released its charge and its guard restored the
-        # context: the same small query and a non-aggregate query still work.
+        # The over-budget query spills and releases its reservation before the
+        # next statement runs: the small query and a non-aggregate query work.
+        spilled = client.execute(HIGH_CARDINALITY_SQL).to_dict()
+        assert len(spilled) == ROWS
         small = client.execute(LOW_CARDINALITY_SQL).to_dict()
         assert len(small) == 10
         assert client.execute("SELECT COUNT(*) FROM mem_budget_t").scalar() == ROWS
@@ -305,8 +306,7 @@ def test_per_thread_budgets_do_not_leak_across_concurrent_queries():
             # over-budget one: the budget is per query/thread, not global.
             result.append(len(local.execute(LOW_CARDINALITY_SQL).to_dict()))
             try:
-                local.execute(HIGH_CARDINALITY_SQL).to_dict()
-                result.append("ok")
+                result.append(len(local.execute(HIGH_CARDINALITY_SQL).to_dict()))
             except RuntimeError:
                 result.append("error")
             local.close()
@@ -318,7 +318,7 @@ def test_per_thread_budgets_do_not_leak_across_concurrent_queries():
     assert len(outcomes) == 4
     for small_rows, big in outcomes:
         assert small_rows == 10
-        assert big == "error"
+        assert big == ROWS
 
 
 def _run_threads(worker, count=4):
@@ -362,8 +362,8 @@ def test_over_budget_order_by_spills_and_cleans_up(tmp_path, monkeypatch):
         client.close()
 
 
-def test_over_budget_materialising_join_reports_clear_error(tmp_path, monkeypatch):
-    """The hash-join build side is budgeted: a materialising join over a big build fails."""
+def test_over_budget_materialising_join_spills(tmp_path, monkeypatch):
+    """The hash-join build side is budgeted and spills into grace-hash partitions (S11)."""
     client = ApexClient(str(tmp_path / "join"), drop_if_exists=True)
     for name in ("a", "b"):
         client.create_table(name, schema={"k": "int64", "v": "string"})
@@ -375,10 +375,12 @@ def test_over_budget_materialising_join_reports_clear_error(tmp_path, monkeypatc
     client.store({"k": list(range(rows)), "v": [f"y{i % 100}" for i in range(rows)]})
     client.flush()
     try:
+        spill_dir = tmp_path / "spill"
+        monkeypatch.setenv("APEX_SPILL_DIR", str(spill_dir))
         monkeypatch.setenv(LIMIT_ENV, "1")
-        with pytest.raises(Exception) as error:
-            client.execute("SELECT a.v, b.v FROM a JOIN b ON a.k = b.k").to_dict()
-        assert "query memory budget exceeded" in str(error.value)
+        joined = client.execute("SELECT a.v, b.v FROM a JOIN b ON a.k = b.k").to_dict()
+        assert len(joined) == rows
+        assert not spill_dir.exists() or not any(spill_dir.iterdir())
     finally:
         client.close()
 

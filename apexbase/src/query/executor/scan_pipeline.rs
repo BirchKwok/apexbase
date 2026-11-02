@@ -581,9 +581,21 @@ impl ApexExecutor {
         // incremental group state keep scan memory bounded by one row group.
         // Any shape or state outside its gate falls through to the
         // single-batch path below.
-        if let Some(result) = Self::try_batch_group_pipeline(
-            backend, stmt, &predicate, backend.table_key(),
-        )? {
+        // When the streaming kernel's state cannot fit the query budget, fall
+        // through to the single-batch path, whose GROUP BY has a partitioned
+        // spill fallback (S11). The input morsel is materialised below, exactly
+        // like any other shape that leaves the streaming gate.
+        let batched = match Self::try_batch_group_pipeline(
+            backend,
+            stmt,
+            &predicate,
+            backend.table_key(),
+        ) {
+            Ok(result) => result,
+            Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => None,
+            Err(error) => return Err(error),
+        };
+        if let Some(result) = batched {
             return Ok(Some(result));
         }
 
@@ -608,7 +620,13 @@ impl ApexExecutor {
         // HAVING remains attached and is applied after aggregation, before TopK.
         let mut physical_stmt = stmt.clone();
         physical_stmt.where_clause = None;
-        let result = Self::execute_group_by(&filtered, &physical_stmt)?;
+        let result = match Self::execute_group_by(&filtered, &physical_stmt) {
+            Ok(result) => result,
+            Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                Self::spilled_group_by(&filtered, &physical_stmt, error)?
+            }
+            Err(error) => return Err(error),
+        };
         crate::query::executor::record_path("scan_group_pipeline");
         Ok(Some(result))
     }

@@ -4379,6 +4379,108 @@ impl ApexExecutor {
         }
     }
 
+    /// Grace-hash spill fallback for the main hash-join path (S11 / W3-3).
+    ///
+    /// Both inputs are hash-partitioned by their join key, so every matching
+    /// key pair lands in the same partition (NULL keys included); each partition
+    /// pair is joined by the regular kernel in a temporary unbudgeted context and
+    /// the partition results are concatenated. Spill failures keep the original
+    /// budget error with context.
+    fn spilled_hash_join(
+        left: &RecordBatch,
+        right: &RecordBatch,
+        left_key: &str,
+        right_key: &str,
+        join_type: &JoinType,
+        budget_error: std::io::Error,
+    ) -> io::Result<RecordBatch> {
+        let budget = crate::query::executor::memory::effective_query_memory_limit();
+        if budget == 0 || left.num_rows() == 0 || right.num_rows() == 0 {
+            return Err(budget_error);
+        }
+        let left_index = left.schema().index_of(left_key).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("{budget_error}; left join key '{left_key}' is missing"),
+            )
+        })?;
+        let right_index = right.schema().index_of(right_key).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("{budget_error}; right join key '{right_key}' is missing"),
+            )
+        })?;
+        let total_bytes = left
+            .get_array_memory_size()
+            .saturating_add(right.get_array_memory_size())
+            .max(1);
+        let target = (budget / 8).max(1024 * 1024);
+        let partitions = ((total_bytes.saturating_add(target - 1)) / target).clamp(8, 256);
+        let area = match crate::spill::SpillArea::new() {
+            Ok(area) => area,
+            Err(error) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::OutOfMemory,
+                    format!("{budget_error}; spill area unavailable: {error}"),
+                ))
+            }
+        };
+        let partition_error = |error: std::io::Error| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("{budget_error}; spilled JOIN partition failed: {error}"),
+            )
+        };
+        let left_paths = crate::spill::hash_partition_batch(
+            &area,
+            left,
+            &[left_index],
+            partitions,
+            "join-left",
+        )
+        .map_err(partition_error)?;
+        let right_paths = crate::spill::hash_partition_batch(
+            &area,
+            right,
+            &[right_index],
+            partitions,
+            "join-right",
+        )
+        .map_err(partition_error)?;
+        let mut pieces: Vec<RecordBatch> = Vec::with_capacity(partitions);
+        {
+            let _unbudgeted =
+                crate::query::executor::memory::install_query_memory_budget(None);
+            for (left_path, right_path) in left_paths.iter().zip(right_paths.iter()) {
+                let left_part = crate::spill::read_run_batch(left_path)?;
+                let right_part = crate::spill::read_run_batch(right_path)?;
+                if left_part.num_rows() == 0 && right_part.num_rows() == 0 {
+                    continue;
+                }
+                let joined = Self::hash_join(
+                    &left_part,
+                    &right_part,
+                    left_key,
+                    right_key,
+                    join_type,
+                )?;
+                if joined.num_rows() > 0 {
+                    pieces.push(joined);
+                }
+            }
+        }
+        if pieces.is_empty() {
+            // No partition produced rows: join over empty inputs through the
+            // regular kernel to obtain the correctly typed empty result.
+            let empty_left = left.slice(0, 0);
+            let empty_right = right.slice(0, 0);
+            return Self::hash_join(&empty_left, &empty_right, left_key, right_key, join_type);
+        }
+        let schema = pieces[0].schema();
+        arrow::compute::concat_batches(&schema, &pieces)
+            .map_err(|error| err_data(error.to_string()))
+    }
+
     /// Perform hash join between two RecordBatches
     fn hash_join(
         left: &RecordBatch,
@@ -4489,8 +4591,17 @@ impl ApexExecutor {
             }
             bytes
         };
-        let _build_state_charge =
-            crate::query::executor::memory::QueryMemoryCharge::new(build_state_bytes)?;
+        let _build_state_charge = match crate::query::executor::memory::QueryMemoryCharge::new(
+            build_state_bytes,
+        ) {
+            Ok(charge) => charge,
+            Err(error) if error.kind() == std::io::ErrorKind::OutOfMemory => {
+                return Self::spilled_hash_join(
+                    left, right, left_key, right_key, join_type, error,
+                );
+            }
+            Err(error) => return Err(error),
+        };
 
         // For Int64 keys, use optimized direct hash building
         let hash_table: AHashMap<u64, Vec<usize>> =

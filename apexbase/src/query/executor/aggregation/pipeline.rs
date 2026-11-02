@@ -488,7 +488,7 @@ impl ApexExecutor {
         if keys.is_empty() {
             return Ok(batch.clone());
         }
-        let budget = crate::query::executor::memory::configured_query_memory_limit();
+        let budget = crate::query::executor::memory::effective_query_memory_limit();
         let chunk_bytes = if budget == 0 {
             64 * 1024 * 1024
         } else {
