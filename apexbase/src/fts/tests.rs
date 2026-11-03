@@ -329,6 +329,72 @@ mod tests {
     }
 
     #[test]
+    fn recovered_snapshot_without_metadata_is_stale() {
+        // A snapshot that was recovered from disk but lost its generation
+        // metadata cannot be verified against the table and must be rejected.
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("docs.afts");
+        let table_path = dir.path().join("docs.apex");
+        {
+            let engine = FtsEngine::new_with_table(
+                &index_path,
+                FtsConfig::default(),
+                Some(table_path.clone()),
+            )
+            .unwrap();
+            engine
+                .add_documents_arrow_texts(&[1, 2], &["alpha", "beta"])
+                .unwrap();
+            engine.flush().unwrap();
+        }
+        fs::remove_file(dir.path().join("docs.afts.meta")).unwrap();
+        let engine = FtsEngine::new_with_table(
+            &index_path,
+            FtsConfig::default(),
+            Some(table_path.clone()),
+        )
+        .unwrap();
+        let reason = engine.reconcile_source(|| (Some(2), Some(0)));
+        assert!(reason.is_some(), "missing snapshot metadata must be reported");
+        assert!(engine.is_stale());
+        assert!(dir.path().join("docs.afts.stale").exists());
+    }
+
+    #[test]
+    fn in_process_engine_does_not_quarantine_an_unpublished_snapshot() {
+        // `CREATE FTS INDEX` schedules the snapshot write asynchronously and the
+        // Python binding reconciles the very same engine right after the DDL. A
+        // snapshot file whose metadata write has not landed yet is *this*
+        // engine's own in-flight flush, not a stale recovery: a fresh engine
+        // must leave it alone instead of quarantining the index.
+        let dir = tempfile::tempdir().unwrap();
+        let index_path = dir.path().join("docs.afts");
+        let table_path = dir.path().join("docs.apex");
+        let engine = FtsEngine::new_with_table(
+            &index_path,
+            FtsConfig::default(),
+            Some(table_path.clone()),
+        )
+        .unwrap();
+        engine
+            .add_documents_arrow_texts(&[1, 2], &["alpha", "beta"])
+            .unwrap();
+        // Another writer publishes the snapshot file only (the metadata write
+        // is the next step and has not happened yet).
+        let publisher = FtsEngine::new(&index_path, FtsConfig::default()).unwrap();
+        publisher
+            .add_documents_arrow_texts(&[1, 2], &["alpha", "beta"])
+            .unwrap();
+        publisher.flush().unwrap();
+        fs::remove_file(dir.path().join("docs.afts.meta")).unwrap();
+        assert!(index_path.exists());
+        assert!(engine.reconcile_source(|| (Some(2), Some(0))).is_none());
+        assert!(!engine.is_stale());
+        assert!(index_path.exists());
+        assert!(!dir.path().join("docs.afts.stale").exists());
+    }
+
+    #[test]
     fn wal_generation_round_trips_and_truncated_tail_is_detected() {
         let dir = tempfile::tempdir().unwrap();
         let index_path = dir.path().join("docs.afts");

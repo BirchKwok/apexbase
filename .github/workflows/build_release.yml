@@ -577,17 +577,22 @@ jobs:
           echo "The crate version is already published; no crates.io upload is needed."
         fi
 
+        # Upload with --skip-existing unconditionally: PyPI does not allow a
+        # filename to be replaced, so a retry after a partially failed upload can
+        # only fill in the missing wheels. Skipping the upload whenever the
+        # version page exists would leave such a release permanently incomplete.
         if [[ "$PYPI_EXISTS" != "true" ]]; then
-          (
-            mapfile -d '' distributions < <(
-              find dist -type f \( -name '*.whl' -o -name '*.tar.gz' \) -print0
-            )
-            python -m twine upload --verbose "${distributions[@]}"
-          ) &
-          pypi_pid="$!"
+          echo "Uploading the Python distributions to PyPI."
         else
-          echo "The Python package version is already published; no PyPI upload is needed."
+          echo "The Python package version exists on PyPI; uploading with --skip-existing to fill any missing files."
         fi
+        (
+          mapfile -d '' distributions < <(
+            find dist -type f \( -name '*.whl' -o -name '*.tar.gz' \) -print0
+          )
+          python -m twine upload --skip-existing --verbose "${distributions[@]}"
+        ) &
+        pypi_pid="$!"
 
         cargo_status=0
         pypi_status=0

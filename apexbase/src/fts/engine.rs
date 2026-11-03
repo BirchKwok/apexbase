@@ -15,6 +15,13 @@ struct EngineCore {
     /// rebuild has been requested.
     stale_reason: RwLock<Option<String>>,
     reconciled: std::sync::atomic::AtomicBool,
+    /// True when this engine recovered its state from a snapshot on disk. A
+    /// fresh engine that builds its index in-process has no recovered snapshot
+    /// to verify, so a snapshot/metadata pair still being written must not be
+    /// mistaken for a stale recovery: the writer publishes the metadata right
+    /// after the snapshot, and `CREATE FTS INDEX` is followed by an
+    /// `_init_fts()` reconciliation on this same engine.
+    loaded_snapshot: bool,
 }
 
 pub struct FtsEngine {
@@ -42,6 +49,7 @@ impl FtsEngine {
         let mut state = IndexState::default();
         state.needs_rebuild = !index_path.exists();
         let mut snapshot_meta = None;
+        let mut loaded_snapshot = false;
         if index_path.exists() {
             if let Err(error) = load_snapshot(&index_path, &mut state, &config) {
                 match error {
@@ -57,6 +65,7 @@ impl FtsEngine {
                     other => return Err(other),
                 }
             } else {
+                loaded_snapshot = true;
                 snapshot_meta = read_source_meta(&index_path).ok().flatten();
             }
         }
@@ -76,6 +85,7 @@ impl FtsEngine {
                 wal_epoch: AtomicU64::new(wal_epoch),
                 stale_reason: RwLock::new(None),
                 reconciled: std::sync::atomic::AtomicBool::new(false),
+                loaded_snapshot,
             }),
             flush_handle: Mutex::new(None),
         })
@@ -100,6 +110,7 @@ impl FtsEngine {
                 wal_epoch: AtomicU64::new(0),
                 stale_reason: RwLock::new(None),
                 reconciled: std::sync::atomic::AtomicBool::new(false),
+                loaded_snapshot: false,
             }),
             flush_handle: Mutex::new(None),
         })
@@ -151,7 +162,12 @@ impl FtsEngine {
         let wal_epoch = self.core.wal_epoch.load(Ordering::Acquire);
         let recovered_epoch = snapshot_epoch.max(wal_epoch);
         let mut reason = None;
-        if meta.is_none() && self.core.index_path.exists() {
+        // Only a snapshot recovered from disk can prove (or fail to prove) its
+        // source generation. An engine that never loaded a snapshot is either
+        // still building its index in-process or has just written one; while
+        // its metadata is being published, the snapshot file already exists and
+        // must not be quarantined as a legacy/unverifiable recovery.
+        if meta.is_none() && self.core.loaded_snapshot && self.core.index_path.exists() {
             reason = Some(
                 "index has no source generation metadata (created by an older build or copied from elsewhere)"
                     .to_string(),
