@@ -2870,6 +2870,21 @@ impl ApexStorageImpl {
         Ok(())
     }
 
+    #[pyo3(name = "_fts_flush_all")]
+    fn fts_flush_all(&self, py: Python<'_>) -> PyResult<()> {
+        let base_dir = self.current_base_dir();
+        let manager = self.fts_manager.read().clone();
+        if let Some(manager) = manager {
+            py.allow_threads(|| {
+                let _ = manager.flush_all();
+            });
+        }
+        py.allow_threads(|| {
+            crate::Database::flush_fts_for_dir(&base_dir);
+        });
+        Ok(())
+    }
+
     #[pyo3(name = "_fts_index_columns")]
     fn fts_index_columns(
         &self,

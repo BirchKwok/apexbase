@@ -280,6 +280,15 @@ impl Database {
         crate::query::executor::ApexExecutor::invalidate_cache_for_dir(base_dir);
     }
 
+    /// Flush all open FTS engines and join pending backfill tasks for a
+    /// directory (used by `ApexClient.close()`).
+    #[cfg(feature = "python")]
+    #[inline]
+    pub(crate) fn flush_fts_for_dir(base_dir: &Path) {
+        crate::query::executor::wait_fts_backfills_for_dir(base_dir);
+        crate::query::executor::flush_ftss_for_dir(base_dir);
+    }
+
     #[cfg(feature = "python")]
     #[inline]
     pub(crate) fn wait_fts_backfill(base_dir: &Path, table_name: &str) {

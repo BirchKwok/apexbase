@@ -7207,10 +7207,11 @@ class ApexClient:
                         self._flush_pending_memtable_rows_for_read()
                     except Exception:
                         pass
-                    # Best-effort: ensure FTS index is persisted across reopen
+                    # Best-effort: ensure the FTS index (including one created
+                    # through SQL DDL rather than init_fts) is persisted and its
+                    # background worker is idle before the storage closes.
                     try:
-                        if any((isinstance(v, dict) and v.get('enabled', False)) for v in self._fts_tables.values()):
-                            self._storage._fts_flush()
+                        self._storage._fts_flush_all()
                     except Exception:
                         pass
             finally:

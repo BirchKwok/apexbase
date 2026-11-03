@@ -111,8 +111,16 @@ def test_import_persists_while_it_is_still_running(tmp_path):
         deadline = time.time() + 180
         while process.poll() is None and time.time() < deadline:
             tables = list(Path(database).glob("**/*.apex"))
-            if tables:
-                size = max(table.stat().st_size for table in tables)
+            sizes = []
+            for table in tables:
+                try:
+                    sizes.append(table.stat().st_size)
+                except FileNotFoundError:
+                    # The importer may rename the temporary file between glob
+                    # and stat; the next poll observes the persisted name.
+                    continue
+            if sizes:
+                size = max(sizes)
                 if size > 0 and observed_size == 0:
                     # First non-empty sample, still taken while the importer runs.
                     observed_size = size

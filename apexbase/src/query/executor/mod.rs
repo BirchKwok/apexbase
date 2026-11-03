@@ -683,6 +683,15 @@ pub fn get_fts_manager(base_dir: &Path) -> Option<Arc<crate::fts::FtsManager>> {
 
 /// Register (or replace) the FtsManager for a base_dir.
 /// Called by Python `_init_fts()` and by the `CREATE FTS INDEX` DDL handler.
+/// Flush every already-open FTS engine for a base directory without creating
+/// new engines (used by `ApexClient.close()` so background writers finish
+/// before the storage/ directory is released).
+pub fn flush_ftss_for_dir(base_dir: &Path) {
+    if let Some(manager) = get_fts_manager(base_dir) {
+        let _ = manager.flush_all();
+    }
+}
+
 pub fn register_fts_manager(base_dir: &Path, manager: Arc<crate::fts::FtsManager>) {
     FTS_MANAGER_CACHE
         .write()
