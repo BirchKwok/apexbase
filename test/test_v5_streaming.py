@@ -108,12 +108,45 @@ import threading, time
 from apexbase import ApexClient
 
 
+def _windows_memory_mb(field):
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    counters = PROCESS_MEMORY_COUNTERS()
+    counters.cb = ctypes.sizeof(counters)
+    kernel32 = ctypes.WinDLL("kernel32")
+    psapi = ctypes.WinDLL("psapi")
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    get_info = psapi.GetProcessMemoryInfo
+    get_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+    get_info.restype = wintypes.BOOL
+    if not get_info(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+        raise OSError("GetProcessMemoryInfo failed")
+    return getattr(counters, field) / (1024 * 1024)
+
+
 def current_rss_mb():
     if sys.platform.startswith("linux"):
         with open("/proc/self/status", encoding="utf-8") as status:
             for line in status:
                 if line.startswith("VmRSS:"):
                     return int(line.split()[1]) / 1024
+    if sys.platform == "win32":
+        return _windows_memory_mb("WorkingSetSize")
     output = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())])
     return int(output.strip()) / 1024
 

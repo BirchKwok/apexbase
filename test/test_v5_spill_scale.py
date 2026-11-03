@@ -32,11 +32,14 @@ def _windows_memory_mb(field):
 
     counters = PROCESS_MEMORY_COUNTERS()
     counters.cb = ctypes.sizeof(counters)
-    ctypes.windll.psapi.GetProcessMemoryInfo(
-        ctypes.windll.kernel32.GetCurrentProcess(),
-        ctypes.byref(counters),
-        counters.cb,
-    )
+    kernel32 = ctypes.WinDLL("kernel32")
+    psapi = ctypes.WinDLL("psapi")
+    kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+    get_info = psapi.GetProcessMemoryInfo
+    get_info.argtypes = [ctypes.c_void_p, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD]
+    get_info.restype = wintypes.BOOL
+    if not get_info(kernel32.GetCurrentProcess(), ctypes.byref(counters), counters.cb):
+        raise OSError("GetProcessMemoryInfo failed")
     return getattr(counters, field) / (1024 * 1024)
 
 
@@ -49,6 +52,8 @@ def peak_mb():
                         return int(line.split()[1]) / 1024
         except OSError:
             pass
+    if sys.platform == "win32":
+        return _windows_memory_mb("PeakWorkingSetSize")
     import resource
     usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
     return usage / (1024 * 1024) if sys.platform == "darwin" else usage / 1024
