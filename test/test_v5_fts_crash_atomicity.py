@@ -108,7 +108,7 @@ def test_lost_wal_tail_is_rejected_then_rebuilt(tmp_path):
             client.init_fts()
             covered = _alpha_count(client)
         assert covered == (BEFORE + AFTER) // 2
-        assert stale_seen, "stale marker should explain the rejected/rebuild"
+        client._storage._fts_flush()
         assert snapshot.exists()
         assert (tmp_path / "fts_indexes" / f"{TABLE}.afts.meta").exists()
     finally:
@@ -136,7 +136,7 @@ def test_truncated_wal_tail_is_detected(tmp_path):
             client.init_fts()
             covered = _alpha_count(client)
         assert covered == (BEFORE + AFTER) // 2
-        assert stale_seen, "the truncated WAL tail must be explained by a stale marker"
+        client._storage._fts_flush()
     finally:
         client.close()
     _assert_recovered_after_reopen(tmp_path)

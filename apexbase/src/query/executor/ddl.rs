@@ -3230,6 +3230,13 @@ impl ApexExecutor {
 
         // Back-fill all rows into FTS (safe to re-index already-indexed rows)
         let backfilled = Self::fts_backfill_table(base_dir, table, fields.as_deref(), mgr.clone())?;
+        // A large initial build runs on a worker thread and the small-table path
+        // flushes asynchronously; make the index searchable before the DDL
+        // reports success so a MATCH right after ALTER never sees partial state.
+        crate::query::executor::wait_fts_backfill(base_dir, table);
+        if let Ok(engine) = mgr.get_engine(table) {
+            engine.flush().map_err(|e| err_data(e.to_string()))?;
+        }
 
         let msg = format!(
             "FTS index enabled for '{}' ({} rows indexed)",

@@ -94,8 +94,9 @@ def test_bounded_queue_rejects_when_full_or_timed_out():
 
         directory = os.environ["ADMISSION_DIR"]
         client = ApexClient(dirpath=directory)
+        total = 2_000_000
         client.create_table("t", {"v": "int64", "g": "int64"})
-        client.store({"v": list(range(200_000)), "g": [i % 1000 for i in range(200_000)]})
+        client.store({"v": list(range(total)), "g": [i % 1000 for i in range(total)]})
         client.flush()
         client.close()
 
@@ -109,9 +110,14 @@ def test_bounded_queue_rejects_when_full_or_timed_out():
                 )
         thread = threading.Thread(target=hog, daemon=True)
         thread.start()
-        deadline = time.time() + 20
         client = ApexClient(dirpath=directory)
         client.use_table("t")
+        # Wait until the hog actually holds the reservation; otherwise a fast
+        # platform could finish the heavy query before the probe runs.
+        hold_deadline = time.time() + 10
+        while time.time() < hold_deadline and client._storage._admission_stats()[0] == 0:
+            time.sleep(0.001)
+        deadline = time.time() + 20
         rejection = None
         while time.time() < deadline and rejection is None:
             try:
