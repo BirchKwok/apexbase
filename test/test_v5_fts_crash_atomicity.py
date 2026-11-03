@@ -125,12 +125,18 @@ def test_truncated_wal_tail_is_detected(tmp_path):
 
     client = _open(tmp_path)
     try:
+        stale_path = tmp_path / "fts_indexes" / f"{TABLE}.afts.stale"
         try:
-            assert _alpha_count(client) == (BEFORE + AFTER) // 2
+            covered = _alpha_count(client)
+            stale_seen = stale_path.exists()
         except Exception as error:  # noqa: BLE001 - the gate may reject first
             assert "stale" in str(error).lower() or "rebuild" in str(error).lower()
+            stale_seen = stale_path.exists()
+            client.drop_fts()
             client.init_fts()
-        assert _alpha_count(client) == (BEFORE + AFTER) // 2
+            covered = _alpha_count(client)
+        assert covered == (BEFORE + AFTER) // 2
+        assert stale_seen, "the truncated WAL tail must be explained by a stale marker"
     finally:
         client.close()
     _assert_recovered_after_reopen(tmp_path)

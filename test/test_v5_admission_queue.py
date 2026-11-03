@@ -21,7 +21,9 @@ def _run(script: str, env: dict) -> dict:
     merged.pop("APEX_QUERY_QUEUE_WAIT_MS", None)
     import tempfile
     directory = tempfile.mkdtemp(prefix="apex_admission_")
-    script = script.replace("__DIR__", directory)
+    # The path is embedded inside a Python string literal in the child script;
+    # escape backslashes so Windows paths survive -c compilation.
+    script = script.replace("__DIR__", directory.replace("\\", "\\\\"))
     env = {key: value.replace("__DIR__", directory) if isinstance(value, str) else value
            for key, value in env.items()}
     merged.update(env)

@@ -11,6 +11,35 @@ LIMIT_ENV = "APEX_QUERY_MEMORY_MB"
 _CHILD = r'''
 import json, sys
 
+
+def _windows_memory_mb(field):
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESS_MEMORY_COUNTERS(ctypes.Structure):
+        _fields_ = [
+            ("cb", wintypes.DWORD),
+            ("PageFaultCount", wintypes.DWORD),
+            ("PeakWorkingSetSize", ctypes.c_size_t),
+            ("WorkingSetSize", ctypes.c_size_t),
+            ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+            ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+            ("PagefileUsage", ctypes.c_size_t),
+            ("PeakPagefileUsage", ctypes.c_size_t),
+        ]
+
+    counters = PROCESS_MEMORY_COUNTERS()
+    counters.cb = ctypes.sizeof(counters)
+    ctypes.windll.psapi.GetProcessMemoryInfo(
+        ctypes.windll.kernel32.GetCurrentProcess(),
+        ctypes.byref(counters),
+        counters.cb,
+    )
+    return getattr(counters, field) / (1024 * 1024)
+
+
 def peak_mb():
     if sys.platform.startswith("linux"):
         try:

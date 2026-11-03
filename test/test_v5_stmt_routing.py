@@ -146,9 +146,9 @@ def test_copy_without_selected_table_avoids_pyarrow_import(tmp_path):
     script = f"""
 import json, sys
 from apexbase import ApexClient
-client = ApexClient({str(db_dir)!r}, drop_if_exists=True, enable_cache=False)
+client = ApexClient({db_dir.as_posix()!r}, drop_if_exists=True, enable_cache=False)
 before = 'pyarrow' in sys.modules
-result = client.execute("COPY newtab FROM '{csv_path}'").to_dict()
+result = client.execute("COPY newtab FROM '{csv_path.as_posix()}'").to_dict()
 after = 'pyarrow' in sys.modules
 rows = client.execute("SELECT * FROM newtab ORDER BY id").to_dict()
 print(json.dumps({{

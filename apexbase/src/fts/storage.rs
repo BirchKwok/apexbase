@@ -60,6 +60,23 @@ fn source_meta_path(index_path: &Path) -> PathBuf {
     PathBuf::from(format!("{}.meta", index_path.display()))
 }
 
+/// Atomically replace `dest` with `temp`.
+///
+/// `std::fs::rename` cannot replace an existing file on Windows, so a rebuild
+/// that regains an index file would otherwise lose its source metadata. This
+/// keeps the same atomic rename on Unix and falls back to remove+rename on
+/// Windows (or any platform that refuses to overwrite).
+fn replace_file(temp: &Path, dest: &Path) -> io::Result<()> {
+    match fs::rename(temp, dest) {
+        Ok(()) => Ok(()),
+        Err(_) if dest.exists() => {
+            fs::remove_file(dest)?;
+            fs::rename(temp, dest)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 pub(super) fn read_source_meta(index_path: &Path) -> FtsResult<Option<SourceMeta>> {
     let path = source_meta_path(index_path);
     let bytes = match fs::read(&path) {
@@ -92,7 +109,7 @@ fn write_source_meta(index_path: &Path, meta: SourceMeta) -> FtsResult<()> {
     let crc = crc32fast::hash(&bytes);
     bytes.extend_from_slice(&crc.to_le_bytes());
     fs::write(&temp_path, &bytes)?;
-    fs::rename(&temp_path, &path)?;
+    replace_file(&temp_path, &path)?;
     Ok(())
 }
 
@@ -626,7 +643,7 @@ fn persist_snapshot(core: &EngineCore) -> FtsResult<usize> {
     write_u32(&mut file, checksum)?;
     file.flush()?;
     drop(file);
-    fs::rename(&temp_path, &core.index_path)?;
+    replace_file(&temp_path, &core.index_path)?;
     if core.wal_path.exists() {
         fs::remove_file(&core.wal_path)?;
     }
