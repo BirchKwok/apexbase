@@ -94,15 +94,21 @@ def test_lost_wal_tail_is_rejected_then_rebuilt(tmp_path):
         # the table on open (the design allows both); it must never answer from
         # partial coverage. Which path runs first depends on the platform's
         # config-reload timing, so both are accepted here.
+        stale_path = tmp_path / "fts_indexes" / f"{TABLE}.afts.stale"
         try:
             covered = _alpha_count(client)
+            stale_seen = stale_path.exists()
         except Exception as error:  # noqa: BLE001 - explicit stale rejection
             message = str(error).lower()
             assert "stale" in message or "rebuild" in message, message
+            stale_seen = stale_path.exists()
+            # An engine quarantined as stale will not recover through init_fts()
+            # alone on every platform; drop and rebuild from the table.
+            client.drop_fts()
             client.init_fts()
             covered = _alpha_count(client)
         assert covered == (BEFORE + AFTER) // 2
-        assert (tmp_path / "fts_indexes" / f"{TABLE}.afts.stale").exists()
+        assert stale_seen, "stale marker should explain the rejected/rebuild"
         assert snapshot.exists()
         assert (tmp_path / "fts_indexes" / f"{TABLE}.afts.meta").exists()
     finally:

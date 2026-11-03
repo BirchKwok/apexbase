@@ -103,30 +103,49 @@ def _peak_mb():
 
 
 _CHILD = r'''
-import json, sys
+import json, os, subprocess, sys
+import threading, time
 from apexbase import ApexClient
+
+
+def current_rss_mb():
+    if sys.platform.startswith("linux"):
+        with open("/proc/self/status", encoding="utf-8") as status:
+            for line in status:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    output = subprocess.check_output(["ps", "-o", "rss=", "-p", str(os.getpid())])
+    return int(output.strip()) / 1024
+
 
 directory, mode = sys.argv[1], sys.argv[2]
 client = ApexClient(directory)
 client.use_table("t")
-if mode == "stream":
-    total = 0
-    for batch in client.execute_stream("SELECT v, s FROM t"):
-        total += batch.num_rows
-    outcome = total
-else:
-    outcome = len(client.execute("SELECT v, s FROM t").to_dict())
+before = current_rss_mb()
+peak = [before]
+stop = threading.Event()
+
+
+def sample():
+    while not stop.is_set():
+        peak[0] = max(peak[0], current_rss_mb())
+        time.sleep(0.005)
+
+
+sampler = threading.Thread(target=sample, daemon=True)
+sampler.start()
 try:
-    from test_v5_streaming import _peak_mb as peak
-except Exception:
-    peak = None
-
-def peak_mb():
-    import resource
-    usage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    return usage / (1024 * 1024) if sys.platform == "darwin" else usage / 1024
-
-print(json.dumps({"rows": outcome, "peak_mb": peak_mb()}))
+    if mode == "stream":
+        total = 0
+        for batch in client.execute_stream("SELECT v, s FROM t"):
+            total += batch.num_rows
+        outcome = total
+    else:
+        outcome = len(client.execute("SELECT v, s FROM t").to_dict())
+finally:
+    stop.set()
+    sampler.join(timeout=1.0)
+print(json.dumps({"rows": outcome, "growth_mb": max(0.0, peak[0] - before)}))
 client.close()
 '''
 
@@ -136,14 +155,14 @@ def test_streaming_peak_memory_is_lower_than_materialized():
         seed = ApexClient(os.path.join(tmp, "db"), drop_if_exists=True, enable_cache=False)
         seed.create_table("t", {"v": "int64", "s": "string"})
         seed.use_table("t")
-        rows = 400_000
+        rows = 300_000
         chunk = 100_000
         for start in range(0, rows, chunk):
             end = min(start + chunk, rows)
             seed.store(
                 {
                     "v": list(range(start, end)),
-                    "s": [f"x{i % 10}" for i in range(start, end)],
+                    "s": [f"payload-{i:08d}-" + "x" * 400 for i in range(start, end)],
                 }
             )
         seed.flush()
@@ -162,4 +181,8 @@ def test_streaming_peak_memory_is_lower_than_materialized():
 
     assert results["stream"]["rows"] == rows
     assert results["materialized"]["rows"] == rows
-    assert results["stream"]["peak_mb"] < results["materialized"]["peak_mb"], results
+    # Streaming must keep the result out of memory: its query-time RSS growth
+    # stays well below materializing every returned dict row. Process peak RSS
+    # is not comparable across platforms because fixture construction dominates.
+    assert results["stream"]["growth_mb"] < results["materialized"]["growth_mb"] * 0.8, results
+    assert results["materialized"]["growth_mb"] > 20.0, results
