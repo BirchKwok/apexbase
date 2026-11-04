@@ -11,6 +11,10 @@ A small, explicit skip table covers non-runnable snippets: API signatures,
 blocks that require an external service (PostgreSQL Wire, Arrow Flight,
 psycopg2), and fragments that intentionally use placeholder paths. Every
 Python block is either executed by a page test or listed with a reason.
+
+API_REFERENCE.md is handled separately: its non-signature snippets are executed
+against a prepared reference schema, with explicit per-block setup where an
+example needs a different table. Only external-resource snippets are skipped.
 """
 
 from __future__ import annotations
@@ -561,3 +565,196 @@ def test_documentation_sql_examples(
             _close_clients(namespace)
             _restore_extension_codecs()
             os.chdir(old_cwd)
+
+
+# ---------------------------------------------------------------------------
+# Python API reference examples
+# ---------------------------------------------------------------------------
+
+API_DOC = "docs/API_REFERENCE.md"
+
+API_PREAMBLE = """\
+import datetime
+import decimal
+import json
+import os
+from typing import List, Optional
+import numpy as np
+import pandas as pd
+import pyarrow as pa
+from apexbase import ApexClient, ResultView, register_extension_codec
+client = ApexClient(os.path.abspath("./data"))
+query = np.random.rand(128).astype(np.float32)
+query_vector = query
+"""
+
+API_SETUP = """\
+client.create_table("users", {"id": "int64", "name": "string", "age": "int64", "city": "string"})
+client.store({"id": [1, 2, 3], "name": ["Alice", "Bob", "Charlie"],
+              "age": [30, 25, 35], "city": ["Beijing", "Shanghai", "NYC"]})
+client.create_table("events", {"id": "int64", "kind": "string", "ts": "timestamp",
+                               "value": "float64", "user_id": "int64"})
+client.store({"id": [1, 2], "kind": ["click", "signup"],
+              "ts": ["2026-01-01 00:00:00", "2026-01-02 00:00:00"],
+              "value": [1.0, 2.0], "user_id": [1, 2]})
+client.create_table("articles", {"title": "string", "content": "string",
+                                 "author": "string", "published_at": "string",
+                                 "category": "string", "year": "int64"})
+client.store({"title": ["Python tutorial", "Rust guide"],
+              "content": ["Learn Python programming", "Systems programming"],
+              "author": ["Alice", "Bob"], "published_at": ["2024-01-01", "2024-02-01"],
+              "category": ["AI", "Systems"], "year": [2024, 2024]})
+client.create_table("items", {"label": "string", "vec": "float32_vector"})
+client.store({"label": ["a", "b", "c"],
+              "vec": [[0.1] * 128, [0.2] * 128, [0.3] * 128]})
+client.create_table("small_items", {"label": "string", "vec": "float32_vector"})
+client.store({"label": ["a", "b"], "vec": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]})
+client.create_table("embeddings", {"label": "string", "vec": "float16_vector"})
+client.store({"label": ["a", "b"], "vec": [[0.1] * 128, [0.2] * 128]})
+client.create_table("orders", {"order_id": "int64", "total": "float64", "user_id": "int64"})
+client.store({"order_id": [1, 2], "total": [10.0, 20.0], "user_id": [1, 2]})
+client.create_table("customers", {"name": "string"})
+client.store({"name": ["Alice", "Dana"]})
+client.create_table("leads", {"name": "string"})
+client.store({"name": ["Bob", "Eve"]})
+client.create_table("domestic_users", {"name": "string", "city": "string"})
+client.store({"name": ["Alice"], "city": ["Beijing"]})
+client.create_table("international_users", {"name": "string", "city": "string"})
+client.store({"name": ["Bob"], "city": ["Paris"]})
+client.create_table("wishlist", {"user_id": "int64"})
+client.store({"user_id": [1]})
+client.create_table("support_tickets", {"user_id": "int64", "status": "string"})
+client.store({"user_id": [1], "status": ["open"]})
+client.create_table("logs", {"level": "string", "message": "string"})
+client.store({"level": ["INFO"], "message": ["started"]})
+client.use_database("analytics")
+client.create_table("events", {"event": "string", "cnt": "int64", "user_id": "int64"})
+client.store({"event": ["click"], "cnt": [12], "user_id": [1]})
+client.use_database("default")
+client.use_table("users")
+results = client.execute("SELECT * FROM users")
+import pathlib
+pathlib.Path("unsubscribed.csv").write_text("email\\na@example.com\\n", encoding="utf-8")
+"""
+
+# Block-specific setup for reference examples that need a different table or
+# schema than the general context. Keyed by the documented block start line.
+API_ITEMS_SETUP = API_PREAMBLE + API_SETUP + 'client.use_table("items")\n'
+API_ARTICLES_SETUP = API_PREAMBLE + API_SETUP + 'client.use_table("articles")\n'
+API_EMBEDDINGS_SETUP = API_PREAMBLE + API_SETUP + 'client.use_table("embeddings")\n'
+API_ARTICLES_FTS_SETUP = (
+    API_ARTICLES_SETUP
+    + 'client.init_fts(index_fields=["title", "content"])\n'
+)
+API_USERS_EMAIL_SETUP = (
+    API_PREAMBLE
+    + API_SETUP
+    + 'client.use_table("users")\nclient.add_column("email", "string")\n'
+)
+API_USERS_TEMP_SETUP = (
+    API_PREAMBLE
+    + API_SETUP
+    + 'client.use_table("users")\nclient.add_column("temp_field", "string")\n'
+)
+
+API_BLOCK_SETUP: dict[int, str] = {
+    856: API_USERS_TEMP_SETUP,
+    867: API_USERS_EMAIL_SETUP,
+    954: API_ARTICLES_SETUP,
+    1003: API_ARTICLES_FTS_SETUP,
+    1023: API_ARTICLES_FTS_SETUP,
+    1036: API_ARTICLES_FTS_SETUP,
+    1066: API_ARTICLES_SETUP,
+    1078: API_ARTICLES_FTS_SETUP,
+    1085: API_ARTICLES_FTS_SETUP,
+    1103: API_ARTICLES_FTS_SETUP,
+    1119: API_ARTICLES_FTS_SETUP,
+    1135: API_ARTICLES_FTS_SETUP,
+    1151: API_ARTICLES_FTS_SETUP,
+    1185: API_ARTICLES_FTS_SETUP,
+    1197: API_ARTICLES_FTS_SETUP,
+    1607: API_ITEMS_SETUP,
+    1980: API_USERS_EMAIL_SETUP,
+    2096: API_EMBEDDINGS_SETUP,
+    2161: API_ITEMS_SETUP,
+    2236: API_ITEMS_SETUP,
+    2304: API_ITEMS_SETUP,
+    2351: API_PREAMBLE,
+    2467: API_PREAMBLE,
+    2584: API_ITEMS_SETUP,
+    2599: API_ITEMS_SETUP,
+}
+
+# Non-runnable reference snippets with an explicit reason, keyed by line.
+API_SKIPS: dict[int, str] = {
+    573: "requires an existing Lance dataset",
+    1520: "API signature, not executable",
+    1889: "API signature, not executable",
+    1718: "uses a placeholder file path",
+    1752: "uses a placeholder file path",
+    1783: "uses a placeholder file path",
+    1801: "uses a placeholder file path",
+    1858: "uses a placeholder file path",
+    1901: "uses a placeholder file path",
+}
+
+
+def _api_setup_for(code: str, line: int) -> str:
+    override = API_BLOCK_SETUP.get(line)
+    if override is not None:
+        return override
+    if re.search(
+        r'create_table\("(users|events|articles|items|orders|embeddings|logs)"',
+        code,
+    ) or re.search(r"(?m)^\s*CREATE TABLE\b", code):
+        return API_PREAMBLE
+    return API_PREAMBLE + API_SETUP
+
+
+def _api_blocks() -> list[tuple[int, str]]:
+    return [
+        (line, code)
+        for line, code in extract_python_blocks(API_DOC)
+        if not _is_signature(code)
+    ]
+
+
+@pytest.mark.parametrize(
+    "block",
+    _api_blocks(),
+    ids=lambda block: f"{API_DOC}:{block[0]}",
+)
+def test_api_reference_python_examples(
+    block: tuple[int, str], tmp_path: Path
+) -> None:
+    line, code = block
+    reason = API_SKIPS.get(line)
+    if reason:
+        pytest.skip(reason)
+    old_cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        namespace: dict[str, object] = {"__name__": "__main__"}
+        exec(compile(_api_setup_for(code, line), f"{API_DOC}:setup", "exec"), namespace)
+        try:
+            exec(compile("\n" * (line - 1) + code, API_DOC, "exec"), namespace)
+        except Exception as exc:  # pragma: no cover - failure path
+            raise AssertionError(
+                f"{API_DOC}:{line} example failed: {type(exc).__name__}: {exc}"
+            ) from exc
+    finally:
+        _close_clients(namespace)
+        _restore_extension_codecs()
+        os.chdir(old_cwd)
+
+
+def test_api_reference_skips_have_reasons() -> None:
+    for key, reason in API_SKIPS.items():
+        assert reason, key
+
+
+def test_api_reference_coverage_is_broad() -> None:
+    blocks = _api_blocks()
+    assert len(blocks) >= 100, len(blocks)
+    assert len(API_SKIPS) <= 12, API_SKIPS
+    assert len(blocks) - len(API_SKIPS) >= 90

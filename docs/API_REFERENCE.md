@@ -205,7 +205,7 @@ client.execute("""
 """)
 
 # INSERT into a different database
-client.execute("INSERT INTO analytics.events (name, cnt) VALUES ('click', 1)")
+client.execute("INSERT INTO analytics.events (event, cnt) VALUES ('click', 1)")
 
 # UPDATE in a different database
 client.execute("UPDATE default.users SET age = 31 WHERE name = 'Alice'")
@@ -592,8 +592,8 @@ writer. Returns the written dataset URI/path.
 
 **Example:**
 ```python
-client.to_lance("export_lance_dir")
-client.to_lance("export_lance_dir", sql="SELECT name, age FROM users WHERE age > 18")
+client.to_lance("export_users_lance")
+client.to_lance("export_adults_lance", sql="SELECT name, age FROM users WHERE age > 18")
 ```
 
 ---
@@ -1065,7 +1065,7 @@ Initialize full-text search for a table.
 **Example:**
 ```python
 client.init_fts(index_fields=["title", "content"])
-client.init_fts(index_fields=["name"], lazy_load=True)
+client.init_fts(index_fields=["title"], lazy_load=True)
 ```
 
 #### search_text
@@ -1506,7 +1506,7 @@ Iterate over the same batches.
 
 ```python
 for batch in results.iter_batches(max_chunksize=4096):
-    process(batch)
+    print(batch.num_rows)
 ```
 
 #### tolist
@@ -1619,7 +1619,7 @@ client.execute("SELECT * FROM users WHERE city IN (?)", params=[["Beijing", "Sha
 
 # Bound TopK vector query (keeps the native FFI fast path)
 client.execute(
-    "SELECT explode_rename(topk_distance(embedding, ?, 10, 'cosine'), '_id', 'dist') FROM items",
+    "SELECT explode_rename(topk_distance(vec, ?, 10, 'cosine'), '_id', 'dist') FROM items",
     params=[query_vector],
 )
 ```
@@ -2011,7 +2011,7 @@ client.execute("""
 client.execute("""
     SELECT email FROM users
     EXCEPT
-    SELECT email FROM read_csv('/data/unsubscribed.csv')
+    SELECT email FROM read_csv('unsubscribed.csv')
 """)
 ```
 
@@ -2048,7 +2048,7 @@ client.store({
 })
 
 # Python list/tuple vectors are also accepted
-client.store({"label": "d", "vec": [0.1, 0.2, 0.3]})
+client.store({"label": "d", "vec": [0.1] * 128})
 ```
 
 ---
@@ -2082,7 +2082,7 @@ vecs = np.random.rand(1000, 128).astype(np.float32)
 client.store([{"label": str(i), "vec": vecs[i]} for i in range(len(vecs))])
 
 # Python lists also work, including single-record writes
-client.store({"label": "queryable", "vec": [0.1, 0.2, 0.3, 0.4]})
+client.store({"label": "queryable", "vec": [0.1] * 128})
 
 # float16 source data — stored directly
 vecs_f16 = vecs.astype(np.float16)
@@ -2099,9 +2099,10 @@ query = np.random.rand(128).astype(np.float32)
 # TopK search
 results = client.topk_distance("vec", query, k=10, metric="l2")
 
-# SQL distance functions also work
-client.execute("""
-    SELECT label, array_distance(vec, [0.1, 0.2, 0.3, 0.4]) AS dist
+# SQL distance functions also work; the literal must match the column dimension.
+query_literal = ", ".join(["0.1"] * 128)
+client.execute(f"""
+    SELECT label, array_distance(vec, [{query_literal}]) AS dist
     FROM embeddings
     ORDER BY dist
     LIMIT 5
@@ -2252,13 +2253,13 @@ records  = client.retrieve_many(top_ids.tolist())
 
 # Or use a SQL subquery
 client.execute("""
-    SELECT items.label, items.vec
-    FROM items
+    SELECT small_items.label, small_items.vec
+    FROM small_items
     WHERE _id IN (
         SELECT _id FROM (
             SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 5, 'l2'), '_id', 'dist')
-            FROM items
-        )
+            FROM small_items
+        ) AS ranked
     )
 """)
 ```
@@ -2348,10 +2349,15 @@ FROM table_name
 **Examples:**
 
 ```python
+# A 3-dim table keeps the SQL literals readable.
+client.execute("CREATE TABLE IF NOT EXISTS small_items (label STRING, vec FLOAT32_VECTOR)")
+client.store({"label": ["a", "b"], "vec": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6]]})
+client.use_table("small_items")
+
 # Basic: top 10 by L2 distance
 results = client.execute("""
     SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 10, 'l2'), '_id', 'dist')
-    FROM items
+    FROM small_items
 """)
 df = results.to_pandas()
 # df: _id (int64), dist (float64), 10 rows sorted nearest first
@@ -2362,13 +2368,13 @@ results = client.execute("""
         topk_distance(vec, [1.0, 0.0, 0.0], 5, 'cosine'),
         'item_id', 'cosine_dist'
     )
-    FROM items
+    FROM small_items
 """)
 
 # Dot product (inner product) search
 results = client.execute("""
     SELECT explode_rename(topk_distance(vec, [0.5, 0.5, 0.5], 20, 'dot'), '_id', 'score')
-    FROM embeddings
+    FROM small_items
 """)
 ```
 
@@ -2485,11 +2491,10 @@ You can execute multiple SQL statements in a single call by separating them with
 ```python
 # Execute multiple statements at once
 client.execute("""
-    CREATE TABLE IF NOT EXISTS products;
-    ALTER TABLE products ADD COLUMN name STRING;
-    ALTER TABLE products ADD COLUMN price FLOAT;
+    CREATE TABLE IF NOT EXISTS products (name STRING, price FLOAT);
     INSERT INTO products (name, price) VALUES ('Laptop', 999.99)
 """)
+client.use_table("products")
 
 # Multiple INSERT statements
 client.execute("""
@@ -2500,7 +2505,7 @@ client.execute("""
 
 # The result of the last statement is returned
 results = client.execute("""
-    CREATE TABLE IF NOT EXISTS temp;
+    CREATE TABLE IF NOT EXISTS temp (name STRING);
     INSERT INTO temp (name) VALUES ('test');
     SELECT * FROM temp
 """)
@@ -2562,7 +2567,7 @@ budget message. The in-memory paths are unchanged (canary-verified).
 
 ```python
 for batch in client.execute_stream("SELECT id, payload FROM events"):
-    process(batch)  # pyarrow.RecordBatch, one row group at a time
+    print(batch.num_rows)  # pyarrow.RecordBatch, one row group at a time
 ```
 
 `execute_stream(sql)` returns an iterator of `pyarrow.RecordBatch` objects:
