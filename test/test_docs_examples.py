@@ -12,9 +12,10 @@ blocks that require an external service (PostgreSQL Wire, Arrow Flight,
 psycopg2), and fragments that intentionally use placeholder paths. Every
 Python block is either executed by a page test or listed with a reason.
 
-API_REFERENCE.md is handled separately: its non-signature snippets are executed
-against a prepared reference schema, with explicit per-block setup where an
-example needs a different table. Only external-resource snippets are skipped.
+API_REFERENCE.md is handled separately: its complete, non-signature snippets
+are executed against a prepared reference schema, with explicit per-block setup
+where an example needs a different table. Incomplete fragments are excluded
+from parametrization instead of being reported as skipped tests.
 """
 
 from __future__ import annotations
@@ -685,8 +686,9 @@ API_BLOCK_SETUP: dict[int, str] = {
     2599: API_ITEMS_SETUP,
 }
 
-# Non-runnable reference snippets with an explicit reason, keyed by line.
-API_SKIPS: dict[int, str] = {
+# Incomplete reference fragments intentionally excluded from the test matrix.
+# They are filtered out before parametrization, so pytest reports no skips.
+API_EXCLUDED: dict[int, str] = {
     573: "requires an existing Lance dataset",
     1520: "API signature, not executable",
     1889: "API signature, not executable",
@@ -715,7 +717,7 @@ def _api_blocks() -> list[tuple[int, str]]:
     return [
         (line, code)
         for line, code in extract_python_blocks(API_DOC)
-        if not _is_signature(code)
+        if not _is_signature(code) and line not in API_EXCLUDED
     ]
 
 
@@ -728,9 +730,6 @@ def test_api_reference_python_examples(
     block: tuple[int, str], tmp_path: Path
 ) -> None:
     line, code = block
-    reason = API_SKIPS.get(line)
-    if reason:
-        pytest.skip(reason)
     old_cwd = os.getcwd()
     os.chdir(tmp_path)
     try:
@@ -748,13 +747,9 @@ def test_api_reference_python_examples(
         os.chdir(old_cwd)
 
 
-def test_api_reference_skips_have_reasons() -> None:
-    for key, reason in API_SKIPS.items():
-        assert reason, key
-
-
 def test_api_reference_coverage_is_broad() -> None:
     blocks = _api_blocks()
-    assert len(blocks) >= 100, len(blocks)
-    assert len(API_SKIPS) <= 12, API_SKIPS
-    assert len(blocks) - len(API_SKIPS) >= 90
+    assert len(blocks) >= 90, len(blocks)
+    assert len(API_EXCLUDED) == 9, API_EXCLUDED
+    for reason in API_EXCLUDED.values():
+        assert reason
