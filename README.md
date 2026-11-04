@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/img/hero.svg" alt="ApexBase 2.0.0 — the embedded database for the agent era" width="100%">
+<img src="docs/img/hero.svg" alt="ApexBase — the embedded database for the agent era" width="100%">
 
 <p>
   <a href="https://pypi.org/project/apexbase/"><img alt="PyPI" src="https://img.shields.io/pypi/v/apexbase?logo=pypi&logoColor=white&label=PyPI"></a>
