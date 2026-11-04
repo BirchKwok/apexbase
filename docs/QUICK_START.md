@@ -155,8 +155,13 @@ print(df)
 For file-based analysis without an import step:
 
 ```python
-db.execute("SELECT city, COUNT(*) FROM read_parquet('orders.parquet') GROUP BY city")
-db.execute("SELECT * FROM read_csv('events.csv') LIMIT 10")
+# Write the DataFrame to Parquet, then query it without an import step.
+events.to_parquet("events.parquet", index=False)
+
+with ApexClient("./analytics") as db:
+    df = db.execute("SELECT * FROM read_parquet('events.parquet')").to_pandas()
+
+print(df)
 ```
 
 See [Data Import](user-guide/data-import.md) for CSV, JSON, Parquet, Lance,
@@ -224,7 +229,7 @@ When a result may be large, stream Arrow batches instead of materializing it:
 with ApexClient("./agent-memory") as db:
     db.use_table("memories")
     for batch in db.execute_stream("SELECT content FROM memories"):
-        handle(batch)  # pyarrow.RecordBatch, one row group at a time
+        print(batch.num_rows, "rows in this batch")  # pyarrow.RecordBatch
 ```
 
 Multi-statement SQL is one transaction: statements run in order and a failure

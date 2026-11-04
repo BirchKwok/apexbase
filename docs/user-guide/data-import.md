@@ -93,6 +93,7 @@ For repeated queries, parse a file once into a temporary table:
 
 ```python
 client.register_temp_table("events_file", "events.csv")
+client.use_table("events_file")
 
 client.execute("""
     SELECT event, COUNT(*) AS rows

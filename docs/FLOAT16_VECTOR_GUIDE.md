@@ -151,10 +151,12 @@ result = client.batch_topk_distance("vec", queries, k=10, metric="l2")
 `array_distance`, `l1_distance`, `linf_distance` all work on `FLOAT16_VECTOR` columns:
 
 ```python
-client.execute("""
+# The table stores 128-dimension vectors; build the literal with the same dim.
+query_vec = ", ".join(["0.1"] * 128)
+client.execute(f"""
     SELECT doc_id,
-           array_distance(vec, [0.1, 0.2, 0.3, 0.4]) AS l2_dist,
-           l1_distance(vec,    [0.1, 0.2, 0.3, 0.4]) AS l1_dist
+           array_distance(vec, [{query_vec}]) AS l2_dist,
+           l1_distance(vec,    [{query_vec}]) AS l1_dist
     FROM embeddings
     ORDER BY l2_dist
     LIMIT 5

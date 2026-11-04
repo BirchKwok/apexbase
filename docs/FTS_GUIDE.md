@@ -122,16 +122,22 @@ Key design points:
 from apexbase import ApexClient
 
 client = ApexClient("./data")
-client.create_table("articles")
+client.create_table("articles", {
+    "title": "string", "content": "string",
+    "author": "string", "published_at": "string", "category": "string",
+})
 
 # 1. Create the FTS index (DDL)
 client.execute("CREATE FTS INDEX ON articles (title, content)")
 
 # 2. Insert data — rows are indexed automatically on each store()
 client.store([
-    {"title": "Rust programming language", "content": "Rust is fast and safe"},
-    {"title": "Python tutorial",           "content": "Python is easy to learn"},
-    {"title": "Machine learning basics",   "content": "Deep learning with PyTorch"},
+    {"title": "Rust programming language", "content": "Rust is fast and safe",
+     "author": "Alice", "published_at": "2024-02-01", "category": "Systems"},
+    {"title": "Python tutorial",           "content": "Python is easy to learn",
+     "author": "Bob", "published_at": "2024-03-15", "category": "Languages"},
+    {"title": "Machine learning basics",   "content": "Deep learning with PyTorch",
+     "author": "Alice", "published_at": "2024-04-20", "category": "AI"},
 ])
 
 # 3. Query using MATCH() in WHERE
@@ -204,7 +210,7 @@ client.init_fts(index_fields=["title", "content"])
 client.init_fts(cache_size=200000)
 
 # Keep the term directory and postings mmap-backed across reopen
-client.init_fts(index_fields=["subject", "body"], lazy_load=True)
+client.init_fts(index_fields=["title", "content"], lazy_load=True)
 ```
 
 **Examples:**

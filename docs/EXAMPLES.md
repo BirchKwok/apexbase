@@ -272,8 +272,8 @@ ApexBase supports full SQL DDL (Data Definition Language) operations:
 ```python
 client = ApexClient("./data")
 
-# Create a new table (becomes the active table)
-client.execute("CREATE TABLE employees")
+# Create a new table with an explicit schema (becomes the active table)
+client.execute("CREATE TABLE employees (name STRING, age INT, department STRING)")
 
 # Create table only if it doesn't exist
 client.execute("CREATE TABLE IF NOT EXISTS departments")
@@ -399,12 +399,12 @@ client = ApexClient("./data")
 
 # Setup entire schema in one call
 client.execute("""
-    CREATE TABLE IF NOT EXISTS products;
-    ALTER TABLE products ADD COLUMN name STRING;
-    ALTER TABLE products ADD COLUMN price FLOAT;
-    ALTER TABLE products ADD COLUMN category STRING;
+    CREATE TABLE IF NOT EXISTS products (
+        name STRING, price FLOAT, category STRING
+    );
     INSERT INTO products (name, price, category) VALUES ('Laptop', 999.99, 'Electronics')
 """)
+client.use_table("products")
 
 # Insert multiple rows efficiently
 client.execute("""
@@ -744,6 +744,9 @@ client.close()
 ### FTS with Options
 
 ```python
+client.create_table("logs", {"message": "string", "source": "string"})
+client.store({"message": ["service started"], "source": ["api"]})
+
 # Large index: lazy loading + bigger cache
 client.execute("""
     CREATE FTS INDEX ON logs (message, source)
@@ -798,7 +801,7 @@ client.close()
 
 ```python
 client = ApexClient("./data")
-client.use_table("docs")
+client.use_table("articles")
 
 # Initialize with lazy loading
 client.init_fts(
@@ -1166,8 +1169,8 @@ client.store({
 # Single record
 client.store({"label": "query_item", "vec": np.array([0.1] * D, dtype=np.float32)})
 
-# Python list/tuple vectors also work
-client.store({"label": "list_item", "vec": [0.1, 0.2, 0.3]})
+# Python list/tuple vectors also work — keep the column dimension consistent
+client.store({"label": "list_item", "vec": [0.1] * D})
 ```
 
 ### Quantized candidate retrieval with exact reranking
@@ -1177,6 +1180,7 @@ accelerator generates a wider candidate set; ApexBase then recomputes distances
 from `vec` and returns the exact order within that set.
 
 ```python
+query = np.random.rand(D).astype(np.float32)
 client.create_quantized_column(
     source="vec",
     target="vec_tq4",
@@ -1297,10 +1301,18 @@ Rows padded with `(-1, inf)` when fewer than k neighbours exist.
 Vector search is also available as a SQL expression. The Python `topk_distance()` method builds this SQL internally; you can write it directly for more complex compositions.
 
 ```python
+# A small 3-dim table keeps the SQL literals readable; the SQL form is the
+# same for any dimension.
+client.create_table("small_items", {"label": "string", "vec": "float32_vector"})
+client.store({
+    "label": ["a", "b", "c"],
+    "vec": [[0.1, 0.2, 0.3], [0.4, 0.5, 0.6], [0.7, 0.8, 0.9]],
+})
+
 # Basic SQL vector search
 results = client.execute("""
     SELECT explode_rename(topk_distance(vec, [0.1, 0.2, 0.3], 10, 'l2'), '_id', 'dist')
-    FROM items
+    FROM small_items
 """)
 df = results.to_pandas()
 # 10 rows: _id (int64), dist (float64), sorted nearest first
@@ -1311,13 +1323,13 @@ results = client.execute("""
         topk_distance(vec, [1.0, 0.0, 0.0], 5, 'cosine'),
         'item_id', 'cosine_dist'
     )
-    FROM items
+    FROM small_items
 """)
 
 # Dot product search
 results = client.execute("""
     SELECT explode_rename(topk_distance(vec, [0.5, 0.5, 0.5], 20, 'dot'), '_id', 'score')
-    FROM embeddings
+    FROM small_items
 """)
 ```
 
@@ -1361,8 +1373,8 @@ top = client.topk_distance('vec', query_vec, k=3, metric='cosine')
 # Retrieve full records
 top_ids  = top.get_ids()
 results  = client.retrieve_many(top_ids.tolist())
-for row in results:
-    print(row['title'], row['_id'])
+for row, row_id in zip(results, top_ids.tolist()):
+    print(row['title'], row_id)
 
 # Batch: multiple query vectors at once
 queries = np.random.rand(10, DIM).astype(np.float32)

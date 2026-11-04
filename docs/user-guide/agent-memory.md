@@ -250,7 +250,13 @@ arguments, so inline the vector literal as shown.
 if len(mem.db.search_text("rollback")) == 0:
     rows = []
 else:
-    rows = mem.db.execute(...).to_dict()   # the hybrid SQL above
+    rows = mem.db.execute(f"""
+        SELECT content, source,
+               cosine_distance(embedding, {vector_literal}) AS distance
+        FROM memories
+        WHERE MATCH('rollback') AND source = 'runbook'
+        ORDER BY distance LIMIT 5
+    """).to_dict()
 ```
 
 ## Choose A Retrieval Mode

@@ -65,8 +65,8 @@ comma-separated list for `IN (?)`.
 ```python
 client.execute("SELECT * FROM users WHERE age > ?", params=[30])   # positional
 client.execute(
-    "INSERT INTO events (kind, ts) VALUES (:kind, :ts)",
-    params={"kind": "click", "ts": "2026-08-07 12:00:00"},
+    "INSERT INTO events (event, ts) VALUES (:event, :ts)",
+    params={"event": "click", "ts": "2026-08-07 12:00:00"},
 )                                                                   # named
 client.execute("SELECT * FROM users WHERE city IN (?)",
                params=[["Beijing", "Shanghai"]])                    # IN-list

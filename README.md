@@ -160,8 +160,8 @@ database should be a file, not a fleet.
 
 Public baseline: **1,000,000 rows**, **1,000,000 Float32 vectors × 128 dims**,
 2 warmups, 5 timed iterations, result cache disabled, median of three retained
-same-machine runs (Apple arm64, Python 3.12). ApexBase won **105/105** tabular
-and **6/6** exact-vector comparison rows in this baseline.
+same-machine runs (Apple arm64, Python 3.12). ApexBase won all **105 tabular metrics**
+and all **6 exact-vector rows** in this baseline.
 
 | Workload (median) | ApexBase | SQLite | DuckDB | vs best competitor |
 | --- | ---: | ---: | ---: | ---: |
@@ -286,11 +286,16 @@ from apexbase import ApexClient
 
 # Arrow-native conversion to and from Lance.
 with ApexClient("./data") as client:
-    client.use_table("articles")
+    client.create_table("articles", schema={"title": "string", "body": "string"})
+    client.store({
+        "title": ["Agent memory", "Local analytics"],
+        "body": ["Retrieval over long-term memory.", "SQL over local files."],
+    })
     client.to_lance("./articles.lance")
 
 with ApexClient("./imported") as client:
     client.from_lance("./articles.lance", table_name="articles")
+    print(client.execute("SELECT * FROM articles").to_dict())
 ```
 
 Parquet, CSV, JSON, Pandas, Polars, PyArrow, PostgreSQL clients, and Arrow

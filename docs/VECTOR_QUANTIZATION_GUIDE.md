@@ -17,6 +17,16 @@ For retrieval systems that need exact reranking, keep the Float32 vector as the
 authoritative column and add a separate stored accelerator:
 
 ```python
+import numpy as np
+from apexbase import ApexClient
+
+client = ApexClient("./items")
+rows = [
+    {"title": f"item {i}", "embedding": np.random.rand(128).astype(np.float32)}
+    for i in range(100)
+]
+query = np.random.rand(128).astype(np.float32)
+
 client.create_table("items", {
     "title": "string",
     "embedding": "float32_vector",

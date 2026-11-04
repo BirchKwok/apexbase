@@ -127,9 +127,11 @@ stream it:
 
 ```python
 with ApexClient("./events") as client:
+    client.execute("CREATE TABLE IF NOT EXISTS events (id INT, payload TEXT)")
+    client.store({"id": list(range(5)), "payload": [f"payload-{i}" for i in range(5)]})
     client.use_table("events")
     for batch in client.execute_stream("SELECT id, payload FROM events"):
-        consume(batch)  # pyarrow.RecordBatch, one row group at a time
+        print(batch.num_rows, "rows in this batch")  # pyarrow.RecordBatch
 ```
 
 Plain projections stream one row-group batch at a time. Shapes that must be
