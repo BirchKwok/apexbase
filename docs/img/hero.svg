@@ -1,4 +1,4 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 360" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 220" role="img" aria-labelledby="title desc">
   <title id="title">ApexBase 2.0.0 — the embedded database for the agent era</title>
   <desc id="desc">ApexBase wordmark with SQL, full-text search, vector retrieval and agent memory, plus v2.0.0 benchmark highlights.</desc>
   <defs>
@@ -12,47 +12,37 @@
       <stop offset="1" stop-color="#7fe3d4"/>
     </linearGradient>
     <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
-      <stop offset="0" stop-color="#26a69a" stop-opacity="0.35"/>
+      <stop offset="0" stop-color="#26a69a" stop-opacity="0.30"/>
       <stop offset="1" stop-color="#26a69a" stop-opacity="0"/>
     </radialGradient>
     <pattern id="dots" width="26" height="26" patternUnits="userSpaceOnUse">
       <circle cx="1.5" cy="1.5" r="1.2" fill="#7fe3d4" opacity="0.10"/>
     </pattern>
     <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
-      <feGaussianBlur stdDeviation="26"/>
+      <feGaussianBlur stdDeviation="20"/>
     </filter>
   </defs>
 
-  <rect width="1200" height="360" rx="28" fill="url(#bg)"/>
-  <rect width="1200" height="360" rx="28" fill="url(#dots)"/>
-  <circle cx="1040" cy="40" r="170" fill="url(#glow)" filter="url(#soft)"/>
-  <rect x="1" y="1" width="1198" height="358" rx="27" fill="none" stroke="#26a69a" stroke-opacity="0.28"/>
+  <rect width="1200" height="220" rx="22" fill="url(#bg)"/>
+  <rect width="1200" height="220" rx="22" fill="url(#dots)"/>
+  <circle cx="1080" cy="10" r="120" fill="url(#glow)" filter="url(#soft)"/>
+  <rect x="1" y="1" width="1198" height="218" rx="21" fill="none" stroke="#26a69a" stroke-opacity="0.26"/>
 
-  <g transform="translate(72,72) scale(1.5)" aria-hidden="true">
-    <rect width="64" height="64" rx="14" fill="#00897b"/>
-    <path d="M18 24c0-5.52 6.27-10 14-10s14 4.48 14 10v16c0 5.52-6.27 10-14 10s-14-4.48-14-10V24z" fill="#ffffff" opacity=".95"/>
-    <path d="M46 24c0 5.52-6.27 10-14 10s-14-4.48-14-10 6.27-10 14-10 14 4.48 14 10z" fill="#26a69a"/>
-    <path d="M23 25.5 32 18l9 7.5-3.2 2.6L32 23.3l-5.8 4.8L23 25.5z" fill="#ffffff"/>
-    <path d="M23 39.5c2.4 2.15 5.54 3.2 9 3.2s6.6-1.05 9-3.2" fill="none" stroke="#00897b" stroke-width="3" stroke-linecap="round"/>
+  <text x="64" y="86" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="62" font-weight="900" letter-spacing="-1.5" fill="#f4fbfa">ApexBase</text>
+  <text x="66" y="122" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="20" font-weight="500" fill="#b9d7d3">The embedded database for the agent era</text>
+  <text x="66" y="154" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="15" font-weight="600" letter-spacing="0.3" fill="#58c9bb">SQL  ·  Full-text search  ·  Vector retrieval  ·  Agent memory</text>
+  <rect x="66" y="172" width="430" height="3" rx="1.5" fill="url(#accent)" opacity="0.85"/>
+
+  <g transform="translate(760,38)">
+    <rect width="376" height="144" rx="14" fill="#ffffff" fill-opacity="0.045" stroke="#7fe3d4" stroke-opacity="0.26"/>
+    <text x="24" y="28" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="12" font-weight="700" letter-spacing="1.8" fill="#7fe3d4">V2.0.0 · V5 GA</text>
+
+    <text x="24" y="68" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="30" font-weight="900" fill="#ffffff">105/105</text>
+    <text x="24" y="88" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#9fb8b5">tabular rows won</text>
+
+    <text x="170" y="68" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="30" font-weight="900" fill="#ffffff">6/6</text>
+    <text x="170" y="88" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="11" fill="#9fb8b5">exact-vector rows won</text>
+
+    <text x="24" y="120" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="13" font-weight="600" fill="#dff5f1">One local file. No server.</text>
   </g>
-
-  <text x="198" y="154" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="86" font-weight="900" letter-spacing="-2" fill="#f4fbfa">ApexBase</text>
-  <text x="200" y="204" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="27" font-weight="500" fill="#b9d7d3">The embedded database for the agent era</text>
-  <text x="200" y="250" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="21" font-weight="600" letter-spacing="0.4" fill="#58c9bb">SQL  ·  Full-text search  ·  Vector retrieval  ·  Agent memory</text>
-  <rect x="200" y="274" width="500" height="3" rx="1.5" fill="url(#accent)" opacity="0.85"/>
-
-  <g transform="translate(780,68)">
-    <rect width="348" height="226" rx="18" fill="#ffffff" fill-opacity="0.045" stroke="#7fe3d4" stroke-opacity="0.28"/>
-    <text x="30" y="38" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="15" font-weight="700" letter-spacing="2.2" fill="#7fe3d4">V2.0.0 · V5 GA</text>
-
-    <text x="30" y="84" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="38" font-weight="900" fill="#ffffff">105/105</text>
-    <text x="30" y="106" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="14" fill="#9fb8b5">tabular benchmark rows won</text>
-
-    <text x="30" y="145" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="38" font-weight="900" fill="#ffffff">6/6</text>
-    <text x="30" y="167" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="14" fill="#9fb8b5">exact-vector rows won</text>
-
-    <text x="30" y="202" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" fill="#dff5f1">One local file. No server.</text>
-  </g>
-
-  <text x="72" y="330" font-family="Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif" font-size="16" font-weight="600" letter-spacing="0.6" fill="#6f938f">FORMAT 5 IS STABLE  ·  MEMORY-BOUNDED EXECUTION  ·  SPILL + STREAMING  ·  HYBRID RETRIEVAL</text>
 </svg>
