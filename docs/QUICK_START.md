@@ -1,64 +1,184 @@
-# Quick Start Guide
+# Quickstart
 
-Get started with ApexBase in 5 minutes.
+Go from `pip install` to a working local database in about five minutes. You
+will build a persistent agent-memory store with hybrid retrieval, run
+analytical SQL over a DataFrame, and learn the knobs that keep an embedded
+database healthy in production.
 
-## Installation
+ApexBase is an embedded engine: there is no server to start and no connection
+string to manage. A database is a directory or a single `:memory:` client.
+
+## 1. Install
 
 ```bash
 pip install apexbase
 ```
 
-Or from source:
+Verify the native extension loads:
+
 ```bash
-git clone https://github.com/BirchKwok/ApexBase.git
-pip install maturin
-maturin develop --release
+python - <<'PY'
+import apexbase
+from apexbase import ApexClient
+print("apexbase", apexbase.__version__)
+with ApexClient(":memory:") as db:
+    db.execute("CREATE TABLE smoke (ok BOOL)")
+    db.execute("INSERT INTO smoke VALUES (true)")
+    print(db.execute("SELECT COUNT(*) FROM smoke").scalar())
+PY
 ```
 
-## Basic Example
+Building from source needs a Rust toolchain and `maturin`; see
+[Installation](installation.md) for platform requirements and the release-build
+workflow. Upgrading from v1? Read the
+[2.0 migration notes](whats-new-2.0.md) first.
+
+## 2. Give your agent a memory
+
+Agent memory has three jobs: write a memory, recall the relevant ones, and stay
+inside a bounded memory and latency budget. ApexBase does all three in one
+engine: BM25 recall, vector ranking, SQL metadata, and persistence.
 
 ```python
+from datetime import datetime, timezone
+
 from apexbase import ApexClient
 
-# 1. Create client
-client = ApexClient("./my_data")
 
-# 2. Create a table (required before any data operations)
-client.create_table("users")
+class AgentMemory:
+    def __init__(self, path="./agent-memory"):
+        self.db = ApexClient(path)
+        if "memories" not in self.db.list_tables():
+            self.db.execute("""
+                CREATE TABLE memories (
+                    content TEXT,
+                    source TEXT,
+                    created_at TEXT,
+                    embedding FLOAT16_VECTOR
+                )
+            """)
+            self.db.execute("CREATE FTS INDEX ON memories(content)")
+        self.db.use_table("memories")
 
-# 3. Store data
-client.store({"name": "Alice", "age": 30, "city": "NYC"})
+    def remember(self, content, embedding, source="chat", created_at=None):
+        self.db.store([{
+            "content": content,
+            "source": source,
+            "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+            "embedding": embedding,
+        }])
 
-# 4. Query
-results = client.execute("SELECT * FROM users WHERE age > 25")
+    def recall(self, text, embedding, k=5, source=None):
+        # Native fusion: BM25 recall + cosine ranking over one table.
+        hits = self.db.hybrid_search(
+            embedding, text, k=k * 4,
+            vector_col="embedding", metric="cosine",
+        )
+        rows = self.db.retrieve_many([int(i) for i in hits.get_ids()]).to_dict()
+        if source is not None:
+            rows = [row for row in rows if row["source"] == source]
+        return rows[:k]
 
-# 5. Use results
-df = results.to_pandas()
+
+memory = AgentMemory()
+memory.remember("User prefers dark mode.", [0.10, 0.82, 0.20], source="profile")
+memory.remember("Deploys run Fridays at 17:00 UTC.", [0.30, 0.40, 0.85], source="ops")
+
+for row in memory.recall("deploy schedule", [0.28, 0.42, 0.84], k=2):
+    print("-", row["content"])
+```
+
+What each piece does:
+
+- `FLOAT16_VECTOR` stores embeddings at half precision; you can switch to
+  `FLOAT32_VECTOR` when exact fidelity matters more than size.
+- `CREATE FTS INDEX` gives BM25 recall over `content`.
+- `hybrid_search()` fuses the BM25 and vector branches with reciprocal rank
+  fusion. Use `fusion="weighted"` and `alpha` when you need to tune the blend.
+- The table is a normal `.apex` file. Reopen the same path in the next process
+  and the memory is still there.
+- The API is model-agnostic: your embedding model produces the vector, and any
+  function-calling framework can wrap `recall()` as a tool.
+
+Expose recall to a model with a small JSON schema:
+
+```python
+RECALL_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "recall_memory",
+        "description": "Retrieve memories relevant to the current task.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "k": {"type": "integer", "default": 5},
+            },
+            "required": ["query"],
+        },
+    },
+}
+```
+
+Read the [Agent Memory & RAG guide](user-guide/agent-memory.md) for session
+scoping, forgetting, recency filters, and the SQL hybrid pattern.
+
+## 3. Analyze data with SQL and DataFrames
+
+Import a DataFrame, run analytical SQL, and take the result back as Pandas.
+The same code path works for Polars (`to_polars()`) and Arrow (`to_arrow()`).
+
+```python
+import pandas as pd
+
+from apexbase import ApexClient
+
+events = pd.DataFrame({
+    "event": ["signup", "click", "purchase", "click", "signup"],
+    "value": [0.0, 2.5, 29.9, 1.2, 0.0],
+    "day": ["2026-01-01", "2026-01-02", "2026-01-02", "2026-01-03", "2026-01-04"],
+})
+
+with ApexClient("./analytics") as db:
+    db.from_pandas(events, table_name="events")
+    df = db.execute("""
+        SELECT event, COUNT(*) AS n, ROUND(AVG(value), 2) AS avg_value
+        FROM events
+        WHERE day >= '2026-01-02'
+        GROUP BY event
+        ORDER BY n DESC
+    """).to_pandas()
+
 print(df)
-
-# 6. Close
-client.close()
 ```
 
-## In-Memory And Zero-Setup SQL
+For file-based analysis without an import step:
 
-Use `":memory:"` for a fully ephemeral database with the regular client API:
+```python
+db.execute("SELECT city, COUNT(*) FROM read_parquet('orders.parquet') GROUP BY city")
+db.execute("SELECT * FROM read_csv('events.csv') LIMIT 10")
+```
+
+See [Data Import](user-guide/data-import.md) for CSV, JSON, Parquet, Lance,
+Pandas, Polars, and PyArrow workflows.
+
+## 4. Use in-memory mode
+
+`ApexClient(":memory:")` is a true process-local database, not a temporary
+directory. It creates no database, catalog, WAL, delta, or index files, and its
+contents disappear when the client closes:
 
 ```python
 from apexbase import ApexClient
 
-with ApexClient(":memory:") as client:
-    client.execute("CREATE TABLE events (kind TEXT, duration_ms DOUBLE)")
-    client.execute(
-        "INSERT INTO events VALUES (?, ?)",
-        params=["query", 1.8],
-    )
-    print(client.execute("SELECT AVG(duration_ms) FROM events").scalar())
+with ApexClient(":memory:") as db:
+    db.execute("CREATE TABLE events (kind TEXT, duration_ms DOUBLE)")
+    db.execute("INSERT INTO events VALUES (?, ?)", params=["query", 1.8])
+    print(db.execute("SELECT AVG(duration_ms) FROM events").scalar())
 ```
 
-For a short SQL-only script, the module-level helper removes even the client
-setup. Calls share one lazily initialized in-memory connection in the current
-process:
+For short SQL-only scripts, the module-level helper shares one lazily created
+in-memory connection in the current process:
 
 ```python
 import apexbase
@@ -68,316 +188,55 @@ apexbase.execute("INSERT INTO flags VALUES ('cache', true)")
 print(apexbase.execute("SELECT * FROM flags").to_dict())
 ```
 
-Use a filesystem path instead when data must survive process exit.
+Use a filesystem path when data must survive the process.
 
-## Working with Tables
+## 5. Tune durability and memory
 
-ApexBase requires explicit table creation before any data operations. Each table is stored as a separate `.apex` file.
+Choose durability when opening the client:
 
-```python
-client = ApexClient("./data")
-
-# Create tables (the last created table becomes the active table)
-client.create_table("users")
-client.store({"name": "Bob", "email": "bob@example.com"})
-
-# Create table with pre-defined schema (avoids type inference on first insert)
-client.create_table("orders", schema={
-    "user_id": "int64",
-    "amount": "float64",
-    "product": "string"
-})
-client.store({"user_id": 0, "amount": 100.0, "product": "Widget"})
-
-# Switch between tables
-client.use_table("users")
-
-# List tables
-print(client.list_tables())  # ['orders', 'users']
-
-# Reopen an existing database
-client2 = ApexClient("./data")
-client2.use_table("users")  # Select an existing table
-
-client.close()
-```
-
-## SQL DDL (Data Definition Language)
-
-ApexBase supports full SQL DDL operations:
+| Mode | Best for | Behavior |
+| --- | --- | --- |
+| `fast` (default) | Analytics, scratch data, rebuildable memory | Writes stay in the OS page cache; no fsync |
+| `safe` | Application data and agent memory | Fsync on explicit `flush()` / `close()` |
+| `max` | Highest crash safety | Fsync every write |
 
 ```python
-client = ApexClient("./data")
-
-# CREATE TABLE
-client.execute("CREATE TABLE employees")
-client.execute("CREATE TABLE IF NOT EXISTS departments")  # No error if exists
-
-# ALTER TABLE
-client.execute("ALTER TABLE employees ADD COLUMN name STRING")
-client.execute("ALTER TABLE employees ADD COLUMN age INT")
-
-# INSERT
-client.execute("INSERT INTO employees (name, age) VALUES ('Alice', 30)")
-client.execute("INSERT INTO employees (name, age) VALUES ('Bob', 25), ('Charlie', 35)")
-
-# Query
-results = client.execute("SELECT * FROM employees WHERE age > 25")
-
-# DROP TABLE
-client.execute("DROP TABLE employees")
-client.execute("DROP TABLE IF EXISTS departments")  # No error if not exists
-
-# Check tables
-print(client.list_tables())
-
-client.close()
+with ApexClient("./agent-memory", durability="safe") as db:
+    db.use_table("memories")
+    db.store({"content": "durable memory",
+              "source": "chat",
+              "created_at": "2026-11-04T10:00:00Z",
+              "embedding": [0.1, 0.2, 0.3]})
+    db.flush()
 ```
 
-### Multi-Statement SQL
+For long-running processes and multi-agent hosts, set the memory bounds once:
 
-Execute multiple SQL statements in a single call using semicolons:
+```bash
+export APEX_QUERY_MEMORY_MB=256      # per-query operator budget (default 1024)
+export APEX_PROCESS_BUDGET_MB=1024   # process admission ceiling (default: off)
+export APEX_SPILL_DIR=/var/tmp/apex-spill  # out-of-core ORDER BY/GROUP BY/JOIN
+```
+
+When a result may be large, stream Arrow batches instead of materializing it:
 
 ```python
-client = ApexClient("./data")
-
-# Execute multiple DDL statements at once
-client.execute("""
-    CREATE TABLE IF NOT EXISTS products;
-    ALTER TABLE products ADD COLUMN name STRING;
-    ALTER TABLE products ADD COLUMN price FLOAT;
-    INSERT INTO products (name, price) VALUES ('Laptop', 999.99)
-""")
-
-# Execute multiple INSERT statements
-client.execute("""
-    INSERT INTO products (name, price) VALUES ('Mouse', 29.99);
-    INSERT INTO products (name, price) VALUES ('Keyboard', 79.99);
-    INSERT INTO products (name, price) VALUES ('Monitor', 299.99)
-""")
-
-# Query results
-results = client.execute("SELECT * FROM products ORDER BY price DESC")
-print(results.to_pandas())
-
-client.close()
+with ApexClient("./agent-memory") as db:
+    db.use_table("memories")
+    for batch in db.execute_stream("SELECT content FROM memories"):
+        handle(batch)  # pyarrow.RecordBatch, one row group at a time
 ```
 
-**Supported DDL / DML Statements:**
+Multi-statement SQL is one transaction: statements run in order and a failure
+or `ROLLBACK` discards the batch. `BEGIN` / `COMMIT` / `ROLLBACK` also work as
+their own statements, and PostgreSQL Wire applies the same routing to
+multi-statement messages.
 
-- `CREATE TABLE [IF NOT EXISTS] table_name`
-- `ALTER TABLE ... ADD COLUMN column_name TYPE`
-- `INSERT INTO ... VALUES ...`
-- `DROP TABLE [IF EXISTS] table_name`
+## 6. Next steps
 
-**Multi-Statement SQL:**
-
-- Separate statements with semicolons (`;`)
-- Statements are executed sequentially
-- The result of the last statement is returned
-
-## Bulk Data Import
-
-```python
-import pandas as pd
-
-client = ApexClient("./data")
-
-# from_pandas with table_name auto-creates and selects the table
-df = pd.DataFrame({
-    "name": ["Alice", "Bob", "Charlie"],
-    "age": [25, 30, 35]
-})
-client.from_pandas(df, table_name="users")
-
-# From columnar dict (fastest, requires active table)
-client.store({
-    "product": ["A", "B", "C"],
-    "price": [10.5, 20.0, 15.0],
-    "quantity": [100, 200, 150]
-})
-
-client.close()
-```
-
-## SQL Queries
-
-```python
-client = ApexClient("./data")
-client.create_table("metrics")
-
-# Insert test data
-for i in range(100):
-    client.store({"id": i, "value": i * 10, "category": "even" if i % 2 == 0 else "odd"})
-
-# Basic query (use your table name in FROM clause)
-results = client.execute("SELECT * FROM metrics WHERE value > 500")
-
-# Aggregation
-scalar = client.execute("SELECT COUNT(*) FROM metrics").scalar()
-avg = client.execute("SELECT AVG(value) FROM metrics").scalar()
-
-# GROUP BY
-results = client.execute("""
-    SELECT category, COUNT(*), AVG(value)
-    FROM metrics
-    GROUP BY category
-""")
-
-# ORDER BY with LIMIT
-results = client.execute("""
-    SELECT * FROM metrics
-    ORDER BY value DESC
-    LIMIT 10
-""")
-
-client.close()
-```
-
-### Quoted Identifiers
-
-If a column name is a SQL reserved keyword (e.g. `order`, `group`), wrap it in backticks or double quotes:
-
-```python
-# Backtick style (Hive/MySQL)
-results = client.execute("SELECT `order`, `group` FROM t WHERE `order` > 10")
-
-# Double-quote style (SQL standard)
-results = client.execute('SELECT "order", "group" FROM t WHERE "order" > 10')
-```
-
-## Full-Text Search
-
-```python
-client = ApexClient("./data")
-client.create_table("docs")
-
-# Add documents
-client.store([
-    {"title": "Python Guide", "content": "Learn Python programming"},
-    {"title": "Rust Tutorial", "content": "Systems programming with Rust"},
-    {"title": "Database Design", "content": "Designing efficient databases"}
-])
-
-# Initialize FTS
-client.init_fts(index_fields=["title", "content"])
-
-# Search
-ids = client.search_text("Python")
-print(f"Found {len(ids)} documents")
-
-# Search and retrieve records
-results = client.search_and_retrieve("programming")
-for row in results:
-    print(row["title"])
-
-# Fuzzy search (handles typos)
-ids = client.fuzzy_search_text("progamming")  # Note the typo
-
-client.close()
-```
-
-## Column Operations
-
-```python
-client = ApexClient("./data")
-client.create_table("people")
-client.store({"name": "Alice", "age": 30})
-
-# Add column
-client.add_column("email", "String")
-
-# Rename column
-client.rename_column("email", "contact_email")
-
-# Get column type
-dtype = client.get_column_dtype("age")
-print(f"age is {dtype}")  # Int64
-
-# Drop column
-client.drop_column("contact_email")
-
-# List fields
-fields = client.list_fields()
-print(fields)  # ['_id', 'name', 'age']
-
-client.close()
-```
-
-## Context Manager (Recommended)
-
-```python
-# Automatic cleanup
-with ApexClient("./data") as client:
-    client.create_table("mydata")
-    client.store({"key": "value"})
-    results = client.execute("SELECT * FROM mydata")
-    df = results.to_pandas()
-    # Client automatically closed
-
-# With clean slate
-with ApexClient.create_clean("./fresh_data") as client:
-    client.create_table("mydata")
-    client.store({"fresh": "start"})
-```
-
-## Durability Options
-
-```python
-# Fast (default) - async writes, best performance
-client = ApexClient("./data", durability="fast")
-
-# Safe - sync writes, data safety
-client = ApexClient("./data", durability="safe")
-
-# Max - fsync every write, maximum durability
-client = ApexClient("./data", durability="max")
-```
-
-## ResultView Operations
-
-```python
-results = client.execute("SELECT * FROM users")
-
-# Different formats
-df = results.to_pandas()
-pl_df = results.to_polars()
-arrow = results.to_arrow()
-dicts = results.to_dict()
-
-# Properties
-print(results.shape)      # (rows, columns) of the materialized Arrow result
-print(results.columns)    # user columns; the internal _id column is hidden by default
-print(len(results))       # row count
-
-# Access
-first = results.first()
-ids = results.get_ids()   # numpy array
-
-# Iteration
-for row in results:
-    print(row)
-
-# Indexing
-row = results[0]
-```
-
-!!! note "The internal row id stays hidden"
-    Result rows carry an internal `_id` column that `results.columns`,
-    `results.shape`, and `to_pandas()` all hide by default, so `shape[1]`
-    always equals `len(results.columns)`. Pass `show_internal_id=True` to
-    `execute()` when you need the id:
-
-    ```python
-    results = client.execute("SELECT * FROM users", show_internal_id=True)
-    print(results.columns)  # ['_id', 'name', 'age']
-    ```
-
-    `results.get_ids()` returns the ids without changing the projection.
-
-## Next Steps
-
-- [API Reference](API_REFERENCE.md) - Complete API documentation
-- [Examples](EXAMPLES.md) - More usage examples
-- [Core Concepts](concepts.md) - Mental model for databases, tables, durability, and results
-- [Project README](https://github.com/BirchKwok/ApexBase#readme) - Repository overview
+- [Agent Memory & RAG](user-guide/agent-memory.md): the complete agent-memory workflow.
+- [Python Client](user-guide/python-client.md): lifecycle, streaming, transactions, typed projection.
+- [SQL Guide](user-guide/sql.md): joins, CTEs, windows, set operations, parameters.
+- [Core Concepts](concepts.md): databases, tables, durability, and result views.
+- [Performance](performance.md): reproduce the public benchmark on your machine.
+- [API Reference](API_REFERENCE.md): exact method signatures.

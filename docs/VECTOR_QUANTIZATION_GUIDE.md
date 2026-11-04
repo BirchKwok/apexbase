@@ -4,6 +4,15 @@ ApexBase supports vector columns stored as `FLOAT32_VECTOR`, `FLOAT16_VECTOR`,
 `BFLOAT16_VECTOR`, `INT8_VECTOR`, `UINT8_VECTOR`, `BIT1_VECTOR`, and
 `TURBOQUANT2_VECTOR` / `TURBOQUANT3_VECTOR` / `TURBOQUANT4_VECTOR`.
 
+For agent memory and RAG, retrieval cost has two independent axes: bytes
+scanned and rows compared. ApexBase gives you a dial for each inside the same
+engine — compress the stored vectors (this page) and prune the scan with an IVF
+index — then rerank the surviving candidates against the exact float32 source.
+Cost and recall stay explicit tuning parameters instead of a separate service to
+keep in sync. The same table can feed `hybrid_search()` when you also need BM25;
+see [Hybrid Search](API_REFERENCE.md#hybrid-search) and
+[Agent memory](user-guide/agent-memory.md).
+
 For retrieval systems that need exact reranking, keep the Float32 vector as the
 authoritative column and add a separate stored accelerator:
 
@@ -115,3 +124,39 @@ query-once integer score; exact source reranking is the appropriate path when
 the final ordering must match Float32. Likewise, very compact 1Bit and
 TurboQuant codecs trade candidate recall for storage and scan speed. Always
 measure recall and tune `candidate_k` on representative embeddings.
+
+## IVF candidate pruning
+
+For larger tables you can also prune the scan with a persisted IVF index. It
+stores k-means centroids plus per-list row positions in `<table>.apex.ivf`, and
+`nprobe` controls how many lists a query scans:
+
+```python
+# continuing the items table above (authoritative float32 `embedding` column)
+client.create_vector_index("embedding", nlist=64, iterations=10, metric="l2")
+
+info = client.vector_index_info()
+print(info["nlist"], info["rows"], info["stale"])   # 64 5000 False
+
+hits = client.topk_distance("embedding", query, k=20, nprobe=16)
+client.drop_vector_index()
+```
+
+- `create_vector_index()` requires the authoritative float32 vector column; it
+  rejects `FLOAT16_VECTOR` and quantized columns (`not a supported f32 vector
+  column`).
+- Query with the same `metric` you built with (`l2` or `cosine`).
+- After any write, `vector_index_info()["stale"]` is `True`. An `nprobe` query
+  then fails explicitly instead of silently degrading: `vector index is stale:
+  built over N rows but the table now has M; rebuild it with
+  create_vector_index`. Rebuild after bulk loads.
+- `nprobe` and `accelerator` are separate query paths in 2.0.0; a single call
+  rejects the combination (`nprobe does not support accelerator yet`). Use one
+  per call, or stage the two passes yourself.
+- Reference point: the 2.0.0 release harness records 10M-row IVF recall@10 =
+  0.97 at ~11 ms median with `nprobe=16`. Measure on your own embeddings and
+  tune `nlist`/`nprobe`.
+
+Combined, the two dials bound both sides of retrieval cost: IVF reduces the rows
+compared, and a quantized accelerator reduces the bytes read for the surviving
+candidates before exact float32 reranking.

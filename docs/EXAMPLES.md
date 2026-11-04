@@ -4,20 +4,162 @@ Comprehensive examples covering the core ApexBase Python API end to end.
 
 ## Table of Contents
 
-1. [Basic Operations](#basic-operations)
-2. [Table Management](#table-management)
-3. [SQL DDL Operations](#sql-ddl-operations)
-4. [Data Import](#data-import)
-5. [Querying Data](#querying-data)
-6. [File Reading Table Functions](#file-reading-table-functions)
-7. [Temporary Tables from Files](#temporary-tables-from-files)
-8. [Set Operations](#set-operations)
-9. [Vector Search](#vector-search)
-10. [Column Operations](#column-operations)
-11. [Full-Text Search](#full-text-search)
-12. [Data Modification](#data-modification)
-13. [Utility Methods](#utility-methods)
-14. [Advanced Usage](#advanced-usage)
+1. [Agent & RAG workflows](#agent-rag-workflows)
+2. [Basic Operations](#basic-operations)
+3. [Table Management](#table-management)
+4. [SQL DDL Operations](#sql-ddl-operations)
+5. [Data Import](#data-import)
+6. [Querying Data](#querying-data)
+7. [File Reading Table Functions](#file-reading-table-functions)
+8. [Temporary Tables from Files](#temporary-tables-from-files)
+9. [Set Operations](#set-operations)
+10. [Vector Search](#vector-search)
+11. [Column Operations](#column-operations)
+12. [Full-Text Search](#full-text-search)
+13. [Data Modification](#data-modification)
+14. [Utility Methods](#utility-methods)
+15. [Advanced Usage](#advanced-usage)
+
+---
+
+## Agent & RAG workflows
+
+ApexBase keeps retrieval and transactional state in one embedded engine, so an
+agent can write memory, recall it with hybrid search, stream large reads, and
+roll back failed steps without an external search or vector service. The
+examples below each run against a fresh directory.
+
+> See [Hybrid Search](API_REFERENCE.md#hybrid-search), [FTS Guide](FTS_GUIDE.md),
+> [Float16 Vectors](FLOAT16_VECTOR_GUIDE.md) and
+> [Agent memory](user-guide/agent-memory.md) for the underlying features.
+
+### Hybrid retrieval over one table
+
+`hybrid_search()` fuses a BM25 branch (FTS) with a vector branch
+(`topk_distance`) on `_id`. It requires a filesystem database — the vector branch
+uses the direct mmap scan — and an FTS index. Keep such a table append-only or
+edit rows with `replace()` / `DELETE`: a SQL `UPDATE` makes the raw vector scan
+reject the column.
+
+```python
+import numpy as np
+from apexbase import ApexClient
+
+# hybrid_search uses the direct mmap vector scan, so use a filesystem directory
+# (:memory: handles pure SQL/FTS but does not serve the hybrid vector branch).
+client = ApexClient("./rag_db")
+client.execute("CREATE TABLE docs (title TEXT, body TEXT, vec FLOAT16_VECTOR)")
+client.execute("CREATE FTS INDEX ON docs (title, body)")
+
+rng = np.random.default_rng(0)
+docs = ["agent memory", "vector database", "sql joins", "streaming results"]
+vecs = rng.random((len(docs), 64)).astype(np.float32)
+client.store({
+    "title": docs,
+    "body": [f"notes about {d}" for d in docs],
+    "vec": [vecs[i] for i in range(len(docs))],
+})
+
+hits = client.hybrid_search(
+    rng.random(64).astype(np.float32),  # query embedding
+    "agent memory",                     # BM25 query
+    k=3,
+    vector_col="vec",
+    fusion="rrf",                       # or "weighted" (tune alpha)
+)
+print(hits.to_pandas())                 # _id, score
+client.close()
+```
+
+### Stream a large SELECT
+
+`execute_stream()` yields `pyarrow.RecordBatch` objects one row group at a time,
+so a large read never materializes fully. Shapes outside the streaming gate
+(`ORDER BY`, `GROUP BY`, `JOIN`) are bounded by the spill operators and delivered
+as one batch.
+
+```python
+from apexbase import ApexClient
+
+client = ApexClient("./stream_db")
+client.execute("CREATE TABLE events (id INT, payload TEXT)")
+client.store({"id": list(range(200_000)),
+              "payload": [f"payload-{i}" for i in range(200_000)]})
+
+# Only one row-group batch is resident at a time.
+rows = 0
+for batch in client.execute_stream("SELECT id, payload FROM events WHERE id >= 10"):
+    rows += batch.num_rows
+print(rows)   # 199990
+client.close()
+```
+
+### Transaction batches with read-after-write
+
+A statement batch is one transaction, and `execute_batch()` returns one
+`ResultView` per statement with read-after-write visibility inside the
+transaction. `ROLLBACK` discards the batch, `COMMIT` keeps it.
+
+```python
+from apexbase import ApexClient
+
+client = ApexClient("./txn_db")
+client.execute("CREATE TABLE accounts (id INT, balance INT)")
+client.execute("INSERT INTO accounts VALUES (1, 100), (2, 50)")
+
+# One call = one transaction; read-after-write is visible inside it.
+views = client.execute_batch([
+    "BEGIN",
+    "INSERT INTO accounts VALUES (3, 75)",
+    "SELECT * FROM accounts WHERE id = 3",   # sees the uncommitted row
+    "ROLLBACK",
+])
+print(views[2].to_pandas())                  # id=3 visible inside the transaction
+print(len(client.execute("SELECT * FROM accounts WHERE id = 3")))  # 0 after rollback
+
+# Commit instead to keep the change.
+views = client.execute_batch([
+    "BEGIN",
+    "INSERT INTO accounts VALUES (4, 25)",
+    "SELECT * FROM accounts WHERE id = 4",
+    "COMMIT",
+])
+print(len(client.execute("SELECT * FROM accounts WHERE id = 4")))  # 1
+client.close()
+```
+
+### Memory budgets and spill
+
+Bound execution instead of guessing: `APEX_QUERY_MEMORY_MB` caps per-query
+operator state, `APEX_PROCESS_BUDGET_MB` adds process admission, and
+`ORDER BY` / `GROUP BY` / `DISTINCT` / `JOIN` spill to `APEX_SPILL_DIR` when the
+budget is exceeded (results are unchanged). Statements that do not fit wait in a
+bounded queue or are rejected explicitly (`[APEX_ADMISSION_QUEUE_FULL]` /
+`[APEX_ADMISSION_TIMEOUT]`), never silently dropped.
+
+```python
+import os
+
+# Read by the executor per query; set them before you start working.
+os.environ["APEX_QUERY_MEMORY_MB"] = "256"      # per-query operator budget (MiB, 0 = unlimited)
+os.environ["APEX_PROCESS_BUDGET_MB"] = "1024"   # optional process admission budget (MiB)
+os.environ["APEX_SPILL_DIR"] = os.path.abspath("./apex_spill")  # ORDER BY / GROUP BY / DISTINCT / JOIN spill root
+
+from apexbase import ApexClient
+
+client = ApexClient("./budget_db")
+client.execute("CREATE TABLE big (grp TEXT, val DOUBLE)")
+client.store({"grp": [f"g{i}" for i in range(200_000)],
+              "val": [0.5] * 200_000})
+
+# Same result, but operator state is bounded; a query that exceeds the budget
+# spills to APEX_SPILL_DIR instead of failing.
+result = client.execute(
+    "SELECT grp, COUNT(*) AS n FROM big GROUP BY grp ORDER BY grp LIMIT 5"
+)
+print(result.to_pandas())
+client.close()
+```
 
 ---
 
@@ -242,6 +384,11 @@ client.close()
 | `INT` | `INTEGER`, `INT32`, `INT64` | Integer numbers |
 | `FLOAT` | `DOUBLE`, `FLOAT64` | Floating-point numbers |
 | `BOOL` | `BOOLEAN` | True/false values |
+
+V5 adds the logical types `uuid`, `decimal(p,s)`, `timestamp` / `timestamptz` /
+`date` / `time` / `interval`, `list<element>` and `extension<codec>`, plus the
+vector and quantized vector types. See the full list in the
+[Python API reference](API_REFERENCE.md#create_table).
 
 ### Multi-Statement SQL
 
@@ -804,7 +951,7 @@ import numpy as np
 n = 1_000_000
 
 data = {
-    "id": range(n),
+    "id": list(range(n)),
     "value": np.random.randn(n),
     "category": np.random.choice(["A", "B", "C"], n)
 }
@@ -1289,6 +1436,10 @@ client.drop_temp_table("sales")
 
 ```python
 client.execute("CREATE TEMP TABLE invoices AS SELECT * FROM read_csv('/data/invoices.csv')")
+
+# Select the new table before querying it unqualified.
+client.use_table("invoices")
+print(client.execute("SELECT COUNT(*) FROM invoices").scalar())
 ```
 
 ### Performance comparison
@@ -1433,9 +1584,11 @@ result = client.execute("""
 
 **Batched And Buffered Writes:** `execute_batch`, `execute_batch_parallel`, `begin_buffered_writes`, `end_buffered_writes`, `flush_buffered_writes`, `buffered_write_count`
 
-**Query:** `execute`, `query`, `retrieve`, `retrieve_many`, `retrieve_all`, `count_rows`
+**Query:** `execute`, `execute_stream`, `query`, `retrieve`, `retrieve_many`, `retrieve_all`, `count_rows`
 
-**Vector Search:** `topk_distance(col, query, k=10, metric='l2', id_col='_id', dist_col='dist')`, `batch_topk_distance(col, queries, k=10, metric='l2')`, `create_quantized_column(source, target=None, codec='turboquant4')`, `drop_quantized_column(target)`
+**Vector Search:** `topk_distance(col, query, k=10, metric='l2', id_col='_id', dist_col='dist', accelerator=None, candidate_k=None, rescore=True, nprobe=None)`, `batch_topk_distance(col, queries, k=10, metric='l2')`, `create_quantized_column(source, target=None, codec='turboquant4')`, `drop_quantized_column(target)`, `create_vector_index(col, nlist=64, iterations=10, metric='l2')`, `vector_index_info()`, `drop_vector_index()`
+
+**Hybrid Retrieval:** `hybrid_search(vector_query, text_query, k=10, vector_col='vec', metric='l2', fusion='rrf', alpha=0.5, candidate_k=None, rrf_k=60)`
 
 **Modification:** `replace`, `batch_replace`, `delete`
 

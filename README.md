@@ -1,28 +1,254 @@
+<div align="center">
+
+<img src="docs/img/hero.svg" alt="ApexBase 2.0.0 — the embedded database for the agent era" width="100%">
+
 <p>
-  <img align="left" src="docs/img/apexbase-wordmark.svg" width="360" alt="ApexBase">
-  <br>
-  <br>
-  <br>
+  <a href="https://pypi.org/project/apexbase/"><img alt="PyPI" src="https://img.shields.io/pypi/v/apexbase?logo=pypi&logoColor=white&label=PyPI"></a>
+  <a href="https://pypi.org/project/apexbase/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/apexbase"></a>
+  <a href="https://pypi.org/project/apexbase/"><img alt="Downloads" src="https://img.shields.io/pypi/dm/apexbase?label=downloads%2Fmonth"></a>
+  <a href="https://github.com/BirchKwok/ApexBase/releases/tag/v2.0.0"><img alt="Release" src="https://img.shields.io/github/v/release/BirchKwok/ApexBase?label=release"></a>
+  <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
+  <a href="https://birchkwok.github.io/apexbase/"><img alt="Docs" src="https://img.shields.io/badge/docs-birchkwok.github.io-00897b"></a>
 </p>
-<br clear="left">
 
-[![PyPI](https://img.shields.io/pypi/v/apexbase.svg)](https://pypi.org/project/apexbase/)
-[![Python](https://img.shields.io/pypi/pyversions/apexbase.svg)](https://pypi.org/project/apexbase/)
-[![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
+**One Rust engine, one local file: analytical SQL, full-text search, vector retrieval, and agent memory.**
+No database server. No separate search or vector service. Python, PostgreSQL Wire, and Arrow Flight interfaces.
 
-**ApexBase is a high-performance embedded HTAP database with a Rust core and a Python-first API.**
+[Quickstart](https://birchkwok.github.io/apexbase/latest/QUICK_START/) ·
+[Agent memory](https://birchkwok.github.io/apexbase/latest/user-guide/agent-memory/) ·
+[What's new in 2.0](https://birchkwok.github.io/apexbase/latest/whats-new-2.0/) ·
+[Docs](https://birchkwok.github.io/apexbase/) ·
+[Performance](https://birchkwok.github.io/apexbase/latest/performance/)
 
-**Install it, choose persistent `.apex` files or a true process-local in-memory database, run analytical SQL, import/export DataFrames, and optionally expose persistent data through PostgreSQL Wire or Arrow Flight. No separate database service is required.**
+</div>
+
+> **v2.0.0 is the V5 GA release.** On-disk format 5 is now stable for this
+> release line, and V5 builds read V4 files. This release completes the logical
+> type system, closes the remaining SQL semantics gaps, bounds execution memory
+> through admission control, spill, and streaming, and reconciles full-text
+> indexes on open so stale indexes fail loudly instead of answering with partial
+> results. Read the [2.0 release notes](https://birchkwok.github.io/apexbase/latest/whats-new-2.0/).
 
 ## Why ApexBase
 
-| What you need | What ApexBase gives you |
+| You are building | ApexBase gives you |
 | --- | --- |
-| **Fast local analytics** | Columnar storage, shared scan/selection operators, vectorized execution, SQL aggregations, joins, CTEs, windows, and indexes |
-| **Low-friction Python workflows** | `ApexClient`, `apexbase.execute`, Pandas / Polars / PyArrow conversion, file table functions, and local or in-memory storage |
-| **One engine for mixed workloads** | HTAP design: fast writes, point lookups, analytical scans, transactions, and MVCC |
-| **Search built in** | Full-text search, vector TopK, Float16/BFloat16/Int8/UInt8/1Bit/TurboQuant storage, and exact reranking from a retained source vector |
-| **Tool compatibility** | PostgreSQL Wire for database clients and Arrow Flight for fast columnar transfer |
+| **An AI agent or RAG pipeline** | Persistent agent memory with BM25 + vector fusion, SQL metadata filters, and a single `.apex` file you can copy or back up |
+| **Local analytics** | Columnar scans, joins, CTEs, windows, set operations, aggregations, and DataFrame round-trips without a warehouse |
+| **An HTAP application** | Fast ingest, point reads, analytical SQL, MVCC transactions, and durable writes in one embedded engine |
+| **A tool that needs a database** | PostgreSQL Wire for psql/DBeaver/BI clients and Arrow Flight for columnar transports, both from the same files |
+| **A long-running service** | Per-query memory budgets, process admission control, out-of-core spill, and `execute_stream()` for bounded results |
+| **A Rust or Python codebase** | A Rust core with a Python-first API, PyArrow-native results, and a Rust embedded API when you need it |
+
+## Quickstart: give your agent a memory
+
+Install once:
+
+```bash
+pip install apexbase
+```
+
+Then keep agent memories, retrieve them with hybrid search, and query them with
+SQL. Everything lives in one local directory:
+
+```python
+from apexbase import ApexClient
+
+with ApexClient("./agent-memory") as db:
+    if "memories" not in db.list_tables():
+        db.execute("""
+            CREATE TABLE memories (
+                content TEXT,
+                source TEXT,
+                created_at TEXT,
+                embedding FLOAT16_VECTOR
+            )
+        """)
+        db.execute("CREATE FTS INDEX ON memories(content)")
+    db.use_table("memories")
+
+    db.store([
+        {"content": "User prefers dark mode and concise answers.",
+         "source": "profile", "created_at": "2026-11-04T09:00:00Z",
+         "embedding": [0.10, 0.82, 0.20]},
+        {"content": "Deploys run Fridays at 17:00 UTC.",
+         "source": "ops", "created_at": "2026-11-04T09:10:00Z",
+         "embedding": [0.30, 0.40, 0.85]},
+        {"content": "Retrieval should combine BM25 with embedding similarity.",
+         "source": "notes", "created_at": "2026-11-04T09:20:00Z",
+         "embedding": [0.16, 0.74, 0.58]},
+    ])
+
+    # BM25 recall + cosine ranking fused in one native call.
+    hits = db.hybrid_search(
+        [0.28, 0.42, 0.84], "deploy schedule",
+        k=3, vector_col="embedding", metric="cosine",
+    )
+    for row in db.retrieve_many([int(i) for i in hits.get_ids()]).to_dict():
+        print("-", row["content"])
+```
+
+That is the agent-memory pattern: embeddings from your model, BM25 from the
+same engine, SQL for scope and recency, and no second database to operate. The
+[Agent Memory & RAG guide](https://birchkwok.github.io/apexbase/latest/user-guide/agent-memory/)
+adds tool-calling wrappers, forgetting, multi-session scoping, and memory limits.
+
+## Or: local analytics in a few lines
+
+```python
+import pandas as pd
+from apexbase import ApexClient
+
+events = pd.DataFrame({
+    "event": ["signup", "click", "purchase", "click", "signup"],
+    "value": [0.0, 2.5, 29.9, 1.2, 0.0],
+    "day": ["2026-01-01", "2026-01-02", "2026-01-02", "2026-01-03", "2026-01-04"],
+})
+
+with ApexClient(":memory:") as db:
+    db.from_pandas(events, table_name="events")
+    print(db.execute("""
+        SELECT event, COUNT(*) AS n, ROUND(AVG(value), 2) AS avg_value
+        FROM events
+        WHERE day >= '2026-01-02'
+        GROUP BY event
+        ORDER BY n DESC
+    """).to_pandas())
+```
+
+Results hand off directly to Pandas, Polars, or PyArrow. Use a filesystem path
+for persistence or `ApexClient(":memory:")` for a true process-local database
+that creates no files, including no WAL, catalog, or index files.
+
+<details>
+<summary><b>Or: zero-setup SQL for a script</b></summary>
+
+```python
+import apexbase
+
+apexbase.execute("CREATE TABLE metrics (name TEXT, value DOUBLE)")
+apexbase.execute("INSERT INTO metrics VALUES ('p95', 4.2), ('p99', 9.8)")
+print(apexbase.execute("SELECT AVG(value) AS avg FROM metrics").scalar())
+```
+
+Module-level calls share one lazily created in-memory connection in the current
+process. Use an explicit `ApexClient` when you need lifecycle control or
+persistence.
+
+</details>
+
+## Why not assemble three systems?
+
+The usual local AI stack is a database for metadata, a search engine for BM25, a
+vector store for embeddings, and glue code to keep them consistent. ApexBase
+puts all four in one engine and one file:
+
+| Layer | Typical stack | ApexBase |
+| --- | --- | --- |
+| **Structured data and SQL** | SQLite or DuckDB | One embedded HTAP engine |
+| **Full-text search** | FTS5, Meilisearch, Elasticsearch | Native BM25 + `MATCH()` in SQL |
+| **Embeddings** | FAISS, sqlite-vector, pgvector | Float32/Float16/BFloat16/Int8/UInt8/1Bit/TurboQuant columns |
+| **Fusion and filters** | Application glue + re-query | `hybrid_search()` or one SQL statement |
+| **Serving** | Separate search/vector services | No server; optional PG Wire and Arrow Flight |
+| **Consistency** | Multiple copies to keep in sync | One MVCC engine, one file generation |
+
+ApexBase is an embedded engine, not a distributed search cluster. That is the
+point: for an agent, a notebook, a desktop app, or a single-node service, the
+database should be a file, not a fleet.
+
+## Performance snapshot
+
+Public baseline: **1,000,000 rows**, **1,000,000 Float32 vectors × 128 dims**,
+2 warmups, 5 timed iterations, result cache disabled, median of three retained
+same-machine runs (Apple arm64, Python 3.12). ApexBase won **105/105** tabular
+and **6/6** exact-vector comparison rows in this baseline.
+
+| Workload (median) | ApexBase | SQLite | DuckDB | vs best competitor |
+| --- | ---: | ---: | ---: | ---: |
+| `COUNT(*)` | 0.08 ms | 8.45 ms | 0.55 ms | 6.9× faster |
+| Filter `name = 'user_5000'` | 0.19 ms | 46.64 ms | 1.64 ms | 8.5× faster |
+| `GROUP BY` + `HAVING` | 0.68 ms | 362.4 ms | 3.81 ms | 5.6× faster |
+| `ORDER BY ... LIMIT 100` | 1.99 ms | 55.58 ms | 5.68 ms | 2.9× faster |
+| Bulk insert (1M rows) | 246 ms | 1,001 ms | 165.7 s | 4.1× faster |
+| FTS index build | 1.82 ms | 1,637 ms | 1,230 ms | 675× faster |
+| Vector TopK cosine (single) | 5.75 ms | 169.1 ms | 49.5 ms | 8.6× faster |
+| Vector batch TopK L2 (10) | 50.0 ms | 1,403 ms | 352.7 ms | 7.1× faster |
+
+Benchmarks are workload-sensitive. Reproduce them with
+`python benchmarks/bench_vs_sqlite_duckdb.py`, and read the retained setup,
+per-workload scoreboard, 10M-row scale checks, and quantized recall numbers in
+the [Performance documentation](https://birchkwok.github.io/apexbase/latest/performance/).
+
+## Architecture
+
+```mermaid
+flowchart LR
+    py["Python app or notebook"] --> engine
+    agent["AI agent or RAG pipeline"] --> engine
+    pg["psql, DBeaver, BI tools"] --> pgw["PostgreSQL Wire"]
+    flight["Arrow Flight clients"] --> fl["Arrow Flight"]
+    pgw --> engine
+    fl --> engine
+    engine["ApexBase engine<br/>SQL · FTS · vectors · MVCC"] --> file[(".apex file<br/>one local file")]
+    engine --> mem["in-memory backend"]
+```
+
+One engine serves embedded Python and Rust, PostgreSQL Wire, and Arrow Flight.
+Storage is columnar with compressed frames, delta/overlay visibility, and MVCC;
+data is never duplicated into a separate search or vector service.
+
+## Interfaces
+
+| Interface | Use it when | Entry point |
+| --- | --- | --- |
+| **Python API** | Embedded apps, notebooks, agents, data pipelines | `ApexClient(path)` / `ApexClient(":memory:")` |
+| **Process-local SQL** | Short scripts with no setup | `from apexbase import execute` |
+| **Rust API** | Native Rust integration without Python | `apexbase::embedded::ApexDB` |
+| **PostgreSQL Wire** | psql, DBeaver, DataGrip, BI tools, libpq clients | `apexbase-server` or `apexbase-serve` |
+| **Arrow Flight** | Fast columnar transfer into Arrow-native systems | `apexbase-flight` or `apexbase-serve` |
+
+## What's new in 2.0
+
+- **Stable storage format 5.** V5 builds read V4 files; `APEX_WIDTH_FIDELITY=0`
+  writes the V4 layout when older readers must stay compatible.
+- **A complete logical type system.** `uuid`, `decimal(p,s)`,
+  `timestamp`/`timestamptz`/`date`/`time`/`interval`, `list<T>`, and explicit
+  `extension<codec>` columns, with typed Arrow/Polars projection.
+- **Bounded execution by design.** `APEX_QUERY_MEMORY_MB` caps per-query
+  operators, `APEX_PROCESS_BUDGET_MB` adds process admission with a bounded
+  queue, `ORDER BY`/`GROUP BY`/`DISTINCT`/`JOIN` spill to disk, and
+  `execute_stream()` yields Arrow batches instead of materializing everything.
+- **Closed SQL semantics gaps.** `DISTINCT *` deduplicates on visible columns,
+  duplicate projection aliases are uniquified deterministically, `RIGHT JOIN`
+  ordering is fixed, and transactions/`COPY ... FROM` use uniform routing.
+- **Safer full-text search.** FTS snapshots and WAL generations are reconciled
+  with the table on open; stale indexes are rejected explicitly.
+- **Multi-process writes.** `_id` ranges are reserved from a shared on-disk
+  high-water mark, so several processes can write one table.
+- **Faster, broader retrieval.** A persisted IVF index, native hybrid ranking,
+  and nine vector storage codecs with exact reranking from the source vector.
+
+The full feature-by-feature guide, migration rules, and known limits are in
+[What's new in 2.0](https://birchkwok.github.io/apexbase/latest/whats-new-2.0/);
+the historical list is in the
+[release notes](https://birchkwok.github.io/apexbase/latest/release-notes/).
+
+## Documentation
+
+**Start at <https://birchkwok.github.io/apexbase/>**
+
+| Goal | Page |
+| --- | --- |
+| **Install and run** | [Installation](https://birchkwok.github.io/apexbase/latest/installation/) · [Quickstart](https://birchkwok.github.io/apexbase/latest/QUICK_START/) |
+| **Build agent memory** | [Agent Memory & RAG](https://birchkwok.github.io/apexbase/latest/user-guide/agent-memory/) |
+| **Learn the model** | [Core Concepts](https://birchkwok.github.io/apexbase/latest/concepts/) |
+| **Use the Python API** | [Python Client](https://birchkwok.github.io/apexbase/latest/user-guide/python-client/) · [API Reference](https://birchkwok.github.io/apexbase/latest/API_REFERENCE/) |
+| **Write SQL** | [SQL Guide](https://birchkwok.github.io/apexbase/latest/user-guide/sql/) |
+| **Import data** | [Data Import](https://birchkwok.github.io/apexbase/latest/user-guide/data-import/) |
+| **Expose database tools** | [Server Protocols](https://birchkwok.github.io/apexbase/latest/user-guide/server-protocols/) |
+| **Search text and vectors** | [Full-Text Search](https://birchkwok.github.io/apexbase/latest/FTS_GUIDE/) · [Float16 Vectors](https://birchkwok.github.io/apexbase/latest/FLOAT16_VECTOR_GUIDE/) · [Vector Quantization](https://birchkwok.github.io/apexbase/latest/VECTOR_QUANTIZATION_GUIDE/) |
+| **Embed from Rust** | [Rust Embedded API](https://birchkwok.github.io/apexbase/latest/RUST_EMBEDDED_API/) |
+| **Understand internals** | [Storage Architecture](https://birchkwok.github.io/apexbase/latest/STORAGE_ARCHITECTURE/) · [Resource Ownership](https://birchkwok.github.io/apexbase/latest/RESOURCE_OWNERSHIP/) |
 
 ## Install
 
@@ -30,172 +256,35 @@
 pip install apexbase
 ```
 
-Build from source:
+Requirements: Python 3.9+, Linux/macOS/Windows on x86_64 or ARM64. Building from
+source needs a Rust toolchain and `maturin`:
 
 ```bash
+git clone https://github.com/BirchKwok/ApexBase.git
+cd ApexBase
 python -m pip install maturin
 maturin develop --release
 ```
 
-## 30-Second Example: FTS + SQL + Vector Search In One Local File
-
-```python
-from apexbase import ApexClient
-
-with ApexClient("./rag-data") as client:
-    client.execute("""
-        CREATE TABLE articles (
-            title TEXT,
-            body TEXT,
-            category TEXT,
-            views INT,
-            embedding FLOAT16_VECTOR
-        )
-    """)
-    client.use_table("articles")
-
-    client.store([
-        {
-            "title": "Rust-powered local analytics",
-            "body": "A columnar embedded database for fast SQL and search.",
-            "category": "database",
-            "views": 4200,
-            "embedding": [0.10, 0.82, 0.20],
-        },
-        {
-            "title": "Hybrid retrieval for RAG",
-            "body": "Combine full-text recall, SQL filters, and semantic vector ranking.",
-            "category": "ai",
-            "views": 6100,
-            "embedding": [0.16, 0.74, 0.58],
-        },
-        {
-            "title": "SQLite migration notes",
-            "body": "Move local applications to an analytical embedded store.",
-            "category": "database",
-            "views": 2600,
-            "embedding": [0.80, 0.12, 0.10],
-        },
-    ])
-
-    client.execute("CREATE FTS INDEX ON articles(title, body)")
-
-    # FTS recall + structured SQL guardrails + pgvector-style semantic rerank.
-    df = client.execute("""
-        SELECT
-            title,
-            category,
-            views,
-            cosine_distance(embedding, [0.12, 0.78, 0.25]) AS semantic_dist
-        FROM articles
-        WHERE MATCH('database')
-          AND category = 'database'
-          AND views > 3000
-        ORDER BY semantic_dist
-        LIMIT 5
-    """).to_pandas()
-
-    print(df)
-```
-
-**ApexBase gives you pgvector-style semantic search, SQL filters, and full-text search in the same embedded database file.** It is the kind of stack you would otherwise assemble from SQLite/DuckDB + FTS + pgvector, but without a server process or a separate search/vector service; results still convert directly to Pandas, Polars, or Arrow.
-
-For scratch work, tests, and short-lived analytics, use the same API without
-creating database, catalog, WAL, delta, or index files:
-
-```python
-from apexbase import ApexClient
-
-with ApexClient(":memory:") as client:
-    client.execute("CREATE TABLE metrics (name TEXT, value DOUBLE)")
-    client.execute("INSERT INTO metrics VALUES ('latency_ms', 2.4)")
-    print(client.execute("SELECT AVG(value) AS average FROM metrics").scalar())
-```
-
-For the smallest SQL-only scripts, `apexbase.execute(...)` uses one lazily
-created process-local in-memory connection shared by later module-level calls;
-create a table before running table-scoped queries.
-
-## Performance At A Glance
-
-The latest retained complete public snapshot uses **1,000,000 tabular rows**
-and **1,000,000 vectors x 128 dimensions** on Apple arm64 with Python 3.12.
-
-| Area | Snapshot |
-| --- | --- |
-| **Public coverage** | 105 tabular metrics, 6 exact-vector metrics, and 8 ApexBase quantized-vector precision rows |
-| **Comparable results** | ApexBase wins 105 / 105 tabular metrics against the fastest competitor in the latest complete runs; exact-vector 6 / 6 |
-| **Exact vector search** | All 6 single/batch Float32 TopK rows beat the compared engines and match brute-force exact top-k row sets |
-| **Reproducibility** | Fixed data sizes, 2 warmups, 5 timed iterations, dependency metadata, and a retained JSON report |
-
-Benchmarks are workload-sensitive. The default benchmark command tracks this public scoreboard; extended diagnostics live in `benchmarks/bench_vs_sqlite_duckdb_extended.py`. See the full reproducible setup in the [Performance documentation](https://birchkwok.github.io/apexbase/latest/performance/).
-
-Starting with 1.33, filtered grouped queries can use a shared physical scan
-protocol across persisted base data and delta/overlay state. The protocol keeps
-predicate selection, grouping, `HAVING`, and ordered TopK as composable
-operators with a generic fallback for unsupported or inexact predicate forms.
-v1.34.0 adds a serial row-group pipeline, bounded parallel scan/fold execution,
-streaming overlay reads, and a per-query aggregation memory budget on top of it.
-See [Scan & Physical Execution](https://birchkwok.github.io/apexbase/latest/SCAN_EXECUTION_ARCHITECTURE/)
-and [Resource Ownership](https://birchkwok.github.io/apexbase/latest/RESOURCE_OWNERSHIP/).
-
-v2.0.0 is the **V5 GA** release. Files use on-disk format version `5`, which is
-now the stable format for this release line. V5 builds read V4 files, and
-`APEX_WIDTH_FIDELITY=0` writes the V4 layout for files that must stay readable
-by pre-V5 builds. Format 5 adds an optional logical-type schema section
-(`uuid`, `decimal(p,s)`, `timestamp`/`timestamptz`/`date`/`time`/`interval`,
-`list<T>` and extension codecs), keeps one compressed frame per column for
-chunked tables (set `APEX_CHUNK_INDEX=0` for the flat frame expected by older
-builds), and reserves `_id` ranges against a shared on-disk high-water mark so
-several processes can write one table.
-
-V5 also closes the SQL semantics gaps (`DISTINCT *`, alias uniquification,
-RIGHT JOIN ordering) and unifies statement routing inside transactions and for
-`COPY ... FROM` without a selected table. Memory is bounded by design:
-`APEX_QUERY_MEMORY_MB` caps per-query operator memory, `APEX_PROCESS_BUDGET_MB`
-adds a process-level admission ceiling with a bounded queue, out-of-core spill
-keeps `ORDER BY`/`GROUP BY`/`DISTINCT`/`JOIN` within memory
-(`APEX_SPILL_DIR`), and `ApexClient.execute_stream()` streams results batch by
-batch. Extension codecs are explicit: `bytes`/`json` are built in, `pickle`
-must be registered deliberately. The complete V5→V4 compatibility rules and
-migration notes are in the
-[release notes](https://birchkwok.github.io/apexbase/latest/release-notes/) and
-[Storage Architecture](https://birchkwok.github.io/apexbase/latest/STORAGE_ARCHITECTURE/).
-
-## Documentation
-
-**Start here:** <https://birchkwok.github.io/apexbase/>
-
-| Goal | Page |
-| --- | --- |
-| **Get running quickly** | [Installation](https://birchkwok.github.io/apexbase/latest/installation/) and [Quick Start](https://birchkwok.github.io/apexbase/latest/QUICK_START/) |
-| **Understand the model** | [Core Concepts](https://birchkwok.github.io/apexbase/latest/concepts/) |
-| **Use the Python API** | [Python Client Guide](https://birchkwok.github.io/apexbase/latest/user-guide/python-client/) and [API Reference](https://birchkwok.github.io/apexbase/latest/API_REFERENCE/) |
-| **Write SQL** | [SQL Guide](https://birchkwok.github.io/apexbase/latest/user-guide/sql/) |
-| **Import files and DataFrames** | [Data Import](https://birchkwok.github.io/apexbase/latest/user-guide/data-import/) |
-| **Use database tools or Arrow clients** | [Server Protocols](https://birchkwok.github.io/apexbase/latest/user-guide/server-protocols/) |
-| **Search text or vectors** | [Full-Text Search](https://birchkwok.github.io/apexbase/latest/FTS_GUIDE/), [Float16 Vectors](https://birchkwok.github.io/apexbase/latest/FLOAT16_VECTOR_GUIDE/), and [Vector Quantization](https://birchkwok.github.io/apexbase/latest/VECTOR_QUANTIZATION_GUIDE/) |
-| **Embed from Rust** | [Rust Embedded API](https://birchkwok.github.io/apexbase/latest/RUST_EMBEDDED_API/) |
-
-## Interfaces
+## Development
 
 ```bash
-# Embedded Python
-python -c "from apexbase import ApexClient; print(ApexClient)"
-
-# PostgreSQL Wire + Arrow Flight together
-apexbase-serve --dir ./data
-
-# Individual protocol servers
-apexbase-server --dir ./data --port 5432
-apexbase-flight --dir ./data --port 50051
+maturin develop --release   # build the native extension
+pytest                      # full Python suite
+cargo test                  # full Rust suite
+python -m mkdocs serve      # preview this documentation
 ```
 
-## Lance Interop
+The engineering constraints for changes (release builds, complete tests,
+same-machine performance gates, benchmark baselines) are in
+[AGENTS.md](AGENTS.md). The docs site source lives in [`docs/`](docs/).
+
+## Interoperability
 
 ```python
 from apexbase import ApexClient
 
+# Arrow-native conversion to and from Lance.
 with ApexClient("./data") as client:
     client.use_table("articles")
     client.to_lance("./articles.lance")
@@ -204,8 +293,17 @@ with ApexClient("./imported") as client:
     client.from_lance("./articles.lance", table_name="articles")
 ```
 
-Lance conversion uses Arrow tables as the handoff path. This keeps the in-process conversion lean and Arrow-native, while each format still writes its own on-disk layout.
+Parquet, CSV, JSON, Pandas, Polars, PyArrow, PostgreSQL clients, and Arrow
+Flight consumers are supported without an extra service. The conversion path is
+Arrow-native; each format still owns its on-disk layout.
 
 ## License
 
-Apache-2.0
+Apache-2.0. See [LICENSE](LICENSE).
+
+<div align="center">
+
+**If ApexBase fits your stack, star the repository and try the
+[quickstart](https://birchkwok.github.io/apexbase/latest/QUICK_START/).**
+
+</div>

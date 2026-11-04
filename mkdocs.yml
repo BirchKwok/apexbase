@@ -1,10 +1,14 @@
 site_name: ApexBase
 site_author: Birch Kwok
-site_description: High-performance HTAP embedded database with Rust core and Python API
+site_description: >-
+  ApexBase is an embedded HTAP database with a Rust core and a Python-first API:
+  analytical SQL, BM25 full-text search, vector retrieval, and agent memory in
+  one local .apex file. No server required.
 site_url: https://birchkwok.github.io/apexbase/
 repo_url: https://github.com/BirchKwok/ApexBase
 repo_name: birchkwok/ApexBase
 edit_uri: edit/main/docs/
+copyright: Copyright &copy; 2025-2026 Birch Kwok · Apache-2.0
 
 strict: true
 exclude_docs: |
@@ -27,14 +31,18 @@ theme:
     - navigation.tabs.sticky
     - navigation.sections
     - navigation.path
+    - navigation.footer
     - toc.integrate
-    - search.suggest
-    - search.highlight
-    - search.share
+    - toc.follow
+    - content.action.edit
+    - content.action.view
     - content.code.copy
     - content.code.select
     - content.code.annotate
     - content.tabs.link
+    - search.suggest
+    - search.highlight
+    - search.share
   palette:
     - media: "(prefers-color-scheme)"
       toggle:
@@ -42,11 +50,15 @@ theme:
         name: Switch to light mode
     - media: "(prefers-color-scheme: light)"
       scheme: default
+      primary: teal
+      accent: amber
       toggle:
         icon: material/brightness-7
         name: Switch to dark mode
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
+      primary: teal
+      accent: amber
       toggle:
         icon: material/brightness-4
         name: Switch to system preference
@@ -60,9 +72,20 @@ extra:
   version:
     provider: mike
     default: latest
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/BirchKwok/ApexBase
+      name: ApexBase on GitHub
+    - icon: fontawesome/brands/python
+      link: https://pypi.org/project/apexbase/
+      name: ApexBase on PyPI
+
+extra_css:
+  - stylesheets/extra.css
 
 plugins:
-  - search
+  - search:
+      lang: en
 
 markdown_extensions:
   - admonition
@@ -73,23 +96,32 @@ markdown_extensions:
       permalink: true
       permalink_class: headerlink
   - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - pymdownx.highlight:
       anchor_linenums: true
       line_spans: __span
       pygments_lang_class: true
   - pymdownx.inlinehilite
   - pymdownx.snippets
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
   - pymdownx.tabbed:
       alternate_style: true
 
 nav:
   - Home: index.md
+  - What's New in 2.0: whats-new-2.0.md
   - Getting Started:
       - Installation: installation.md
-      - Quick Start: QUICK_START.md
+      - Quickstart: QUICK_START.md
       - Core Concepts: concepts.md
   - User Guide:
+      - Agent Memory & RAG: user-guide/agent-memory.md
       - Python Client: user-guide/python-client.md
       - SQL Guide: user-guide/sql.md
       - Data Import: user-guide/data-import.md

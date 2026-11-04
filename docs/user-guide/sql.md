@@ -1,17 +1,21 @@
 # SQL Guide
 
-ApexBase supports a practical SQL dialect for embedded HTAP workloads: DDL, DML, analytical SELECT queries, joins, CTEs, set operations, transactions, table functions, full-text search, and vector search.
+ApexBase supports a practical SQL dialect for embedded HTAP workloads: DDL, DML,
+analytical `SELECT`, joins, CTEs, set operations, transactions, table functions,
+full-text search, and vector search.
 
 ## Running SQL
 
 ```python
 from apexbase import ApexClient
 
-with ApexClient("./data") as client:
-    client.execute("CREATE TABLE IF NOT EXISTS users")
+with ApexClient("./data", durability="safe") as client:
+    client.execute("CREATE TABLE IF NOT EXISTS users (name STRING, age INT)")
     client.execute("INSERT INTO users (name, age) VALUES ('Alice', 30)")
     result = client.execute("SELECT * FROM users WHERE age >= 18")
 ```
+
+A statement string with several statements runs as one transaction.
 
 ## DDL
 
@@ -22,22 +26,34 @@ ALTER TABLE users ADD COLUMN age INT;
 DROP TABLE IF EXISTS old_users;
 ```
 
-Use qualified names for named databases:
+Use qualified names for named databases: `CREATE TABLE analytics.events;` and
+`DROP TABLE IF EXISTS analytics.old_events;`.
+
+`CREATE TABLE` accepts logical types: `DECIMAL(p,s)`/`NUMERIC(p,s)`,
+`TIMESTAMP`, `TIMESTAMPTZ`, `DATE`, `TIME`, `INTERVAL`, `UUID`, `LIST<T>`, and
+the vector types. `DECIMAL` stores a 16-byte payload and keeps precision and scale; time values
+round-trip as Python `datetime`/`date`/`time`/`timedelta`:
 
 ```sql
-CREATE TABLE analytics.events;
-DROP TABLE IF EXISTS analytics.old_events;
+CREATE TABLE ledger (id INT, amount DECIMAL(18,2), created TIMESTAMP);
+INSERT INTO ledger (id, amount, created)
+VALUES (1, '19.99', '2026-11-04 09:30:00');
 ```
+
+See [Logical Types](../API_REFERENCE.md#table-management) for the full type list.
 
 ## DML
 
 ```sql
-INSERT INTO users (name, age) VALUES ('Alice', 30);
-INSERT INTO users (name, age) VALUES ('Bob', 25), ('Charlie', 35);
-
+INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25);
 UPDATE users SET age = 31 WHERE name = 'Alice';
 DELETE FROM users WHERE age < 18;
 ```
+
+`UPDATE ... SET` accepts literals and bound parameters; complex right-hand-side
+expressions are not supported yet. `UPDATE` on a table with a vector column
+disables the direct vector scan used by `hybrid_search()`; see
+[Agent Memory & RAG](agent-memory.md#recency-and-scope).
 
 ## Parameter Binding
 
@@ -47,22 +63,18 @@ placeholders consume values from a list/tuple; named `:name`, `@name`, or
 comma-separated list for `IN (?)`.
 
 ```python
-# Positional
-client.execute("SELECT * FROM users WHERE age > ?", params=[30])
-
-# Named
+client.execute("SELECT * FROM users WHERE age > ?", params=[30])   # positional
 client.execute(
     "INSERT INTO events (kind, ts) VALUES (:kind, :ts)",
     params={"kind": "click", "ts": "2026-08-07 12:00:00"},
-)
-
-# IN-list expansion
-client.execute("SELECT * FROM users WHERE city IN (?)", params=[["Beijing", "Shanghai"]])
+)                                                                   # named
+client.execute("SELECT * FROM users WHERE city IN (?)",
+               params=[["Beijing", "Shanghai"]])                    # IN-list
 ```
 
-Binding works for SELECT, DML, DDL, and transaction statements, and keeps the
-TopK vector query on its native FFI fast path. Wrong placeholder arity raises
-`ValueError`, and an unsupported value type raises `TypeError`.
+Binding works for SELECT, DML, DDL, and transaction statements and keeps TopK on
+its native FFI path. Wrong arity raises `ValueError`; an unsupported value type
+raises `TypeError`.
 
 ## Analytical Queries
 
@@ -101,12 +113,6 @@ JOIN active_users a ON u.id = a.user_id
 WHERE a.events > 5;
 ```
 
-```sql
-SELECT *
-FROM users
-WHERE id IN (SELECT user_id FROM events WHERE event = 'signup');
-```
-
 ## Window Functions
 
 ```sql
@@ -124,13 +130,28 @@ FROM events;
 SELECT user_id FROM web_events
 UNION
 SELECT user_id FROM mobile_events;
-
-SELECT user_id FROM paid_users
-EXCEPT
-SELECT user_id FROM refunded_users;
 ```
 
 `UNION`, `UNION ALL`, `INTERSECT`, and `EXCEPT` are supported.
+
+## V5 Semantics Notes
+
+Three v2.0.0 changes can alter results of queries written for older releases:
+
+- `SELECT DISTINCT *` deduplicates on visible columns only; `_id` is not part
+  of the key (`show_internal_id=True` still returns one representative `_id`).
+- Duplicate projection aliases are made unique: `SELECT a AS x, b AS x` yields
+  columns `x`, `x_1`.
+- `ORDER BY <alias>` resolves projection aliases, including the RIGHT JOIN path.
+  NULLs sort last for ascending and first for descending (Arrow default).
+
+```sql
+SELECT DISTINCT * FROM dup;            -- dedupes (a, b, c), not _id
+SELECT a AS x, b AS x FROM dup;        -- columns: x, x_1
+SELECT v FROM nul ORDER BY v ASC;      -- NULLs last
+```
+
+Use explicit distinct aliases when output names are part of a contract.
 
 ## Indexes
 
@@ -144,14 +165,8 @@ REINDEX orders;   -- rebuild persistent secondary-index postings
 ```
 
 `DROP INDEX` requires the `ON table` clause. Secondary-index DDL, `ANALYZE`, and
-`REINDEX` operate on the selected table, so call `use_table(name)` first (or use
-the `ON table` form where the statement accepts it). All of them work on
-filesystem and `:memory:` databases; a process-local table keeps its statistics
-and index postings in memory.
-
-ApexBase marks persisted index postings stale before a committed table change
-and refuses to use them in planning or execution until `REINDEX` rebuilds them,
-so a stale index degrades to a correct scan instead of returning wrong rows.
+`REINDEX` operate on the selected table. Persisted postings are marked stale
+before a committed table change and are not used until `REINDEX` rebuilds them.
 
 ## Transactions
 
@@ -164,7 +179,12 @@ RELEASE before_adjustment;
 COMMIT;
 ```
 
-Use `ROLLBACK` to cancel a transaction, or `ROLLBACK TO savepoint_name` to undo part of one.
+Use `ROLLBACK` to cancel a transaction, or `ROLLBACK TO savepoint_name` to undo
+part of one. A multi-statement string in one `execute()` call is a single
+transaction, and a client-side `BEGIN` covers later batches. Statements route
+the same way inside and outside transactions, so buffered DML obeys the same
+commit boundary. PG Wire adds implicit transactions for multi-statement simple
+queries; see [Server Protocols](server-protocols.md#postgresql-wire).
 
 ### Commit Failures
 
@@ -177,13 +197,27 @@ commit_outcome=unknown txn_id=42: <original I/O error>
 
 | Outcome | Meaning | Safe next step |
 | --- | --- | --- |
-| `not_committed` | No commit marker or data application was attempted. | Retry the work as a new transaction. |
-| `unknown` | A marker or data write may have taken effect, or the transaction is gone and its outcome is unavailable. | Reopen the database, inspect the authoritative state, and reconcile; never blind-replay the DML. |
-| `committed` | Data, indexes, and transaction publication completed; only post-commit maintenance failed. | Treat the work as durable. |
+| `not_committed` | Nothing was applied. | Retry as a new transaction. |
+| `unknown` | A marker or data write may have taken effect. | Reopen, inspect state, reconcile; never blind-replay. |
+| `committed` | Data, indexes, and publication completed. | Treat the work as durable. |
 
-Multi-table transactions apply their work in deterministic table order. After a
-crash, recovery converges each table independently: the contract is per-table
-convergence, not database-wide atomicity.
+Multi-table transactions apply work in deterministic table order. After a crash,
+recovery converges each table independently, not database-wide.
+
+## COPY
+
+```sql
+COPY users TO 'users.csv' (FORMAT CSV, HEADER);
+COPY users TO 'users.parquet' (FORMAT PARQUET);
+
+COPY people FROM 'people.csv' (FORMAT CSV, HEADER);
+```
+
+`COPY <table> TO` requires a selected table. `COPY <new_table> FROM` creates and
+publishes the table without a selected table, and the target becomes the selected
+table for later unqualified statements. In 2.0.0, `COPY ... FROM` is supported
+for CSV; import Parquet with `read_parquet()` or `from_pyarrow()` instead, and
+see [Data Import](data-import.md#parquet-and-lance).
 
 ## File Table Functions
 
@@ -195,13 +229,9 @@ FROM read_csv('events.csv')
 GROUP BY city;
 ```
 
-Supported functions:
-
-- `read_csv(path)`
-- `read_parquet(path)`
-- `read_json(path)`
-
-For repeated queries over a file, register it as a temporary table from Python. See [Data Import](data-import.md).
+Supported functions are `read_csv(path)`, `read_parquet(path)`, and
+`read_json(path)`. For repeated queries, register the file as a temporary table
+from Python; see [Data Import](data-import.md).
 
 ## Full-Text Search
 
@@ -213,7 +243,18 @@ FROM articles
 WHERE MATCH('rust database');
 ```
 
-For fuzzy matching, lifecycle commands, and configuration, see the [Full-Text Search Guide](../FTS_GUIDE.md).
+`MATCH()` takes one string literal and requires all query terms. `FTS_SCORE()`
+projects or orders by BM25 relevance; `FUZZY_MATCH()` tolerates typos:
+
+```sql
+SELECT title, FTS_SCORE() AS relevance
+FROM articles WHERE MATCH('database') ORDER BY relevance DESC;
+
+SELECT title FROM articles WHERE FUZZY_MATCH('databse');
+```
+
+See the [Full-Text Search Guide](../FTS_GUIDE.md) for configuration and
+lifecycle.
 
 ## Vector Search
 
@@ -229,24 +270,28 @@ SELECT explode_rename(
 FROM items;
 ```
 
-The supported metrics are `'l2'`, `'cosine'`, and `'dot'`. The same expression
-accepts a bound parameter for the query vector from Python:
+A bound parameter works for the query vector from Python
+(`params=[query_vector]`). Order existing rows by distance with `cosine_distance()` when you do not need a
+TopK heap; its query vector must be an inline array literal:
 
-```python
-client.execute(
-    "SELECT explode_rename(topk_distance(embedding, ?, 10, 'cosine'), '_id', 'dist') FROM items",
-    params=[query_vector],
-)
+```sql
+SELECT id, cosine_distance(embedding, [0.1, 0.2, 0.3]) AS dist
+FROM items ORDER BY dist LIMIT 10;
 ```
 
-Vector columns can be declared as `FLOAT32_VECTOR`, `FLOAT16_VECTOR`,
-`BFLOAT16_VECTOR`, `INT8_VECTOR`, `UINT8_VECTOR`, `BIT1_VECTOR`, or
-`TURBOQUANT2_VECTOR` / `TURBOQUANT3_VECTOR` / `TURBOQUANT4_VECTOR`.
-Standalone quantized columns are searchable but cannot provide an exact source
-for reranking. For the recommended source-plus-accelerator layout, lifecycle
-rules, and Python rescore API, see the
-[Vector Quantization Guide](../VECTOR_QUANTIZATION_GUIDE.md). Float16 SIMD
-details remain in the [Float16 Vector Guide](../FLOAT16_VECTOR_GUIDE.md).
+Metrics: `'l2'`/`'euclidean'`, `'l2_squared'`, `'l1'`, `'linf'`,
+`'cosine'`/`'cosine_distance'`, and `'dot'`/`'inner_product'`. Vector columns can
+be `FLOAT32_VECTOR`, `FLOAT16_VECTOR`, `BFLOAT16_VECTOR`, `INT8_VECTOR`,
+`UINT8_VECTOR`, `BIT1_VECTOR`, or `TURBOQUANT2/3/4_VECTOR`; for the
+source-plus-accelerator layout, see the
+[Vector Quantization Guide](../VECTOR_QUANTIZATION_GUIDE.md).
+
+!!! warning "Known issue: MATCH() plus cosine_distance()"
+    Combining `MATCH()` with `cosine_distance()` raises
+    `RuntimeError: array_distance: FixedSizeList dim 0 != query dim N` when the
+    text branch returns no rows. Use `hybrid_search()` for combined ranking, or
+    guard with `search_text()` first — see
+    [Agent Memory & RAG](agent-memory.md#hybrid-sql-for-structured-filters).
 
 ## Explain
 
@@ -255,33 +300,34 @@ EXPLAIN SELECT * FROM users WHERE age > 30;
 EXPLAIN ANALYZE SELECT city, COUNT(*) FROM users GROUP BY city;
 ```
 
-`EXPLAIN` prints the candidate and chosen plan, including the index access spec
-when one is executable. `EXPLAIN ANALYZE` also reports what actually ran:
-
-- `Actual Path` — the physical route that executed;
-- `Actual Rows` and `Actual Time` — measured result size and duration;
-- `Plan Divergence` — a note when execution had to leave the planned route (for
-  example, a planned index route that was unavailable at execution time);
-- `Feedback Recorded` — whether this run's cost/time feedback was written to
-  the table sidecar.
-
-`EXPLAIN ANALYZE` persists per-shape cost and time feedback in the table
-sidecar `<table>.plan_feedback`. Feedback is ignored when its sidecar schema
-version or the recorded OS/architecture/parallelism fingerprint differs, and it
-is dropped on schema changes.
-
-Use `EXPLAIN` when you are checking whether a query is taking a fast path, using an index, or falling back to the full planner.
+`EXPLAIN` reports the candidate and chosen plan, including the index access spec
+when one is executable. `EXPLAIN ANALYZE` also reports `Actual Path`,
+`Actual Rows`, `Actual Time`, `Plan Divergence` (when execution left the planned
+route), and `Feedback Recorded`. It persists per-shape cost and time feedback in
+`<table>.plan_feedback`; feedback is ignored when the sidecar schema version or
+OS/architecture/parallelism fingerprint differs, and dropped on schema changes.
 
 ## Execution Limits
 
 Aggregation state for supported `GROUP BY` kernels is charged against a
 per-query byte budget. Set `APEX_QUERY_MEMORY_MB` to the budget in MiB (`0`
-disables the budget, default `1024`). Exceeding it fails the query with an
-out-of-memory error instead of letting the process exhaust memory; reservations
-are released on success, cancellation, failure, and fallback.
+disables it, default `1024`). `ORDER BY`, `GROUP BY`, `DISTINCT`, and equi-join
+operators spill to `APEX_SPILL_DIR` when they exceed the budget, so the query
+completes with an identical result instead of failing. `APEX_PROCESS_BUDGET_MB`
+adds process-wide admission with a bounded queue and explicit
+`[APEX_ADMISSION_*]` errors.
 
-Supported batched scans may use parallel row-group workers. At most
-`min(CPU - 1, 8)` workers run across all queries in a process, and parallel
-execution is selected only when the calibrated serial cost is at least 2 ms and
-parallel history is still faster. `APEX_PARALLEL_SCAN` is a diagnostic
-override: `0`/`1` forces serial, and `N >= 2` forces `N` workers.
+`execute()` materializes its result. Use `client.execute_stream()` for large
+`SELECT` results: it yields `pyarrow.RecordBatch` objects, streaming plain
+projections one row group at a time and spill-bounded shapes as one batch.
+
+Batched scans may use up to `min(CPU - 1, 8)` row-group workers across all queries
+in a process. `APEX_PARALLEL_SCAN` overrides this: `0`/`1` forces serial, `N >= 2`
+forces `N` workers.
+
+## Where To Go Next
+
+- [Python Client](python-client.md) and [Data Import](data-import.md) for the
+  Python API and bulk loads.
+- [Agent Memory & RAG](agent-memory.md) for hybrid retrieval, and the
+  [FTS Guide](../FTS_GUIDE.md) / [Vector Quantization Guide](../VECTOR_QUANTIZATION_GUIDE.md).

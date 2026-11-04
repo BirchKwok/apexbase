@@ -2,6 +2,13 @@
 
 ApexBase supports `FLOAT16_VECTOR` columns for storing embedding vectors in half-precision (float16) format.  Compared to the default float32 `FixedList` column, float16 halves the storage footprint and enables hardware-accelerated SIMD distance kernels on ARM and x86 platforms.
 
+This matters most for agent memory and RAG: a long-term memory table keeps growing
+while the model's context window does not. Half-precision embeddings halve the
+bytes scanned per recall query, so you can keep more history on one machine and
+still run exact TopK over the full table. The same column can feed
+`hybrid_search()` (BM25 plus vector fusion) and be streamed with
+`execute_stream()` when a read is too large to materialize — both covered below.
+
 ---
 
 ## Table of Contents
@@ -27,6 +34,17 @@ ApexBase supports `FLOAT16_VECTOR` columns for storing embedding vectors in half
 | Models that already quantize (CLIP, text embeddings) | Prototype / exploration phase where precision matters |
 
 For most modern embedding models (CLIP, BERT, Sentence-Transformers, OpenAI `text-embedding-*`), float16 quantization error is well below retrieval noise.
+
+!!! note "v2.0.0 (V5 GA)"
+    `FLOAT16_VECTOR` is a physical fixed-width vector column, not part of the
+    V5 logical-type section (`uuid`, `decimal(p,s)`, the time family,
+    `list<T>`, extension codecs); `describe_table()` reports it as
+    `float16_vector`. The 2.0.0 release also puts hybrid retrieval, streaming
+    reads and bounded execution in the same engine: `hybrid_search()` fuses
+    BM25 with a float16 vector branch, `execute_stream()` yields large reads
+    batch by batch, and `APEX_QUERY_MEMORY_MB` / `APEX_SPILL_DIR` keep
+    sort/aggregation/join state bounded. `hybrid_search()` requires a filesystem
+    database.
 
 ---
 
@@ -80,9 +98,14 @@ If your upstream model already produces float16 numpy arrays, they are accepted 
 vecs_f16 = np.random.rand(n, dim).astype(np.float16)
 client.store([{"doc_id": str(i), "vec": vecs_f16[i]} for i in range(n)])
 
-# Single-record writes are correct too
-client.store({"doc_id": "one", "vec": [0.1, 0.2, 0.3, 0.4]})
+# Single-record writes are correct too — keep the column dimension consistent
+client.store({"doc_id": "one", "vec": [0.1] * dim})
 ```
+
+!!! warning "Fixed dimension"
+    The column's dimension is fixed by the first valid write. A later store with
+    a different length raises `OSError: column 'vec' stores <D>-dimension
+    vectors; row 0 has <N>` — keep every row at the same dimension.
 
 ---
 
@@ -147,6 +170,46 @@ client.execute(f"""
     FROM embeddings
 """)
 ```
+
+### Hybrid retrieval and streaming
+
+`hybrid_search()` fuses the float16 vector branch with a BM25 text branch and
+needs a filesystem database; `execute_stream()` reads large projections batch by
+batch on any database:
+
+```python
+import numpy as np
+from apexbase import ApexClient
+
+client = ApexClient("./rag_db")     # persistent directory: hybrid uses the mmap scan
+client.execute("CREATE TABLE docs (title TEXT, body TEXT, vec FLOAT16_VECTOR)")
+client.execute("CREATE FTS INDEX ON docs (title, body)")
+
+vecs = np.random.rand(3, 128).astype(np.float32)
+client.store({
+    "title": ["Agent memory", "Rust guide", "Python tutorial"],
+    "body": ["retrieval over long-term agent memory",
+             "systems programming", "learn python"],
+    "vec": [vecs[i] for i in range(3)],
+})
+
+# Fuse BM25 and float16 vector recall in one call (RRF by default).
+hits = client.hybrid_search(
+    np.random.rand(128).astype(np.float32),
+    "agent memory",
+    k=3, vector_col="vec",
+)
+print(hits.to_pandas())     # _id, score
+
+# Stream large reads batch by batch instead of materializing them.
+for batch in client.execute_stream("SELECT title, body FROM docs"):
+    print(batch.num_rows)
+client.close()
+```
+
+See [Hybrid Search](API_REFERENCE.md#hybrid-search) for `fusion` / `alpha`, and
+[Vector Quantization](VECTOR_QUANTIZATION_GUIDE.md) when half precision is not
+small enough.
 
 ---
 

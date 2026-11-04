@@ -6,24 +6,75 @@ ApexBase includes **ApexFTS**, its native Rust full-text storage engine, directl
 
 ## Table of Contents
 
-1. [Architecture](#architecture)
-2. [Quick Start](#quick-start)
-3. [DDL Reference](#ddl-reference)
+1. [Why FTS in the same engine](#why-fts-in-the-same-engine)
+2. [Architecture](#architecture)
+3. [Quick Start](#quick-start)
+4. [DDL Reference](#ddl-reference)
    - [CREATE FTS INDEX](#create-fts-index)
    - [DROP FTS INDEX](#drop-fts-index)
    - [ALTER FTS INDEX DISABLE / ENABLE](#alter-fts-index-disable-enable)
    - [SHOW FTS INDEXES](#show-fts-indexes)
-4. [Query Reference](#query-reference)
+5. [Query Reference](#query-reference)
    - [MATCH()](#match)
    - [FTS_SCORE()](#fts_score)
    - [FUZZY_MATCH()](#fuzzy_match)
-5. [Combining FTS with SQL](#combining-fts-with-sql)
-6. [Python API](#python-api)
-7. [PG Wire and Arrow Flight](#pg-wire-and-arrow-flight)
-8. [Lifecycle and Storage](#lifecycle-and-storage)
-9. [Configuration Options](#configuration-options)
-10. [Performance Tips](#performance-tips)
-11. [Known Constraints](#known-constraints)
+6. [Combining FTS with SQL](#combining-fts-with-sql)
+7. [Python API](#python-api)
+8. [PG Wire and Arrow Flight](#pg-wire-and-arrow-flight)
+9. [Lifecycle and Storage](#lifecycle-and-storage)
+10. [Configuration Options](#configuration-options)
+11. [Performance Tips](#performance-tips)
+12. [Known Constraints](#known-constraints)
+
+---
+
+## Why FTS in the same engine
+
+Agent and RAG pipelines need two kinds of recall over the same records. BM25
+recall is precise for names, identifiers, quoted spans and rare terms; vector
+recall is semantic. ApexBase serves both from one table:
+
+- **BM25 recall** through ApexFTS: `MATCH()`, `FUZZY_MATCH()` and `FTS_SCORE()`
+  are SQL predicates executed in Rust beside the data.
+- **SQL filters compose directly.** Because `MATCH()` is a `WHERE` predicate, you
+  can add tenant IDs, date ranges, categories and aggregations in the same
+  statement instead of post-filtering a separate search service.
+- **Vector fusion** through `hybrid_search()`: one call fuses a BM25 branch and a
+  `topk_distance()` branch on `_id` using reciprocal rank fusion (`rrf`) or
+  normalized weights (`weighted`), so your retriever gets one ranked list.
+- **One database directory, no external search service.** The index lives under
+  `{dir}/fts_indexes/` next to the table data and is served by the same executor
+  over Python, PG Wire and Arrow Flight.
+
+```python
+import numpy as np
+from apexbase import ApexClient
+
+client = ApexClient("./rag_db")   # use a filesystem directory for hybrid retrieval
+client.execute("CREATE TABLE docs (title TEXT, body TEXT, vec FLOAT32_VECTOR)")
+client.execute("CREATE FTS INDEX ON docs (title, body)")
+
+vecs = np.random.rand(3, 4).astype(np.float32)
+client.store({
+    "title": ["Agent memory", "Rust guide", "Python tutorial"],
+    "body": ["retrieval over long-term agent memory",
+             "systems programming", "learn python"],
+    "vec": [vecs[i] for i in range(3)],
+})
+
+hits = client.hybrid_search(
+    np.random.rand(4).astype(np.float32),   # query embedding
+    "agent memory",                          # BM25 query
+    k=3,
+    vector_col="vec",
+    fusion="rrf",
+)
+print(hits.to_pandas())    # _id, score — one fused ranked list
+client.close()
+```
+
+See [Hybrid Search](API_REFERENCE.md#hybrid-search) for the full signature and
+[Agent memory](user-guide/agent-memory.md) for the end-to-end retrieval workflow.
 
 ---
 
@@ -48,6 +99,7 @@ ApexBase includes **ApexFTS**, its native Rust full-text storage engine, directl
                     ┌────────────▼────────────────────────┐
                     │  Disk: {dir}/fts_indexes/{table}.afts│
                     │        + {table}.afts.wal            │
+                    │        + {table}.afts.meta           │
                     │         {dir}/fts_config.json        │
                     └─────────────────────────────────────┘
 ```
@@ -58,7 +110,7 @@ Key design points:
 - `MATCH('query')` in a `WHERE` clause is resolved once to an `Arc<RoaringTreemap>`; Arrow batches test `_id` membership directly without materializing an `IN` list.
 - The configuration is persisted in `fts_config.json` alongside the `.apex` data files, and is re-loaded automatically on process restart.
 - Postings use 64-bit Roaring bitmaps. Packed per-document token streams provide BM25 term frequency, document length, and phrase positions without duplicating the term dictionary.
-- Updates and deletes are recorded in a checksummed WAL and compacted into an atomically replaced v3 snapshot.
+- Updates and deletes are recorded in a checksummed WAL and compacted into an atomically replaced v3 snapshot; the snapshot's `.afts.meta` records the source-table generation used to reject stale indexes on open (v2.0.0).
 - With `lazy_load=true`, the fixed-width term directory and posting blobs remain mmap-backed; posting bitmaps are decoded on first access into a bounded cache.
 - Text is NFKC-normalized and Unicode-lowercased. Unicode word boundaries cover Latin, Cyrillic, Arabic and other spaced scripts; n-grams cover Han, Hiragana, Katakana and Hangul.
 
@@ -371,6 +423,39 @@ client.execute("""
 """)
 ```
 
+### Hybrid retrieval with vectors
+
+FTS and vector search can also be combined in one statement: `MATCH()` narrows
+the candidate rows, and a `topk_distance()` subquery supplies semantic recall.
+The derived table needs an alias:
+
+```python
+# docs: a table with title/body text and a vec vector column (see the hybrid example above)
+results = client.execute("""
+    SELECT title
+    FROM docs
+    WHERE MATCH('agent memory')
+      AND _id IN (
+          SELECT t._id FROM (
+              SELECT explode_rename(
+                  topk_distance(vec, [0.1, 0.2, 0.3, 0.4], 50, 'l2'),
+                  '_id', 'dist'
+              )
+              FROM docs
+          ) t
+      )
+    LIMIT 10
+""")
+```
+
+For a single ranked list instead of a filter intersection, use the
+`hybrid_search()` Python API shown in
+[Why FTS in the same engine](#why-fts-in-the-same-engine); it fuses the two
+branches with RRF by default. See [Hybrid Search](API_REFERENCE.md#hybrid-search)
+for `fusion` and `alpha`, [Float16 Vectors](FLOAT16_VECTOR_GUIDE.md) for
+half-precision embeddings, and [Vector Quantization](VECTOR_QUANTIZATION_GUIDE.md)
+for compressed candidate generation before exact reranking.
+
 ---
 
 ## Python API
@@ -508,7 +593,8 @@ No extra configuration required — the FTS registry is global within the server
 ├── fts_config.json        ← FTS configuration (shared with Python API)
 └── fts_indexes/
     ├── articles.afts      ← ApexFTS atomic snapshot
-    └── articles.afts.wal  ← checksummed write-ahead log
+    ├── articles.afts.wal  ← checksummed write-ahead log
+    └── articles.afts.meta ← source-generation metadata used by v2.0.0 reconciliation
 ```
 
 When an enabled table has only a legacy `.nfts` file, ApexBase treats the `.apex` table as the source of truth and rebuilds an `.afts` snapshot on first initialization. Unknown or corrupt ApexFTS versions are quarantined instead of being opened as valid data.
@@ -532,6 +618,23 @@ When an enabled table has only a legacy `.nfts` file, ApexBase treats the `.apex
 
 This file is written by both the Rust DDL handlers (`CREATE FTS INDEX`) and the Python `init_fts()` / `drop_fts()` methods, ensuring consistent state across interfaces.
 
+!!! note "v2.0.0 (V5 GA): generation reconciliation and stale-index rejection"
+    On open, ApexBase reconciles the recovered `.afts` snapshot/WAL generation
+    with its source table (row-count and table-generation checks). If the index
+    cannot account for the table — a lost WAL tail, a writer that bypassed FTS,
+    or a snapshot without source-generation metadata — the index is quarantined
+    (renamed to `{table}.afts.stale`) and SQL full-text queries fail with an
+    explicit error instead of answering from partial coverage:
+
+    ```
+    FTS index for table 'docs' is stale and was quarantined: <reason>;
+    rebuild it with init_fts() before querying
+    ```
+
+    Rebuild the index to restore full-text reads, then run your query again.
+    This is a safety property, not a retryable transient error: never silently
+    accept a stale index in retrieval code.
+
 ---
 
 ## Configuration Options
@@ -553,7 +656,7 @@ This file is written by both the Rust DDL handlers (`CREATE FTS INDEX`) and the 
    SELECT * FROM articles WHERE MATCH('python') AND category = 'tutorial';
    ```
 
-4. **Flush before searching.** After a bulk `store()`, call `client._storage._fts_flush()` (or just wait — the WAL is flushed automatically on close) to ensure all documents are searchable.
+4. **Rows are searchable immediately.** `store()` / `INSERT` index each document before they return, so a following `MATCH()` sees the new rows. Call `client.flush()` after a bulk load if you want the storage and WAL persisted now rather than on close.
 
 5. **Compact after write-heavy periods.** `client.compact_fts_index()` merges snapshot, WAL, updates, and tombstones into one atomic `.afts` snapshot.
 
@@ -562,4 +665,6 @@ This file is written by both the Rust DDL handlers (`CREATE FTS INDEX`) and the 
 ## Known Constraints
 
 - `FTS_SCORE()` currently scores exact `MATCH()` queries; fuzzy edit-distance candidates do not expose BM25 scores through SQL.
+- `hybrid_search()` needs an initialized FTS index and a filesystem database — its vector branch uses the direct mmap vector scan, so it does not run on a `:memory:` client (pure SQL and FTS work there).
+- For tables you query with `hybrid_search()`, change rows with `store()` / `replace()` / `DELETE`; after a SQL `UPDATE` the direct vector scan can reject the column (`topk_distance(raw=True): column '...' is not served by the direct vector scan`) and does not recover in that session. Non-raw `topk_distance()` and SQL distance functions keep working.
 - Legacy v2 snapshots use the eager compatibility loader and upgrade to v3 on the next compaction.

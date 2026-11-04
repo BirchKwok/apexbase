@@ -1,431 +1,139 @@
 # Performance
 
-This page records the latest complete public cross-engine benchmark. It is a
-reproducible snapshot, not a universal claim: rerun the suite on your own
-hardware and workload.
+This page records the retained public cross-engine benchmark for ApexBase
+v2.0.0. It is a reproducible snapshot, not a universal claim: rerun the suite
+on your own hardware and workload before drawing conclusions.
 
-## v1.35.0 Public No-Cache Snapshot
+## v2.0.0 public snapshot
 
-- **Date / source**: 2026-09-21, v1.35.0 release tree (commit `ffba5de`); runtime code was measured immediately before the metadata-only version bump
-- **System**: macOS 27.0, Apple arm64 (10 cores), 32 GB RAM
-- **Tabular stack**: Python 3.12.2, ApexBase 1.35.0 runtime, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
-- **Vector stack**: Python 3.12.2, ApexBase 1.35.0 runtime, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1
-- **Build**: maturin 1.9.1, rustc 1.92.0, release profile
-- **Tabular dataset**: 1,000,000 rows x 5 columns
-- **Vector dataset**: 1,000,000 Float32 vectors x 128 dimensions, `k=10`, 10 exact batch queries; quantized module 20 queries with `candidate_k=100` and seed `20260821`
-- **Method**: result cache disabled for every ApexBase client (`enable_cache=False`), 2 warmup iterations + 5 timed iterations, materialized results
-- **Retained report**: `local-perf-results/memory-fts-parity-20260921-080412/public-benchmark-final2.json`
+- **Date / source**: 2026-11-03, v2.0.0 release tree (commit `426424a`)
+- **Baseline protocol**: median of three same-machine runs
+  (`benchmarks/latest_public_baseline.json`, `baseline_meta.samples = 3`)
+- **System**: macOS 27.0.1, Apple arm64 (10 cores), 32 GB RAM
+- **Runtime stack**: Python 3.12.2, ApexBase 2.0.0, SQLite 3.46.0, DuckDB
+  1.1.3, PyArrow 23.0.1, sqlite-vector 1.0.0
+- **Build**: rustc 1.92.0, maturin 1.9.1, release profile
+- **Tabular dataset**: 1,000,000 rows × 5 columns
+- **Vector dataset**: 1,000,000 Float32 vectors × 128 dimensions, `k=10`,
+  10 exact batch queries
+- **Quantized module**: 1,000,000 rows, 20 queries, `candidate_k=100`,
+  seed `20260821`
+- **Method**: ApexBase result cache disabled, 2 warmup iterations + 5 timed
+  iterations, materialized results
+- **Retained report**: `benchmarks/latest_public_baseline.json`
 
-The no-cache public suite completed all **117/117 named rows**: 103 tabular,
-6 exact-vector, and 8 ApexBase quantized precision rows. ApexBase won every row
-that has a direct competitor — **115/115**: 103/103 tabular, 6/6 exact vector,
-and 6/6 quantized codecs shared with sqlite-vector. Float16 and BFloat16 remain
-ApexBase-only quantized formats and are excluded from the comparable total.
+The suite completes all **119 named rows**: 105 tabular, 6 exact-vector, and
+8 quantized precision rows. Every row with a direct competitor is won —
+**117/117 comparable**: 105/105 tabular, 6/6 exact vector, and 6/6 quantized
+codecs shared with sqlite-vector. Float16 and BFloat16 are ApexBase-only
+quantized formats and are excluded from the comparable total.
 
 | Scope | Metrics | Apex wins | Ties | Slower |
 | --- | ---: | ---: | ---: | ---: |
-| OLAP fair | 71 | 71 | 0 | 0 |
-| OLTP fair | 32 | 32 | 0 | 0 |
+| OLAP fair | 105 | 105 | 0 | 0 |
 | Exact vector similarity | 6 | 6 | 0 | 0 |
 | Quantized vector, shared codecs | 6 | 6 | 0 | 0 |
-| **Comparable total** | **115** | **115** | **0** | **0** |
+| **Comparable total** | **117** | **117** | **0** | **0** |
 
-Representative medians from the retained run:
+### Workload scoreboard
 
-| Metric | ApexBase | SQLite | DuckDB | ApexBase vs best competitor |
+| Workload | Metrics | Apex wins | Apex vs best competitor |
+| --- | ---: | ---: | ---: |
+| Load & Index | 2 | 2 | 0.09× (11.1× faster) |
+| Point & Limited Reads | 17 | 17 | 0.19× (5.3× faster) |
+| Filtering | 11 | 11 | 0.46× (2.2× faster) |
+| Aggregation | 14 | 14 | 0.19× (5.3× faster) |
+| Ordering, Window, View | 9 | 9 | 0.04× (25.0× faster) |
+| Full Materialization | 3 | 3 | 0.26× (3.8× faster) |
+| Joins | 5 | 5 | 0.21× (4.8× faster) |
+| Set Operations | 6 | 6 | 0.22× (4.5× faster) |
+| Subqueries & CTE | 4 | 4 | 0.11× (9.1× faster) |
+| Expression Evaluation | 5 | 5 | 0.34× (2.9× faster) |
+| File Scan | 9 | 9 | 0.34× (2.9× faster) |
+| DML | 13 | 13 | 0.05× (20.0× faster) |
+| Search | 1 | 1 | 0.17× (5.9× faster) |
+| Table Ops | 5 | 5 | 0.51× (2.0× faster) |
+| Other | 1 | 1 | 0.68× (1.5× faster) |
+
+`Apex vs best competitor` is the ratio of total workload time to the fastest
+competitor total (geometric mean for per-query comparisons); lower is better.
+
+### Representative medians
+
+| Metric | ApexBase | SQLite | DuckDB | ApexBase vs best |
 | --- | ---: | ---: | ---: | ---: |
-| COUNT(*) | 0.062 ms | 7.851 ms | 0.458 ms | 7.45x faster |
-| Projection full scan (3 cols) | 204.896 ms | 875.487 ms | 629.557 ms | 3.07x faster |
-| GROUP BY + HAVING | 0.650 ms | 343.608 ms | 2.834 ms | 4.36x faster |
-| Boolean Filter+GROUP+HAVING+TopK | 3.982 ms | 182.182 ms | 4.409 ms | 1.11x faster |
-| NOT filter (age NOT BETWEEN, name NOT LIKE) | 1.992 ms | 58.469 ms | 3.124 ms | 1.57x faster |
-| ORDER BY score LIMIT 100 | 1.904 ms | 53.783 ms | 5.014 ms | 2.63x faster |
-| Bulk Insert (N rows; default fair) | 219.892 ms | 989.950 ms | 146.49 s | 4.50x faster |
-| FTS Index Build (name,city,category) | 1.469 ms | 1.52 s | 1.21 s | 821.84x faster |
+| `COUNT(*)` | 0.080 ms | 8.453 ms | 0.552 ms | 6.9× faster |
+| Point lookup (SQL by `_id`) | 0.004 ms | 0.004 ms | 4.002 ms | 1.3× faster |
+| Filter (`name = 'user_5000'`) | 0.194 ms | 46.635 ms | 1.644 ms | 8.5× faster |
+| Filter (age BETWEEN 25 AND 35) | 67.899 ms | 280.567 ms | 174.607 ms | 2.6× faster |
+| Multi-condition filter | 187.608 ms | 604.410 ms | 364.692 ms | 1.9× faster |
+| `GROUP BY` city (10 groups) | 0.652 ms | 362.494 ms | 3.972 ms | 6.1× faster |
+| `GROUP BY` + `HAVING` | 0.682 ms | 362.404 ms | 3.813 ms | 5.6× faster |
+| `COUNT(DISTINCT city)` | 0.220 ms | 91.969 ms | 4.414 ms | 20.0× faster |
+| Window `ROW_NUMBER` by city | 0.494 ms | 553.034 ms | 50.933 ms | 103.2× faster |
+| `ORDER BY score LIMIT 100` | 1.994 ms | 55.580 ms | 5.682 ms | 2.8× faster |
+| Projection full scan (3 cols) | 225.311 ms | 885.678 ms | 699.396 ms | 3.1× faster |
+| `SELECT *` → pandas | 23.456 ms | 1,396.460 ms | 219.166 ms | 9.3× faster |
+| LEFT JOIN count | 0.823 ms | 156.612 ms | 4.346 ms | 5.3× faster |
+| Bulk insert (1M rows) | 245.573 ms | 1,001.223 ms | 165,728.633 ms | 4.1× faster |
+| FTS index build (3 fields) | 1.823 ms | 1,637.500 ms | 1,229.940 ms | 674.5× faster |
 
-Exact vector medians for the same run:
+All timings are medians in milliseconds from the retained baseline. Results are
+materialized; ApexBase's result cache is disabled for every measurement.
+
+### Exact vector search
+
+1,000,000 Float32 vectors × 128 dimensions, `k=10`, compared against SQLite +
+sqlite-vector and DuckDB. All six rows matched brute-force exact TopK row sets.
 
 | Metric | ApexBase | SQLite + sqlite-vector | DuckDB |
 | --- | ---: | ---: | ---: |
-| TopK L2 | 6.139 ms | 149.805 ms | 28.752 ms |
-| TopK Cosine | 6.178 ms | 171.305 ms | 34.643 ms |
-| TopK Dot | 6.856 ms | 147.032 ms | 28.779 ms |
-| Batch TopK L2 (10 queries) | 50.186 ms | 1,531.393 ms | 278.580 ms |
-| Batch TopK Cosine (10 queries) | 56.231 ms | 1,700.752 ms | 372.599 ms |
-| Batch TopK Dot (10 queries) | 46.646 ms | 1,469.580 ms | 275.547 ms |
+| TopK L2 | 5.643 ms | 144.645 ms | 36.805 ms |
+| TopK Cosine | 5.750 ms | 169.105 ms | 49.544 ms |
+| TopK Dot | 5.474 ms | 137.335 ms | 39.775 ms |
+| Batch TopK L2 (10 queries) | 50.036 ms | 1,403.238 ms | 352.702 ms |
+| Batch TopK Cosine (10 queries) | 55.469 ms | 1,683.128 ms | 441.690 ms |
+| Batch TopK Dot (10 queries) | 50.293 ms | 1,361.057 ms | 398.597 ms |
 
-Quantized batch-amortized retrieval for the same run (20 queries, `k=10`,
-`candidate_k=100`):
+### Quantized vector retrieval
 
-| Codec | Apex quantized | Apex recall | Apex exact-rescore | Rescore recall | sqlite-vector quantized | SQLite recall |
+The quantized module keeps the source Float32 vector as the authoritative
+column, scans a compressed accelerator for candidates, and optionally rescans
+the source vector for exact reranking. Twenty queries, `k=10`,
+`candidate_k=100`, batch-amortized latency per query.
+
+| Codec | Apex quantized | Apex recall | Apex exact rescore | Rescore recall | SQLite quantized | SQLite recall |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| INT8 | 1.146 ms | 0.975 | 15.950 ms | 1.000 | 8.484 ms | 0.945 |
-| UINT8 | 3.576 ms | 0.985 | 19.041 ms | 1.000 | 8.545 ms | 0.960 |
-| 1-bit | 0.645 ms | 0.140 | 13.100 ms | 0.415 | 1.933 ms | 0.100 |
-| TurboQuant 2-bit | 4.663 ms | 0.450 | 18.103 ms | 0.870 | 26.715 ms | 0.535 |
-| TurboQuant 3-bit | 16.608 ms | 0.595 | 32.906 ms | 0.990 | 65.008 ms | 0.725 |
-| TurboQuant 4-bit | 8.624 ms | 0.760 | 23.765 ms | 1.000 | 51.266 ms | 0.840 |
+| INT8 | 1.428 ms | 0.975 | 5.615 ms | 1.000 | 8.671 ms | 0.945 |
+| UINT8 | 3.600 ms | 0.985 | 8.395 ms | 1.000 | 8.660 ms | 0.960 |
+| 1-bit | 0.582 ms | 0.140 | 2.195 ms | 0.415 | 1.995 ms | 0.100 |
+| TurboQuant 2-bit | 5.795 ms | 0.450 | 7.863 ms | 0.870 | 27.249 ms | 0.535 |
+| TurboQuant 3-bit | 20.431 ms | 0.595 | 24.357 ms | 0.990 | 66.844 ms | 0.725 |
+| TurboQuant 4-bit | 12.563 ms | 0.760 | 16.934 ms | 1.000 | 52.058 ms | 0.840 |
+| Float16 | 2.502 ms | 1.000 | 3.288 ms | 1.000 | — | — |
+| BFloat16 | 12.556 ms | 1.000 | 22.120 ms | 1.000 | — | — |
 
-ApexBase-only derived columns in the same run: Float16 at 2.009 ms quantized
-with 1.000 recall, and BFloat16 at 9.546 ms with 1.000 recall.
+Recall is overlap with each engine's own exact Float32 top-10. ApexBase's exact
+reranking recovered 1.000 recall for INT8, UINT8, TurboQuant 4-bit, Float16,
+and BFloat16 on this dataset. See the
+[Vector Quantization Guide](VECTOR_QUANTIZATION_GUIDE.md) for how to choose a
+codec.
 
-## v1.34.0 Public No-Cache Snapshot
+### 10M-row scale checks
 
-- **Date / source**: 2026-09-20, v1.34.0 release tree (commit `41f3400`)
-- **System**: macOS 27.0, Apple arm64 (10 cores), 32 GB RAM
-- **Tabular stack**: Python 3.12.2, ApexBase 1.34.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
-- **Vector stack**: Python 3.12.2, ApexBase 1.34.0, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1
-- **Build**: maturin 1.9.1, rustc 1.92.0, release profile
-- **Tabular dataset**: 1,000,000 rows x 5 columns
-- **Vector dataset**: 1,000,000 Float32 vectors x 128 dimensions, `k=10`, 10 exact batch queries; quantized module 20 queries with `candidate_k=100` and seed `20260821`
-- **Method**: result cache disabled for every ApexBase client (`enable_cache=False`), 2 warmup iterations + 5 timed iterations, materialized results
-- **Retained report**: `local-perf-results/release-1.34.0-20260920/public-benchmark.json`
+The release-scale harness (not part of the 1M public scoreboard) records:
 
-The no-cache public suite completed all **117/117 named rows**: 103 tabular,
-6 exact-vector, and 8 ApexBase quantized precision rows. ApexBase won every row
-that has a direct competitor — **115/115**: 103/103 tabular, 6/6 exact vector,
-and 6/6 quantized codecs shared with sqlite-vector. Float16 and BFloat16 remain
-ApexBase-only quantized formats and are excluded from the comparable total.
+| Workload at 10M rows | Result |
+| --- | ---: |
+| `COUNT(*)` | 0.043 ms |
+| Low-cardinality `GROUP BY` | 7.1 ms |
+| High-cardinality `GROUP BY` (10M groups, 1 GB budget) | 2.6 s |
+| Same query with a 256 MB budget | Spilled to disk, exact result |
+| IVF recall@10, `nprobe=16` | 0.97 at ~11 ms median |
+| `ORDER BY ... LIMIT` | 83.8 ms (DuckDB 50.5 ms) |
 
-| Scope | Metrics | Apex wins | Ties | Slower |
-| --- | ---: | ---: | ---: | ---: |
-| OLAP fair | 71 | 71 | 0 | 0 |
-| OLTP fair | 32 | 32 | 0 | 0 |
-| Exact vector similarity | 6 | 6 | 0 | 0 |
-| Quantized vector, shared codecs | 6 | 6 | 0 | 0 |
-| **Comparable total** | **115** | **115** | **0** | **0** |
-
-Representative medians from the retained run:
-
-| Metric | ApexBase | SQLite | DuckDB | ApexBase vs best competitor |
-| --- | ---: | ---: | ---: | ---: |
-| COUNT(*) | 0.084 ms | 8.399 ms | 0.500 ms | 5.93x faster |
-| Projection full scan (3 cols) | 212.418 ms | 885.736 ms | 670.344 ms | 3.16x faster |
-| Filter (name = 'user_5000') | 0.187 ms | 46.945 ms | 1.749 ms | 9.36x faster |
-| GROUP BY city (10 groups) | 0.999 ms | 371.201 ms | 3.506 ms | 3.51x faster |
-| GROUP BY + HAVING | 0.722 ms | 366.956 ms | 3.580 ms | 4.96x faster |
-| Boolean Filter+GROUP+HAVING+TopK | 4.014 ms | 192.575 ms | 5.746 ms | 1.43x faster |
-| Multi-cond (age>30 AND score>50) | 196.646 ms | 592.362 ms | 363.623 ms | 1.85x faster |
-| JSON Read + GROUP BY category | 59.921 ms | N/A | 88.128 ms | 1.47x faster |
-| ORDER BY score LIMIT 100 | 1.948 ms | 55.595 ms | 5.512 ms | 2.83x faster |
-| Bulk Insert (N rows; default fair) | 233.685 ms | 1.05 s | 189.52 s | 4.49x faster |
-| FTS Index Build (name,city,category) | 1.651 ms | 1.54 s | 1.14 s | 692.52x faster |
-| Batch TopK L2 (10 queries) | 55.884 ms | 1.43 s | 388.870 ms | 6.96x faster |
-
-Exact vector medians for the same run:
-
-| Metric | ApexBase | SQLite + sqlite-vector | DuckDB |
-| --- | ---: | ---: | ---: |
-| TopK L2 | 7.479 ms | 142.252 ms | 31.412 ms |
-| TopK Cosine | 7.020 ms | 172.040 ms | 35.477 ms |
-| TopK Dot | 7.415 ms | 139.883 ms | 39.810 ms |
-| Batch TopK L2 (10 queries) | 55.884 ms | 1,431.887 ms | 388.870 ms |
-| Batch TopK Cosine (10 queries) | 48.162 ms | 1,547.773 ms | 396.102 ms |
-| Batch TopK Dot (10 queries) | 51.467 ms | 1,406.353 ms | 417.101 ms |
-
-Quantized batch-amortized retrieval for the same run (20 queries, `k=10`,
-`candidate_k=100`):
-
-| Codec | Apex quantized | Apex recall | Apex exact-rescore | Rescore recall | sqlite-vector quantized | SQLite recall |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| INT8 | 1.373 ms | 0.975 | 17.582 ms | 1.000 | 8.773 ms | 0.945 |
-| UINT8 | 3.436 ms | 0.985 | 20.898 ms | 1.000 | 8.702 ms | 0.960 |
-| 1-bit | 0.627 ms | 0.140 | 15.184 ms | 0.415 | 2.050 ms | 0.100 |
-| TurboQuant 2-bit | 4.961 ms | 0.450 | 20.351 ms | 0.870 | 27.467 ms | 0.535 |
-| TurboQuant 3-bit | 18.669 ms | 0.595 | 34.908 ms | 0.990 | 67.610 ms | 0.725 |
-| TurboQuant 4-bit | 9.650 ms | 0.760 | 25.782 ms | 1.000 | 52.467 ms | 0.840 |
-
-ApexBase-only derived columns in the same run: Float16 at 2.476 ms quantized
-with 1.000 recall, and BFloat16 at 10.114 ms with 1.000 recall.
-
-### Cross-date comparison caveat
-
-`benchmarks/latest_public_baseline.json` was recorded on macOS 26.6.2, so
-comparing it with this run crosses an OS upgrade. The default comparison
-reported 13 metrics above the 15% relative threshold; the same-machine
-base/current canary and full gates re-measured those paths against the
-identical commit and passed. The nonzero cross-date comparison remains on
-record at
-`local-perf-results/release-1.34.0-20260920/public-baseline-comparison.log` and
-must not be read as a regression verdict; only the same-machine comparison
-decides that.
-
-## v1.33.1 Public No-Cache Snapshot
-
-- **Date / source**: 2026-09-05, v1.33.1 release tree; runtime code was measured immediately before the metadata-only version bump
-- **System**: macOS 26.6.2, Apple arm64 (10 cores), 32 GB RAM
-- **Tabular stack**: Python 3.12.2, ApexBase 1.33.0 runtime, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
-- **Vector stack**: Python 3.12.2, ApexBase 1.33.0 runtime, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1
-- **Tabular dataset**: 1,000,000 rows x 5 columns
-- **Vector dataset**: 1,000,000 Float32 vectors x 128 dimensions, `k=10`, 10 exact batch queries
-- **Method**: result cache disabled for every ApexBase client, 2 warmup iterations + 5 timed iterations, materialized results
-- **Retained baseline**: `benchmarks/latest_public_baseline.json`
-
-The no-cache public suite completed all **117/117 named rows**: 103 tabular,
-6 exact-vector, and 8 ApexBase quantized precision rows. Of the 115 rows with a
-direct competitor, ApexBase won **115/115**. Float16 and BFloat16 remain
-ApexBase-only quantized formats and are excluded from the comparable total.
-
-| Scope | Metrics | Apex wins | Ties | Slower |
-| --- | ---: | ---: | ---: | ---: |
-| OLAP fair | 71 | 71 | 0 | 0 |
-| OLTP fair | 32 | 32 | 0 | 0 |
-| Exact vector similarity | 6 | 6 | 0 | 0 |
-| Quantized vector, shared codecs | 6 | 6 | 0 | 0 |
-| **Comparable total** | **115** | **115** | **0** | **0** |
-
-Representative medians from the retained run:
-
-| Metric | ApexBase | SQLite | DuckDB | ApexBase vs best competitor |
-| --- | ---: | ---: | ---: | ---: |
-| COUNT(*) | 0.094 ms | 7.946 ms | 0.505 ms | 5.35x faster |
-| Projection full scan (3 cols) | 233.267 ms | 921.937 ms | 726.772 ms | 3.12x faster |
-| GROUP BY city (10 groups) | 0.577 ms | 370.302 ms | 3.386 ms | 5.87x faster |
-| GROUP BY + HAVING | 0.581 ms | 368.544 ms | 4.136 ms | 7.13x faster |
-| Boolean Filter+GROUP+HAVING+TopK | **3.978 ms** | 193.017 ms | **5.680 ms** | **1.43x faster** |
-| Multi-cond (age>30 AND score>50) | 196.598 ms | 614.324 ms | 390.751 ms | 1.99x faster |
-| JSON Read + GROUP BY category | 57.783 ms | N/A | 89.379 ms | 1.55x faster |
-| ORDER BY score LIMIT 100 | 1.935 ms | 56.396 ms | 5.058 ms | 2.61x faster |
-| Vector batch L2, 10 queries | 45.946 ms | 1.37 s | 317.081 ms | 6.90x faster |
-
-An independent repeat measured `Boolean Filter+GROUP+HAVING+TopK` at 4.02 ms
-versus DuckDB at 5.39 ms. Both complete runs recorded 103/103 tabular wins,
-6/6 exact-vector wins, and 6/6 wins for quantized codecs shared with
-sqlite-vector. The repeat is retained separately as
-`local-perf-results/20260905-no-cache-public/public_benchmark_repeat.json` and
-is not used to select or replace individual baseline samples.
-
-The benchmark now creates every ApexBase client with `enable_cache=False`.
-The legacy `--no-result-cache` option is accepted only for command-line
-compatibility; it does not change behavior because no-cache is unconditional.
-Results from older cached methodology remain useful historical snapshots but
-must not be treated as a base/current regression comparison against this run.
-
-## v1.33 Scan-Pipeline Guard Coverage
-
-The 1.33 architecture adds an ApexBase-only same-machine guard metric named
-`Uncached delta Filter+GROUP+HAVING+TopK`. It disables the Python result cache,
-creates a write-after-load overlay, rotates filter and `HAVING` parameters, and
-checks the complete storage-scan/operator path. This metric belongs to the
-base/current regression gate. The public SQLite/DuckDB suite now independently
-uses the same no-result-cache contract for all ApexBase metrics.
-
-Release acceptance still requires the public suite plus same-machine canary
-and full base/current comparisons. Reports are retained under
-`local-perf-results/<timestamp>/`; individual fast public results never replace
-the same-machine regression decision when the compared revisions share a
-compatible benchmark contract.
-
-## v1.30.0 Public Snapshot
-
-- **Date / source**: 2026-08-22, v1.30.0 optimized `main` workspace
-- **System**: macOS 26.6.2, Apple arm64 (10 cores), 32 GB RAM
-- **Tabular stack**: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0, DuckDB 1.1.3, PyArrow 23.0.1
-- **Vector stack**: Python 3.12.2, ApexBase 1.30.0, SQLite 3.46.0 + sqlite-vector 1.0.0 (NEON), DuckDB 1.1.3, PyArrow 23.0.1
-- **Tabular dataset**: 1,000,000 rows x 5 columns
-- **Vector dataset**: 1,000,000 Float32 vectors x 128 dimensions, `k=10`, 10 batch queries
-- **Method**: 2 warmup iterations + 5 timed iterations, materialized results
-- **Report**: `benchmarks/results/v1.30.0-public-unified-vector-1m.json`
-
-The unified public suite completed all **116/116 named metrics**: 102 tabular,
-6 exact-vector, and 8 ApexBase quantized precision rows. Of the 114 rows with a
-direct competitor, ApexBase won **111/114**: 99 of 102 tabular metrics, all 6
-exact-vector metrics, and all 6 quantized codecs shared with sqlite-vector.
-Float16 and BFloat16 have no sqlite-vector quantized equivalent. The three
-slower tabular results were small table-management operations against SQLite's
-minimal empty-table DDL path; ApexBase remained faster than DuckDB on them.
-
-| Scope | Metrics | Apex wins | Ties | Slower |
-| --- | ---: | ---: | ---: | ---: |
-| OLAP fair | 70 | 70 | 0 | 0 |
-| OLTP fair | 32 | 29 | 0 | 3 |
-| Exact vector similarity | 6 | 6 | 0 | 0 |
-| Quantized vector, shared codecs | 6 | 6 | 0 | 0 |
-| **Comparable total** | **114** | **111** | **0** | **3** |
-
-The six public vector rows use exact Float32 scans. SQLite is represented by
-the [sqlite-vector](https://github.com/sqliteai/sqlite-vector) extension's
-`vector_full_scan()` rather than by SQLite core, which has no native vector
-distance operator. Quantized scans remain a separate diagnostic because their
-recall and storage contracts differ from exact Float32 search.
-
-## v1.30.0 Tabular And Exact Vector Metrics
-
-These tables are the retained v1.30.0 run
-(`benchmarks/results/v1.30.0-vector-quantization-public-final.json`), kept as a
-historical reference. The current comparable numbers are in the version
-sections above; do not mix rows across snapshots.
-
-### OLAP Fair Metrics (70)
-
-| Metric | ApexBase | SQLite | DuckDB |
-| --- | ---: | ---: | ---: |
-| COUNT(*) | 0.075 ms | 8.035 ms | 0.519 ms |
-| SELECT * LIMIT 100 (cold reopen) | 0.110 ms | 0.140 ms | 0.602 ms |
-| SELECT * LIMIT 100 (warm cache) | 0.076 ms | 0.121 ms | 0.232 ms |
-| SELECT * LIMIT 10K (cold reopen) | 4.461 ms | 13.626 ms | 8.879 ms |
-| SELECT * LIMIT 10K (warm cache) | 4.303 ms | 12.919 ms | 8.590 ms |
-| Projection full scan (3 cols) | 238.617 ms | 922.001 ms | 698.914 ms |
-| Filtered LIMIT 100 (age>30) | 0.017 ms | 0.141 ms | 0.290 ms |
-| LIMIT 100 OFFSET 10K | 0.049 ms | 0.240 ms | 0.301 ms |
-| Filter (name = 'user_5000') | 0.162 ms | 46.726 ms | 1.727 ms |
-| Filter (age BETWEEN 25 AND 35) | 70.793 ms | 288.977 ms | 165.045 ms |
-| GROUP BY city (10 groups) | 1.507 ms | 364.261 ms | 4.032 ms |
-| GROUP BY category (10 groups) | 1.511 ms | 365.684 ms | 3.358 ms |
-| GROUP BY city ORDER BY count | 0.969 ms | 279.311 ms | 3.416 ms |
-| GROUP BY category ORDER BY count | 1.010 ms | 281.478 ms | 3.149 ms |
-| GROUP BY + HAVING | 1.558 ms | 360.756 ms | 3.857 ms |
-| GROUP BY category + HAVING | 1.556 ms | 356.575 ms | 3.596 ms |
-| Persistent VIEW select | 0.910 ms | 363.288 ms | 2.582 ms |
-| ORDER BY score LIMIT 100 | 2.260 ms | 55.744 ms | 5.601 ms |
-| ORDER BY score ASC LIMIT 100 | 1.981 ms | 55.992 ms | 4.788 ms |
-| Aggregation (5 funcs) | 0.235 ms | 88.328 ms | 1.219 ms |
-| Filtered aggregation (category) | 0.434 ms | 61.952 ms | 1.174 ms |
-| Filtered aggregation (city) | 0.425 ms | 60.457 ms | 1.123 ms |
-| COUNT WHERE category | 0.247 ms | 57.858 ms | 0.841 ms |
-| Complex (Filter+Group+Order) | 1.544 ms | 167.413 ms | 3.037 ms |
-| SELECT * -> pandas (full scan) | 27.275 ms | 1.43 s | 217.250 ms |
-| GROUP BY city,category (100 grp) | 1.164 ms | 681.439 ms | 5.467 ms |
-| LIKE filter (name LIKE user_1%) | 43.767 ms | 210.222 ms | 101.863 ms |
-| Multi-cond (age>30 AND score>50) | 195.705 ms | 619.532 ms | 373.821 ms |
-| ORDER BY city,score DESC LIMIT100 | 3.412 ms | 76.123 ms | 7.217 ms |
-| COUNT(DISTINCT city) | 0.195 ms | 92.387 ms | 4.259 ms |
-| COUNT(DISTINCT category) | 0.192 ms | 94.236 ms | 4.832 ms |
-| IN filter (city IN 3 cities) | 125.114 ms | 514.088 ms | 285.915 ms |
-| Numeric IN (age IN 9 values) | 61.760 ms | 280.557 ms | 144.735 ms |
-| OR cross-col (age=25 OR city=BJ) | 71.940 ms | 226.453 ms | 112.400 ms |
-| Numeric OR (age=20\|30\|40\|50) | 31.485 ms | 150.690 ms | 67.100 ms |
-| Window ROW_NUMBER PARTITION BY city | 0.742 ms | 518.455 ms | 46.636 ms |
-| JOIN GROUP BY ORDER LIMIT | 5.160 ms | 392.784 ms | 7.876 ms |
-| LEFT JOIN COUNT | 0.806 ms | 161.447 ms | 3.966 ms |
-| LEFT JOIN extra ON predicate | 0.812 ms | 145.464 ms | 3.527 ms |
-| FULL OUTER JOIN (bounded) | 0.728 ms | 1.246 ms | 1.771 ms |
-| CROSS JOIN COUNT | 0.598 ms | 48.583 ms | 1.596 ms |
-| UNION ALL (ordered) | 1.468 ms | 81.119 ms | 3.709 ms |
-| UNION DISTINCT (ordered) | 2.644 ms | 84.339 ms | 3.140 ms |
-| INTERSECT (ordered) | 7.846 ms | 177.454 ms | 8.191 ms |
-| EXCEPT (ordered) | 2.882 ms | 175.378 ms | 7.385 ms |
-| IN subquery COUNT | 0.673 ms | 101.201 ms | 3.414 ms |
-| EXISTS subquery COUNT | 5.185 ms | 399.828 ms | 23.765 ms |
-| Derived table GROUP BY | 1.118 ms | 279.524 ms | 4.106 ms |
-| CTE with AVG filter | 1.419 ms | 364.752 ms | 4.786 ms |
-| CASE aggregate GROUP BY | 1.360 ms | 315.547 ms | 5.727 ms |
-| String functions (UPPER/LENGTH/SUBSTR/CONCAT/TRIM) | 0.935 ms | 1.919 ms | 1.663 ms |
-| Numeric functions (ROUND/ABS/FLOOR/CEIL/MOD) | 0.736 ms | 1.344 ms | 1.273 ms |
-| COALESCE/NULLIF filter | 0.381 ms | 137.111 ms | 2.116 ms |
-| NOT filter (age NOT BETWEEN, name NOT LIKE) | 2.062 ms | 63.308 ms | 3.607 ms |
-| Deep offset (LIMIT 100 OFFSET 100K) | 47.073 ms | 255.639 ms | 198.049 ms |
-| ORDER BY expression (LENGTH) | 2.230 ms | 70.825 ms | 5.375 ms |
-| Window SUM OVER (running) | 0.575 ms | 452.769 ms | 42.017 ms |
-| Window RANK (partitioned) | 0.561 ms | 476.528 ms | 43.014 ms |
-| Window LAG (partitioned) | 0.574 ms | 441.836 ms | 35.582 ms |
-| DISTINCT (city, category) | 4.235 ms | 635.642 ms | 5.785 ms |
-| GROUP BY 2 cols + HAVING | 1.145 ms | 481.822 ms | 5.116 ms |
-| CSV Read + COUNT(*) | 13.659 ms | N/A | 46.370 ms |
-| CSV Read + Filter + GROUP BY | 27.802 ms | N/A | 51.477 ms |
-| CSV Read + Full Scan LIMIT 1000 | 14.786 ms | N/A | 22.633 ms |
-| JSON Read + COUNT(*) | 4.652 ms | N/A | 66.710 ms |
-| JSON Read + Filter | 8.690 ms | N/A | 82.001 ms |
-| JSON Read + GROUP BY category | 56.599 ms | N/A | 89.853 ms |
-| Temp Table (CSV) Query (filter+agg) | 0.464 ms | N/A | 0.719 ms |
-| JSON Read + ORDER BY LIMIT 100 | 48.435 ms | N/A | 103.954 ms |
-| CSV Read + ORDER BY LIMIT 100 | 18.192 ms | N/A | 57.492 ms |
-
-### OLTP Fair Metrics (32)
-
-| Metric | ApexBase | SQLite | DuckDB |
-| --- | ---: | ---: | ---: |
-| Bulk Insert (N rows; default fair) | 238.079 ms | 1.04 s | 185.68 s |
-| Point Lookup (SQL by ID) | 2.71 us | 4.31 us | 2.847 ms |
-| Retrieve Many (SQL, 100 IDs) | 0.197 ms | 0.335 ms | 4.835 ms |
-| COUNT(*) (direct API) | 6.19 us | 7.895 ms | 0.304 ms |
-| Point lookup (projected SQL) | 2.44 us | 3.32 us | 2.523 ms |
-| Point lookup (direct full row) | 2.05 us | 4.29 us | 2.613 ms |
-| Missing ID lookup | 2.16 us | 2.63 us | 2.918 ms |
-| Retrieve 10 IDs (projected SQL) | 7.88 us | 0.015 ms | 3.759 ms |
-| Retrieve 100 IDs (projected SQL) | 0.036 ms | 0.107 ms | 5.151 ms |
-| SELECT 3 cols LIMIT 100 | 0.045 ms | 0.078 ms | 0.176 ms |
-| String equality (projected) | 0.049 ms | 47.056 ms | 1.462 ms |
-| City filter LIMIT 100 | 0.020 ms | 0.109 ms | 0.216 ms |
-| Insert 1 row (default fair) | 0.011 ms | 0.015 ms | 0.319 ms |
-| Insert+Read own row | 0.014 ms | 0.019 ms | 4.150 ms |
-| Insert+COUNT visible | 0.017 ms | 8.230 ms | 0.678 ms |
-| UPDATE by ID | 3.04 us | 4.34 us | 0.891 ms |
-| UPDATE missing ID | 3.01 us | 3.90 us | 0.907 ms |
-| UPDATE+Read by ID | 5.11 us | 7.32 us | 1.852 ms |
-| Replace row by ID | 0.62 us | 4.44 us | 1.007 ms |
-| Insert+DELETE by ID | 0.023 ms | 0.027 ms | 1.385 ms |
-| DELETE missing ID | 0.41 us | 3.97 us | 0.684 ms |
-| Insert 1K rows (default fair) | 0.682 ms | 1.702 ms | 185.861 ms |
-| UPDATE rows (age=25; idempotent) | 4.144 ms | 43.291 ms | 15.605 ms |
-| Store+DELETE 1K (combined) | 1.076 ms | 40.499 ms | 184.709 ms |
-| DELETE 1K (pure delete; setup rows) | 0.187 ms | 39.612 ms | 0.385 ms |
-| FTS Index Build (name,city,category) | 1.546 ms | 1.57 s | 1.15 s |
-| FTS Search ('Electronics') | 5.437 ms | 30.056 ms | 23.242 ms |
-| Table CREATE (1 col) | 0.016 ms | 0.040 ms | 0.116 ms |
-| Table DROP | 0.056 ms | 0.031 ms | 0.098 ms |
-| Table CREATE+DROP cycle | 0.110 ms | 0.068 ms | 0.276 ms |
-| List tables (10) | 0.011 ms | 0.020 ms | 2.846 ms |
-| ALTER TABLE ADD COLUMN | 0.067 ms | 0.082 ms | 0.107 ms |
-
-### Exact Vector Similarity (6)
-
-| Metric | ApexBase | SQLite + sqlite-vector | DuckDB |
-| --- | ---: | ---: | ---: |
-| TopK L2 | 7.684 ms | 135.728 ms | 35.056 ms |
-| TopK Cosine | 7.888 ms | 160.234 ms | 41.254 ms |
-| TopK Dot | 8.080 ms | 134.895 ms | 32.260 ms |
-| Batch TopK L2 (10 queries) | 49.072 ms | 1,347.899 ms | 340.936 ms |
-| Batch TopK Cosine (10 queries) | 50.763 ms | 1,505.297 ms | 390.632 ms |
-| Batch TopK Dot (10 queries) | 49.674 ms | 1,337.900 ms | 344.654 ms |
-
-All vector rows matched the brute-force exact top-k row sets.
-
-## v1.30.0 Quantized L2 Distance Snapshot
-
-This is the retained v1.30.0 run
-(`benchmarks/results/v1.30.0-public-unified-vector-1m.json`). The current
-quantized medians are in the v1.34.0 section above.
-
-The public benchmark entrypoint includes this snapshot alongside the tabular
-and exact-vector modules. It uses 1,000,000 identical normally
-distributed Float32 vectors with 128 dimensions, 20 query vectors, `k=10`, two
-warmups, and five timed iterations. Latency is the median per query across
-repeated query batches. ApexBase uses its native `batch_topk_distance()` API;
-sqlite-vector has no batch API, so its measurement repeats
-`vector_quantize_scan()` once per query. These values therefore describe
-batch-amortized retrieval, not isolated single-query latency.
-
-Recall is overlap with each engine's own exact Float32 top-10. sqlite-vector
-quantized data was preloaded, and ApexBase exact reranking used
-`candidate_k=100`.
-
-The common comparison covers the six modes supported by both engines. The
-codec names describe each engine's implementation, not a shared binary format.
-
-| Codec | ApexBase quantized | Apex recall | Apex exact-rescore | Rescore recall | sqlite-vector quantized | SQLite recall | SQLite preload |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| INT8 | 1.306 ms | 0.975 | 18.785 ms | 1.000 | 8.779 ms | 0.945 | 129.70 MiB |
-| UINT8 | 3.467 ms | 0.985 | 23.775 ms | 1.000 | 8.765 ms | 0.960 | 129.70 MiB |
-| 1-bit | 0.695 ms | 0.140 | 16.158 ms | 0.415 | 2.057 ms | 0.100 | 22.89 MiB |
-| TurboQuant 2-bit | 5.094 ms | 0.450 | 21.372 ms | 0.870 | 27.343 ms | 0.535 | 41.96 MiB |
-| TurboQuant 3-bit | 18.641 ms | 0.595 | 34.990 ms | 0.990 | 66.771 ms | 0.725 | 57.22 MiB |
-| TurboQuant 4-bit | 9.559 ms | 0.760 | 26.240 ms | 1.000 | 52.141 ms | 0.840 | 72.48 MiB |
-
-sqlite-vector does not expose Float16 or BFloat16 through
-`vector_quantize_scan()`. ApexBase's additional derived-column results were:
-
-| ApexBase-only codec | Quantized L2 | Recall@10 | Exact-rescore | Rescore recall |
-| --- | ---: | ---: | ---: | ---: |
-| Float16 | 2.504 ms | 1.000 | 17.064 ms | 1.000 |
-| BFloat16 | 10.527 ms | 1.000 | 31.441 ms | 1.000 |
-
-Across all six shared quantizers, ApexBase's batch-amortized compressed scan
-was 2.53x to 6.72x faster. INT8, UINT8, and 1Bit also had higher
-recall in this dataset; TurboQuant 2/3/4 traded lower initial candidate recall
-for speed, while exact source reranking recovered 0.935-1.000 recall. The JSON
-report also retains build time, database size, and sqlite-vector's estimated
-preloaded representation size for every mode.
+The last row is a known performance follow-up rather than a regression in the
+release gate.
 
 ## Reproduce
 
@@ -436,19 +144,40 @@ python benchmarks/bench_vs_sqlite_duckdb.py \
   --output benchmarks/results/public.json
 ```
 
-Use `--skip-vector` for a tabular-only run, or
-`--skip-quantized-vector` to retain exact-vector metrics while omitting the
-compressed module. The unified command accepts `--quantized-vector-rows`,
-`--quantized-vector-queries`, `--quantized-vector-candidate-k`, and
-`--quantized-vector-seed` when a different compressed workload is required:
+Use `--skip-vector` for a tabular-only run or `--skip-quantized-vector` to keep
+exact-vector metrics while omitting the compressed module. The unified command
+accepts `--rows`, `--warmup`, `--iterations`, `--vector-rows`, `--vector-dim`,
+and the `--quantized-vector-*` options when a different workload is required.
+
+`benchmarks/latest_public_baseline.json` is the maintained baseline. Rebuild it
+from at least three same-machine runs so a single noisy run cannot move it:
 
 ```bash
-python benchmarks/bench_vs_sqlite_duckdb.py \
-  --quantized-vector-rows 1000000 \
-  --quantized-vector-queries 20 \
-  --quantized-vector-candidate-k 100 \
-  --output benchmarks/results/public-with-quantization.json
+python benchmarks/rebuild_public_baseline.py \
+  --input run1.json run2.json run3.json \
+  --output benchmarks/latest_public_baseline.json
 ```
 
-The quantization benchmark requires the optional `sqliteai-vector` Python
-package and a Python build linked against a compatible SQLite version.
+The quantized benchmark requires the optional `sqliteai-vector` Python package
+and a Python build linked against a compatible SQLite version.
+
+## Methodology and limits
+
+- Results are workload-sensitive. A lower row count, a different Python build,
+  or a different CPU changes absolute latency; compare shapes and ratios rather
+  than single numbers.
+- The public suite is a cross-engine scoreboard, not ApexBase's own regression
+  gate. Regressions are caught by the same-machine base/current guard in
+  `benchmarks/run_local_perf_guard.py` and the canary in
+  `benchmarks/bench_perf_canary.py`.
+- SQLite rows use the `sqlite-vector` extension for ranked vector metrics; without
+  the extension, those rows are reported as unavailable rather than estimated.
+- All reports are retained as JSON, including config, system, build, and
+  dependency metadata, so a result can be audited after the fact.
+
+## History
+
+v1.x snapshots (v1.35.0, v1.34.0, v1.30.0) remain in the
+[release notes](release-notes.md) and the git history. This page is kept in sync
+with `benchmarks/latest_public_baseline.json`; when the maintained baseline is
+rebuilt, the snapshot section above is updated with it.
