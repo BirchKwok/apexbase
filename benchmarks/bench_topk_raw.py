@@ -5,7 +5,14 @@ commit has no `raw=True`, so this measures the current build only. The flat
 return skips the Arrow RecordBatch/Table/ResultView fixed cost; the ranking is
 byte-for-byte the same, which `test/test_topk_distance_raw.py` pins.
 
-Usage: python benchmarks/bench_topk_raw.py [--rows 1000] [--dim 8] [--k 10]
+With ``--update`` it also measures the ranking after a SQL ``UPDATE`` of a
+non-vector column: the direct mmap lane must keep serving the same ranking
+instead of standing down for the rest of the session (the 2.0.0 defect), so a
+fast-path regression shows up as a latency jump here even though every other
+benchmark only measures a pristine table. This case cannot join the base/current
+gate: the base revision has no ``raw=True`` at all, so its metric set differs.
+
+Usage: python benchmarks/bench_topk_raw.py [--rows 1000] [--dim 8] [--k 10] [--update]
 """
 from __future__ import annotations
 
@@ -43,6 +50,11 @@ def main() -> int:
     parser.add_argument("--k", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iterations", type=int, default=200)
+    parser.add_argument(
+        "--update",
+        action="store_true",
+        help="also measure raw TopK after a SQL UPDATE of a non-vector column",
+    )
     parser.add_argument("--output")
     args = parser.parse_args()
 
@@ -50,9 +62,16 @@ def main() -> int:
     matrix = rng.standard_normal((args.rows, args.dim), dtype=np.float32)
     with tempfile.TemporaryDirectory() as tmp:
         client = ApexClient(tmp, drop_if_exists=False, enable_cache=False)
-        client.create_table("t", schema={"vec": "float32_vector"})
+        client.create_table(
+            "t", schema={"label": "int64", "vec": "float32_vector"}
+        )
         client.use_table("t")
-        client.store({"vec": [matrix[i] for i in range(args.rows)]})
+        client.store(
+            {
+                "label": list(range(args.rows)),
+                "vec": [matrix[i] for i in range(args.rows)],
+            }
+        )
         client.flush()
         try:
             query = matrix[0].copy()
@@ -70,10 +89,43 @@ def main() -> int:
                 {"category": "ApexBase TopK return shape", "query": f"TopK default ResultView (rows={args.rows}, k={args.k})", "ApexBase": default["median_ms"]},
                 {"category": "ApexBase TopK return shape", "query": f"TopK raw flat (rows={args.rows}, k={args.k})", "ApexBase": raw["median_ms"]},
             ]
+            raw_after_update = None
+            if args.update:
+                before = client.topk_distance("vec", query, k=args.k, raw=True)
+                updated = client.execute(
+                    "UPDATE t SET label = -1 WHERE label < ?",
+                    params=[max(1, args.rows // 10)],
+                ).to_dict()
+                if not updated or updated[0].get("result", 0) < 1:
+                    raise SystemExit("benchmark UPDATE matched no rows")
+                raw_after_update = measure(
+                    lambda: client.topk_distance("vec", query, k=args.k, raw=True),
+                    args.warmup,
+                    args.iterations,
+                )
+                after = client.topk_distance("vec", query, k=args.k, raw=True)
+                if after != before:
+                    raise SystemExit(
+                        "raw TopK ranking changed after an unrelated SQL UPDATE: "
+                        f"{after} != {before}"
+                    )
+                results.append(
+                    {
+                        "category": "ApexBase TopK after UPDATE",
+                        "query": f"TopK raw flat after SQL UPDATE (rows={args.rows}, k={args.k})",
+                        "ApexBase": raw_after_update["median_ms"],
+                    }
+                )
             print(f"rows={args.rows} dim={args.dim} k={args.k}")
             print(f"default ResultView  {default['median_ms']:.4f} ms  (p99 {default['p99_ms']:.4f})")
             print(f"raw flat            {raw['median_ms']:.4f} ms  (p99 {raw['p99_ms']:.4f})")
             print(f"speedup             {default['median_ms'] / raw['median_ms']:.2f}x")
+            if raw_after_update is not None:
+                print(
+                    f"raw after UPDATE    {raw_after_update['median_ms']:.4f} ms  "
+                    f"(p99 {raw_after_update['p99_ms']:.4f}, "
+                    f"{raw_after_update['median_ms'] / raw['median_ms']:.2f}x vs raw)"
+                )
             if args.output:
                 with open(args.output, "w") as handle:
                     json.dump({"results": results}, handle, indent=2)

@@ -7722,3 +7722,118 @@ fn extension_logical_type_roundtrips_and_maps_to_binary() {
     assert_eq!(ColumnType::Extension.fixed_size(), 0);
     assert_eq!(ColumnType::from_u8(34), Some(ColumnType::Extension));
 }
+
+// ====== Direct mmap vector scan vs. pending DeltaStore updates ======
+
+fn direct_scan_fixture(path: &std::path::Path) -> (usize, usize) {
+    use crate::storage::DurabilityLevel;
+
+    let rows = 8usize;
+    let dim = 3usize;
+    let schema = [
+        ("label".to_string(), ColumnType::Int64),
+        ("vec".to_string(), ColumnType::FixedList),
+    ];
+    let storage =
+        OnDemandStorage::create_with_schema_and_durability(path, DurabilityLevel::Fast, &schema)
+            .unwrap();
+    let mut int_columns = HashMap::new();
+    int_columns.insert("label".to_string(), (0..rows as i64).collect::<Vec<i64>>());
+    let mut fixed_columns = HashMap::new();
+    fixed_columns.insert(
+        "vec".to_string(),
+        (0..rows)
+            .map(|row| {
+                (0..dim)
+                    .flat_map(|col| (((row * dim + col) as f32).to_le_bytes()))
+                    .collect::<Vec<u8>>()
+            })
+            .collect::<Vec<Vec<u8>>>(),
+    );
+    storage
+        .insert_typed_with_nulls_full(
+            int_columns,
+            HashMap::new(),
+            HashMap::new(),
+            HashMap::new(),
+            fixed_columns,
+            HashMap::new(),
+            HashMap::new(),
+        )
+        .unwrap();
+    storage.save_v4().unwrap();
+    (rows, dim)
+}
+
+#[test]
+fn direct_vector_scan_tolerates_non_vector_delta_updates() {
+    use crate::compute::vector_ops::{DistanceComputer, DistanceMetric};
+
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("direct_scan_delta_updates.apex");
+    let (_rows, dim) = direct_scan_fixture(&path);
+
+    let storage = OnDemandStorage::open(&path).unwrap();
+    let computer = DistanceComputer::new(DistanceMetric::L2, vec![0.0f32; dim]);
+    let baseline = storage
+        .topk_fixedlist_direct("vec", &computer, 2)
+        .unwrap()
+        .expect("dense V4 table is served by the direct scan");
+    assert_eq!(baseline.iter().map(|(row, _)| *row).collect::<Vec<_>>(), [0, 1]);
+
+    // A SQL UPDATE records its cells in the DeltaStore. The vector column and
+    // the row set are untouched, so the zero-copy lane must keep serving the
+    // table (2.0.0 disabled it and never recovered, even across reopen).
+    storage.delta_batch_update_rows(&[(1, "label", crate::data::Value::Int64(99))]);
+    assert!(storage.has_pending_deltas());
+    assert_eq!(
+        storage
+            .topk_fixedlist_direct("vec", &computer, 2)
+            .unwrap()
+            .expect("unrelated pending update must not disable the direct scan"),
+        baseline
+    );
+
+    // The batch lane shares the guard.
+    let query = vec![0.0f32; dim];
+    let batch = storage
+        .batch_topk_fixedlist_direct("vec", &query, 1, 2, DistanceMetric::L2)
+        .unwrap()
+        .expect("batch direct scan keeps serving after an unrelated update");
+    assert_eq!(batch[0], baseline);
+
+    // Persisting the DeltaStore sidecar and reopening loads the same overlay;
+    // the direct lane still has to serve the table.
+    storage.save_delta_store().unwrap();
+    drop(storage);
+    let reopened = OnDemandStorage::open(&path).unwrap();
+    assert!(reopened.has_pending_deltas());
+    assert_eq!(
+        reopened
+            .topk_fixedlist_direct("vec", &computer, 2)
+            .unwrap()
+            .expect("reopened pending update must not disable the direct scan"),
+        baseline
+    );
+
+    // Updating the scanned column itself invalidates the base bytes.
+    reopened.delta_batch_update_rows(&[(3, "vec", crate::data::Value::Null)]);
+    assert!(reopened
+        .topk_fixedlist_direct("vec", &computer, 2)
+        .unwrap()
+        .is_none());
+    assert!(reopened
+        .batch_topk_fixedlist_direct("vec", &query, 1, 2, DistanceMetric::L2)
+        .unwrap()
+        .is_none());
+
+    // Pending deletes change the visible row set, so the lane stands down until
+    // the overlay is merged.
+    reopened.clear_delta_store().unwrap();
+    assert!(reopened.delta_delete_row(3).unwrap());
+    assert!(reopened.has_pending_deltas());
+    assert!(reopened
+        .topk_fixedlist_direct("vec", &computer, 2)
+        .unwrap()
+        .is_none());
+}

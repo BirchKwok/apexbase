@@ -51,8 +51,10 @@ DELETE FROM users WHERE age < 18;
 ```
 
 `UPDATE ... SET` accepts literals and bound parameters; complex right-hand-side
-expressions are not supported yet. `UPDATE` on a table with a vector column
-disables the direct vector scan used by `hybrid_search()`; see
+expressions are not supported yet. Updating only non-vector columns keeps the
+direct vector scan used by `hybrid_search()` and `topk_distance(raw=True)`;
+changing the vector column (or `_id`) makes the next raw scan fall back to a
+merged read with identical results. See
 [Agent Memory & RAG](agent-memory.md#recency-and-scope).
 
 ## Parameter Binding

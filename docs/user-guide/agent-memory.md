@@ -103,11 +103,11 @@ What the class does:
 `toy_embed` is a deterministic placeholder; replace it with your model's
 function and keep a fixed dimension.
 
-!!! note "Use a persistent database"
-    In 2.0.0 `hybrid_search` needs the persistent vector-scan lane; an
-    `ApexClient(":memory:")` client raises
-    `RuntimeError: topk_distance(raw=True): column 'embedding' is not served by
-    the direct vector scan`.
+!!! note "Persistent database vs. :memory:"
+    `hybrid_search()` and `topk_distance(raw=True)` work on both. The zero-copy
+    direct vector scan is a file-backed feature; on an `ApexClient(":memory:")`
+    client they fall back to a merged Arrow read: the results are identical,
+    only the zero-copy fast path is skipped.
 
 ## Recency And Scope
 
@@ -124,7 +124,8 @@ scoped = mem.db.execute(
 ```
 
 `replace()` rewrites the whole row, so carry the fields you keep; `delete()`
-removes by internal id.
+removes by internal id; a SQL `UPDATE` is the shortcut for changing one or two
+columns in place.
 
 ```python
 row = mem.db.retrieve(2)          # internal id from retrieve()/get_ids()
@@ -136,12 +137,14 @@ mem.db.execute("DELETE FROM memories WHERE created_at < ?",
 mem.db.delete(id=3)
 ```
 
-!!! warning "Known issue: avoid SQL UPDATE on vector tables"
-    On 2.0.0, a SQL `UPDATE` on a table with a vector column permanently
-    disables the direct vector scan used by `hybrid_search()` (and
-    `topk_distance(raw=True)`), even after `flush()` or reopen. Use `replace()`
-    or `delete()` plus a fresh `store()` for edits and forgetting. Non-raw
-    `topk_distance()` and SQL `cosine_distance()` keep working after an UPDATE.
+!!! note "SQL UPDATE and the vector fast path"
+    An `UPDATE` that changes only non-vector columns keeps the direct vector
+    scan used by `hybrid_search()` (and `topk_distance(raw=True)`), also after
+    `flush()` or a reopen. An `UPDATE` that rewrites the vector column (or
+    `_id`) makes the next raw scan fall back to a merged read; the results are
+    identical, only the zero-copy fast path is skipped. Non-raw
+    `topk_distance()` and SQL `cosine_distance()` are unaffected either way.
+    `replace()` / `delete()` remain handy for whole-row edits and forgetting.
 
 For retention, delete by `created_at`; no index rebuild is needed.
 

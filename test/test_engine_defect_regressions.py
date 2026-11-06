@@ -989,3 +989,50 @@ class TestColumnarMaterializationKeepsRichTypes:
         # A projection of just the rich column keeps it too.
         projected = tmp_client.execute("SELECT ts FROM events").to_dict()
         assert all(isinstance(row["ts"], datetime.datetime) for row in projected)
+
+
+class TestNullLiteralUpdateOverlay:
+    """`UPDATE ... SET col = NULL` must reach every physical Arrow type.
+
+    DeltaMerger only had typed overlay branches for integers, floats, strings
+    and booleans. A NULL assignment to a timestamp, JSON, BLOB/binary or vector
+    column was recorded in the DeltaStore and then ignored by the merge, so the
+    scan kept returning the pre-UPDATE value and `IS NULL` counted zero rows.
+    """
+
+    def test_null_literal_reaches_timestamp_json_and_blob(self, tmp_client):
+        tmp_client.execute(
+            "CREATE TABLE t (a INT, ts TIMESTAMP, js JSON, b BLOB)"
+        )
+        tmp_client.use_table("t")
+        tmp_client.store(
+            {
+                "a": [1, 2],
+                "ts": ["2026-01-01 00:00:00", "2026-01-02 00:00:00"],
+                "js": ['{"x":1}', '{"x":2}'],
+                "b": [b"p", b"q"],
+            }
+        )
+        tmp_client.flush()
+
+        updated = tmp_client.execute(
+            "UPDATE t SET ts = NULL, js = NULL, b = NULL WHERE a = 1"
+        ).to_dict()
+        assert updated == [{"result": 1}], updated
+
+        rows = tmp_client.execute(
+            "SELECT a, ts, js, b FROM t ORDER BY a"
+        ).to_dict()
+        assert rows[0]["ts"] is None
+        assert rows[0]["js"] is None
+        assert rows[0]["b"] is None
+        # The untouched row keeps its values.
+        assert rows[1]["ts"] is not None
+        assert rows[1]["js"] == '{"x":2}'
+        assert rows[1]["b"] == b"q"
+
+        for column in ("ts", "js", "b"):
+            counted = tmp_client.execute(
+                f"SELECT count(*) AS n FROM t WHERE {column} IS NULL"
+            ).to_dict()
+            assert counted == [{"n": 1}], (column, counted)

@@ -30,6 +30,123 @@ pub(super) fn pylist_representable(dtype: &arrow::datatypes::DataType) -> bool {
     )
 }
 
+/// Resolve the direct mmap scan's ranked row positions to `(id, distance)`.
+///
+/// The direct lanes return positions in the visible row space. The O(k) `_id`
+/// read answers them while the base has no persisted deletion vectors;
+/// otherwise the `_id` column (which merges the overlay) resolves them.
+fn resolve_direct_topk_rows(
+    backend: &Arc<TableStorageBackend>,
+    topk: &[(usize, f32)],
+) -> PyResult<Vec<(i64, f64)>> {
+    use arrow::array::Int64Array;
+
+    let positions: Vec<usize> = topk.iter().map(|(row_idx, _)| *row_idx).collect();
+    let ids: Vec<i64> = match backend.storage.ids_at_active_positions(&positions) {
+        Ok(Some(ids)) => ids,
+        _ => {
+            let id_batch = backend
+                .read_columns_to_arrow(Some(&["_id"]), 0, None)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            let id_col = id_batch
+                .column_by_name("_id")
+                .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
+                .ok_or_else(|| PyRuntimeError::new_err("topk_distance: _id column is not Int64"))?;
+            positions.iter().map(|&row| id_col.value(row)).collect()
+        }
+    };
+    Ok(ids
+        .into_iter()
+        .zip(topk.iter().map(|(_, distance)| *distance as f64))
+        .collect())
+}
+
+/// Exact heap TopK through the delta-merging Arrow reader.
+///
+/// Used whenever the direct mmap lane cannot serve the column: pending
+/// deletes or vector-column updates, compressed/legacy row groups, or the
+/// in-memory backend. Produces the same ranking as the direct lanes.
+fn arrow_topk_rows(
+    backend: &Arc<TableStorageBackend>,
+    col: &str,
+    computer: &crate::compute::vector_ops::DistanceComputer,
+    k: usize,
+) -> PyResult<Vec<(i64, f64)>> {
+    use crate::compute::vector_ops::{topk_heap_direct_parallel, topk_heap_direct_parallel_fixed};
+    use arrow::array::{BinaryArray, FixedSizeListArray, Int64Array};
+
+    let needed: [&str; 2] = [col, "_id"];
+    let full_batch = backend
+        .read_columns_to_arrow(Some(&needed), 0, None)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    if full_batch.num_rows() == 0 {
+        return Ok(Vec::new());
+    }
+    let column = full_batch
+        .column_by_name(col)
+        .ok_or_else(|| PyRuntimeError::new_err(format!("column '{}' not found", col)))?;
+    let topk = if let Some(fixed) = column.as_any().downcast_ref::<FixedSizeListArray>() {
+        if fixed.value_length() as usize != computer.query.len() {
+            return Err(PyRuntimeError::new_err(format!(
+                "topk_distance: query dimension {} does not match column dimension {}",
+                computer.query.len(),
+                fixed.value_length()
+            )));
+        }
+        topk_heap_direct_parallel_fixed(fixed, computer, k)
+    } else if let Some(binary) = column.as_any().downcast_ref::<BinaryArray>() {
+        let expected = computer.query.len() * std::mem::size_of::<f32>();
+        if let Some(actual) = (0..binary.len())
+            .find(|&idx| !binary.is_null(idx))
+            .map(|idx| binary.value(idx).len())
+        {
+            if actual != expected {
+                return Err(PyRuntimeError::new_err(format!(
+                    "topk_distance: query dimension {} does not match column dimension {}",
+                    computer.query.len(),
+                    actual / std::mem::size_of::<f32>()
+                )));
+            }
+        }
+        topk_heap_direct_parallel(binary, computer, k)
+    } else {
+        return Err(PyRuntimeError::new_err(format!(
+            "column '{}' is not a vector column",
+            col
+        )));
+    };
+    let id_col = full_batch.column_by_name("_id");
+    Ok(topk
+        .iter()
+        .map(|(row_idx, distance)| {
+            let id = id_col
+                .and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+                .map(|array| array.value(*row_idx))
+                .unwrap_or(*row_idx as i64);
+            (id, *distance as f64)
+        })
+        .collect())
+}
+
+/// Exact single-query TopK over `col`, preferring the zero-copy mmap lanes and
+/// falling back to the delta-merging reader when they cannot serve the table.
+fn topk_rows_for_column(
+    backend: &Arc<TableStorageBackend>,
+    col: &str,
+    computer: &crate::compute::vector_ops::DistanceComputer,
+    k: usize,
+) -> PyResult<Vec<(i64, f64)>> {
+    let direct = backend
+        .topk_fixedlist_direct(col, computer, k)
+        .ok()
+        .flatten()
+        .or_else(|| backend.topk_binary_direct(col, computer, k).ok().flatten());
+    match direct {
+        Some(topk) => resolve_direct_topk_rows(backend, &topk),
+        None => arrow_topk_rows(backend, col, computer, k),
+    }
+}
+
 #[pymethods]
 impl ApexStorageImpl {
     fn _execute_arrow_ffi(&self, py: Python<'_>, sql: &str) -> PyResult<(usize, usize)> {
@@ -445,8 +562,11 @@ impl ApexStorageImpl {
     ///
     /// The fixed-list and binary direct scans produce the ranked positions and
     /// distances; only the k winning ids are resolved (the same O(k) path as the
-    /// default binding). `topk_distance(raw=True)` uses this; the default method
-    /// keeps its ResultView shape.
+    /// default binding). When those lanes cannot serve the table state (pending
+    /// deletes or vector-column updates, compressed/legacy row groups, in-memory
+    /// tables) the delta-merging Arrow reader computes the identical ranking.
+    /// `topk_distance(raw=True)` uses this; the default method keeps its
+    /// ResultView shape.
     #[pyo3(name = "_topk_distance_vectors_ffi")]
     fn topk_distance_vectors_ffi(
         &self,
@@ -459,7 +579,6 @@ impl ApexStorageImpl {
         use crate::compute::vector_ops::{
             bytes_to_query_vec_f32, DistanceComputer, DistanceMetric,
         };
-        use arrow::array::Int64Array;
 
         let query_f32 = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(
@@ -487,44 +606,13 @@ impl ApexStorageImpl {
             let backend = crate::Database::cached_backend(&table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
             let computer = DistanceComputer::new(metric_enum, query_f32.clone());
-
-            let topk = backend
-                .topk_fixedlist_direct(&col_owned, &computer, k)
-                .ok()
-                .flatten()
-                .or_else(|| {
-                    backend
-                        .topk_binary_direct(&col_owned, &computer, k)
-                        .ok()
-                        .flatten()
-                });
-            let Some(topk) = topk else {
-                // A raw scan only serves the fixed-list/binary mmap lanes; other
-                // encodings keep using the default ResultView API.
-                return Err(PyRuntimeError::new_err(format!(
-                    "topk_distance(raw=True): column '{}' is not served by the direct vector scan",
-                    col_owned
-                )));
-            };
-            let positions: Vec<usize> = topk.iter().map(|(row_idx, _)| *row_idx).collect();
-            let ids: Vec<i64> = match backend.storage.ids_at_active_positions(&positions) {
-                Ok(Some(ids)) => ids,
-                _ => {
-                    let id_batch = backend
-                        .read_columns_to_arrow(Some(&["_id"]), 0, None)
-                        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                    let id_col = id_batch
-                        .column_by_name("_id")
-                        .and_then(|column| column.as_any().downcast_ref::<Int64Array>())
-                        .ok_or_else(|| {
-                            PyRuntimeError::new_err(
-                                "topk_distance(raw=True): _id column is not Int64",
-                            )
-                        })?;
-                    positions.iter().map(|&row| id_col.value(row)).collect()
-                }
-            };
-            let dists: Vec<f64> = topk.iter().map(|(_, distance)| *distance as f64).collect();
+            let rows = topk_rows_for_column(&backend, &col_owned, &computer, k)?;
+            let mut ids = Vec::with_capacity(rows.len());
+            let mut dists = Vec::with_capacity(rows.len());
+            for (id, distance) in rows {
+                ids.push(id);
+                dists.push(distance);
+            }
             Ok((ids, dists))
         })
     }
@@ -607,8 +695,11 @@ impl ApexStorageImpl {
         k: usize,
         metric: &str,
     ) -> PyResult<(usize, usize)> {
-        use crate::compute::vector_ops::bytes_to_query_vec_f32;
-        use arrow::array::{Array, StructArray};
+        use crate::compute::vector_ops::{
+            bytes_to_query_vec_f32, DistanceComputer, DistanceMetric,
+        };
+        use arrow::array::{ArrayRef, Float64Array, Int64Array, StructArray};
+        use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
 
         let query_f32 = bytes_to_query_vec_f32(query_bytes).ok_or_else(|| {
             pyo3::exceptions::PyValueError::new_err(
@@ -625,160 +716,25 @@ impl ApexStorageImpl {
             .get_current_table_path()
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
 
-        // Direct path — no SQL string formatting or parsing overhead.
         let col_owned = col.to_string();
         let metric_str = metric.to_string();
-        let names = vec!["_id".to_string(), "dist".to_string()];
 
         let batch = py.allow_threads(|| -> PyResult<RecordBatch> {
-            use crate::compute::vector_ops::{
-                topk_heap_direct_parallel, DistanceComputer, DistanceMetric,
-            };
-            use arrow::array::{ArrayRef, BinaryArray, Float64Array, Int64Array};
-            use arrow::datatypes::{DataType as ArrowDataType, Field, Schema};
-
             let metric_enum = DistanceMetric::from_str(&metric_str).ok_or_else(|| {
                 PyRuntimeError::new_err(format!(
                     "_topk_distance_ffi: unknown metric '{}'",
                     metric_str
                 ))
             })?;
-
             let backend = crate::Database::cached_backend(&table_path)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            let id_field = Field::new(&names[0], ArrowDataType::Int64, false);
-            let dist_field = Field::new(&names[1], ArrowDataType::Float64, false);
-            let out_schema = std::sync::Arc::new(Schema::new(vec![id_field, dist_field]));
-
             let computer = DistanceComputer::new(metric_enum, query_f32.clone());
-
-            // FAST PATH: zero-copy scan on OS mmap — no Arrow batch, no memcpy
-            let direct_topk = backend
-                .topk_fixedlist_direct(&col_owned, &computer, k)
-                .ok()
-                .flatten()
-                .or_else(|| {
-                    backend
-                        .topk_binary_direct(&col_owned, &computer, k)
-                        .ok()
-                        .flatten()
-                });
-            if let Some(topk) = direct_topk {
-                if topk.is_empty() {
-                    return RecordBatch::try_new(
-                        out_schema,
-                        vec![
-                            std::sync::Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-                            std::sync::Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
-                        ],
-                    )
-                    .map_err(|e| PyRuntimeError::new_err(e.to_string()));
-                }
-                // Resolve only the k winning ids: the ID section starts each row
-                // group's body, so this is O(k) instead of decoding the whole
-                // `_id` column (W1-5: 8 MB at 1M rows to recover 10 ids).
-                let positions: Vec<usize> =
-                    topk.iter().map(|(row_idx, _)| *row_idx).collect();
-                let ids: Vec<i64> = match backend.storage.ids_at_active_positions(&positions) {
-                    Ok(Some(ids)) => ids,
-                    _ => {
-                        let id_batch = backend
-                            .read_columns_to_arrow(Some(&["_id"]), 0, None)
-                            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-                        let id_col = id_batch.column_by_name("_id");
-                        positions
-                            .iter()
-                            .map(|&row_idx| {
-                                id_col
-                                    .and_then(|a| a.as_any().downcast_ref::<Int64Array>())
-                                    .map(|a| a.value(row_idx))
-                                    .unwrap_or(row_idx as i64)
-                            })
-                            .collect()
-                    }
-                };
-                let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
-                return RecordBatch::try_new(
-                    out_schema,
-                    vec![
-                        std::sync::Arc::new(Int64Array::from(ids)) as ArrayRef,
-                        std::sync::Arc::new(Float64Array::from(dists)) as ArrayRef,
-                    ],
-                )
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
-            }
-
-            // FALLBACK: Arrow path for Binary columns / compressed RGs
-            let needed: &[&str] = &[&col_owned, "_id"];
-            let full_batch = backend
-                .read_columns_to_arrow(Some(needed), 0, None)
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-
-            if full_batch.num_rows() == 0 {
-                return RecordBatch::try_new(
-                    out_schema,
-                    vec![
-                        std::sync::Arc::new(Int64Array::from(Vec::<i64>::new())) as ArrayRef,
-                        std::sync::Arc::new(Float64Array::from(Vec::<f64>::new())) as ArrayRef,
-                    ],
-                )
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()));
-            }
-
-            let bin_col = full_batch.column_by_name(&col_owned).ok_or_else(|| {
-                PyRuntimeError::new_err(format!("column '{}' not found", col_owned))
-            })?;
-
-            let topk = if let Some(fixed_arr) = bin_col
-                .as_any()
-                .downcast_ref::<arrow::array::FixedSizeListArray>()
-            {
-                if fixed_arr.value_length() as usize != computer.query.len() {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "topk_distance: query dimension {} does not match column dimension {}",
-                        computer.query.len(),
-                        fixed_arr.value_length()
-                    )));
-                }
-                use crate::compute::vector_ops::topk_heap_direct_parallel_fixed;
-                topk_heap_direct_parallel_fixed(fixed_arr, &computer, k)
-            } else if let Some(bin_arr) = bin_col.as_any().downcast_ref::<BinaryArray>() {
-                let expected = computer.query.len() * std::mem::size_of::<f32>();
-                if let Some(actual) = (0..bin_arr.len())
-                    .find(|&idx| !bin_arr.is_null(idx))
-                    .map(|idx| bin_arr.value(idx).len())
-                {
-                    if actual != expected {
-                        return Err(PyRuntimeError::new_err(format!(
-                            "topk_distance: query dimension {} does not match column dimension {}",
-                            computer.query.len(),
-                            actual / std::mem::size_of::<f32>()
-                        )));
-                    }
-                }
-                topk_heap_direct_parallel(bin_arr, &computer, k)
-            } else {
-                return Err(PyRuntimeError::new_err(format!(
-                    "column '{}' is not a vector column",
-                    col_owned
-                )));
-            };
-
-            let id_col = full_batch.column_by_name("_id");
-            let ids: Vec<i64> = topk
-                .iter()
-                .map(|(row_idx, _)| {
-                    if let Some(arr) = &id_col {
-                        if let Some(a) = arr.as_any().downcast_ref::<Int64Array>() {
-                            return a.value(*row_idx);
-                        }
-                    }
-                    *row_idx as i64
-                })
-                .collect();
-            let dists: Vec<f64> = topk.iter().map(|(_, d)| *d as f64).collect();
-
+            let rows = topk_rows_for_column(&backend, &col_owned, &computer, k)?;
+            let (ids, dists): (Vec<i64>, Vec<f64>) = rows.into_iter().unzip();
+            let out_schema = std::sync::Arc::new(Schema::new(vec![
+                Field::new("_id", ArrowDataType::Int64, false),
+                Field::new("dist", ArrowDataType::Float64, false),
+            ]));
             RecordBatch::try_new(
                 out_schema,
                 vec![

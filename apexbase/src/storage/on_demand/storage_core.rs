@@ -2990,6 +2990,22 @@ impl OnDemandStorage {
         !self.delta_store.read().is_empty()
     }
 
+    /// Whether pending DeltaStore entries still allow the direct mmap vector
+    /// scan over `col_name`.
+    ///
+    /// The lane addresses base row positions and base vector bytes, so pending
+    /// cell updates to *other* columns leave both valid: a SQL `UPDATE` no
+    /// longer disables it until compaction. Pending deletes or updates to the
+    /// scanned column (or `_id`) change the visible row set and must fall back
+    /// to the DeltaMerger-backed reader.
+    pub(crate) fn direct_vector_scan_deltas_compatible(&self, col_name: &str) -> bool {
+        let delta = self.delta_store.read();
+        delta.is_empty()
+            || (delta.delete_count() == 0
+                && !delta.updates_column(col_name)
+                && !delta.updates_column("_id"))
+    }
+
     /// Physical base row count when persisted V4 row-group deletion vectors
     /// make it differ from `header.row_count` (which counts *active* rows).
     ///

@@ -19,7 +19,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::SystemTime;
 
@@ -72,6 +72,12 @@ struct MappedCatalog {
     capacity: u32,
     file_len: u64,
     modified: SystemTime,
+    /// True only while this catalog was created in-process because the
+    /// database had no `.apex_tables` yet. That is the one moment where the
+    /// `*.apex` files on disk are the legacy registry and may be adopted;
+    /// once the catalog exists it is authoritative, and an empty registry
+    /// means "no tables" even if dropped files are awaiting deferred unlink.
+    adopt_existing_files: AtomicBool,
 }
 
 unsafe impl Send for MappedCatalog {}
@@ -566,9 +572,16 @@ impl CatalogLock {
     pub fn insert(&self, name: &str) -> io::Result<()> {
         let catalog = &self.catalog;
         let mut tables = snapshot_from_catalog(catalog)?;
-        if tables.is_empty() {
+        if tables.is_empty()
+            && catalog
+                .adopt_existing_files
+                .load(Ordering::Acquire)
+        {
             // First mutation after opening a legacy database without a
             // catalog: adopt existing `*.apex` files before registering.
+            // This must not run once a catalog exists: an empty registry after
+            // DROP TABLE is authoritative, and its unlinked files are deferred
+            // deletions that must not be resurrected by a same-name CREATE.
             for (table_name, path) in scan_apex_files(&catalog.base_dir)? {
                 tables.entry(table_name).or_insert(path);
             }
@@ -613,6 +626,7 @@ impl CatalogLock {
         let generation = catalog.bump_generation();
 
         tables.insert(name.to_string(), table_path(&catalog.base_dir, name));
+        catalog.adopt_existing_files.store(false, Ordering::Release);
         REGISTRY_CACHE.insert(
             catalog.base_dir.clone(),
             (generation, Some(catalog.modified), tables),
@@ -666,7 +680,10 @@ impl CatalogLock {
     pub fn remove(&self, name: &str) -> io::Result<Option<PathBuf>> {
         let catalog = &self.catalog;
         let mut tables = snapshot_from_catalog(catalog)?;
-        let adopted_backfill = tables.is_empty();
+        let adopted_backfill = tables.is_empty()
+            && catalog
+                .adopt_existing_files
+                .load(Ordering::Acquire);
         if adopted_backfill {
             for (table_name, path) in scan_apex_files(&catalog.base_dir)? {
                 tables.entry(table_name).or_insert(path);
@@ -680,6 +697,7 @@ impl CatalogLock {
             // The dropped table had no slot of its own; persist the remaining
             // backfilled entries so they survive a remap.
             catalog.persist_tables(&tables)?;
+            catalog.adopt_existing_files.store(false, Ordering::Release);
             let generation = catalog.generation();
             REGISTRY_CACHE.insert(
                 catalog.base_dir.clone(),
@@ -687,6 +705,8 @@ impl CatalogLock {
             );
             return Ok(Some(removed));
         }
+
+        catalog.adopt_existing_files.store(false, Ordering::Release);
 
         let bytes = catalog.mapping.as_ref();
         let last_slot = catalog.header_u32(28) as usize;
@@ -1010,7 +1030,12 @@ fn ensure_mapped(base_dir: &Path, lock_file: fs::File) -> io::Result<Arc<MappedC
     }
 
     let meta_path = base_dir.join(TABLE_CATALOG_FILE);
-    if !meta_path.exists() {
+    // A database without a catalog predates the registry: its `*.apex` files
+    // are the only table list, so the first mutation adopts them. As soon as
+    // the catalog exists (including this newly created empty one) it becomes
+    // authoritative and table files are never adopted again.
+    let adopt_existing_files = !meta_path.exists();
+    if adopt_existing_files {
         write_v2_file(&meta_path)?;
     }
 
@@ -1055,6 +1080,7 @@ fn ensure_mapped(base_dir: &Path, lock_file: fs::File) -> io::Result<Arc<MappedC
         capacity,
         file_len: file_len as u64,
         modified,
+        adopt_existing_files: AtomicBool::new(adopt_existing_files),
     });
     CATALOGS.insert(base_dir.to_path_buf(), Arc::clone(&catalog));
     Ok(catalog)
@@ -1101,6 +1127,10 @@ const TABLE_FILE_SUFFIXES: &[&str] = &[
     ".deltastore",
     ".deltastore.tmp",
     ".plan_feedback",
+    // Persisted coarse vector index and its build scratch file. A same-name
+    // recreation must not inherit the previous table's IVF centroids/lists.
+    ".ivf",
+    ".ivf.tmp",
     // Durable "secondary indexes may be incomplete" marker written before a
     // transaction's commit point; it must be reaped with the table so a
     // same-name recreation does not inherit a stale-marker read fallback.
@@ -1126,6 +1156,11 @@ fn file_fingerprint(path: &Path) -> Fingerprint {
 }
 
 fn unlink_table_files(table_path: &Path) {
+    // Release cached mappings before unlinking sidecars: Windows refuses to
+    // delete a file while a section is mapped, which used to leave the persisted
+    // IVF index behind after DROP TABLE.
+    crate::storage::on_demand::forget_vector_index(table_path);
+    crate::storage::on_demand::forget_blob_packed_dedup(table_path);
     let _ = fs::remove_file(table_path);
     let stem = table_path.to_string_lossy();
     for suffix in TABLE_FILE_SUFFIXES {
@@ -1135,7 +1170,6 @@ fn unlink_table_files(table_path: &Path) {
     // (`<table>.apex.blobs`). It is a directory, so the suffix loop above cannot
     // reclaim it; without this every DROP leaves the payloads on disk forever.
     let _ = fs::remove_dir_all(format!("{stem}.blobs"));
-    crate::storage::on_demand::forget_blob_packed_dedup(table_path);
     // Rewrite scratch files carry a pid and sequence number, so they are not
     // matched by the fixed suffixes above and would otherwise stay behind in the
     // directory after the table is dropped.
@@ -1467,4 +1501,70 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    #[test]
+    fn dropped_table_files_are_not_adopted_by_same_name_creates() {
+        let dir = temp_dir("drop_all_recreate");
+        {
+            let registry = lock(&dir).unwrap();
+            registry.insert("a").unwrap();
+            registry.insert("b").unwrap();
+        }
+        // Both tables wrote data before being dropped. DROP is catalog-only: the
+        // files stay on disk until the deferred unlink runs, so they are present
+        // when the names are recreated.
+        fs::write(dir.join("a.apex"), b"a-data").unwrap();
+        fs::write(dir.join("b.apex"), b"b-data").unwrap();
+        {
+            let registry = lock(&dir).unwrap();
+            registry.remove("a").unwrap();
+            registry.remove("b").unwrap();
+        }
+        assert!(dir.join("a.apex").exists() && dir.join("b.apex").exists());
+        // The first CREATE reaped `a`; the second must not see `b` whose file is
+        // still awaiting the deferred unlink (the empty-registry legacy scan used
+        // to adopt it and answer "Table 'b' already exists").
+        {
+            let registry = lock(&dir).unwrap();
+            registry.insert("a").expect("recreate a");
+            registry.insert("b").expect("recreate b");
+            let tables: Vec<String> = registry.snapshot().unwrap().into_keys().collect();
+            assert_eq!(tables, ["a", "b"]);
+        }
+        release(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn legacy_database_files_are_adopted_once() {
+        let dir = temp_dir("legacy_adopt");
+        fs::write(dir.join("x.apex"), b"x").unwrap();
+        fs::write(dir.join("y.apex"), b"y").unwrap();
+        {
+            let registry = lock(&dir).unwrap();
+            registry.insert("z").unwrap();
+            let tables: Vec<String> = registry.snapshot().unwrap().into_keys().collect();
+            assert_eq!(tables, ["x", "y", "z"]);
+        }
+        // Once the catalog exists it is authoritative: dropping every table must
+        // not make the next mutation adopt the leftover (deferred-unlink) files.
+        fs::write(dir.join("y.apex"), b"y2").unwrap();
+        {
+            let registry = lock(&dir).unwrap();
+            registry.remove("x").unwrap();
+            registry.remove("y").unwrap();
+            registry.remove("z").unwrap();
+        }
+        assert!(dir.join("y.apex").exists(), "deferred unlink keeps the file");
+        {
+            let registry = lock(&dir).unwrap();
+            registry.insert("x").expect("recreate x");
+            registry
+                .insert("y")
+                .expect("leftover files must not be adopted as tables");
+            let tables: Vec<String> = registry.snapshot().unwrap().into_keys().collect();
+            assert_eq!(tables, ["x", "y"]);
+        }
+        release(&dir);
+        let _ = fs::remove_dir_all(&dir);
+    }
 }

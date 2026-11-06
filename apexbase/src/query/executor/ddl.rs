@@ -418,21 +418,23 @@ impl ApexExecutor {
         table: &str,
         if_exists: bool,
     ) -> io::Result<ApexResult> {
+        let table_name = crate::storage::table_catalog::bare_name(table);
+        let base_dir = table_path.parent().unwrap_or(table_path);
         if crate::storage::is_memory_path(table_path) {
-            if crate::storage::engine::engine().drop_memory_table(table_path) || if_exists {
-                return Ok(ApexResult::Scalar(0));
+            let dropped = crate::storage::engine::engine().drop_memory_table(table_path);
+            if !dropped && !if_exists {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("Table '{}' does not exist", table),
+                ));
             }
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("Table '{}' does not exist", table),
-            ));
+            Self::drop_table_fts_state(base_dir, table_name)?;
+            return Ok(ApexResult::Scalar(0));
         }
         // Invalidate ALL caches to release file handles and mmaps
         invalidate_storage_cache(table_path);
         crate::storage::engine::engine().invalidate(table_path);
 
-        let table_name = crate::storage::table_catalog::bare_name(table);
-        let base_dir = table_path.parent().unwrap_or(table_path);
         let registry_lock = crate::storage::table_catalog::lock(base_dir)?;
         let registry = registry_lock.snapshot()?;
         let listed = registry.contains_key(table_name);
@@ -446,6 +448,11 @@ impl ApexExecutor {
                 ));
             }
         }
+
+        // A dropped table also loses its full-text index. Leaving the config
+        // entry or postings behind made a same-name CREATE inherit the old
+        // documents, so `hybrid_search()` returned ids that no longer exist.
+        Self::drop_table_fts_state(base_dir, table_name)?;
 
         if listed {
             registry_lock.remove(table_name)?;
@@ -3126,21 +3133,36 @@ impl ApexExecutor {
         Ok(count)
     }
 
-    /// DROP FTS INDEX ON table — remove config entry and delete index files
-    pub(super) fn execute_drop_fts_index(base_dir: &Path, table: &str) -> io::Result<ApexResult> {
+    /// Remove every full-text artifact a table owns: the `fts_config.json`
+    /// entry, the cached engine (with its index files), and — when no engine was
+    /// opened in this process — the on-disk index files themselves.
+    ///
+    /// Shared by `DROP FTS INDEX` and `DROP TABLE`. A dropped table must not
+    /// leave postings behind: a later same-name `CREATE TABLE` would otherwise
+    /// serve ghost document ids from the previous table.
+    fn drop_table_fts_state(base_dir: &Path, table: &str) -> io::Result<()> {
         crate::query::executor::wait_fts_backfill(base_dir, table);
 
-        // Update config
         let mut cfg = Self::read_fts_config(base_dir);
         if let Some(obj) = cfg.as_object_mut() {
-            obj.remove(table);
+            if obj.remove(table).is_some() {
+                Self::write_fts_config(base_dir, &cfg);
+            }
         }
-        Self::write_fts_config(base_dir, &cfg);
 
-        // Remove from FTS manager if present
         if let Some(mgr) = crate::query::executor::get_fts_manager(base_dir) {
-            let _ = mgr.remove_engine(table, true);
+            mgr.remove_engine(table, true)
+                .map_err(|e| err_data(e.to_string()))?;
+        } else {
+            crate::fts::remove_table_index_files(&base_dir.join("fts_indexes"), table)
+                .map_err(|e| err_data(e.to_string()))?;
         }
+        Ok(())
+    }
+
+    /// DROP FTS INDEX ON table — remove config entry and delete index files
+    pub(super) fn execute_drop_fts_index(base_dir: &Path, table: &str) -> io::Result<ApexResult> {
+        Self::drop_table_fts_state(base_dir, table)?;
 
         let msg = format!("FTS index dropped for table '{}'", table);
         use arrow::array::StringArray;

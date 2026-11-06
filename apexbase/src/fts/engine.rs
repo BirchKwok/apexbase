@@ -709,22 +709,7 @@ impl FtsManager {
         }
         self.table_configs.write().remove(table_name);
         if delete_files {
-            for suffix in [
-                "afts",
-                "afts.wal",
-                "afts.tmp",
-                "afts.meta",
-                "afts.meta.tmp",
-                "afts.stale",
-                "afts.incompatible",
-                "nfts",
-                "nfts.wal",
-            ] {
-                let path = self.base_path.join(format!("{table_name}.{suffix}"));
-                if path.exists() {
-                    fs::remove_file(path)?;
-                }
-            }
+            remove_table_index_files(&self.base_path, table_name)?;
         }
         Ok(())
     }
@@ -735,4 +720,36 @@ impl FtsManager {
         }
         Ok(())
     }
+}
+
+/// Every file suffix an FTS table owns in a database's `fts_indexes` directory.
+const TABLE_INDEX_FILE_SUFFIXES: &[&str] = &[
+    "afts",
+    "afts.wal",
+    "afts.tmp",
+    "afts.meta",
+    "afts.meta.tmp",
+    "afts.stale",
+    "afts.incompatible",
+    "nfts",
+    "nfts.wal",
+];
+
+/// Delete the on-disk FTS files of one table without needing a live manager.
+///
+/// `DROP TABLE` has to clear the index even when no engine was opened in the
+/// current process (a fresh client that never called `init_fts()`, or a database
+/// whose manager was released). Otherwise the postings survive the drop and a
+/// same-name `CREATE TABLE` inherits them as ghost document ids.
+pub fn remove_table_index_files(base_path: &Path, table_name: &str) -> FtsResult<()> {
+    if crate::storage::is_memory_path(base_path) {
+        return Ok(());
+    }
+    for suffix in TABLE_INDEX_FILE_SUFFIXES {
+        let path = base_path.join(format!("{table_name}.{suffix}"));
+        if path.exists() {
+            fs::remove_file(path).map_err(FtsError::Io)?;
+        }
+    }
+    Ok(())
 }

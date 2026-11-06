@@ -13,6 +13,30 @@ static IVF_VECTOR_CACHE: once_cell::sync::Lazy<
     parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, String), (u64, u64, std::sync::Arc<Vec<f32>>, usize)>>,
 > = once_cell::sync::Lazy::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
+/// Path of the persisted coarse index that belongs to `table_path`.
+fn vector_index_path_for(table_path: &std::path::Path) -> std::path::PathBuf {
+    let mut path = table_path.to_path_buf();
+    let name = path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    path.set_file_name(format!("{name}.ivf"));
+    path
+}
+
+/// Release every cached mapping/payload for a table's persisted IVF index.
+///
+/// DROP TABLE deletes the table's sidecars, and Windows cannot unlink a file
+/// while a section is still mapped; the caches must be dropped before the
+/// `.ivf` file is reaped (and a `drop_vector_index()` must not leave its own
+/// mapping behind either).
+pub(crate) fn forget_vector_index(table_path: &std::path::Path) {
+    let path = vector_index_path_for(table_path);
+    IVF_MMAP_CACHE.lock().remove(&path);
+    IVF_VECTOR_CACHE.lock().retain(|(cached, _), _| cached != &path);
+}
+
 
 /// Metadata for the persisted coarse vector index (`<table>.apex.ivf`).
 #[derive(Debug, Clone)]
@@ -61,9 +85,9 @@ impl OnDemandStorage {
     ) -> io::Result<Option<Vec<(usize, f32)>>> {
         use crate::compute::vector_ops::topk_heap_on_floats;
 
-        // Direct mmap row offsets match visible Arrow row positions only while
-        // no overlay update or deletion is pending.
-        if self.has_pending_deltas() {
+        // Direct mmap row offsets match visible Arrow row positions while the
+        // pending overlay keeps the row set and this column's bytes intact.
+        if !self.direct_vector_scan_deltas_compatible(col_name) {
             return Ok(None);
         }
         let footer = match self.get_or_load_footer()? {
@@ -481,7 +505,7 @@ impl OnDemandStorage {
     ) -> io::Result<Option<Vec<(usize, f32)>>> {
         use crate::compute::vector_ops::topk_heap_on_floats;
 
-        if self.has_pending_deltas() {
+        if !self.direct_vector_scan_deltas_compatible(col_name) {
             return Ok(None);
         }
         let footer = match self.get_or_load_footer()? {
@@ -1104,7 +1128,7 @@ impl OnDemandStorage {
         if n_queries == 0 || queries.len() == 0 {
             return Ok(Some(vec![vec![]; n_queries]));
         }
-        if self.has_pending_deltas() {
+        if !self.direct_vector_scan_deltas_compatible(col_name) {
             return Ok(None);
         }
         let query_dim = queries.len() / n_queries;
@@ -1528,7 +1552,7 @@ impl OnDemandStorage {
         if n_queries == 0 || queries.len() == 0 {
             return Ok(Some(vec![vec![]; n_queries]));
         }
-        if self.has_pending_deltas() {
+        if !self.direct_vector_scan_deltas_compatible(col_name) {
             return Ok(None);
         }
         let query_dim = queries.len() / n_queries;
@@ -1961,6 +1985,8 @@ impl OnDemandStorage {
 
     /// Remove the persisted coarse index. Returns whether a file was removed.
     pub fn drop_vector_index(&self) -> io::Result<bool> {
+        // Release the cached mapping first: Windows cannot unlink a mapped file.
+        forget_vector_index(&self.path);
         match std::fs::remove_file(self.vector_index_path()) {
             Ok(()) => Ok(true),
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),

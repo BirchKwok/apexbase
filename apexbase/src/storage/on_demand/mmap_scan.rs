@@ -14,6 +14,7 @@ mod vector;
 pub use predicate::MmapScanPred;
 use predicate::*;
 pub(crate) use predicate::{MmapBatchColumn, MmapBatchColumns};
+pub(crate) use vector::forget_vector_index;
 #[cfg(test)]
 pub(crate) use predicate::zone_pruned_row_groups;
 #[cfg(test)]

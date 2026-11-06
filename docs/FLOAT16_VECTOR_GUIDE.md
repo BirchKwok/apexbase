@@ -43,8 +43,9 @@ For most modern embedding models (CLIP, BERT, Sentence-Transformers, OpenAI `tex
     reads and bounded execution in the same engine: `hybrid_search()` fuses
     BM25 with a float16 vector branch, `execute_stream()` yields large reads
     batch by batch, and `APEX_QUERY_MEMORY_MB` / `APEX_SPILL_DIR` keep
-    sort/aggregation/join state bounded. `hybrid_search()` requires a filesystem
-    database.
+    sort/aggregation/join state bounded. `hybrid_search()` needs an initialized
+    FTS index; its vector branch uses the zero-copy mmap scan on a file-backed
+    database and a merged read on `:memory:`.
 
 ---
 
@@ -175,8 +176,9 @@ client.execute(f"""
 
 ### Hybrid retrieval and streaming
 
-`hybrid_search()` fuses the float16 vector branch with a BM25 text branch and
-needs a filesystem database; `execute_stream()` reads large projections batch by
+`hybrid_search()` fuses the float16 vector branch with a BM25 text branch; the
+vector branch uses the zero-copy mmap scan on a file-backed database and a
+merged read on `:memory:`. `execute_stream()` reads large projections batch by
 batch on any database:
 
 ```python

@@ -671,6 +671,6 @@ This file is written by both the Rust DDL handlers (`CREATE FTS INDEX`) and the 
 ## Known Constraints
 
 - `FTS_SCORE()` currently scores exact `MATCH()` queries; fuzzy edit-distance candidates do not expose BM25 scores through SQL.
-- `hybrid_search()` needs an initialized FTS index and a filesystem database — its vector branch uses the direct mmap vector scan, so it does not run on a `:memory:` client (pure SQL and FTS work there).
-- For tables you query with `hybrid_search()`, change rows with `store()` / `replace()` / `DELETE`; after a SQL `UPDATE` the direct vector scan can reject the column (`topk_distance(raw=True): column '...' is not served by the direct vector scan`) and does not recover in that session. Non-raw `topk_distance()` and SQL distance functions keep working.
+- `hybrid_search()` needs an initialized FTS index, but not a file-backed database: on a file-backed database its vector branch uses the zero-copy direct mmap scan, and when that fast path cannot serve (`:memory:`, pending deletes, a compressed or older row group) it falls back to a merged Arrow read with the same results.
+- A SQL `UPDATE` on a table with a vector column keeps the direct vector scan as long as the statement leaves the vector column (and `_id`) untouched; rewriting the vector column makes the next raw scan fall back to a merged read. `store()` / `replace()` / `DELETE` remain the natural choices for appending, whole-row edits and deletions, and non-raw `topk_distance()` and SQL distance functions work in every case.
 - Legacy v2 snapshots use the eager compatibility loader and upgrade to v3 on the next compaction.

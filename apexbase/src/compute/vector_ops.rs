@@ -1948,7 +1948,31 @@ pub fn topk_heap_direct_parallel_fixed(
         .downcast_ref::<arrow::array::Float32Array>()
         .expect("FixedSizeList child must be Float32Array");
     let floats: &[f32] = float_arr.values().as_ref();
-    topk_heap_on_floats(floats, n, dim, computer, k)
+    let Some(nulls) = col.nulls() else {
+        return topk_heap_on_floats(floats, n, dim, computer, k);
+    };
+
+    // NULL vectors take no part in the ranking, exactly like a SQL NULL
+    // distance result. The delta overlay can materialize them (`UPDATE ...
+    // SET vec = NULL`), and a raw byte scan would otherwise score the stale
+    // child values and rank a row whose vector is logically absent.
+    let mut live: Vec<f32> = Vec::with_capacity(n * dim);
+    let mut positions: Vec<usize> = Vec::with_capacity(n);
+    for row in 0..n {
+        if nulls.is_null(row) {
+            continue;
+        }
+        let start = row * dim;
+        if start + dim > floats.len() {
+            break;
+        }
+        live.extend_from_slice(&floats[start..start + dim]);
+        positions.push(row);
+    }
+    topk_heap_on_floats(&live, positions.len(), dim, computer, k)
+        .into_iter()
+        .map(|(index, distance)| (positions[index], distance))
+        .collect()
 }
 
 /// Core parallel TopK on a raw contiguous `&[f32]` (no Arrow, no allocation).
@@ -3227,4 +3251,27 @@ mod tests {
         assert!((fa.value(0)).abs() < 1e-5); // distance to itself
         assert!((fa.value(1) - 1.4142135).abs() < 1e-4); // √2
     }
+
+    #[test]
+    fn topk_fixed_list_skips_null_vectors() {
+        use arrow::array::FixedSizeListArray;
+        use arrow::buffer::NullBuffer;
+        use arrow::datatypes::{DataType as ArrowDataType2, Field};
+        use std::sync::Arc;
+
+        let item = Arc::new(Field::new("item", ArrowDataType2::Float32, true));
+        let values = Float32Array::from(vec![0.0f32, 0.0, 1.0, 1.0, 2.0, 2.0]);
+        // Row 1 is a NULL vector (`UPDATE t SET vec = NULL`); it must not be
+        // ranked from whatever bytes the child buffer happens to hold.
+        let nulls = NullBuffer::from(vec![true, false, true]);
+        let col = FixedSizeListArray::new(item, 2, Arc::new(values), Some(nulls));
+        let computer = DistanceComputer::new(DistanceMetric::L2, vec![0.0, 0.0]);
+        let topk = topk_heap_direct_parallel_fixed(&col, &computer, 3);
+        assert_eq!(
+            topk.iter().map(|(row, _)| *row).collect::<Vec<_>>(),
+            [0, 2],
+            "NULL vectors are excluded from the ranking"
+        );
+    }
+
 }

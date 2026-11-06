@@ -235,15 +235,54 @@ impl DeltaMerger {
                 )
             }
             _ => {
-                // For unsupported types (including dictionary columns without
-                // pending updates), just take the kept rows without updates
+                // Types without a typed overlay branch (fixed-list vectors,
+                // binary/blob, timestamps, decimals, ...) still have to honour
+                // pending NULL assignments: `UPDATE t SET vec = NULL` used to be
+                // recorded in the DeltaStore and then silently ignored here, so
+                // every scan kept returning the stale base value.
                 let indices = arrow::array::UInt32Array::from(
                     kept_positions.iter().map(|&p| p as u32).collect::<Vec<_>>(),
                 );
-                arrow::compute::take(base_col, &indices, None)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
+                let taken = arrow::compute::take(base_col, &indices, None)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+                Self::overlay_null_updates(taken, col_name, kept_positions, base_row_ids, delta)
             }
         }
+    }
+
+    /// Apply pending `Value::Null` cell updates to a column whose physical Arrow
+    /// type has no typed overlay branch above.
+    ///
+    /// SQL `UPDATE` only assigns literals, and for these column types NULL is the
+    /// only representable assignment; a non-NULL unsupported update keeps the old
+    /// behaviour of leaving the base value in place. The overlay is a validity
+    /// bitmap change only, so it works for vectors, binary and any nested type.
+    fn overlay_null_updates(
+        taken: ArrayRef,
+        col_name: &str,
+        kept_positions: &[usize],
+        base_row_ids: &[u64],
+        delta: &DeltaStore,
+    ) -> io::Result<ArrayRef> {
+        if !delta.updates_column(col_name) {
+            return Ok(taken);
+        }
+        let mask = BooleanArray::from(
+            kept_positions
+                .iter()
+                .map(|&pos| {
+                    matches!(
+                        delta.get_updated_value(base_row_ids[pos], col_name),
+                        Some(Value::Null)
+                    )
+                })
+                .collect::<Vec<bool>>(),
+        );
+        if mask.true_count() == 0 {
+            return Ok(taken);
+        }
+        arrow::compute::nullif(&taken, &mask)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))
     }
 
     fn merge_int64(
@@ -605,4 +644,80 @@ mod tests {
         assert_eq!(values.value(city.keys().value(1) as usize), "beijing");
         assert_eq!(values.value(city.keys().value(2) as usize), "shanghai");
     }
+
+    fn make_vector_batch() -> (RecordBatch, Vec<u64>) {
+        use arrow::array::{BinaryArray, FixedSizeListArray, Float32Array, UInt64Array};
+
+        let item = Arc::new(Field::new("item", ArrowDataType::Float32, true));
+        let values = Float32Array::from(vec![
+            1.0f32, 2.0, 3.0, //
+            4.0, 5.0, 6.0, //
+            7.0, 8.0, 9.0,
+        ]);
+        let vec = FixedSizeListArray::new(item.clone(), 3, Arc::new(values), None);
+        let payload = BinaryArray::from(vec![&b"a"[..], &b"b"[..], &b"c"[..]]);
+        let ids = UInt64Array::from(vec![0u64, 1, 2]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("_id", ArrowDataType::UInt64, false),
+            Field::new(
+                "vec",
+                ArrowDataType::FixedSizeList(item, 3),
+                true,
+            ),
+            Field::new("payload", ArrowDataType::Binary, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(ids), Arc::new(vec), Arc::new(payload)],
+        )
+        .unwrap();
+        (batch, vec![0, 1, 2])
+    }
+
+    #[test]
+    fn test_merge_applies_null_updates_to_vectors_and_binary() {
+        use arrow::array::{BinaryArray, FixedSizeListArray, Float32Array};
+
+        let (batch, row_ids) = make_vector_batch();
+        let dir = tempfile::tempdir().unwrap();
+        let mut delta = DeltaStore::new(&dir.path().join("vectors.apex"));
+        // `UPDATE t SET vec = NULL` and the same for a binary column: these
+        // types have no typed overlay branch, so the merge must still apply the
+        // NULL assignment instead of silently returning the base value.
+        delta.update_cell(1, "vec", Value::Null);
+        delta.update_cell(2, "payload", Value::Null);
+
+        let merged = DeltaMerger::merge(&batch, &delta, &row_ids).unwrap();
+        assert_eq!(merged.num_rows(), 3);
+
+        let vectors = merged
+            .column(1)
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .unwrap();
+        assert!(!vectors.is_null(0));
+        assert!(vectors.is_null(1), "NULL vector update must reach the scan");
+        assert!(!vectors.is_null(2));
+        let child = vectors
+            .values()
+            .as_any()
+            .downcast_ref::<Float32Array>()
+            .unwrap();
+        assert_eq!(
+            (child.value(0), child.value(1), child.value(2)),
+            (1.0, 2.0, 3.0),
+            "untouched vector cells keep their base value"
+        );
+
+        let payload = merged
+            .column(2)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert!(!payload.is_null(0));
+        assert!(!payload.is_null(1));
+        assert!(payload.is_null(2), "NULL binary update must reach the scan");
+        assert_eq!(payload.value(0), b"a");
+    }
+
 }

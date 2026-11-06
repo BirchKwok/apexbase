@@ -36,17 +36,18 @@ examples below each run against a fresh directory.
 ### Hybrid retrieval over one table
 
 `hybrid_search()` fuses a BM25 branch (FTS) with a vector branch
-(`topk_distance`) on `_id`. It requires a filesystem database — the vector branch
-uses the direct mmap scan — and an FTS index. Keep such a table append-only or
-edit rows with `replace()` / `DELETE`: a SQL `UPDATE` makes the raw vector scan
-reject the column.
+(`topk_distance`) on `_id`. It requires an FTS index but works on `:memory:` too:
+the vector branch uses the zero-copy direct mmap scan on a file-backed database,
+and falls back to a merged read otherwise with the same results. Edit rows with
+`store()` / `replace()` / `DELETE`, or with a SQL `UPDATE` for single columns —
+an `UPDATE` that leaves the vector column alone keeps the fast path.
 
 ```python
 import numpy as np
 from apexbase import ApexClient
 
-# hybrid_search uses the direct mmap vector scan, so use a filesystem directory
-# (:memory: handles pure SQL/FTS but does not serve the hybrid vector branch).
+# A filesystem directory lets the hybrid vector branch use the zero-copy mmap
+# scan; on :memory: the same search runs through the merged Arrow fallback.
 client = ApexClient("./rag_db")
 client.execute("CREATE TABLE docs (title TEXT, body TEXT, vec FLOAT16_VECTOR)")
 client.execute("CREATE FTS INDEX ON docs (title, body)")

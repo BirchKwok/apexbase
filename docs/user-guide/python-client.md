@@ -29,8 +29,10 @@ with ApexClient(":memory:") as client:
     client.execute("CREATE TABLE scratch (value INT)")
 ```
 
-Cross-process features such as `hybrid_search()` need a file-backed database, not
-`:memory:`. For a shared process-local session, the module-level helpers
+The vector fast path (`topk_distance(raw=True)` and the vector branch of
+`hybrid_search()`) runs as a zero-copy mmap scan on a file-backed database; on
+`:memory:` both work through a merged Arrow read with identical results. For a
+shared process-local session, the module-level helpers
 (`apexbase.execute(...)`) behave the same way with one implicit client.
 
 ## Database And Table Selection
@@ -288,9 +290,14 @@ client.execute("UPDATE users SET age = 31 WHERE name = 'Alice'")
 client.execute("DELETE FROM users WHERE age < 18")
 ```
 
-Prefer `replace()` or `delete()` on tables with a vector column: in 2.0.0 a SQL
-`UPDATE` on such a table disables the direct vector scan used by
-`hybrid_search()`. See [Agent Memory & RAG](agent-memory.md#recency-and-scope).
+All three editing routes work on tables with a vector column: a SQL `UPDATE`
+changes single columns in place, `replace()` rewrites a whole row, and
+`delete()` removes rows by id or predicate. An `UPDATE` that leaves the vector
+column (and `_id`) untouched keeps the direct vector scan used by
+`hybrid_search()` and `topk_distance(raw=True)`, also after `flush()` or a
+reopen; rewriting the vector column makes the next raw scan fall back to a
+merged read with identical results. See
+[Agent Memory & RAG](agent-memory.md#recency-and-scope).
 
 ## Schema Changes
 

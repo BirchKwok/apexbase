@@ -507,4 +507,28 @@ mod tests {
             vec![1]
         );
     }
+
+    #[test]
+    fn remove_table_index_files_clears_every_suffix_without_an_engine() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path();
+        let table = "docs";
+        for suffix in ["afts", "afts.wal", "afts.meta", "afts.tmp", "nfts.wal"] {
+            std::fs::write(base.join(format!("{table}.{suffix}")), b"x").unwrap();
+        }
+        // A different table's index is not touched.
+        std::fs::write(base.join("other.afts"), b"keep").unwrap();
+
+        remove_table_index_files(base, table).unwrap();
+        for suffix in ["afts", "afts.wal", "afts.meta", "afts.tmp", "nfts.wal"] {
+            assert!(
+                !base.join(format!("{table}.{suffix}")).exists(),
+                "DROP must remove {table}.{suffix}"
+            );
+        }
+        assert!(base.join("other.afts").exists());
+        // Dropping the same name twice is a no-op, not an error.
+        remove_table_index_files(base, table).unwrap();
+    }
+
 }
