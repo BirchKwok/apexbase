@@ -1036,3 +1036,50 @@ class TestNullLiteralUpdateOverlay:
                 f"SELECT count(*) AS n FROM t WHERE {column} IS NULL"
             ).to_dict()
             assert counted == [{"n": 1}], (column, counted)
+
+
+class TestRelativeClientPathsAreCwdScoped:
+    """The process-wide storage registry must not merge different directories.
+
+    `ApexClient("./db")` used the raw relative path as the registry key, so two
+    clients created from different working directories shared one storage. The
+    documentation replay (each page runs in a fresh temporary directory) hit
+    this when an earlier page left a relative-path client registered: the
+    agent-memory page then reused a 3-dimension table from the README example
+    and failed to store 8-dimension vectors. Paths are canonicalized on open.
+    """
+
+    def test_same_relative_path_in_different_working_directories(self, tmp_path):
+        import os
+
+        from apexbase import ApexClient
+
+        previous = os.getcwd()
+        first = second = None
+        try:
+            one = tmp_path / "one"
+            two = tmp_path / "two"
+            one.mkdir()
+            two.mkdir()
+
+            os.chdir(one)
+            first = ApexClient("./db")
+            first.create_table("t", {"v": "int64"})
+            first.store({"v": [1]})
+
+            os.chdir(two)
+            second = ApexClient("./db")
+            second.create_table("t", {"v": "int64"})
+            second.store({"v": [2]})
+            assert [row["v"] for row in second.execute("SELECT v FROM t").to_dict()] == [2]
+
+            os.chdir(one)
+            assert [row["v"] for row in first.execute("SELECT v FROM t").to_dict()] == [1]
+        finally:
+            os.chdir(previous)
+            for client in (first, second):
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass

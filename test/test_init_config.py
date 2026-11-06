@@ -135,7 +135,7 @@ class TestApexClientInitialization:
                 os.chdir(temp_dir)
                 client = ApexClient(dirpath=None)
                 client.create_table("default")
-                assert client._dirpath == Path('.')
+                assert client._dirpath == Path(os.getcwd())
                 client.close()
             finally:
                 # Must change back BEFORE temp_dir cleanup on Windows
@@ -257,7 +257,7 @@ class TestApexClientInitialization:
                 os.chdir(temp_dir)
                 client = ApexClient(dirpath="")
                 client.create_table("default")
-                assert client._dirpath == Path('.')
+                assert client._dirpath == Path(os.getcwd())
                 client.close()
             finally:
                 # Must change back BEFORE temp_dir cleanup on Windows

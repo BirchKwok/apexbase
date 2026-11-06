@@ -1154,8 +1154,16 @@ class ApexClient:
         elif dirpath is None:
             dirpath = "."
         
-        self._dirpath = Path(dirpath)
-        if not self._in_memory:
+        # Canonicalize relative paths against the current working directory.
+        # The process-wide client/storage registry is keyed by `_db_path`
+        # (a string): two callers using "./db" from different working
+        # directories must not share one storage. Documentation examples do
+        # exactly that when a page replays in a fresh temporary directory.
+        # In-memory databases keep their `apexbase_memory:` URI untouched.
+        if self._in_memory:
+            self._dirpath = Path(dirpath)
+        else:
+            self._dirpath = Path(os.path.abspath(str(dirpath)))
             self._dirpath.mkdir(parents=True, exist_ok=True)
         
         # Use .apex file format for V3 storage
