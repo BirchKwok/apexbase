@@ -318,10 +318,15 @@ def test_docs_and_version_are_consistent():
     # Version strings agree across the crate, package and lock files. The
     # version is derived from pyproject.toml (the release workflow already
     # enforces that Cargo.toml matches it) so bumping a release only edits the
-    # version sources, not this test.
-    import tomllib
+    # version sources, not this test. Regex instead of tomllib: `tomllib` only
+    # exists in Python 3.11+ and the release matrix still tests 3.9/3.10.
+    import re
 
-    expected = tomllib.loads(read("pyproject.toml"))["project"]["version"]
+    project_version = re.search(
+        r'(?m)^version\s*=\s*"([^"]+)"', read("pyproject.toml")
+    )
+    assert project_version, "pyproject.toml has no project version"
+    expected = project_version.group(1)
     assert expected.startswith("2."), expected
     for path in ("Cargo.toml", "Cargo.lock"):
         assert f'version = "{expected}"' in read(path), path
@@ -332,7 +337,6 @@ def test_docs_and_version_are_consistent():
     assert f"## [v{expected}]" in release_notes
 
     # No format-version constant above the stable V5 value exists.
-    import re
 
     for path in (ROOT / "apexbase" / "src").rglob("*.rs"):
         text = path.read_text(encoding="utf-8", errors="ignore")
