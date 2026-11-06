@@ -4,6 +4,13 @@ This page records the retained public cross-engine benchmark for ApexBase
 v2.0.0. It is a reproducible snapshot, not a universal claim: rerun the suite
 on your own hardware and workload before drawing conclusions.
 
+v2.1.0 is a correctness release. Its same-machine base/current gate shows no
+regressions on the same toolchain; compared with this v2.0.0 snapshot (built with
+rustc 1.92) a new-stable codegen shift is visible on a few shapes — the base
+revision built with the newer toolchain shows the same shift, so it is a
+toolchain effect, not a v2.1.0 regression. The baseline below remains the
+reference for cross-engine comparisons.
+
 ## v2.0.0 public snapshot
 
 - **Date / source**: 2026-11-03, v2.0.0 release tree (commit `426424a`)

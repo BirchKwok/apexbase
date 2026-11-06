@@ -58,7 +58,8 @@ For the storage model, see [Core Concepts](concepts.md).
 python -m pip install --upgrade apexbase
 ```
 
-v2.0.0 is the V5 GA release:
+v2.1.0 is the current release on the V5 GA line (a drop-in upgrade from
+2.0.0: the on-disk format and SQL surface are unchanged):
 
 - V4 files open unchanged. No migration step or table rewrite is required; a
   table starts declaring format version 5 on its first V5-only write.
@@ -87,6 +88,13 @@ maturin develop --release
 `flight` features declared in `pyproject.toml`. Install `protoc` first
 (`protobuf-compiler`, `brew install protobuf`, or `choco install protoc`) or
 the build stops at the gRPC parts.
+
+The release profile no longer strips the extension dylib. rustc 1.92.x
+stripped macOS 26/27 dylibs into an invalid Mach-O (`mis-aligned LINKEDIT string
+pool`; [rust-lang/rust#157750](https://github.com/rust-lang/rust/issues/157750)),
+so `maturin develop --release` now leaves symbols for the packaging step and
+works on every toolchain the crate builds with. If you strip wheels yourself,
+use rustc 1.98.1 or newer (the upstream fix).
 
 For a development environment with test tools:
 

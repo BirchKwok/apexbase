@@ -315,12 +315,21 @@ def test_docs_and_version_are_consistent():
     ):
         assert section in api, section
 
-    # Version strings agree across the crate, package and lock files.
-    for path in ("Cargo.toml", "pyproject.toml", "Cargo.lock"):
-        text = read(path)
-        assert 'version = "2.0.0"' in text, path
-        assert 'version = "1.39.0"' not in text, path
-    assert '__version__ = "2.0.0"' in read("apexbase/python/apexbase/__init__.py")
+    # Version strings agree across the crate, package and lock files. The
+    # version is derived from pyproject.toml (the release workflow already
+    # enforces that Cargo.toml matches it) so bumping a release only edits the
+    # version sources, not this test.
+    import tomllib
+
+    expected = tomllib.loads(read("pyproject.toml"))["project"]["version"]
+    assert expected.startswith("2."), expected
+    for path in ("Cargo.toml", "Cargo.lock"):
+        assert f'version = "{expected}"' in read(path), path
+        assert 'version = "1.39.0"' not in read(path), path
+    assert f'__version__ = "{expected}"' in read("apexbase/python/apexbase/__init__.py")
+    assert f"releases/tag/v{expected}" in readme
+    assert f"releases/tag/v{expected}" in read("docs/index.md")
+    assert f"## [v{expected}]" in release_notes
 
     # No format-version constant above the stable V5 value exists.
     import re

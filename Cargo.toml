@@ -1,6 +1,6 @@
 [package]
 name = "apexbase"
-version = "2.0.0"
+version = "2.1.0"
 edition = "2021"
 authors = ["Birch Kwok <birchkwok@gmail.com>"]
 description = "High-performance HTAP embedded database with Rust core"
@@ -181,4 +181,10 @@ tempfile = "3.10"
 opt-level = 3
 lto = "fat"
 codegen-units = 1
-strip = true
+# Do not strip the release dylib here. rustc <= 1.92 strips macOS 26/27 dylibs
+# into an invalid Mach-O ("mis-aligned LINKEDIT string pool", dyld refuses to
+# load the wheel, rust-lang/rust#157750). Leaving symbols to the packaging step
+# keeps `maturin develop --release`/`maturin build --release` working on every
+# supported toolchain. Distribution builds that pin rustc >= 1.98.1 may strip
+# the wheel afterwards.
+strip = false

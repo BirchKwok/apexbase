@@ -3,6 +3,76 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v2.1.0](https://github.com/BirchKwok/ApexBase/releases/tag/v2.1.0)
+*2026-11-06*
+
+[Compare with v2.0.0](https://github.com/BirchKwok/ApexBase/compare/v2.0.0...v2.1.0)
+
+> **Correctness release.** v2.1.0 fixes four defects that changed answers or
+> availability around the SQL write path and DDL, and raises the source-build
+> minimum to Rust 1.98.1 so macOS 26/27 builds produce loadable stripped dylibs.
+> The on-disk format (version 5), SQL surface, and Python API are unchanged:
+> this is a drop-in upgrade from 2.0.0.
+
+### Highlights
+
+- **SQL `UPDATE` keeps the direct vector scan.** A table with a vector column no
+  longer loses the zero-copy mmap lane after any `UPDATE` (including after
+  `flush()` or reopen). Cell updates that do not touch the vector column or
+  `_id` keep the fast path; when the lane cannot serve the table state,
+  `topk_distance(raw=True)` and `hybrid_search()` now fall back to the
+  DeltaStore-merging reader instead of raising.
+- **`UPDATE ... SET vec = NULL` now really assigns NULL.** Pending NULL updates
+  for fixed-list vectors (and for binary, timestamp, JSON and other columns
+  without a typed overlay branch) were recorded in the DeltaStore and then
+  silently ignored by the reader. Scans, point reads, `vec IS NULL`, and the
+  exact TopK now agree, and NULL vectors are excluded from the ranking.
+- **`DROP TABLE` clears the table's search and vector state.** The full-text
+  config entry, cached engine and `.afts` files, plus the persisted `<table>.ivf`
+  coarse index, are removed with the table. A same-name `CREATE TABLE` can no
+  longer inherit ghost document ids from the previous FTS index.
+- **Dropping every table no longer resurrects one.** With an empty registry, the
+  next `CREATE TABLE` used to scan the directory and adopt a dropped table's
+  file that was still awaiting deferred unlink, so recreating the second name
+  failed with `Table '<name>' already exists`. The legacy file adoption now runs
+  only once, for databases that predate the catalog; afterwards the catalog is
+  authoritative.
+
+### Behavior changes
+
+- After `DROP TABLE`, full-text search on a same-name recreated table requires
+  `init_fts()`/`CREATE FTS INDEX` again; stale postings are no longer served.
+- TopK over a vector column skips rows whose vector is NULL (both
+  `topk_distance()` shapes and `batch_topk_distance()`); SQL distance
+  expressions already returned NULL for those rows.
+
+### Build and packaging
+
+- **The release profile no longer strips the macOS extension dylib.** rustc
+  1.92.x (and older) strip macOS 26/27 dylibs into an invalid Mach-O
+  (`mis-aligned LINKEDIT string pool`, rust-lang/rust#157750); such wheels cannot
+  be imported. Leaving symbols to the packaging step makes
+  `maturin develop --release` and `maturin build --release` produce a loadable
+  extension on every toolchain the crate supports; wheels are slightly larger.
+  If you strip wheels yourself, use rustc 1.98.1 or newer (the upstream fix).
+- Wheels and the sdist keep the same version source (Cargo + pyproject) and the
+  release workflow validates that both match the pushed tag.
+
+### Upgrade notes
+
+- `python -m pip install --upgrade apexbase`; existing `.apex` files open
+  unchanged and no migration or rewrite is required.
+- Source builds behave as before for every supported Rust toolchain; no
+  environment variable or MSRV change is needed.
+- See [What's New in 2.0](whats-new-2.0.md) for the V5 GA feature set.
+
+### Known limits
+
+- The v2.0.0 known limits are unchanged: `ORDER BY ... LIMIT` over 10M rows is
+  slower than DuckDB in the scale harness, results from `execute()` are
+  materialized (use `execute_stream()` for large outputs), and the 10M-row
+  SQLite comparison runs on a 1M-row subset.
+
 ## [v2.0.0](https://github.com/BirchKwok/ApexBase/releases/tag/v2.0.0)
 *2026-11-03*
 

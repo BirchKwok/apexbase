@@ -6,7 +6,7 @@
   <a href="https://pypi.org/project/apexbase/"><img alt="PyPI" src="https://img.shields.io/pypi/v/apexbase?logo=pypi&logoColor=white&label=PyPI"></a>
   <a href="https://pypi.org/project/apexbase/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/apexbase"></a>
   <a href="https://pypi.org/project/apexbase/"><img alt="Downloads" src="https://img.shields.io/pypi/dm/apexbase?label=downloads%2Fmonth"></a>
-  <a href="https://github.com/BirchKwok/ApexBase/releases/tag/v2.0.0"><img alt="Release" src="https://img.shields.io/github/v/release/BirchKwok/ApexBase?label=release"></a>
+  <a href="https://github.com/BirchKwok/ApexBase/releases/tag/v2.1.0"><img alt="Release" src="https://img.shields.io/github/v/release/BirchKwok/ApexBase?label=release"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
   <a href="https://birchkwok.github.io/apexbase/"><img alt="Docs" src="https://img.shields.io/badge/docs-birchkwok.github.io-00897b"></a>
 </p>
@@ -22,12 +22,13 @@ No database server. No separate search or vector service. Python, PostgreSQL Wir
 
 </div>
 
-> **v2.0.0 is the V5 GA release.** On-disk format 5 is now stable for this
-> release line, and V5 builds read V4 files. This release completes the logical
-> type system, closes the remaining SQL semantics gaps, bounds execution memory
-> through admission control, spill, and streaming, and reconciles full-text
-> indexes on open so stale indexes fail loudly instead of answering with partial
-> results. Read the [2.0 release notes](https://birchkwok.github.io/apexbase/latest/whats-new-2.0/).
+> **v2.1.0 is a correctness release on the V5 GA line.** It keeps the vector
+> fast path usable across SQL `UPDATE`, makes `UPDATE ... SET vec = NULL` really
+> assign NULL (and excludes NULL vectors from TopK), clears full-text and
+> persisted vector state when a table is dropped, and fixes recreating several
+> tables after a multi-table `DROP`. The on-disk format is unchanged, so it is a
+> drop-in upgrade from 2.0.0. Read the
+> [2.1 release notes](https://birchkwok.github.io/apexbase/latest/release-notes/).
 
 ## Why ApexBase
 
