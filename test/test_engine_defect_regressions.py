@@ -1083,3 +1083,103 @@ class TestRelativeClientPathsAreCwdScoped:
                         client.close()
                     except Exception:
                         pass
+
+
+class TestFilesystemAliasesShareOneStorage:
+    """Path spelling must not create two process-local storages for one file.
+
+    The client/storage registry is keyed by the database path. Canonicalizing
+    only relative paths left symlink aliases (and macOS `/tmp` -> `/private/tmp`)
+    pointing at one file but registering two independent storages, which bypasses
+    the in-process sharing guarantees. The key is now the filesystem identity.
+    """
+
+    def test_symlink_alias_uses_one_registry_entry(self, tmp_path):
+        import os
+
+        from apexbase import ApexClient
+
+        if os.name == "nt":
+            # Creating directory symlinks needs elevated privileges on Windows CI;
+            # the POSIX job covers the alias behaviour.
+            return
+        real = tmp_path / "real"
+        real.mkdir()
+        link = tmp_path / "link"
+        os.symlink(real, link, target_is_directory=True)
+
+        first = ApexClient(str(real))
+        second = ApexClient(str(link))
+        try:
+            assert first._storage is second._storage
+            first.create_table("t", {"v": "int64"})
+            first.store({"v": [1]})
+            second.use_table("t")
+            assert [row["v"] for row in second.execute("SELECT v FROM t").to_dict()] == [1]
+        finally:
+            first.close()
+            second.close()
+
+    def test_dotdot_spelling_uses_one_registry_entry(self, tmp_path):
+        from apexbase import ApexClient
+
+        real = tmp_path / "nested"
+        real.mkdir()
+        direct = ApexClient(str(real / "db"))
+        via_dotdot = ApexClient(str(tmp_path / "nested" / ".." / "nested" / "db"))
+        try:
+            assert direct._storage is via_dotdot._storage
+        finally:
+            direct.close()
+            via_dotdot.close()
+
+    def test_tmp_and_private_tmp_share_one_storage(self):
+        import os
+        import shutil
+        import uuid
+
+        from apexbase import ApexClient
+
+        resolved = os.path.realpath("/tmp")
+        if resolved == "/tmp":
+            # Not a symlinked /tmp (Linux CI); the symlink test covers aliases.
+            return
+        name = f"apexbase-tmp-alias-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+        short = os.path.join("/tmp", name)
+        long = os.path.join(resolved, name)
+        os.makedirs(short)
+        first = second = None
+        try:
+            first = ApexClient(short)
+            second = ApexClient(long)
+            assert first._storage is second._storage
+        finally:
+            if first is not None:
+                first.close()
+            if second is not None:
+                second.close()
+            shutil.rmtree(short, ignore_errors=True)
+
+    def test_relative_apex_storage_path_is_pinned_to_creation_directory(self, tmp_path):
+        import os
+
+        from apexbase._core import ApexStorage
+
+        one = tmp_path / "one"
+        two = tmp_path / "two"
+        one.mkdir()
+        two.mkdir()
+        previous = os.getcwd()
+        try:
+            os.chdir(one)
+            storage = ApexStorage("./direct.apex")
+            os.chdir(two)
+            storage.execute("CREATE TABLE t (v INT)")
+            storage.execute("INSERT INTO t VALUES (1)")
+            storage.close()
+        finally:
+            os.chdir(previous)
+        # The path names the database file; its parent directory is the database
+        # root, so tables land alongside the file even after the CWD changed.
+        assert (one / "t.apex").exists()
+        assert not (two / "t.apex").exists()

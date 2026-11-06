@@ -766,6 +766,36 @@ pub struct ApexStorageImpl {
     schema_stable_memtable_writer: RwLock<Option<SchemaStableMemtableWriter>>,
 }
 
+/// Resolve a storage path to its filesystem identity.
+///
+/// Every process-global cache below the binding (table catalog, FTS manager,
+/// backend caches) is keyed by the resolved path string. A caller that passes a
+/// relative path, `..`, or a symlink alias must land in the same cache entry as
+/// the canonical spelling, otherwise the engine opens two independent storages
+/// for one database file.
+fn canonical_storage_path(path: PathBuf) -> PathBuf {
+    // POSIX only: `std::fs::canonicalize` on Windows returns a verbatim `\\?\`
+    // path, which downstream code joined with table names and compared as a
+    // string does not expect. The Python client resolves Windows aliases with
+    // `os.path.realpath` before it reaches this binding.
+    #[cfg(unix)]
+    {
+        if let Ok(canonical) = std::fs::canonicalize(&path) {
+            return canonical;
+        }
+        // The database file usually does not exist yet on the first open; resolve
+        // the directory and append the final component.
+        if let Some(parent) = path.parent() {
+            if let Ok(canonical_parent) = std::fs::canonicalize(parent) {
+                if let Some(name) = path.file_name() {
+                    return canonical_parent.join(name);
+                }
+            }
+        }
+    }
+    path
+}
+
 /// Internal Rust-only methods (not exposed to Python)
 impl ApexStorageImpl {
     #[inline]
@@ -1928,6 +1958,13 @@ impl ApexStorageImpl {
             std::env::current_dir()
                 .unwrap_or_else(|_| PathBuf::from("."))
                 .join(&path_obj)
+        };
+        // Resolve `..`/symlink aliases so the binding's caches and the parent
+        // directory keys (`root_dir`) use one canonical spelling of this file.
+        let abs_path = if in_memory {
+            abs_path
+        } else {
+            canonical_storage_path(abs_path)
         };
         let root_dir = abs_path
             .parent()

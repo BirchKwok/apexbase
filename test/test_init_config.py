@@ -34,8 +34,9 @@ class TestApexClientInitialization:
             client = ApexClient(dirpath=temp_dir)
             client.create_table("default")
             
-            # Check basic attributes
-            assert client._dirpath == Path(temp_dir)
+            # Check basic attributes. The client stores the canonical filesystem
+            # path (symlinks resolved) so aliased spellings share one storage.
+            assert client._dirpath == Path(os.path.realpath(temp_dir))
             assert client._current_table == "default"
             assert client._batch_size == 1000
             assert client._enable_cache is True

@@ -1154,16 +1154,21 @@ class ApexClient:
         elif dirpath is None:
             dirpath = "."
         
-        # Canonicalize relative paths against the current working directory.
-        # The process-wide client/storage registry is keyed by `_db_path`
-        # (a string): two callers using "./db" from different working
-        # directories must not share one storage. Documentation examples do
-        # exactly that when a page replays in a fresh temporary directory.
+        # Canonicalize the database directory to its filesystem identity before
+        # it becomes the process-wide registry key (`str(self._db_path)`):
+        # * relative paths resolve against the current working directory, so the
+        #   same "./db" text cannot merge two different directories;
+        # * symlinks resolve, so "./db" and its symlink alias are one storage
+        #   (two independent storages on one file bypass the in-process sharing
+        #   guarantees);
+        # * ".." is normalized, and "~" is expanded.
         # In-memory databases keep their `apexbase_memory:` URI untouched.
         if self._in_memory:
             self._dirpath = Path(dirpath)
         else:
-            self._dirpath = Path(os.path.abspath(str(dirpath)))
+            self._dirpath = Path(
+                os.path.realpath(os.path.expanduser(str(dirpath)))
+            )
             self._dirpath.mkdir(parents=True, exist_ok=True)
         
         # Use .apex file format for V3 storage
