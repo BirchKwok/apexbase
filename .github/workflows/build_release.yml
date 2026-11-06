@@ -102,7 +102,7 @@ jobs:
       fail-fast: false
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         ref: ${{ github.event.inputs.tag || github.ref }}
@@ -147,12 +147,14 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        # ubuntu-latest is 26.04, which has no prebuilt 3.9 interpreter in
+        # actions/python-versions; 24.04 is the newest image with one.
+        os: [ubuntu-24.04, windows-latest, macos-latest]
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
       fail-fast: false
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         ref: ${{ github.event.inputs.tag || github.ref }}
@@ -166,7 +168,7 @@ jobs:
         key: python-${{ matrix.os }}-${{ matrix.python-version }}-${{ env.APEXBASE_CI_CPU }}
 
     - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
 
@@ -362,7 +364,7 @@ jobs:
     needs: [resolve-release, test, rust-test]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         ref: ${{ github.event.inputs.tag || github.ref }}
@@ -393,14 +395,14 @@ jobs:
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13"]
       fail-fast: false
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         ref: ${{ github.event.inputs.tag || github.ref }}
 
     - name: Set up Python ${{ matrix.python-version }}
       id: py
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: ${{ matrix.python-version }}
 
@@ -449,7 +451,7 @@ jobs:
     needs: [resolve-release, test, rust-test]
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
       with:
         fetch-depth: 0
         ref: ${{ github.event.inputs.tag || github.ref }}
