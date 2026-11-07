@@ -64,6 +64,57 @@ def test_public_baseline_is_a_three_sample_median_with_105_metrics():
     assert baseline["config"]["profile"] == "public"
 
 
+def test_public_baseline_wins_every_comparable_metric():
+    """The public scoreboard claim must stay true: 117/117 comparable wins.
+
+    Every tabular row with a competitor, every exact-vector row, and every
+    quantized codec shared with sqlite-vector must have ApexBase at or below the
+    best competitor. This turns the maintained baseline into a regression guard:
+    a change that loses a public metric fails the release suite instead of only
+    showing up in a manual benchmark log.
+    """
+    baseline = json.loads((ROOT / "benchmarks/latest_public_baseline.json").read_text())
+
+    def competitors(row):
+        return [
+            row[key]
+            for key in ("SQLite", "DuckDB")
+            if isinstance(row.get(key), (int, float))
+        ]
+
+    comparable = 0
+    for row in baseline["results"]:
+        values = competitors(row)
+        if not values:
+            continue
+        comparable += 1
+        assert row["ApexBase"] <= min(values), (row["query"], row)
+
+    vector = baseline.get("vector_similarity") or {}
+    for section in ("head_to_head", "batch"):
+        for row in vector.get(section) or []:
+            values = competitors(row)
+            if not values:
+                continue
+            comparable += 1
+            assert row["ApexBase"] <= min(values), (section, row["query"], row)
+    assert vector.get("summary", {}).get("slower", 0) == 0, vector.get("summary")
+
+    quantized = baseline.get("quantized_vector_similarity") or {}
+    apex_by_codec = {row["codec"]: row for row in quantized.get("apexbase") or []}
+    for row in quantized.get("sqlite_vector") or []:
+        apex = apex_by_codec.get(row["codec"])
+        if apex is None:
+            continue
+        comparable += 1
+        assert (
+            apex["quantized_ms_per_query"] <= row["quantized_ms_per_query"]
+        ), (row["codec"], apex, row)
+    assert quantized.get("summary", {}).get("slower", 0) == 0, quantized.get("summary")
+
+    assert comparable == 117, comparable
+
+
 def test_typed_logical_types_across_reopen_catalog_and_alter(tmp_path):
     import datetime as dt
     from decimal import Decimal

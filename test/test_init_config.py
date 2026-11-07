@@ -136,7 +136,9 @@ class TestApexClientInitialization:
                 os.chdir(temp_dir)
                 client = ApexClient(dirpath=None)
                 client.create_table("default")
-                assert client._dirpath == Path(os.getcwd())
+                # Compare filesystem identity: Windows getcwd() may use the
+                # short 8.3 spelling while realpath returns the long form.
+                assert os.path.samefile(client._dirpath, os.getcwd())
                 client.close()
             finally:
                 # Must change back BEFORE temp_dir cleanup on Windows
@@ -258,7 +260,9 @@ class TestApexClientInitialization:
                 os.chdir(temp_dir)
                 client = ApexClient(dirpath="")
                 client.create_table("default")
-                assert client._dirpath == Path(os.getcwd())
+                # Compare filesystem identity: Windows getcwd() may use the
+                # short 8.3 spelling while realpath returns the long form.
+                assert os.path.samefile(client._dirpath, os.getcwd())
                 client.close()
             finally:
                 # Must change back BEFORE temp_dir cleanup on Windows

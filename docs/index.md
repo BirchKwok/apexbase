@@ -12,7 +12,7 @@ hide:
 <p align="center">
   <a href="https://pypi.org/project/apexbase/"><img alt="PyPI" src="https://img.shields.io/pypi/v/apexbase?logo=pypi&logoColor=white&label=PyPI"></a>
   <a href="https://pypi.org/project/apexbase/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/apexbase"></a>
-  <a href="https://github.com/BirchKwok/ApexBase/releases/tag/v2.1.0"><img alt="Release" src="https://img.shields.io/github/v/release/BirchKwok/ApexBase?label=release"></a>
+  <a href="https://github.com/BirchKwok/ApexBase/releases/tag/v2.1.1"><img alt="Release" src="https://img.shields.io/github/v/release/BirchKwok/ApexBase?label=release"></a>
   <a href="https://github.com/BirchKwok/ApexBase/blob/main/LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
 </p>
 
@@ -185,15 +185,22 @@ iterations, median of three same-machine runs on Apple arm64. ApexBase won
 See [Performance](performance.md) for the full scoreboard, 10M-row checks, and
 reproduction commands.
 
-## v2.1.0 highlights
+## v2.1.1 highlights
 
+- **One database file, one storage.** The client/storage registry is keyed by
+  the directory's filesystem identity: relative paths, `..`, `~`, symlink
+  aliases and macOS `/tmp` vs `/private/tmp` no longer open a second, independent
+  storage for the same database file.
 - **Correct writes around vectors and DDL.** SQL `UPDATE` keeps the direct vector
   scan (and `raw=True`/`hybrid_search()` fall back correctly when it cannot),
   `UPDATE ... SET vec = NULL` really assigns NULL and NULL vectors are excluded
   from TopK, `DROP TABLE` clears the table's FTS and IVF state, and recreating
   several dropped tables no longer reports `already exists`.
 - **Drop-in upgrade.** On-disk format 5, the SQL surface and the Python API are
-  unchanged from 2.0.0; existing files need no migration.
+  unchanged from 2.0.x; existing files need no migration.
+- **Public benchmark still all-win.** 117/117 comparable metrics (105 tabular,
+  6 exact-vector, 6 quantized shared codecs) beat SQLite and DuckDB; the release
+  suite now asserts that automatically.
 - **macOS 26/27 builds no longer strip the release dylib.** rustc at or below
   1.92 turned stripped dylibs into an invalid Mach-O
   (`mis-aligned LINKEDIT string pool`, rust-lang/rust#157750); the release
@@ -251,7 +258,7 @@ reproduction commands.
 
 ## Project status
 
-ApexBase v2.1.0 is the current release on the V5 GA line. The engine is
+ApexBase v2.1.1 is the current release on the V5 GA line. The engine is
 Apache-2.0 licensed, ships
 prebuilt wheels for Linux, macOS, and Windows, and supports Python 3.9 through
 3.13; other platform and architecture combinations build from source. The public

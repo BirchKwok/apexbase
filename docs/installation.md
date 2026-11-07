@@ -58,8 +58,8 @@ For the storage model, see [Core Concepts](concepts.md).
 python -m pip install --upgrade apexbase
 ```
 
-v2.1.0 is the current release on the V5 GA line (a drop-in upgrade from
-2.0.0: the on-disk format and SQL surface are unchanged):
+v2.1.1 is the current release on the V5 GA line (a drop-in upgrade from
+2.0.x: the on-disk format and SQL surface are unchanged):
 
 - V4 files open unchanged. No migration step or table rewrite is required; a
   table starts declaring format version 5 on its first V5-only write.

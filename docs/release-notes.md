@@ -3,6 +3,49 @@
 This page summarizes the changes introduced in each ApexBase release, grouped by functional area.
 
 
+## [v2.1.1](https://github.com/BirchKwok/ApexBase/releases/tag/v2.1.1)
+*2026-11-07*
+
+[Compare with v2.1.0](https://github.com/BirchKwok/ApexBase/compare/v2.1.0...v2.1.1)
+
+> **Database-identity fix.** v2.1.1 canonicalizes the database directory to its
+> filesystem identity before it becomes the process-wide storage-registry key.
+> Relative paths, `..`, `~`, symlink aliases and macOS `/tmp` vs `/private/tmp`
+> now resolve to one storage; previously some spellings opened a second,
+> independent storage for the same file. The on-disk format is unchanged and
+> existing databases need no migration.
+
+### Fixes
+
+- **One storage per database file.** `ApexClient` resolves the directory with
+  `os.path.realpath` + `os.path.expanduser`; the low-level `ApexStorage` binding
+  canonicalizes its storage path on POSIX as well (resolving the parent when the
+  database file does not exist yet). Relative paths remain supported: they are
+  resolved against the working directory at open time.
+- **No regression when the CWD changes later.** Because the canonical path is
+  captured at construction, an `ApexStorage` handle keeps targeting the
+  database it was opened on even if the process later changes directory.
+- **Public benchmark all-win guard.** The release suite now asserts that every
+  maintained public-baseline metric with a direct competitor stays won:
+  117/117 comparable metrics (105 tabular, 6 exact vector, 6 quantized codecs
+  shared with sqlite-vector) are at or below the best competitor.
+
+### Verification
+
+- New regression tests cover: the same relative path from different working
+  directories (must stay independent), symlink aliases and `/tmp` aliases
+  (must share one storage), `..` spellings, and a relative `ApexStorage` path
+  followed by a working-directory change.
+- Full Python and Rust test suites pass; the public benchmark still reports
+  `105/105` tabular, `6/6` exact-vector and `6/6` shared quantized-codec wins.
+
+### Upgrade notes
+
+- `python -m pip install --upgrade apexbase`; the on-disk format is unchanged,
+  so no migration or rewrite is required.
+- The maintained public performance baseline remains the v2.0.0 snapshot; the
+  same-machine base/current gate is the release performance authority.
+
 ## [v2.1.0](https://github.com/BirchKwok/ApexBase/releases/tag/v2.1.0)
 *2026-11-06*
 

@@ -6,7 +6,7 @@
   <a href="https://pypi.org/project/apexbase/"><img alt="PyPI" src="https://img.shields.io/pypi/v/apexbase?logo=pypi&logoColor=white&label=PyPI"></a>
   <a href="https://pypi.org/project/apexbase/"><img alt="Python versions" src="https://img.shields.io/pypi/pyversions/apexbase"></a>
   <a href="https://pypi.org/project/apexbase/"><img alt="Downloads" src="https://img.shields.io/pypi/dm/apexbase?label=downloads%2Fmonth"></a>
-  <a href="https://github.com/BirchKwok/ApexBase/releases/tag/v2.1.0"><img alt="Release" src="https://img.shields.io/github/v/release/BirchKwok/ApexBase?label=release"></a>
+  <a href="https://github.com/BirchKwok/ApexBase/releases/tag/v2.1.1"><img alt="Release" src="https://img.shields.io/github/v/release/BirchKwok/ApexBase?label=release"></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-Apache--2.0-blue"></a>
   <a href="https://birchkwok.github.io/apexbase/"><img alt="Docs" src="https://img.shields.io/badge/docs-birchkwok.github.io-00897b"></a>
 </p>
@@ -22,13 +22,15 @@ No database server. No separate search or vector service. Python, PostgreSQL Wir
 
 </div>
 
-> **v2.1.0 is a correctness release on the V5 GA line.** It keeps the vector
-> fast path usable across SQL `UPDATE`, makes `UPDATE ... SET vec = NULL` really
-> assign NULL (and excludes NULL vectors from TopK), clears full-text and
-> persisted vector state when a table is dropped, and fixes recreating several
-> tables after a multi-table `DROP`. The on-disk format is unchanged, so it is a
-> drop-in upgrade from 2.0.0. Read the
-> [2.1 release notes](https://birchkwok.github.io/apexbase/latest/release-notes/).
+> **v2.1.1 fixes how the embedded engine identifies a database directory.** On
+> the V5 GA line, the
+> process-wide storage registry is now keyed by the directory's filesystem
+> identity, so relative paths, `..`, `~`, symlink aliases and macOS
+> `/tmp` vs `/private/tmp` all open the same storage instead of silently
+> creating a second one. It also keeps the v2.1.0 correctness fixes for vector
+> writes, `DROP TABLE` cleanup and multi-table re-creation. The on-disk format is
+> unchanged: a drop-in upgrade from 2.0.x. Read the
+> [release notes](https://birchkwok.github.io/apexbase/latest/release-notes/).
 
 ## Why ApexBase
 
